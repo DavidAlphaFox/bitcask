@@ -1719,6 +1719,7 @@ do_put(_Key, _Value, State, 0, LastErr) ->
     {{error, LastErr}, State};
 do_put(Key, Value, #bc_state{write_file = WriteFile} = State, 
        Retries, _LastErr) ->
+    % 计算值的大小
     ValSize =
         case Value of
             tombstone ->
@@ -1726,7 +1727,9 @@ do_put(Key, Value, #bc_state{write_file = WriteFile} = State,
             _ ->
                 size(Value)
         end,
+
     State2 =
+        %% 检查是否能写入
         case bitcask_fileops:check_write(WriteFile, Key, ValSize,
                                          State#bc_state.max_file_size) of
             wrap ->
@@ -1735,16 +1738,20 @@ do_put(Key, Value, #bc_state{write_file = WriteFile} = State,
                 %% is that closing/reopening for read only access
                 %% would flush the O/S cache for the file, which may
                 %% be undesirable.
+                %% 打开一个全新的文件进行写入
                 wrap_write_file(State);
             fresh ->
                 %% Time to start our first write file.
+                %% 取得写锁
                 case bitcask_lockops:acquire(write, State#bc_state.dirname) of
                     {ok, WriteLock} ->
                         try
+                            %% 创建新的写文件
                             {ok, NewWriteFile} = bitcask_fileops:create_file(
                                                    State#bc_state.dirname,
                                                    State#bc_state.opts,
                                                    State#bc_state.keydir),
+                            %% 向锁文件写入活跃文件名称
                             ok = bitcask_lockops:write_activefile(
                                    WriteLock,
                                    bitcask_fileops:filename(NewWriteFile)),
@@ -1759,11 +1766,13 @@ do_put(Key, Value, #bc_state{write_file = WriteFile} = State,
             ok ->
                 State
         end,
-
+    %% 获得时间戳
     Tstamp = bitcask_time:tstamp(),
     #bc_state{write_file=WriteFile0} = State2,
+    %% 得到文件的时间戳
     WriteFileId = bitcask_fileops:file_tstamp(WriteFile0),
     case Value of
+        %% 如果是二进制文件
         BinValue when is_binary(BinValue) ->
             % Replacing value from a previous file, so write tombstone for it.
             case bitcask_nifs:keydir_get(State2#bc_state.keydir, Key) of
