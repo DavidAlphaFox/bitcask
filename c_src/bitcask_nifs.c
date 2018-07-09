@@ -262,7 +262,7 @@ typedef struct
     int   fd;
     int   is_write_lock;
     char  filename[0];
-} bitcask_lock_handle;
+} bitcask_lock_handle; //文件锁
 
 KHASH_INIT(global_biggest_file_id, char*, uint32_t, 1, kh_str_hash_func, kh_str_hash_equal);
 KHASH_INIT(global_keydirs, char*, bitcask_keydir*, 1, kh_str_hash_func, kh_str_hash_equal);
@@ -486,7 +486,7 @@ ERL_NIF_TERM bitcask_nifs_keydir_new1(ErlNifEnv* env, int argc, const ERL_NIF_TE
             keydir = kh_val(priv->global_keydirs, itr);
             // Existing keydir is available. Check the is_ready flag to determine if
             // the original creator is ready for other processes to use it.
-            if (!keydir->is_ready)
+            if (!keydir->is_ready) //keydir存在，需要通知使用者不成功
             {
                 // Notify the caller that while the requested keydir exists, it's not
                 // ready for public usage.
@@ -495,7 +495,7 @@ ERL_NIF_TERM bitcask_nifs_keydir_new1(ErlNifEnv* env, int argc, const ERL_NIF_TE
             }
             else
             {
-                keydir->refcount++;
+                keydir->refcount++; //增加引用
             }
         }
         else

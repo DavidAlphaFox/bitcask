@@ -467,7 +467,7 @@ check_write(fresh, _Key, _ValSize, _MaxSize) ->
     fresh;
 check_write(#filestate { ofs = Offset }, Key, ValSize, MaxSize) ->
     Size = ?HEADER_SIZE + size(Key) + ValSize,
-    case (Offset + Size) > MaxSize of
+    case (Offset + Size) > MaxSize of %% 文件大小超过限制了 
         true ->
             wrap;
         false ->

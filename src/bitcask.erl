@@ -284,9 +284,9 @@ get(Ref, Key, TryNum) ->
 %% @doc Store a key and value in a bitcase datastore.
 put(Ref, Key, Value) ->
     #bc_state { write_file = WriteFile } = State = get_state(Ref),
-
+    %% 确保文件可写
     %% Make sure we have a file open to write
-    case WriteFile of
+    case WriteFile of 
         undefined ->
             throw({error, read_only});
 
@@ -1722,7 +1722,7 @@ do_put(Key, Value, #bc_state{write_file = WriteFile} = State,
     % 计算值的大小
     ValSize =
         case Value of
-            tombstone ->
+            tombstone -> %% 删除的时候，将墓碑放到数据字段上
                 tombstone_size_for_version(State#bc_state.tombstone_version);
             _ ->
                 size(Value)
