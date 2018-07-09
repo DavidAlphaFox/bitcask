@@ -23,8 +23,6 @@
 -compile(export_all).
 -behaviour(gen_server).
 
--include_lib("eunit/include/eunit.hrl").
-
 -ifdef(PULSE).
 -compile({parse_transform, pulse_instrument}).
 -endif.
@@ -147,7 +145,7 @@ handle_call({file_open, Owner, Filename, Opts}, _From, State) ->
                                    [Filename, Reason]),
             {stop, {file_open_failed, Reason}, Error, State}
     end;
-handle_call(file_close, From, State=#state{fd=Fd}) -> 
+handle_call(file_close, From, State=#state{fd=Fd}) ->
     check_owner(From, State),
     ok = file:close(Fd),
     {stop, normal, ok, State};
