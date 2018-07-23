@@ -1218,7 +1218,8 @@ scan_key_files([Filename | Rest], KeyDir, Acc, CloseFile, KT) ->
                         end,
                         ok
                 end,
-            bitcask_fileops:fold_keys(File, F, undefined, recovery),
+            bitcask_fileops:fold_keys(File, F, undefined, recovery), %% 将指定目录下的数据文件进行归集
+            %% 将所有的key放入keydir
             if CloseFile == true ->
                     bitcask_fileops:close(File);
                true ->

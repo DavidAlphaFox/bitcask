@@ -1,4 +1,4 @@
-
+%% 
 -record(bitcask_entry, { key :: binary(),
                          file_id :: integer(),
                          total_sz :: integer(),

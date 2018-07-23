@@ -137,7 +137,7 @@ static ErlNifResourceType* bitcask_file_RESOURCE;
 typedef struct
 {
     int fd;
-} bitcask_file_handle;
+} bitcask_file_handle; //文件句柄的封装
 
 typedef struct
 {
@@ -148,7 +148,7 @@ typedef struct
     uint32_t tstamp;
     uint16_t key_sz;
     char     key[0];
-} bitcask_keydir_entry;
+} bitcask_keydir_entry; // hash表 
 
 
 static khint_t keydir_entry_hash(bitcask_keydir_entry* entry);
@@ -247,7 +247,7 @@ typedef struct
     ErlNifMutex*  mutex;
     char          is_ready;
     char          name[0];
-} bitcask_keydir;
+} bitcask_keydir; // keydir的描述
 
 typedef struct
 {
@@ -255,7 +255,7 @@ typedef struct
     int             iterating;
     khiter_t        iterator;
     uint64_t        epoch;
-} bitcask_keydir_handle;
+} bitcask_keydir_handle; // keydir的handler
 
 typedef struct
 {
@@ -419,7 +419,7 @@ static ErlNifFunc nif_funcs[] =
 };
 
 ERL_NIF_TERM bitcask_nifs_keydir_new0(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
-{
+{   // 分配keydir的资源
     // First, setup a resource for our handle
     bitcask_keydir_handle* handle = enif_alloc_resource_compat(env,
                                                                bitcask_keydir_RESOURCE,
@@ -428,9 +428,9 @@ ERL_NIF_TERM bitcask_nifs_keydir_new0(ErlNifEnv* env, int argc, const ERL_NIF_TE
 
     // Now allocate the actual keydir instance. Because it's unnamed/shared, we'll
     // leave the name and lock portions null'd out
-    bitcask_keydir* keydir = malloc(sizeof(bitcask_keydir));
+    bitcask_keydir* keydir = malloc(sizeof(bitcask_keydir));//创建新的keydir
     memset(keydir, '\0', sizeof(bitcask_keydir));
-    keydir->entries  = kh_init(entries);
+    keydir->entries  = kh_init(entries);//初始化条目
     keydir->fstats   = kh_init(fstats);
 
     // Assign the keydir to our handle and hand it back
@@ -477,11 +477,11 @@ ERL_NIF_TERM bitcask_nifs_keydir_new1(ErlNifEnv* env, int argc, const ERL_NIF_TE
 
         // Get our private stash and check the global hash table for this entry
         bitcask_priv_data* priv = (bitcask_priv_data*)enif_priv_data(env);
-        enif_mutex_lock(priv->global_keydirs_lock);
+        enif_mutex_lock(priv->global_keydirs_lock); // 给keydirs加锁
 
         bitcask_keydir* keydir;
-        khiter_t itr = kh_get(global_keydirs, priv->global_keydirs, name);
-        if (itr != kh_end(priv->global_keydirs))
+        khiter_t itr = kh_get(global_keydirs, priv->global_keydirs, name); // 得到指定文件的keydirs
+        if (itr != kh_end(priv->global_keydirs)) // 找到了
         {
             keydir = kh_val(priv->global_keydirs, itr);
             // Existing keydir is available. Check the is_ready flag to determine if
@@ -499,13 +499,13 @@ ERL_NIF_TERM bitcask_nifs_keydir_new1(ErlNifEnv* env, int argc, const ERL_NIF_TE
             }
         }
         else
-        {
+        {   // 没找到，创建新的keydir
             // No such keydir, create a new one and add to the globals list. Make sure
             // to allocate enough room for the name.
             keydir = malloc(sizeof(bitcask_keydir) + name_sz + 1);
             memset(keydir, '\0', sizeof(bitcask_keydir) + name_sz + 1);
             strncpy(keydir->name, name, name_sz + 1);
-
+        
             // Initialize hash tables
             keydir->entries  = kh_init(entries);
             keydir->fstats   = kh_init(fstats);
@@ -513,10 +513,10 @@ ERL_NIF_TERM bitcask_nifs_keydir_new1(ErlNifEnv* env, int argc, const ERL_NIF_TE
             // Be sure to initialize the mutex and set our refcount
             keydir->mutex = enif_mutex_create(name);
             keydir->refcount = 1;
-
+            // 全局的keydir进行注册
             // Finally, register this new keydir in the globals
             kh_put2(global_keydirs, priv->global_keydirs, keydir->name, keydir);
-
+            // 得到该keydir最大文件ID
             khiter_t itr_biggest_file_id = kh_get(global_biggest_file_id, priv->global_biggest_file_id, name);
             if (itr_biggest_file_id != kh_end(priv->global_biggest_file_id)) {
                 uint32_t old_biggest_file_id = kh_val(priv->global_biggest_file_id, itr_biggest_file_id);
@@ -1216,7 +1216,7 @@ static void perhaps_sweep_siblings(bitcask_keydir* keydir)
 #else   /* PULSE */
     i = 100*1000;
 #endif
-
+    // 得到当前时间
     gettimeofday(&target, NULL);
     target.tv_usec += max_usec;
     if (target.tv_usec > 1000000)
@@ -1524,7 +1524,7 @@ ERL_NIF_TERM bitcask_nifs_keydir_get_int(ErlNifEnv* env, int argc, const ERL_NIF
         enif_inspect_binary(env, argv[1], &key) &&
         enif_get_uint64(env, argv[2], &epoch))
     {
-        bitcask_keydir* keydir = handle->keydir;
+        bitcask_keydir* keydir = handle->keydir; // 
         LOCK(keydir);
 
         DEBUG_BIN(dbgKey, key.data, key.size);
@@ -2340,10 +2340,10 @@ ERL_NIF_TERM bitcask_nifs_file_open(ErlNifEnv* env, int argc, const ERL_NIF_TERM
     if (enif_get_string(env, argv[0], filename, sizeof(filename), ERL_NIF_LATIN1) &&
         enif_is_list(env, argv[1]))
     {
-        int flags = get_file_open_flags(env, argv[1]);
+        int flags = get_file_open_flags(env, argv[1]); // 得到文件操作flags
         int fd = open(filename, flags, S_IREAD | S_IWRITE);
         if (fd > -1)
-        {
+        {   // 打开文件，建立文件操作的resources
             // Setup a resource for our handle
             bitcask_file_handle* handle = enif_alloc_resource_compat(env,
                                                                      bitcask_file_RESOURCE,
@@ -2389,7 +2389,7 @@ ERL_NIF_TERM bitcask_nifs_file_sync(ErlNifEnv* env, int argc, const ERL_NIF_TERM
 {
     bitcask_file_handle* handle;
     if (enif_get_resource(env, argv[0], bitcask_file_RESOURCE, (void**)&handle))
-    {
+    {   // 通过fsync同步刷硬盘
         int rc = fsync(handle->fd);
         if (rc != -1)
         {
@@ -2883,7 +2883,7 @@ static void free_keydir(bitcask_keydir* keydir)
 
 
 static void bitcask_nifs_keydir_resource_cleanup(ErlNifEnv* env, void* arg)
-{
+{   // 
     bitcask_keydir_handle* handle = (bitcask_keydir_handle*)arg;
     bitcask_keydir* keydir = handle->keydir;
 
@@ -2917,7 +2917,7 @@ static void bitcask_nifs_keydir_resource_cleanup(ErlNifEnv* env, void* arg)
         enif_mutex_lock(priv->global_keydirs_lock);
 
         // Remember biggest_file_id in case someone re-opens the same name
-        uint32_t global_biggest = 0, the_biggest = 0;
+        uint32_t global_biggest = 0, the_biggest = 0;// 得到文件最大的ID
         khiter_t itr_biggest_file_id = kh_get(global_biggest_file_id, priv->global_biggest_file_id, keydir->name);
         if (itr_biggest_file_id != kh_end(priv->global_biggest_file_id)) {
             global_biggest = kh_val(priv->global_biggest_file_id, itr_biggest_file_id);
@@ -3016,7 +3016,7 @@ static int on_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info)
                                                     0);
 
     // Initialize shared keydir hashtable
-    bitcask_priv_data* priv = malloc(sizeof(bitcask_priv_data));
+    bitcask_priv_data* priv = malloc(sizeof(bitcask_priv_data)); // 全局私有信息
     priv->global_biggest_file_id = kh_init(global_biggest_file_id);
     priv->global_keydirs = kh_init(global_keydirs);
     priv->global_keydirs_lock = enif_mutex_create("bitcask_global_handles_lock");
