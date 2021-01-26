@@ -38,6 +38,8 @@
 
 #include <stdio.h>
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
 //typesystem hack to avoid some incorrect errors.
 typedef ErlNifUInt64 uint64;
 
@@ -52,7 +54,7 @@ void DEBUG(const char *fmt, ...)
     vfprintf(stderr, fmt, ap);
     va_end(ap);
 }
-int erts_snprintf(char *, size_t, const char *, ...); 
+int erts_snprintf(char *, size_t, const char *, ...);
 #define MAX_DEBUG_STR 128
 #define DEBUG_STR(N, V) \
     char N[MAX_DEBUG_STR];\
@@ -76,10 +78,6 @@ void DEBUG2(const char *fmt, ...) { }
 #else
 #  define DEBUG_KEYDIR(X) {}
 #  define DEBUG_ENTRY(E) {}
-#endif
-
-#ifdef PULSE
-#include "pulse_c_send.h"
 #endif
 
 #ifdef BITCASK_DEBUG
@@ -376,9 +374,6 @@ static void bitcask_nifs_file_resource_cleanup(ErlNifEnv* env, void* arg);
 
 static ErlNifFunc nif_funcs[] =
 {
-#ifdef PULSE
-    {"set_pulse_pid", 1, set_pulse_pid},
-#endif
     {"keydir_new", 0, bitcask_nifs_keydir_new0},
     {"keydir_new", 1, bitcask_nifs_keydir_new1},
     {"maybe_keydir_new", 1, bitcask_nifs_maybe_keydir_new1},
@@ -447,7 +442,7 @@ ERL_NIF_TERM bitcask_nifs_maybe_keydir_new1(ErlNifEnv* env, int argc, const ERL_
     {
         // Get our private stash and check the global hash table for this entry
         bitcask_priv_data* priv = (bitcask_priv_data*)enif_priv_data(env);
-        
+
         enif_mutex_lock(priv->global_keydirs_lock);
         khiter_t itr = kh_get(global_keydirs, priv->global_keydirs, name);
         khiter_t table_end = kh_end(priv->global_keydirs); /* get end while lock is held! */
@@ -455,13 +450,13 @@ ERL_NIF_TERM bitcask_nifs_maybe_keydir_new1(ErlNifEnv* env, int argc, const ERL_
         if (itr != table_end)
         {
             return bitcask_nifs_keydir_new1(env, argc, argv);
-        } 
+        }
         else
         {
             return enif_make_tuple2(env, ATOM_ERROR, ATOM_NOT_READY);
         }
-    } 
-    else 
+    }
+    else
     {
         return enif_make_badarg(env);
     }
@@ -803,7 +798,7 @@ static inline int is_sib_tombstone(bitcask_keydir_entry_sib *s)
     return 0;
 }
 
-// Extracts the entry values from a regular entry or from the 
+// Extracts the entry values from a regular entry or from the
 // closest snapshot in time in an entry list.
 static int proxy_kd_entry_at_epoch(bitcask_keydir_entry* old,
                                    uint64_t epoch, bitcask_keydir_entry_proxy * ret)
@@ -1211,12 +1206,7 @@ static void perhaps_sweep_siblings(bitcask_keydir* keydir)
         return;
     }
 
-#ifdef  PULSE
-    i = 10;
-#else   /* PULSE */
-    i = 100*1000;
-#endif
-    // 得到当前时间
+
     gettimeofday(&target, NULL);
     target.tv_usec += max_usec;
     if (target.tv_usec > 1000000)
@@ -1667,7 +1657,7 @@ ERL_NIF_TERM bitcask_nifs_keydir_remove(ErlNifEnv* env, int argc, const ERL_NIF_
             }
             // If not iterating, just remove.
             else if(keydir->keyfolders == 0)
-            { 
+            {
                 remove_entry(keydir, fr.itr);
             }
             // else found in entries while iterating
@@ -1712,7 +1702,7 @@ bitcask_keydir_entry * clone_entry(bitcask_keydir_entry * curr)
             next_sib = next_sib->next;
         }
         *sib_ptr = NULL;
-        return MAKE_ENTRY_LIST_POINTER(new_head); 
+        return MAKE_ENTRY_LIST_POINTER(new_head);
     }
     else
     {
@@ -2141,7 +2131,7 @@ ERL_NIF_TERM bitcask_nifs_keydir_trim_fstats(ErlNifEnv* env, int argc, const ERL
         enif_is_list(env, argv[1]))
     {
         bitcask_keydir* keydir = handle->keydir;
-        
+
         LOCK(keydir);
         uint32_t file_id;
 
@@ -2168,7 +2158,7 @@ ERL_NIF_TERM bitcask_nifs_keydir_trim_fstats(ErlNifEnv* env, int argc, const ERL
             list = tail;
         }
         UNLOCK(keydir);
-        return enif_make_tuple2(env, ATOM_OK, 
+        return enif_make_tuple2(env, ATOM_OK,
                                 enif_make_uint(env, non_existent_entries));
     }
     else
@@ -2726,17 +2716,7 @@ static void msg_pending_awaken(ErlNifEnv* env, bitcask_keydir* keydir,
     for (idx = 0; idx < keydir->pending_awaken_count; idx++)
     {
         enif_clear_env(msg_env);
-#ifdef PULSE
-        /* Using PULSE_SEND here sometimes deadlocks the Bitcask PULSE test.
-           Reverting to using enif_send for now.
-           TODO: Check if PULSE_SEND is really necessary and investigate/fix
-                 deadlock in the future
-        */
-        /* PULSE_SEND(env, &keydir->pending_awaken[idx], msg_env, msg); */
         enif_send(env, &keydir->pending_awaken[idx], msg_env, msg);
-#else
-        enif_send(env, &keydir->pending_awaken[idx], msg_env, msg);
-#endif
     }
     enif_free_env(msg_env);
 }
@@ -3053,11 +3033,9 @@ static int on_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info)
     ATOM_CUR = enif_make_atom(env, "cur");
     ATOM_BOF = enif_make_atom(env, "bof");
 
-#ifdef PULSE
-    pulse_c_send_on_load(env);
-#endif
-
     return 0;
 }
 
 ERL_NIF_INIT(bitcask_nifs, nif_funcs, &on_load, NULL, NULL, NULL);
+
+#pragma GCC diagnostic pop

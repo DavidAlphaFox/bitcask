@@ -25,11 +25,13 @@
 
 -ifdef(PULSE).
 -compile({parse_transform, pulse_instrument}).
+-include_lib("pulse_otp/include/pulse_otp.hrl").
 -endif.
 
 -ifdef(TEST).
 -ifdef(EQC).
 -include_lib("eqc/include/eqc.hrl").
+-export([prop_in_window/0]).
 -endif.
 -include_lib("eunit/include/eunit.hrl").
 -endif.
@@ -252,10 +254,4 @@ prop_in_window() ->
                 ?assertEqual(ExpInWindow, in_merge_window(NowHour, {StartTime, EndTime})),
                 true
             end).
-
-prop_in_window_test_() ->
-    {timeout, 30,
-     [fun() -> ?assert(eqc:quickcheck(prop_in_window())) end]}.
-
-
 -endif.

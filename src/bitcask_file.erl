@@ -20,21 +20,29 @@
 %%
 %% -------------------------------------------------------------------
 -module(bitcask_file).
--compile(export_all).
+
 -behaviour(gen_server).
 
 -ifdef(PULSE).
 -compile({parse_transform, pulse_instrument}).
+-include_lib("pulse_otp/include/pulse_otp.hrl").
+-compile({pulse_side_effect, [{file, '_', '_'}]}).
 -endif.
 
 %% API
+
+-export([file_open/2, file_close/1, file_sync/1,
+         file_pread/3, file_read/2,
+         file_pwrite/3, file_write/2,
+         file_position/2, file_seekbof/1, file_truncate/1,
+         file_request/2, check_pid/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
--record(state, {fd    :: file:fd(),
-                owner :: pid()}).
+-record(state, {fd    :: file:fd() | undefined,
+                owner :: pid() | undefined}).
 
 %%%===================================================================
 %%% API
@@ -141,7 +149,7 @@ handle_call({file_open, Owner, Filename, Opts}, _From, State) ->
             State2 = State#state{fd=Fd, owner=Owner},
             {reply, ok, State2};
         Error = {error, Reason} ->
-            error_logger:error_msg("Failed to open file ~p: ~p~n",
+            error_logger:warning_msg("Failed to open file ~p: ~p~n",
                                    [Filename, Reason]),
             {stop, {file_open_failed, Reason}, Error, State}
     end;

@@ -68,7 +68,7 @@
 
 -ifdef(PULSE).
 -compile({parse_transform, pulse_instrument}).
--export([set_pulse_pid/1]).
+-include_lib("pulse_otp/include/pulse_otp.hrl").
 -compile({pulse_skip, [{init,0}]}).
 -endif.
 
@@ -76,7 +76,7 @@
 -ifdef(EQC).
 -include_lib("eqc/include/eqc.hrl").
 -endif.
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
@@ -98,11 +98,6 @@ init() ->
             SoName = filename:join(Dir, "bitcask")
     end,
     erlang:load_nif(SoName, 0).
-
--ifdef(PULSE).
-set_pulse_pid(_Pid) ->
-    erlang:nif_error({error, not_loaded}).
--endif.
 
 %% ===================================================================
 %% Internal functions
@@ -733,7 +728,7 @@ keydir_itr_out_of_date_test2() ->
                      end).
 
 put_till_frozen(R, Name) ->
-    bitcask_nifs:keydir_put(R, crypto:rand_bytes(32), 0, 1234, 0, 1, bitcask_time:tstamp()),
+    bitcask_nifs:keydir_put(R, crypto:strong_rand_bytes(32), 0, 1234, 0, 1, bitcask_time:tstamp()),
     {ready, Ref2} = bitcask_nifs:keydir_new(Name),
     %%?debugFmt("Putting", []),
     case bitcask_nifs:keydir_itr_int(Ref2, 2000001,
@@ -847,7 +842,7 @@ g_entry() ->
                     offset = g_uint64(),
                     tstamp = g_uint32() }.
 
-keydir_get_put_prop() ->
+prop_keydir_get_put() ->
     ?FORALL(E, g_entry(),
             begin
                 {ok, Ref} = keydir_new(),
@@ -861,9 +856,6 @@ keydir_get_put_prop() ->
                 ?assertEqual(E, E2),
                 true
             end).
-
-keydir_get_put_test_() ->
-    {timeout, 60, fun() -> eqc:quickcheck(?QC_OUT(keydir_get_put_prop())) end}.
 
 -endif.
 
