@@ -146,7 +146,7 @@ typedef struct
     uint32_t tstamp;
     uint16_t key_sz;
     char     key[0];
-} bitcask_keydir_entry; // hash表 
+} bitcask_keydir_entry; // hash表中的key部分
 
 
 static khint_t keydir_entry_hash(bitcask_keydir_entry* entry);
@@ -228,7 +228,7 @@ typedef struct
     uint64_t      epoch;
     uint64_t      key_count;
     uint64_t      key_bytes;
-    uint32_t      biggest_file_id;
+  uint32_t      biggest_file_id;// 最大的文件ID
     unsigned int  refcount;
     unsigned int  keyfolders;
     uint64_t      newest_folder;  // Epoch for newest folder
@@ -885,11 +885,11 @@ static void find_keydir_entry(bitcask_keydir* keydir, ErlNifBinary* key,
     // Search pending. If keydir handle used is in iterating mode
     // we want to see a past snapshot instead.
     if (keydir->pending != NULL)
-    {
+      {// 正在进行扩容操作
         if (get_entries_hash(keydir->pending, key,
                              &ret->itr, &ret->pending_entry)
             && (epoch >= ret->pending_entry->epoch))
-        {
+          {// 如果在旧的数组中找到了对应的数据项目
             DEBUG("Found in pending %llu > %llu", epoch, ret->pending_entry->epoch);
             ret->hash = keydir->pending;
             ret->entries_entry = NULL;
@@ -901,7 +901,7 @@ static void find_keydir_entry(bitcask_keydir* keydir, ErlNifBinary* key,
 
     // Definitely not in the pending entries
     ret->pending_entry = NULL;
-
+    // 并没有旧的数组中
     // If a snapshot for that time is found in regular entries
     if (get_entries_hash(keydir->entries, key, &ret->itr, &ret->entries_entry)
         && proxy_kd_entry_at_epoch(ret->entries_entry, epoch, &ret->proxy))
@@ -1190,7 +1190,7 @@ static void remove_entry(bitcask_keydir* keydir, khiter_t itr)
 
 static void perhaps_sweep_siblings(bitcask_keydir* keydir)
 {
-    int i;
+  int i; // 此处会是一个随机值
     bitcask_keydir_entry* current_entry;
     bitcask_keydir_entry_proxy proxy;
     struct timeval target, now;
@@ -1206,7 +1206,7 @@ static void perhaps_sweep_siblings(bitcask_keydir* keydir)
         return;
     }
 
-
+    //得到当前时间戳
     gettimeofday(&target, NULL);
     target.tv_usec += max_usec;
     if (target.tv_usec > 1000000)
@@ -1216,7 +1216,7 @@ static void perhaps_sweep_siblings(bitcask_keydir* keydir)
     }
     while (i--)
     {
-        if ((i % 500) == 0)
+      if ((i % 500) == 0) //每循环500次，检查下当前时间是否超过600微妙
         {
             gettimeofday(&now, NULL);
             if (now.tv_sec > target.tv_usec &&
@@ -1226,13 +1226,13 @@ static void perhaps_sweep_siblings(bitcask_keydir* keydir)
             }
         }
         if (keydir->sweep_itr >= kh_end(keydir->entries))
-        {
+          { //需要交换的指针已经在尾部了，重设指针，结束交换
             keydir->sweep_itr = kh_begin(keydir->entries);
             keydir->sweep_last_generation = keydir->iter_generation;
             return;
         }
         if (kh_exist(keydir->entries, keydir->sweep_itr))
-        {
+          {//交换指针存在于目录表中
             current_entry = kh_key(keydir->entries, keydir->sweep_itr);
             if (IS_ENTRY_LIST(current_entry))
             {
@@ -1514,7 +1514,7 @@ ERL_NIF_TERM bitcask_nifs_keydir_get_int(ErlNifEnv* env, int argc, const ERL_NIF
         enif_inspect_binary(env, argv[1], &key) &&
         enif_get_uint64(env, argv[2], &epoch))
     {
-        bitcask_keydir* keydir = handle->keydir; // 
+        bitcask_keydir* keydir = handle->keydir;
         LOCK(keydir);
 
         DEBUG_BIN(dbgKey, key.data, key.size);
@@ -1526,7 +1526,7 @@ ERL_NIF_TERM bitcask_nifs_keydir_get_int(ErlNifEnv* env, int argc, const ERL_NIF
         find_keydir_entry(keydir, &key, epoch, &f);
 
         if (f.found && !f.proxy.is_tombstone)
-        {
+          {// 找到对应的key value，并且不是墓碑
             ERL_NIF_TERM result;
             result = enif_make_tuple6(env,
                                       ATOM_BITCASK_ENTRY,
@@ -2549,7 +2549,7 @@ ERL_NIF_TERM bitcask_nifs_file_write(ErlNifEnv* env, int argc, const ERL_NIF_TER
 {
     bitcask_file_handle* handle;
     ErlNifBinary bin;
-
+    //获取第一个参数位文件句柄，第二个参数为要写入的二进制
     if (enif_get_resource(env, argv[0], bitcask_file_RESOURCE, (void**)&handle) &&
         enif_inspect_iolist_as_binary(env, argv[1], &bin)) /* Bytes to write */
     {

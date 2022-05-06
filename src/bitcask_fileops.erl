@@ -73,10 +73,10 @@
 create_file(DirName, Opts0, Keydir) ->
     Opts = [create|Opts0],
     case get_create_lock(DirName) of
-        {ok, Lock} ->
+        {ok, Lock} -> %%锁住特定目录
             try
                 {ok, Newest} = bitcask_nifs:increment_file_id(Keydir),
-
+                %% 得到新的文件ID，并建立文件
                 Filename = mk_filename(DirName, Newest),
                 ok = ensure_dir(Filename),
 
@@ -447,7 +447,7 @@ mk_filename(Dirname, Tstamp) ->
 -spec filename(filestate()) -> string().
 filename(#filestate { filename = Fname }) ->
     Fname.
-
+%% 获取hint文件名字
 -spec hintfile_name(string() | filestate()) -> string().
 hintfile_name(Filename) when is_list(Filename) ->
     filename:rootname(Filename, ".data") ++ ".hint";
@@ -779,10 +779,10 @@ open_hint_file(Filename, FinalOpts, Count) ->
     end.
 
 hintfile_entry(Key, Tstamp, TombInt, Offset, TotalSz) ->
-    KeySz = size(Key),
+    KeySz = size(Key),%% 计算Key的长度
     [<<Tstamp:?TSTAMPFIELD, KeySz:?KEYSIZEFIELD, TotalSz:?TOTALSIZEFIELD,
        TombInt:?TOMBSTONEFIELD_V2, Offset:?OFFSETFIELD_V2>>, Key].
-
+%% 32位时间戳，16位的Key长度，32位的总大小，1位的墓碑标志，63位的文件偏移，Key本身
 %% ===================================================================
 %% file/filelib avoidance code.
 %% ===================================================================

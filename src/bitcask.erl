@@ -1768,10 +1768,10 @@ do_put(Key, Value, #bc_state{write_file = WriteFile} = State,
             ok ->
                 State
         end,
-    %% 获得时间戳
+
     Tstamp = bitcask_time:tstamp(),
     #bc_state{write_file=WriteFile0} = State2,
-    %% 得到文件的时间戳
+
     WriteFileId = bitcask_fileops:file_tstamp(WriteFile0),
     case Value of
         %% 如果是二进制文件
