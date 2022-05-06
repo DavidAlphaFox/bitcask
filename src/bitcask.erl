@@ -45,9 +45,8 @@
 -export([has_pending_delete_bit/1]).                    % For EUnit tests
 
 -include_lib("kernel/include/file.hrl").
+-include_lib("kernel/include/logger.hrl").
 -include("bitcask.hrl").
--include("stacktrace.hrl").
-
 
 -ifdef(PULSE).
 -compile({parse_transform, pulse_instrument}).
@@ -415,7 +414,7 @@ fold(State, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
                                              end,
                                          case {K, (TStamp < ExpiryTime)} of
                                              {{key_tx_error, TxErr}, _} ->
-                                                 error_logger:error_msg("Error converting key ~p: ~p", [K0, TxErr]),
+                                                 ?LOG_ERROR("Error converting key ~p: ~p", [K0, TxErr]),
                                                  Acc;
                                              {_, true} ->
                                                  Acc;
@@ -472,14 +471,14 @@ open_fold_files(Dirname, Keydir, Count) ->
                 maybe_log_missing_file(Dirname, Keydir, ErrFile, Err),
                 open_fold_files(Dirname, Keydir, Count-1)
         end
-    catch ?_exception_(X, Y, StackToken) ->
-            {error, {X,Y, ?_get_stacktrace_(StackToken)}}
+    catch Class:Reason:Stacktrace ->
+            {error, {Class, Reason, Stacktrace}}
     end.
 
 maybe_log_missing_file(Dirname, Keydir, ErrFile, enoent) ->
     case is_current_file(Dirname, Keydir, ErrFile) of
         true ->
-            error_logger:error_msg("Unexpectedly missing file ~s", [ErrFile]),
+            ?LOG_ERROR("Unexpectedly missing file ~s", [ErrFile]),
             FileId = bitcask_fileops:file_tstamp(ErrFile),
             %% Forget it to avoid retrying opening it
             _ = bitcask_nifs:keydir_trim_fstats(Keydir, [FileId]),
@@ -524,7 +523,7 @@ subfold(SubFun,[FD | Rest],Acc0) ->
                    Acc1
            catch
                throw:{fold_error, Error, _PartialAcc} ->
-                   error_logger:error_msg("subfold: skipping file ~s: ~p\n",
+                   ?LOG_ERROR("subfold: skipping file ~s: ~p\n",
                                           [FD#filestate.filename, Error]),
                    Acc0
            after
@@ -591,8 +590,8 @@ merge(Dirname, Opts, {FilesToMerge0, ExpiredFiles0}) ->
     catch
         throw:Reason ->
             Reason;
-        ?_exception_(X, Y, StackToken) ->
-            {error, {generic_failure, X, Y, ?_get_stacktrace_(StackToken)}}
+        Class:Reason:Stacktrace ->
+            {error, {generic_failure, Class, Reason, Stacktrace}}
     end.
 
 %% Inner merge function, assumes that bitcask is running and all files exist.
@@ -784,10 +783,10 @@ needs_merge(Ref, Opts) ->
         {ok, 0} ->
             ok;
         {ok, Warn} ->
-            error_logger:info_msg("Trimmed ~p non-existent fstat entries",
+            ?LOG_INFO("Trimmed ~p non-existent fstat entries",
                                   [Warn]);
         Err ->
-            error_logger:error_msg("Error trimming fstats entries: ~p",
+            ?LOG_ERROR("Error trimming fstats entries: ~p",
                                    [Err])
     end,
 
@@ -843,7 +842,7 @@ explicit_merge_files(Dirname) ->
         {error, ReadErr} ->
             case filelib:is_regular(MergeListFile) of
                 true ->
-                    error_logger:error_msg("Invalid merge input file ~s,"
+                    ?LOG_ERROR("Invalid merge input file ~s,"
                                            " deleting : ~p",
                                            [MergeListFile, ReadErr]),
                     _ = file:delete(MergeListFile),
@@ -948,7 +947,7 @@ run_merge_triggers(State, Summary) ->
             %%       recv this information and decide if they want it
             case get_opt(log_needs_merge, State#bc_state.opts) of
                 true ->
-                    error_logger:info_msg("~p needs_merge: ~p\n",
+                    ?LOG_INFO("~p needs_merge: ~p\n",
                                           [State#bc_state.dirname, MergableFiles]);
                 _ ->
                     ok
@@ -1195,7 +1194,7 @@ scan_key_files([Filename | Rest], KeyDir, Acc, CloseFile, KT) ->
                         K = try KT(K0) catch TxErr -> {key_tx_error, TxErr} end,
                         case K of
                             {key_tx_error, KeyTxErr} ->
-                                error_logger:error_msg("Invalid key on load ~p: ~p",
+                                ?LOG_ERROR("Invalid key on load ~p: ~p",
                                                        [K0, KeyTxErr]),
                                 ok;
                             _ ->
@@ -1206,7 +1205,7 @@ scan_key_files([Filename | Rest], KeyDir, Acc, CloseFile, KT) ->
                         K = try KT(K0) catch TxErr -> {key_tx_error, TxErr} end,
                         case K of
                             {key_tx_error, KeyTxErr} ->
-                                error_logger:error_msg("Invalid key on load ~p: ~p",
+                                ?LOG_ERROR("Invalid key on load ~p: ~p",
                                                        [K0, KeyTxErr]);
                             _ ->
                                 bitcask_nifs:keydir_put(KeyDir,
@@ -1326,9 +1325,9 @@ init_keydir_scan_key_files(Dirname, KeyDir, KT, Count) ->
                                           F <- SetuidFiles]),
                 bitcask_nifs:increment_file_id(KeyDir, MaxSetuid)
         end
-    catch ?_exception_(_X, _Y, StackToken) ->
+    catch Class:Reason:Stacktrace ->
             error_msg_perhaps("scan_key_files: ~p ~p @ ~p\n",
-                              [_X, _Y, ?_get_stacktrace_(StackToken)]),
+                              [Class, Reason, Stacktrace]),
             init_keydir_scan_key_files(Dirname, KeyDir, KT, Count - 1)
     end.
 
@@ -1389,7 +1388,7 @@ merge_files(#mstate {  dirname = Dirname,
                     end,
                 case K of
                     {key_tx_error, TxErr} ->
-                        error_logger:error_msg("Invalid key on merge ~p: ~p",
+                        ?LOG_ERROR("Invalid key on merge ~p: ~p",
                                                [K0, TxErr]),
                         State0;
                     _ ->
@@ -1401,7 +1400,7 @@ merge_files(#mstate {  dirname = Dirname,
                      State1#mstate{delete_files = [File|DelFiles]}
              catch
                  throw:{fold_error, Error, _PartialAcc} ->
-                     error_logger:error_msg(
+                     ?LOG_ERROR(
                        "merge_files: skipping file ~s in ~s: ~p\n",
                        [File#filestate.filename, Dirname, Error]),
                      State
@@ -1936,20 +1935,20 @@ purge_setuid_files(Dirname) ->
                 if StaleFs == [] ->
                         ok;
                    true ->
-                        error_logger:info_msg("Deleted ~p stale merge input "
+                        ?LOG_INFO("Deleted ~p stale merge input "
                                               "files from ~p\n",
                                               [length(StaleFs), Dirname])
                 end
             catch
-                ?_exception_(X, Y, StackToken) ->
+                Class:Reason:Stacktrace ->
                     error_msg_perhaps("While deleting stale merge input "
                                       "files from ~p: ~p @ ~p\n",
-                                      [X, Y, ?_get_stacktrace_(StackToken)])
+                                      [Class, Reason, Stacktrace])
             after
                 bitcask_lockops:release(WriteLock)
             end;
         Else ->
-            error_logger:info_msg("Lock failed trying deleting stale merge "
+            ?LOG_INFO("Lock failed trying deleting stale merge "
                                   "input files from ~p: ~p\n", [Dirname, Else])
     end.
 
@@ -1983,7 +1982,7 @@ expiry_merge([File | Files], LiveKeyDir, KT, Acc0) ->
                   K = try KT(K0) catch TxErr -> {key_tx_error, TxErr} end,
                   case K of
                       {key_tx_error, KeyTxErr} ->
-                          error_logger:error_msg("Invalid key on merge ~p: ~p",
+                          ?LOG_ERROR("Invalid key on merge ~p: ~p",
                                                  [K0, KeyTxErr]);
                       _ ->
                           bitcask_nifs:keydir_remove(LiveKeyDir, K, Tstamp,
@@ -1993,11 +1992,11 @@ expiry_merge([File | Files], LiveKeyDir, KT, Acc0) ->
         end,
     case bitcask_fileops:fold_keys(File, Fun, ok, default) of
         {error, Reason} ->
-            error_logger:error_msg("Error folding keys for ~p: ~p\n",
+            ?LOG_ERROR("Error folding keys for ~p: ~p\n",
                                    [File#filestate.filename,Reason]),
             Acc = Acc0;
         _ ->
-            error_logger:info_msg("All keys expired in: ~p scheduling "
+            ?LOG_INFO("All keys expired in: ~p scheduling "
                                   "file for deletion\n",
                                   [File#filestate.filename]),
             Acc = lists:append(Acc0, [File])
@@ -2015,7 +2014,7 @@ error_msg_perhaps(_Fmt, _Args) ->
     ok.
 -else. %TEST
 error_msg_perhaps(Fmt, Args) ->
-    error_logger:error_msg(Fmt, Args).
+    ?LOG_ERROR(Fmt, Args).
 -endif. %TEST
 
 %% ===================================================================
@@ -2053,7 +2052,7 @@ a0_test2() ->
     code:add_pathz("../ebin"),
     application:start(erlang),
     Mode = bitcask_io:determine_file_module(),
-    error_logger:info_msg("Bitcask IO mode is: ~p\n", [Mode]).
+    ?LOG_INFO("Bitcask IO mode is: ~p\n", [Mode]).
 
 roundtrip_test_() ->
     {timeout, 60, fun roundtrip_test2/0}.
