@@ -45,14 +45,17 @@
          is_empty_estimate/1,
          status/1]).
 
-%% Legacy helpers re-exported for callers in other modules
-%% (bitcask_fileops, bitcask_merge_delete) that hard-coded bitcask:fn.
+%% Helpers other modules in this app reach through `bitcask:` directly
+%% (bitcask_fileops, bitcask_merge_delete). Until those modules are
+%% retired with the rest of legacy, keep these here as the canonical
+%% definitions — the bodies live in this file, not delegated to
+%% bitcask_legacy.
 -export([get_opt/2,
-         get_filestate/2,
          is_tombstone/1,
          has_pending_delete_bit/1]).
 
 -include("bitcask.hrl").
+-include_lib("kernel/include/file.hrl").
 
 %% =========================================================================
 %% open/close — the only places that actually pick a mode.
@@ -154,10 +157,14 @@ close(Ref) ->
             bitcask_legacy:close(Ref)
     end.
 
+%% close_write_file/1 finalizes the active hint trailer, releases
+%% bitcask.write.lock, and leaves the Ref usable: the next put/delete
+%% reacquires the lock and creates a fresh active file. Mirrors legacy
+%% semantics — the lock briefly leaves your hands, so a peer process can
+%% open the dir for writing in the gap.
 close_write_file(Ref) ->
-    %% Only meaningful in legacy mode; cask manages active writer internally.
     case is_cask() of
-        true  -> ok;
+        true  -> bitcask_cpp_nifs:cask_close_write_file(Ref);
         false -> bitcask_legacy:close_write_file(Ref)
     end.
 
@@ -207,9 +214,14 @@ fold_keys(Ref, Fun, Acc0) ->
     end.
 
 fold_keys(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
-    %% No cask path here — the {MaxAge, MaxPut, SeeTombstones} contract is
-    %% legacy-specific. cask_cpp callers should use fold_keys/3.
-    bitcask_legacy:fold_keys(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP).
+    case is_cask() of
+        true ->
+            cask_fold_keys6_collect(Ref, Fun, Acc0,
+                                     cask_max_age(MaxAge), cask_max_put(MaxPut),
+                                     SeeTombstonesP);
+        false ->
+            bitcask_legacy:fold_keys(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP)
+    end.
 
 fold(Ref, Fun, Acc0) ->
     case is_cask() of
@@ -218,12 +230,52 @@ fold(Ref, Fun, Acc0) ->
     end.
 
 fold(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
-    bitcask_legacy:fold(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP).
+    case is_cask() of
+        true ->
+            cask_fold6_collect(Ref, Fun, Acc0,
+                                cask_max_age(MaxAge), cask_max_put(MaxPut),
+                                SeeTombstonesP);
+        false ->
+            bitcask_legacy:fold(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP)
+    end.
 
-%% Legacy-only iterator API (cask uses cask_fold_*).
-iterator(Ref, MaxAge, MaxPuts) -> bitcask_legacy:iterator(Ref, MaxAge, MaxPuts).
-iterator_next(Ref)             -> bitcask_legacy:iterator_next(Ref).
-iterator_release(Ref)          -> bitcask_legacy:iterator_release(Ref).
+%% Stateful iterator. Both legacy and cask back this with on-handle state
+%% (one active iterator per Ref). Returns:
+%%   ok | out_of_date | {error, iteration_in_process}
+iterator(Ref, MaxAge, MaxPuts) ->
+    case is_cask() of
+        true ->
+            case bitcask_cpp_nifs:cask_iterator(
+                   Ref, cask_max_age(MaxAge), cask_max_put(MaxPuts)) of
+                ok           -> ok;
+                out_of_date  -> out_of_date;
+                {error, _} = E -> E
+            end;
+        false ->
+            bitcask_legacy:iterator(Ref, MaxAge, MaxPuts)
+    end.
+
+%% Returns #bitcask_entry{} | not_found | {error, iteration_not_started}
+iterator_next(Ref) ->
+    case is_cask() of
+        true ->
+            case bitcask_cpp_nifs:cask_iterator_next(Ref) of
+                not_found    -> not_found;
+                {ok, K, _V, FileId, Offset, TotalSz, Tstamp} ->
+                    #bitcask_entry{key = K, file_id = FileId,
+                                   total_sz = TotalSz, offset = Offset,
+                                   tstamp = Tstamp};
+                {error, _} = E -> E
+            end;
+        false ->
+            bitcask_legacy:iterator_next(Ref)
+    end.
+
+iterator_release(Ref) ->
+    case is_cask() of
+        true  -> bitcask_cpp_nifs:cask_iterator_release(Ref);
+        false -> bitcask_legacy:iterator_release(Ref)
+    end.
 
 %% Directory-level merge dispatcher.
 %%
@@ -378,7 +430,9 @@ cask_fold_keys_collect(Ref, Fun, Acc0) ->
 cask_fold_keys_loop(IterRef, Fun, Acc) ->
     case bitcask_cpp_nifs:cask_fold_next_full(IterRef) of
         done -> Acc;
-        {ok, K, _V, FileId, Offset, TotalSz, Tstamp} ->
+        {ok, K, _V, FileId, Offset, TotalSz, Tstamp, _IsTomb} ->
+            %% fold_keys/3 default: tombstones are filtered upstream
+            %% (see_tombstones=false), so _IsTomb is always false here.
             E = #bitcask_entry{key = K, file_id = FileId,
                                total_sz = TotalSz, offset = Offset,
                                tstamp = Tstamp},
@@ -386,9 +440,96 @@ cask_fold_keys_loop(IterRef, Fun, Acc) ->
         {error, _} = Err -> Err
     end.
 
-%% Helpers required by other modules (bitcask_fileops, bitcask_merge_delete).
-%% In legacy mode they reach into bc_state internals; we delegate.
-get_opt(Key, Opts)            -> bitcask_legacy:get_opt(Key, Opts).
-get_filestate(FileId, State)  -> bitcask_legacy:get_filestate(FileId, State).
-is_tombstone(Value)           -> bitcask_legacy:is_tombstone(Value).
-has_pending_delete_bit(F)     -> bitcask_legacy:has_pending_delete_bit(F).
+%% fold_keys/6 cask branch. SeeTombstonesP=true surfaces tombstones via
+%% callback shape `{tombstone, BCEntry}`; otherwise filter them.
+cask_fold_keys6_collect(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
+    case bitcask_cpp_nifs:cask_fold_start(Ref, MaxAge, MaxPut, SeeTombstonesP) of
+        {ok, IterRef} ->
+            try cask_fold_keys6_loop(IterRef, Fun, Acc0, SeeTombstonesP)
+            after bitcask_cpp_nifs:cask_fold_release(IterRef)
+            end;
+        {error, _} = E -> E
+    end.
+
+cask_fold_keys6_loop(IterRef, Fun, Acc, SeeTombstonesP) ->
+    case bitcask_cpp_nifs:cask_fold_next_full(IterRef) of
+        done -> Acc;
+        {ok, K, _V, FileId, Offset, TotalSz, Tstamp, IsTomb} ->
+            E = #bitcask_entry{key = K, file_id = FileId,
+                               total_sz = TotalSz, offset = Offset,
+                               tstamp = Tstamp},
+            Acc2 = case IsTomb of
+                       true when SeeTombstonesP -> Fun({tombstone, E}, Acc);
+                       true                     -> Acc;  % shouldn't reach
+                       false                    -> Fun(E, Acc)
+                   end,
+            cask_fold_keys6_loop(IterRef, Fun, Acc2, SeeTombstonesP);
+        {error, _} = Err -> Err
+    end.
+
+%% fold/6 cask branch. Callback contract follows legacy:
+%%   normal:        Fun(K, V, Acc)
+%%   tombstone:     Fun({tombstone, K}, V, Acc)  (only when SeeTombstonesP=true)
+cask_fold6_collect(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
+    case bitcask_cpp_nifs:cask_fold_start(Ref, MaxAge, MaxPut, SeeTombstonesP) of
+        {ok, IterRef} ->
+            try cask_fold6_loop(IterRef, Fun, Acc0, SeeTombstonesP)
+            after bitcask_cpp_nifs:cask_fold_release(IterRef)
+            end;
+        {error, _} = E -> E
+    end.
+
+cask_fold6_loop(IterRef, Fun, Acc, SeeTombstonesP) ->
+    case bitcask_cpp_nifs:cask_fold_next_full(IterRef) of
+        done -> Acc;
+        {ok, K, V, _Fid, _Off, _Sz, _Ts, IsTomb} ->
+            Acc2 = case IsTomb of
+                       true when SeeTombstonesP -> Fun({tombstone, K}, V, Acc);
+                       true                     -> Acc;  % shouldn't reach
+                       false                    -> Fun(K, V, Acc)
+                   end,
+            cask_fold6_loop(IterRef, Fun, Acc2, SeeTombstonesP);
+        {error, _} = Err -> Err
+    end.
+
+%% Convert legacy MaxAge (microseconds) / MaxPut to cask iter units.
+%% Legacy fold/6 takes MaxAge already-converted-to-µs (`* 1000` from the ms
+%% app env); cask iter wants seconds with -1 meaning "no limit".
+cask_max_age(undefined) -> -1;
+cask_max_age(N) when is_integer(N), N < 0 -> -1;
+cask_max_age(N) when is_integer(N) -> N div 1000000.
+
+cask_max_put(undefined) -> -1;
+cask_max_put(N) when is_integer(N), N < 0 -> -1;
+cask_max_put(N) when is_integer(N) -> N.
+
+%% Helpers shared with bitcask_fileops / bitcask_merge_delete. These are
+%% byte-level identical to the bodies that lived in bitcask_legacy until
+%% M6 prep moved them here so the cask path no longer depends on legacy.
+
+%% Resolve Opts proplist > app env > undefined.
+get_opt(Key, Opts) ->
+    case proplists:get_value(Key, Opts) of
+        undefined ->
+            case application:get_env(bitcask, Key) of
+                {ok, Value} -> Value;
+                undefined   -> undefined
+            end;
+        Value -> Value
+    end.
+
+%% A "tombstone value" is any binary whose first 17 bytes are
+%% "bitcask_tombstone" — covers v0/v1/v2 in one check (bitcask.hrl).
+is_tombstone(<<?TOMBSTONE_PREFIX, _Rest/binary>>) -> true;
+is_tombstone(_)                                   -> false.
+
+%% setuid bit on the data file marks it for deferred deletion. Read with
+%% bitcask_fileops:read_file_info so we don't bypass its compatibility
+%% wrapper around prim_file:read_file_info.
+has_pending_delete_bit(File) ->
+    try
+        {ok, FI} = bitcask_fileops:read_file_info(File),
+        FI#file_info.mode band 8#4001 /= 0
+    catch _:_ ->
+        false
+    end.

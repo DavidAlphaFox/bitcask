@@ -30,7 +30,7 @@ CaskIterHandle* cask_iter_handle(ErlNifEnv* env, ERL_NIF_TERM term) {
 ERL_NIF_TERM make_cask_resource(ErlNifEnv* env, std::unique_ptr<Cask> c) {
     void* mem = enif_alloc_resource(g_cask_resource_type, sizeof(CaskHandle));
     if (!mem) return 0;
-    new (mem) CaskHandle{std::move(c)};
+    new (mem) CaskHandle{std::move(c), nullptr};
     ERL_NIF_TERM r = enif_make_resource(env, mem);
     enif_release_resource(mem);
     return r;
@@ -226,10 +226,26 @@ ERL_NIF_TERM nif_cask_sync(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv
     return atoms().ok;
 }
 
+ERL_NIF_TERM nif_cask_close_write_file(ErlNifEnv* env, int /*argc*/,
+                                         const ERL_NIF_TERM argv[]) {
+    auto* h = cask_handle(env, argv[0]);
+    if (!h || !h->cask) return enif_make_badarg(env);
+    // If a stateful iterator/3 is active on this cask, releasing it first
+    // matches the legacy contract (close + reopen would do the same).
+    if (h->iter && h->iter->is_iterating()) {
+        h->iter->release();
+        h->iter.reset();
+    }
+    auto r = h->cask->close_write_file();
+    if (!r) return fault_to_term(env, r.error());
+    return atoms().ok;
+}
+
 // =============================================================================
 // Iterator
 // =============================================================================
 
+// 3-arg form: tombstones filtered (legacy fold/3 + list_keys behaviour).
 ERL_NIF_TERM nif_cask_fold_start(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
     auto* h = cask_handle(env, argv[0]);
     int maxage, maxputs;
@@ -239,8 +255,30 @@ ERL_NIF_TERM nif_cask_fold_start(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TER
         return enif_make_badarg(env);
     }
     auto it = h->cask->make_iter();
-    auto r = it->start(maxage, maxputs);
+    auto r = it->start(maxage, maxputs, /*now_sec*/ 0,
+                        /*see_tombstones*/ false);
     if (!r) return fault_to_term(env, r.error());
+    if (*r == keydir::StartIterResult::kOutOfDate) return atoms().out_of_date;
+    auto term = make_iter_resource(env, std::move(it));
+    if (!term) return enif_make_tuple2(env, atoms().error, atoms().allocation_error);
+    return enif_make_tuple2(env, atoms().ok, term);
+}
+
+// 4-arg form: SeeTombstones flag passes through. Used by bitcask:fold/6 and
+// bitcask:fold_keys/6 cask branches.
+ERL_NIF_TERM nif_cask_fold_start4(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
+    auto* h = cask_handle(env, argv[0]);
+    int maxage, maxputs;
+    if (!h || !h->cask ||
+        !enif_get_int(env, argv[1], &maxage) ||
+        !enif_get_int(env, argv[2], &maxputs)) {
+        return enif_make_badarg(env);
+    }
+    const bool see_tombs = (argv[3] == atoms().atom_true);
+    auto it = h->cask->make_iter();
+    auto r = it->start(maxage, maxputs, /*now_sec*/ 0, see_tombs);
+    if (!r) return fault_to_term(env, r.error());
+    if (*r == keydir::StartIterResult::kOutOfDate) return atoms().out_of_date;
     auto term = make_iter_resource(env, std::move(it));
     if (!term) return enif_make_tuple2(env, atoms().error, atoms().allocation_error);
     return enif_make_tuple2(env, atoms().ok, term);
@@ -257,8 +295,9 @@ ERL_NIF_TERM nif_cask_fold_next(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM
                              bytes_to_binary(env, (*r)->value));
 }
 
-// Full-form: returns {ok, K, V, FileId, Offset, TotalSz, Tstamp} so the
-// Erlang side can populate a real #bitcask_entry for fold_keys callbacks.
+// Full-form: returns {ok, K, V, FileId, Offset, TotalSz, Tstamp, IsTomb}
+// so the Erlang side can populate a real #bitcask_entry for fold_keys
+// callbacks AND distinguish a tombstone surfaced by SeeTombstones=true.
 ERL_NIF_TERM nif_cask_fold_next_full(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
     auto* ih = cask_iter_handle(env, argv[0]);
     if (!ih || !ih->iter) return enif_make_badarg(env);
@@ -266,6 +305,63 @@ ERL_NIF_TERM nif_cask_fold_next_full(ErlNifEnv* env, int /*argc*/, const ERL_NIF
     if (!r) return fault_to_term(env, r.error());
     if (!r->has_value()) return atoms().done;
     const auto& e = **r;
+    ERL_NIF_TERM tup[8] = {
+        atoms().ok,
+        bytes_to_binary(env, e.key),
+        bytes_to_binary(env, e.value),
+        enif_make_uint(env, e.file_id),
+        enif_make_uint64(env, e.offset),
+        enif_make_uint(env, e.total_sz),
+        enif_make_uint(env, e.tstamp),
+        e.is_tombstone ? atoms().atom_true : atoms().atom_false,
+    };
+    return enif_make_tuple_from_array(env, tup, 8);
+}
+
+// =============================================================================
+// Stateful iterator (cask-side equivalent of legacy keydir_itr/itr_next/release)
+//
+// Unlike fold_*, iterator state lives on the CaskHandle so subsequent calls
+// don't need a separate IterRef. Matches the legacy iterator/3 contract:
+// only one active iterator per cask, errors if a second start is attempted.
+// =============================================================================
+
+ERL_NIF_TERM nif_cask_iterator(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
+    auto* h = cask_handle(env, argv[0]);
+    int maxage, maxputs;
+    if (!h || !h->cask ||
+        !enif_get_int(env, argv[1], &maxage) ||
+        !enif_get_int(env, argv[2], &maxputs)) {
+        return enif_make_badarg(env);
+    }
+    if (h->iter && h->iter->is_iterating()) {
+        return enif_make_tuple2(env, atoms().error, atoms().iteration_in_process);
+    }
+    auto it = h->cask->make_iter();
+    auto r = it->start(maxage, maxputs, /*now_sec*/ 0,
+                        /*see_tombstones*/ false);
+    if (!r) return fault_to_term(env, r.error());
+    if (*r == keydir::StartIterResult::kOutOfDate) {
+        return atoms().out_of_date;
+    }
+    h->iter = std::move(it);
+    return atoms().ok;
+}
+
+ERL_NIF_TERM nif_cask_iterator_next(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
+    auto* h = cask_handle(env, argv[0]);
+    if (!h || !h->cask) return enif_make_badarg(env);
+    if (!h->iter || !h->iter->is_iterating()) {
+        return enif_make_tuple2(env, atoms().error, atoms().iteration_not_started);
+    }
+    auto r = h->iter->next();
+    if (!r) return fault_to_term(env, r.error());
+    if (!r->has_value()) return atoms().not_found;  // legacy uses not_found at EOI
+    const auto& e = **r;
+    // Legacy iterator_next returns a #bitcask_entry record. The Erlang
+    // facade builds the record from this 7-tuple — same field order as
+    // cask_fold_next_full minus the IsTomb (iterator/3 never surfaces
+    // tombstones; see_tombstones=false above).
     ERL_NIF_TERM tup[7] = {
         atoms().ok,
         bytes_to_binary(env, e.key),
@@ -276,6 +372,16 @@ ERL_NIF_TERM nif_cask_fold_next_full(ErlNifEnv* env, int /*argc*/, const ERL_NIF
         enif_make_uint(env, e.tstamp),
     };
     return enif_make_tuple_from_array(env, tup, 7);
+}
+
+ERL_NIF_TERM nif_cask_iterator_release(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
+    auto* h = cask_handle(env, argv[0]);
+    if (!h) return enif_make_badarg(env);
+    if (h->iter) {
+        h->iter->release();
+        h->iter.reset();
+    }
+    return atoms().ok;
 }
 
 ERL_NIF_TERM nif_cask_fold_release(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {

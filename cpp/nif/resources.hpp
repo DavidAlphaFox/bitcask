@@ -46,8 +46,14 @@ extern ErlNifResourceType* g_cask_iter_resource_type;
 
 // Wraps the C++ Cask object inside a NIF resource. Cask owns its KeyDir and
 // active write/hint files; the destructor handles teardown.
+//
+// `iter` is the optional active iterator established by the legacy
+// `iterator/3` API (only one per cask, lives on the cask handle, not on a
+// separate resource). The fold/3 + fold/6 paths use the separate
+// CaskIterHandle resource and don't touch this slot.
 struct CaskHandle {
     std::unique_ptr<Cask> cask;
+    std::unique_ptr<CaskIter> iter;
 };
 
 struct CaskIterHandle {

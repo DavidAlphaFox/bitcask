@@ -130,9 +130,12 @@ public:
     // Negative values disable the respective limit.
     StartIterResult start(std::uint32_t now_sec, int maxage, int maxputs);
 
-    // Returns the next entry (skipping tombstones and not-yet-existing keys
-    // at this handle's epoch). std::nullopt at end of iteration.
-    std::optional<EntryProxy> next();
+    // Returns the next entry visible at this handle's epoch, std::nullopt
+    // at end. By default skips tombstones (legacy fold semantics). Pass
+    // `include_tombstones=true` to surface in-keydir tombstones with the
+    // proxy's `is_tombstone` field set — used by fold/6's SeeTombstones
+    // path to expose deletes that happened during the fold.
+    std::optional<EntryProxy> next(bool include_tombstones = false);
 
     // Releases iteration; idempotent. If this was the last folder, the parent
     // merges its pending table back into entries_.

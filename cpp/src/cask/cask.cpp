@@ -125,6 +125,33 @@ parse_active_file_id_from_lock(std::span<const std::byte> bytes) noexcept {
     return ::unlink(path.c_str()) == 0;
 }
 
+// Acquire bitcask.write.lock with stale-lock reclaim. Writes the bare PID
+// line; the active-file path is appended later by ensure_active_writer
+// once the file id is known. Used by both Cask::open and the
+// close_write_file → next-put reacquire path.
+[[nodiscard]] std::expected<lock::FileLock, CaskFault>
+acquire_writer_lock(const std::string& dirname) {
+    const auto lock_path = (fs::path(dirname) / "bitcask.write.lock").string();
+    auto fl = lock::FileLock::acquire(lock_path, /*write*/ true);
+    if (!fl && fl.error().errnum == EEXIST) {
+        if (try_remove_stale_lock(lock_path)) {
+            fl = lock::FileLock::acquire(lock_path, /*write*/ true);
+        }
+    }
+    if (!fl) {
+        if (fl.error().errnum == EEXIST) {
+            return std::unexpected(err(CaskError::kWriteLocked, lock_path));
+        }
+        return std::unexpected(io_fault(fl.error().errnum, lock_path));
+    }
+    const std::string pid_line = std::to_string(::getpid()) + "\n";
+    auto pid_bytes = std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(pid_line.data()),
+        pid_line.size());
+    (void)fl->write_data(pid_bytes);
+    return std::move(*fl);
+}
+
 }  // namespace
 
 // =============================================================================
@@ -133,15 +160,16 @@ parse_active_file_id_from_lock(std::span<const std::byte> bytes) noexcept {
 
 CaskIter::~CaskIter() noexcept { release(); }
 
-std::expected<void, CaskFault>
-CaskIter::start(int maxage, int maxputs, std::uint32_t now_sec) {
-    if (iter_ && iter_->is_iterating()) return {};
+std::expected<keydir::StartIterResult, CaskFault>
+CaskIter::start(int maxage, int maxputs, std::uint32_t now_sec,
+                bool see_tombstones) {
+    if (iter_ && iter_->is_iterating()) {
+        return std::unexpected(err(CaskError::kIo, "iter already started"));
+    }
     iter_ = parent_->keydir_->make_iter();
     auto r = iter_->start(now_sec, maxage, maxputs);
-    if (r != keydir::StartIterResult::kOk) {
-        return std::unexpected(err(CaskError::kIo, "iter start failed"));
-    }
-    return {};
+    see_tombstones_ = see_tombstones;
+    return r;  // kOk or kOutOfDate (kAlreadyIterating handled above)
 }
 
 std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
@@ -150,14 +178,36 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
     const auto expiry = parent_->opts_.expiry_secs;
     const auto now = (expiry > 0) ? now_sec_default() : 0;
 
-    // Skip entries that are expired or whose value record is a tombstone.
-    // Loop until we find a deliverable entry or hit end of iteration.
+    // Skip expired entries. Tombstone behaviour depends on see_tombstones_:
+    //   false (default) — skip tombstones entirely (legacy fold/3 behaviour)
+    //   true  — surface them with is_tombstone=true; sibling tombstones
+    //           don't have a real on-disk record so we synthesize a v0
+    //           marker value so callers always see a non-empty value.
     while (true) {
-        auto proxy = iter_->next();
+        auto proxy = iter_->next(/*include_tombstones=*/ see_tombstones_);
         if (!proxy) return std::optional<Entry>{};
 
         if (expiry > 0 && proxy->tstamp + expiry <= now) {
             continue;  // expired; skip
+        }
+
+        // Sibling tombstones live entirely in the keydir (file_id sentinel,
+        // no real record on disk). Skip the file read and synthesize.
+        if (proxy->is_tombstone) {
+            Entry e;
+            e.key.assign(reinterpret_cast<const std::byte*>(proxy->key.data()),
+                          reinterpret_cast<const std::byte*>(proxy->key.data()) +
+                          proxy->key.size());
+            const auto& tomb = bitcask::format::kTombstoneV0;
+            e.value.assign(reinterpret_cast<const std::byte*>(tomb.data()),
+                            reinterpret_cast<const std::byte*>(tomb.data()) +
+                            tomb.size());
+            e.tstamp       = proxy->tstamp;
+            e.file_id      = proxy->file_id;
+            e.offset       = proxy->offset;
+            e.total_sz     = proxy->total_sz;
+            e.is_tombstone = true;
+            return std::optional<Entry>{std::move(e)};
         }
 
         auto* df = parent_->read_file(proxy->file_id);
@@ -176,19 +226,23 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
                     return std::unexpected(err(CaskError::kIo, "read"));
             }
         }
-        // Tombstone records lose their place in fold (legacy hides them).
-        if (bitcask::format::is_tombstone_value(
-                std::string_view(reinterpret_cast<const char*>(rec->value.data()),
-                                  rec->value.size()))) {
-            continue;
-        }
+        // The on-disk record may itself encode a tombstone (key removed
+        // since this iter's snapshot was taken AND we're at fold epoch
+        // before the remove — or the record was already a tombstone in
+        // the file the keydir points at).
+        const bool value_is_tomb = bitcask::format::is_tombstone_value(
+            std::string_view(reinterpret_cast<const char*>(rec->value.data()),
+                              rec->value.size()));
+        if (value_is_tomb && !see_tombstones_) continue;
+
         Entry e;
-        e.key      = std::move(rec->key);
-        e.value    = std::move(rec->value);
-        e.tstamp   = rec->tstamp;
-        e.file_id  = proxy->file_id;
-        e.offset   = proxy->offset;
-        e.total_sz = proxy->total_sz;
+        e.key          = std::move(rec->key);
+        e.value        = std::move(rec->value);
+        e.tstamp       = rec->tstamp;
+        e.file_id      = proxy->file_id;
+        e.offset       = proxy->offset;
+        e.total_sz     = proxy->total_sz;
+        e.is_tombstone = value_is_tomb;
         return std::optional<Entry>{std::move(e)};
     }
 }
@@ -221,11 +275,16 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
     // bitcask.merge.lock. Stale-lock detection (post-crash recovery) runs
     // for both. Merger additionally reads write.lock (if any) to learn the
     // live writer's active file id for needs_merge filtering.
-    if (opts.read_write || opts.merge_only) {
-        const std::string lock_basename =
-            opts.merge_only ? "bitcask.merge.lock" : "bitcask.write.lock";
-        const auto lock_path = (fs::path(cask->dirname_) / lock_basename).string();
-
+    if (opts.read_write && !opts.merge_only) {
+        // Plain writer: bitcask.write.lock with PID line + stale reclaim.
+        auto fl = acquire_writer_lock(cask->dirname_);
+        if (!fl) return std::unexpected(fl.error());
+        cask->write_lock_ = std::move(*fl);
+    } else if (opts.merge_only) {
+        // Merger: bitcask.merge.lock (separate file from write.lock so the
+        // live writer can keep running). Same stale-reclaim policy.
+        const auto lock_path =
+            (fs::path(cask->dirname_) / "bitcask.merge.lock").string();
         auto fl = lock::FileLock::acquire(lock_path, /*write*/ true);
         if (!fl && fl.error().errnum == EEXIST) {
             if (try_remove_stale_lock(lock_path)) {
@@ -238,16 +297,11 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
             }
             return std::unexpected(io_fault(fl.error().errnum, lock_path));
         }
-
-        // Record our PID. Writer also appends its active file id once that
-        // file is created (in ensure_active_writer); merger has no active
-        // file so PID alone is enough.
         const std::string pid_line = std::to_string(::getpid()) + "\n";
         auto pid_bytes = std::span<const std::byte>(
             reinterpret_cast<const std::byte*>(pid_line.data()),
             pid_line.size());
         (void)fl->write_data(pid_bytes);
-
         cask->write_lock_ = std::move(*fl);
 
         // For merger: snapshot the live writer's active file id from
@@ -421,6 +475,15 @@ std::expected<void, CaskFault> Cask::ensure_active_writer() {
                                      "merge_only mode: no active writer"));
     }
 
+    // Reacquire write_lock_ if a previous close_write_file() released it.
+    // Stale-lock reclaim runs identically to open(), so a crashed peer is
+    // handled the same way.
+    if (!write_lock_) {
+        auto fl = acquire_writer_lock(dirname_);
+        if (!fl) return std::unexpected(fl.error());
+        write_lock_ = std::move(*fl);
+    }
+
     active_file_id_ = keydir_->increment_file_id();
     auto data_path = fileops::mk_data_filename(dirname_, active_file_id_);
     auto hint_path = fileops::mk_hint_filename(data_path);
@@ -466,6 +529,36 @@ std::expected<void, CaskFault> Cask::roll_active() {
     active_data_.reset();
     active_hint_.reset();
     return ensure_active_writer();
+}
+
+std::expected<void, CaskFault> Cask::close_write_file() {
+    if (!opts_.read_write) {
+        return std::unexpected(err(CaskError::kReadOnly,
+                                     "close_write_file: read-only cask"));
+    }
+    if (opts_.merge_only) {
+        return std::unexpected(err(CaskError::kReadOnly,
+                                     "close_write_file: merge_only handle"));
+    }
+    // Finalize the hint trailer before dropping the handles so a future
+    // open of this dir doesn't have to re-fold the data file.
+    if (active_hint_) {
+        if (auto r = active_hint_->finalize(); !r) {
+            return std::unexpected(io_fault(r.error().errnum,
+                                             std::string(active_hint_->path())));
+        }
+    }
+    active_data_.reset();
+    active_hint_.reset();
+    active_file_id_ = 0;
+    if (write_lock_) {
+        write_lock_->release_quiet();
+        write_lock_.reset();
+    }
+    // The next put/delete reaches ensure_active_writer, which sees a
+    // null write_lock_ and reacquires before creating the new active
+    // file. No state to set here beyond the resets above.
+    return {};
 }
 
 // ---- read_file cache --------------------------------------------------------

@@ -504,9 +504,36 @@
 - `read_ahead` 选项(性能优化,不影响正确性)
 - `log_needs_merge` 选项(调试日志,可走 Erlang 端)
 - `fold_tombstones` 选项(legacy 测试用)
-- `iterator/3, iterator_next/1, iterator_release/1` 三件套(已有 fold/3 替代)
-- `fold/6, fold_keys/6` 的 MaxAge/MaxPut/SeeTombstones 三参数版本
-- `close_write_file/1`(legacy 测试用)
+
+### M6 准备 — 已替换为 cask 实现的旧 wontfix
+- [x] **`close_write_file/1`** 不再是 cask 模式下的静默 no-op,有真实现
+   - `Cask::close_write_file()`:finalize hint trailer → drop active_data/active_hint → 释放 `bitcask.write.lock`(`release_quiet` unlink lock 文件,peer 进程可立即获锁)
+   - `ensure_active_writer` 加重 acquire 路径:发现 `write_lock_` 为空时调用新 helper `acquire_writer_lock`(连同 stale-lock reclaim,行为对齐 `Cask::open`)
+   - `read-only` / `merge_only` cask 调用返回 `kReadOnly`
+   - 如果该 cask 上有活动 iterator/3,NIF 层先把它 release(防 dangling)
+   - 新 NIF `cask_close_write_file/1`(dirty IO scheduler);`bitcask_cpp_nifs` shim;facade dispatch
+   - 4 个新增 eunit:lock 文件被 unlink / put 透明重 acquire / 双调用幂等 / read-only 报错
+   - ctest 167/167;eunit **107/107**;TSan clean
+- [x] **4 个 helper 内联化**(M6 prep,2026-04-29)
+   - `bitcask:get_opt/2`、`is_tombstone/1`、`has_pending_delete_bit/1` 三个 body 从 `bitcask_legacy` 直接 inline 进 `bitcask.erl`(分别 9 / 2 / 7 行,纯函数 + 一个 `bitcask_fileops:read_file_info` 调用)
+   - `bitcask:get_filestate/2` **删除**——grep 后发现 0 个外部调用方,唯一引用是 `bitcask_legacy.erl:364` 的 `?MODULE:get_filestate(...)`(`?MODULE = bitcask_legacy`,走的不是公共 facade)
+   - `bitcask.erl` 加 `-include_lib("kernel/include/file.hrl").` 让 `#file_info{}` 可见
+   - **cask 路径现在 100% 不依赖 legacy**:`bitcask_legacy:` 引用全部位于 `is_cask()=false` 分支(只在显式选 legacy 模式时才执行)
+   - ctest **167/167** PASS;eunit **103/103** PASS
+- [x] **`iterator/3, iterator_next/1, iterator_release/1`** 三件套
+   - `CaskHandle` 加 `std::unique_ptr<CaskIter> iter` 槽(状态挂在 cask 资源上,匹配 legacy 一 Ref 一 iterator 的契约)
+   - `CaskIter::start` 返回类型升级为 `std::expected<keydir::StartIterResult, CaskFault>`,以便区分 `kOk` / `kOutOfDate` / 已迭代中
+   - 3 个新 NIF:`cask_iterator/3`、`cask_iterator_next/1`、`cask_iterator_release/1`(`iteration_in_process` / `iteration_not_started` / `not_found` / `out_of_date` 全部对齐 legacy 返回形态)
+   - `bitcask:iterator/3` 等三个 facade 加 cask 分支,build `#bitcask_entry`
+   - 4 个新增 eunit:walk-all / next-without-start / double-start / release-idempotent
+   - ctest 167/167 PASS;eunit **103/103** PASS;TSan clean
+- [x] **`fold/6` 和 `fold_keys/6`** 的 MaxAge/MaxPut/SeeTombstones 三参数版本(M6 prep)
+   - C++ 层:`CaskIter::Entry` 加 `is_tombstone` 字段;`CaskIter::start` 加 `see_tombstones` 形参;`IterHandle::next(include_tombstones=false)` 默认行为不变
+   - cask 的 sibling tombstone 在 `see_tombstones=true` 时合成 v0 marker 作为 value 返回
+   - NIF 层:新增 `cask_fold_start/4`(带 SeeTomb);`cask_fold_next_full` 升 8 元组,加 `IsTomb`
+   - Erlang 层:`bitcask:fold/6`、`fold_keys/6` 加 cask 分支,callback 形态对齐 legacy(`{tombstone, K}` / `{tombstone, BCEntry}`);MaxAge μs→s 单位换算
+   - 4 个新增 eunit 验证;ctest 167/167、eunit 99/99 PASS
+   - 语义注释:cask 的 `see_tombstones` 只看到 keydir 内的 tombstone(pending + sibling),不像 legacy `subfold` 扫整个 data 文件;对调试 "fold 期间被删的 key" 这个主用例够用,生产几乎不依赖更强的语义
 
 ---
 

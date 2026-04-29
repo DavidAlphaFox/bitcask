@@ -507,7 +507,7 @@ StartIterResult IterHandle::start(std::uint32_t now_sec,
     return StartIterResult::kOk;
 }
 
-std::optional<EntryProxy> IterHandle::next() {
+std::optional<EntryProxy> IterHandle::next(bool include_tombstones) {
     if (!iterating_) return std::nullopt;
     // Reader lock: cursor_ advances inside this handle (per-iter state, not
     // shared) and entries_/pending_ are only read here.
@@ -519,8 +519,9 @@ std::optional<EntryProxy> IterHandle::next() {
         if (it == parent_->entries_.end()) continue;  // erased between snapshots
 
         auto at = entry_at_epoch(it->second, iter_epoch_);
-        if (!at.found || at.is_tombstone) continue;
-        return to_proxy(it->first, at.rev, /*tombstone*/ false);
+        if (!at.found) continue;
+        if (at.is_tombstone && !include_tombstones) continue;
+        return to_proxy(it->first, at.rev, /*tombstone*/ at.is_tombstone);
     }
     return std::nullopt;
 }

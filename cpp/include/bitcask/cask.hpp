@@ -113,11 +113,22 @@ public:
     CaskIter(const CaskIter&) = delete;
     CaskIter& operator=(const CaskIter&) = delete;
 
-    [[nodiscard]] std::expected<void, CaskFault>
-    start(int maxage = -1, int maxputs = -1, std::uint32_t now_sec = 0);
+    // `see_tombstones`: when true, deleted keys still emit an entry from
+    // next() with `is_tombstone=true` and `value` carrying the tombstone
+    // marker bytes (matches legacy fold/6 + fold_keys/6 SeeTombstones=true).
+    // When false (default), tombstones are silently skipped.
+    //
+    // Returns the underlying keydir StartIterResult. `kOk` means iteration
+    // actually started; `kOutOfDate` means the pending-hash freshness check
+    // failed and no iteration was initiated — caller should retry later.
+    // CaskFault errors are reserved for genuine failures (e.g. handle
+    // already iterating).
+    [[nodiscard]] std::expected<keydir::StartIterResult, CaskFault>
+    start(int maxage = -1, int maxputs = -1, std::uint32_t now_sec = 0,
+          bool see_tombstones = false);
 
-    // Returns the next (key, value) pair, or std::nullopt at end. The
-    // returned vectors own their storage.
+    // Returns the next entry, or std::nullopt at end. The returned vectors
+    // own their storage.
     struct Entry {
         std::vector<std::byte> key;
         std::vector<std::byte> value;
@@ -125,6 +136,7 @@ public:
         std::uint32_t file_id = 0;
         std::uint64_t offset = 0;
         std::uint32_t total_sz = 0;
+        bool is_tombstone = false;
     };
     [[nodiscard]] std::expected<std::optional<Entry>, CaskFault> next();
 
@@ -134,6 +146,7 @@ public:
 private:
     Cask* parent_;
     std::unique_ptr<keydir::IterHandle> iter_;
+    bool see_tombstones_ = false;
 };
 
 // --- The Cask ----------------------------------------------------------------
@@ -162,6 +175,13 @@ public:
     remove(std::span<const std::byte> key, std::uint32_t tstamp = 0);
 
     [[nodiscard]] std::expected<void, CaskFault> sync();
+
+    // Force-close the active write file: finalizes the hint trailer, drops
+    // the active data/hint handles, and releases bitcask.write.lock. The
+    // Cask remains usable — the next put/delete reacquires the lock and
+    // creates a fresh active file (mirrors legacy bitcask:close_write_file).
+    // Read-only or merge_only handles return kReadOnly.
+    [[nodiscard]] std::expected<void, CaskFault> close_write_file();
 
     [[nodiscard]] StatusInfo status();
     [[nodiscard]] bool is_empty_estimate();
