@@ -98,7 +98,10 @@ default_nif_mode() ->
     end.
 
 -ifdef(TEST).
-default_nif_mode_compiled() -> legacy.
+%% M6 prep: TEST profile now defaults to cask_cpp (matches production).
+%% Tests that need legacy semantics must opt in explicitly with
+%% [{nifs, legacy}] or set the application env.
+default_nif_mode_compiled() -> cask_cpp.
 -else.
 default_nif_mode_compiled() -> cask_cpp.
 -endif.
