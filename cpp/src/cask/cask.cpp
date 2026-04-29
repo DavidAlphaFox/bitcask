@@ -49,6 +49,34 @@ std::string_view bytes_to_view(std::span<const std::byte> b) {
     return errno != ESRCH;
 }
 
+// Lock-file payload format (legacy + ours):
+//   "<pid> <active_data_file_path>\n"
+//   or just "<pid>\n" if the active path hasn't been recorded yet.
+// We extract the active file's tstamp/file_id from the path's basename,
+// using fileops::parse_data_tstamp. Returns 0 if no path is present or
+// it cannot be parsed.
+[[nodiscard]] std::uint32_t
+parse_active_file_id_from_lock(std::span<const std::byte> bytes) noexcept {
+    // Skip leading PID digits.
+    std::size_t i = 0;
+    while (i < bytes.size() && static_cast<char>(bytes[i]) >= '0' &&
+                                static_cast<char>(bytes[i]) <= '9') {
+        ++i;
+    }
+    if (i == bytes.size() || static_cast<char>(bytes[i]) != ' ') return 0;
+    ++i;  // skip the space
+
+    // Take the rest up to newline as the path.
+    std::size_t end = i;
+    while (end < bytes.size() && static_cast<char>(bytes[end]) != '\n') ++end;
+    std::string path(reinterpret_cast<const char*>(bytes.data() + i), end - i);
+    if (path.empty()) return 0;
+
+    auto t = fileops::parse_data_tstamp(path);
+    if (!t) return 0;
+    return static_cast<std::uint32_t>(*t);
+}
+
 // Parse the leading positive integer from `bytes` (the lock-file payload
 // is "<pid> <activefile>\n" — we only care about the pid).
 [[nodiscard]] int parse_leading_pid(std::span<const std::byte> bytes) noexcept {
@@ -186,16 +214,17 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
     std::error_code ec;
     fs::create_directories(cask->dirname_, ec);
 
-    // Acquire write lock if read-write. The lock file holds the writer's
-    // PID so other processes can detect a stale lock left by a crashed
-    // owner. legacy uses bitcask.write.lock.
-    if (opts.read_write) {
-        const auto lock_path = (fs::path(cask->dirname_) / "bitcask.write.lock").string();
+    // Lock acquisition: writer takes bitcask.write.lock; merger takes
+    // bitcask.merge.lock. Stale-lock detection (post-crash recovery) runs
+    // for both. Merger additionally reads write.lock (if any) to learn the
+    // live writer's active file id for needs_merge filtering.
+    if (opts.read_write || opts.merge_only) {
+        const std::string lock_basename =
+            opts.merge_only ? "bitcask.merge.lock" : "bitcask.write.lock";
+        const auto lock_path = (fs::path(cask->dirname_) / lock_basename).string();
+
         auto fl = lock::FileLock::acquire(lock_path, /*write*/ true);
         if (!fl && fl.error().errnum == EEXIST) {
-            // Possible stale lock from a previous crash. Inspect the
-            // recorded PID and remove it if the process is gone, then
-            // retry once. (Live writers stay locked.)
             if (try_remove_stale_lock(lock_path)) {
                 fl = lock::FileLock::acquire(lock_path, /*write*/ true);
             }
@@ -207,9 +236,9 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
             return std::unexpected(io_fault(fl.error().errnum, lock_path));
         }
 
-        // Write our PID into the lock file so a future stale check can
-        // find us. Failure to write is non-fatal — legacy permits this and
-        // the lock file alone (without payload) still serves as a mutex.
+        // Record our PID. Writer also appends its active file id once that
+        // file is created (in ensure_active_writer); merger has no active
+        // file so PID alone is enough.
         const std::string pid_line = std::to_string(::getpid()) + "\n";
         auto pid_bytes = std::span<const std::byte>(
             reinterpret_cast<const std::byte*>(pid_line.data()),
@@ -217,6 +246,28 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
         (void)fl->write_data(pid_bytes);
 
         cask->write_lock_ = std::move(*fl);
+
+        // For merger: snapshot the live writer's active file id from
+        // write.lock so needs_merge can exclude it. Race window: writer
+        // may roll over between us reading and merger picking files; that
+        // race exists in legacy too (bitcask_lockops:read_activefile),
+        // and the consequence is at most a missed merge of one freshly-
+        // rolled file (next round picks it up).
+        if (opts.merge_only) {
+            const auto wlock_path =
+                (fs::path(cask->dirname_) / "bitcask.write.lock").string();
+            auto wl = lock::FileLock::acquire(wlock_path, /*write*/ false);
+            if (wl) {
+                if (auto data = wl->read_data()) {
+                    cask->merger_writer_active_id_ =
+                        parse_active_file_id_from_lock(
+                            std::span<const std::byte>(data->data(), data->size()));
+                }
+                wl->release_quiet();
+            }
+            // If write.lock doesn't exist or can't be parsed, no active
+            // writer is detected (id stays 0).
+        }
     }
 
     // Acquire / build the keydir.
@@ -340,6 +391,12 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
 std::expected<void, CaskFault> Cask::ensure_active_writer() {
     if (active_data_) return {};
     if (!opts_.read_write) return std::unexpected(err(CaskError::kReadOnly));
+    if (opts_.merge_only) {
+        // A merger never opens its own active writer; merge::run_merge
+        // creates its own output file via keydir->increment_file_id().
+        return std::unexpected(err(CaskError::kReadOnly,
+                                     "merge_only mode: no active writer"));
+    }
 
     active_file_id_ = keydir_->increment_file_id();
     auto data_path = fileops::mk_data_filename(dirname_, active_file_id_);
@@ -355,6 +412,17 @@ std::expected<void, CaskFault> Cask::ensure_active_writer() {
     if (!hf) return std::unexpected(io_fault(hf.error().errnum, hint_path));
     active_data_ = std::make_unique<fileops::DataFile>(std::move(*df));
     active_hint_ = std::make_unique<fileops::HintFile>(std::move(*hf));
+
+    // Record the new active file path in write.lock so concurrent mergers
+    // (opened with merge_only=true) can read which file id we own. Format
+    // matches legacy: "<pid> <active_data_path>\n".
+    if (write_lock_) {
+        const std::string line = std::to_string(::getpid()) + " " +
+                                  data_path + "\n";
+        auto bytes = std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(line.data()), line.size());
+        (void)write_lock_->write_data(bytes);  // best-effort
+    }
     return {};
 }
 
@@ -362,11 +430,15 @@ std::expected<void, CaskFault>
 Cask::roll_active_if_needed(std::size_t about_to_write) {
     if (!active_data_) return ensure_active_writer();
     if (active_data_->size() + about_to_write <= opts_.max_file_size) return {};
+    return roll_active();
+}
 
-    // Finalize current.
-    if (auto r = active_hint_->finalize(); !r) {
-        return std::unexpected(io_fault(r.error().errnum,
-                                         std::string(active_hint_->path())));
+std::expected<void, CaskFault> Cask::roll_active() {
+    if (active_hint_) {
+        if (auto r = active_hint_->finalize(); !r) {
+            return std::unexpected(io_fault(r.error().errnum,
+                                             std::string(active_hint_->path())));
+        }
     }
     active_data_.reset();
     active_hint_.reset();
@@ -440,13 +512,23 @@ std::expected<void, CaskFault>
 Cask::put(std::span<const std::byte> key,
           std::span<const std::byte> value,
           std::uint32_t tstamp) {
-    if (!opts_.read_write) return std::unexpected(err(CaskError::kReadOnly));
+    if (!opts_.read_write || opts_.merge_only) {
+        return std::unexpected(err(CaskError::kReadOnly));
+    }
     if (key.size()   > format::kMaxKeySize)   return std::unexpected(err(CaskError::kKeyTooLarge));
     if (value.size() > format::kMaxValueSize) return std::unexpected(err(CaskError::kValueTooLarge));
 
     if (tstamp == 0) tstamp = now_sec_default();
     const std::size_t about = format::kHeaderSize + key.size() + value.size();
     if (auto r = roll_active_if_needed(about); !r) return std::unexpected(r.error());
+
+    // M5.1 task 2: a concurrent merger may have advanced biggest_file_id
+    // past our active_file_id_. If we wrote anyway, the keydir's merge-race
+    // detection would return kAlreadyExists and the put would be silently
+    // dropped. Roll over proactively so our active_file_id_ stays ≥ biggest.
+    if (active_data_ && active_file_id_ < keydir_->biggest_file_id()) {
+        if (auto r = roll_active(); !r) return std::unexpected(r.error());
+    }
 
     auto w = active_data_->write(tstamp, key, value);
     if (!w) return std::unexpected(io_fault(w.error().errnum,
@@ -460,7 +542,21 @@ Cask::put(std::span<const std::byte> key,
                             w->total_size, w->offset, tstamp,
                             /*now*/ 0, /*newest*/ true, 0, 0);
     if (pr == keydir::PutResult::kAlreadyExists) {
-        return std::unexpected(err(CaskError::kAlreadyExists));
+        // Lost a race with a concurrent merger between the rollover check
+        // above and the keydir update. Roll once more and retry; on second
+        // failure, surface the error to the caller.
+        if (auto r = roll_active(); !r) return std::unexpected(r.error());
+        auto w2 = active_data_->write(tstamp, key, value);
+        if (!w2) return std::unexpected(io_fault(w2.error().errnum));
+        auto h2 = active_hint_->write(tstamp, w2->total_size, w2->offset,
+                                        /*tomb*/ false, key);
+        if (!h2) return std::unexpected(io_fault(h2.error().errnum));
+        auto pr2 = keydir_->put(bytes_to_view(key), active_file_id_,
+                                  w2->total_size, w2->offset, tstamp,
+                                  0, true, 0, 0);
+        if (pr2 == keydir::PutResult::kAlreadyExists) {
+            return std::unexpected(err(CaskError::kAlreadyExists));
+        }
     }
     return {};
 }
@@ -517,10 +613,24 @@ bool Cask::is_empty_estimate() {
 
 Cask::NeedsMerge Cask::needs_merge(std::uint32_t now_sec) {
     auto info = keydir_->info();
+    // Pick the file id to exclude:
+    //   - normal writer mode: our own active_file_id_
+    //   - merge_only mode: the live writer's active id, snapshotted from
+    //     write.lock at open time. If the writer rolled over after we
+    //     read, files newer than our snapshot may be the new active —
+    //     exclude EVERYTHING with file_id >= snapshot to be safe.
+    const std::uint32_t exclude_id =
+        opts_.merge_only ? merger_writer_active_id_ : active_file_id_;
     std::vector<merge::FileStatus> summary;
     summary.reserve(info.fstats.size());
     for (const auto& f : info.fstats) {
-        if (f.file_id == active_file_id_) continue;  // skip active writer
+        if (opts_.merge_only) {
+            // Defensive: exclude the snapshot active AND any file rolled
+            // over since (file_id > snapshot).
+            if (exclude_id != 0 && f.file_id >= exclude_id) continue;
+        } else {
+            if (f.file_id == active_file_id_) continue;  // skip own writer
+        }
         summary.push_back(merge::summarize(dirname_, f));
     }
     auto d = merge::decide(summary, opts_.policy, now_sec);

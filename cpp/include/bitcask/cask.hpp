@@ -41,6 +41,22 @@ struct CaskOptions {
     // Records older than (now_sec - expiry_secs) are filtered from get/fold
     // and become candidates for the expiry merge trigger. 0 disables.
     std::uint32_t expiry_secs      = 0;
+
+    // Merge-only mode (M5.1 task 2). When true:
+    //   - acquires bitcask.merge.lock instead of bitcask.write.lock, so a
+    //     live writer (which owns write.lock) can keep running concurrently;
+    //   - does NOT create an active writer file (run_merge produces its own
+    //     output file via keydir->increment_file_id());
+    //   - on open, reads bitcask.write.lock to learn the live writer's
+    //     active file id and excludes it from needs_merge candidates.
+    //
+    // Used by bitcask:merge/N facade when dispatched in cask_cpp mode so
+    // a periodic merge_worker doesn't conflict with the main writer.
+    // Mutually exclusive with normal write_lock acquisition; merge_only
+    // implies read_write semantics for files (merge writes a new file),
+    // but does NOT provide a put/delete API on this Cask handle.
+    bool          merge_only       = false;
+
     merge::PolicyOptions policy{};
 };
 
@@ -180,13 +196,26 @@ private:
     std::unordered_map<std::uint32_t,
                         std::unique_ptr<fileops::DataFile>> read_files_;
 
-    // Write lock (if read_write).
+    // Directory lock. In normal read_write mode this is bitcask.write.lock
+    // (held by the live writer). In merge_only mode it is bitcask.merge.lock
+    // (held by a merger that runs alongside the writer).
     std::optional<lock::FileLock> write_lock_;
+
+    // In merge_only mode, the file id of the live writer's active data
+    // file (read once from write.lock at open time). needs_merge uses this
+    // — instead of our own active_file_id_, which is 0 for a merger — to
+    // exclude the live writer's still-being-written file from candidates.
+    // 0 means "no live writer detected" (safe: no extra exclusion).
+    std::uint32_t merger_writer_active_id_ = 0;
 
     // Helpers.
     [[nodiscard]] std::expected<void, CaskFault> load_keydir_from_disk();
     [[nodiscard]] std::expected<void, CaskFault> ensure_active_writer();
     [[nodiscard]] std::expected<void, CaskFault> roll_active_if_needed(std::size_t about_to_write);
+    // Unconditionally finalize the current active writer and open a fresh
+    // one with a new (incremented) file_id. Used by put() to recover from
+    // a concurrent merger advancing biggest_file_id past us.
+    [[nodiscard]] std::expected<void, CaskFault> roll_active();
     [[nodiscard]] fileops::DataFile* read_file(std::uint32_t file_id);
 };
 

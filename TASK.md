@@ -368,37 +368,86 @@
 
 ---
 
-## 里程碑 5:并发优化 + 工程化 (3–5 天)
+## 里程碑 5:功能补齐 + 并发优化 + 工程化 (5–8 天)
 
-> 目标:释放 C++23 并发性能;把工程基础设施补齐。
+> 目标:把 cask_cpp 与 legacy 的功能 gap 补齐到 prod-ready,然后释放
+> C++23 并发性能,把 CI/Benchmark/文档基础设施补齐。
+>
+> M3-M4 收尾阶段做的功能 gap 盘点(详见对话记录 / doc/USAGE.md)显示:
+> 在生产单进程典型场景下 cask_cpp 已能代替 legacy,但有几条 P0/P1
+> 路径在 merge_worker、sync_strategy、status 等场景下偏差。M5.1/5.2
+> 先把这些填平,再做性能与工程化。
 
-### 性能
+### M5.1 — P0:生产风险修复 🟨
+- [x] **`bitcask:merge/1, /2, /3` facade 加 cask 分支**(任务 1)
+   - cask 模式自动 dispatch:`merge_mode/1` 读 `{nifs, _}` opt > app env > default
+   - `cask_merge_dir/3` 开临时 Cask → 调 `cask_needs_merge` 或用显式 files → 调 `cask_merge` → close
+   - 三种 arity 全支持:all-files / explicit list / `{Files, Expired}` 元组
+   - 3 个新增 parity 测试
+- [x] **`bitcask_merge_worker` 与 cask 写锁兼容**(任务 2,完整方案)
+   - **两锁模型**:写者 `bitcask.write.lock`,merger `bitcask.merge.lock`,互不冲突
+   - `CaskOptions::merge_only` 字段:`true` 时 acquire merge.lock 而非 write.lock,不创建 active writer
+   - **write.lock 内容扩展**为 legacy 格式 `<pid> <active_data_path>\n`,且 rollover 时 `ensure_active_writer` 重写 lock content
+   - **merger 排除写者 active 文件**:open 时读 write.lock,parse 出 active file_id;`needs_merge` 排除所有 file_id ≥ 该 id(防写者 race-rollover 时误合并新 active)
+   - **写者自动 rollover 应对 merge race**:put 前如果发现 `active_file_id_ < biggest_file_id_`(merger 已经把 biggest 推过),先 roll;失败时再 retry 一次
+   - `bitcask:merge/N` facade 默认用 `merge_only` 选项打开 → 不再与 writer 冲突
+   - NIF 层支持 `merge_only` atom
+   - 3 个新增测试:writer holds + merge runs concurrently / write.lock format / second merger blocked
+   - eunit **161/161** PASS;ctest **161/161** PASS
+- [ ] **`sync_strategy` 完整支持**
+   - `none`(默认):写入不主动 sync
+   - `o_sync`:打开文件时加 O_SYNC 标志 — 当前 `CaskOptions::o_sync` 已支持但未从 Erlang opt 解析
+   - `{seconds, N}`:在 Cask 内启动一个定时器线程,每 N 秒 fsync(可选,M5.1 可降级为不支持并文档说明)
+- [ ] **写中途崩溃 → 末尾半条 record 显式截断**
+   - Cask::open 加载阶段:fold data 文件,记录最后一条 valid record 的 offset
+   - 用 `truncate_here` 在那个 offset 截断
+   - 避免 fold 每次都跳过坏尾
+
+### M5.2 — P1:行为差异修复 + 跨模式兼容 ⏳
+- [ ] `Cask::status` 暴露 KeyBytes 和 Epoch(底层已经有,只是 NIF 没传出)
+- [ ] `bitcask:status/1` cask 分支返回完整 5 元组
+- [ ] `cask_fold_next` 增加 `{ok, K, V, FileId, Offset, TotalSz, Tstamp}` 形态(可选第二函数 cask_fold_next_full)
+   - 让 `bitcask:fold_keys/3` 在 cask 下回 callback 时填上真实 #bitcask_entry 字段
+- [ ] **跨模式互通双向测试**
+   - 测试 1:cask_cpp 写 → close → legacy 重开 → 数据可读
+   - 测试 2:legacy 写 → close → cask_cpp 重开 → 数据可读
+- [ ] **tombstone v2 支持**(写)
+   - `Cask::remove` 接受可选 file_id 参数,写 v2 tombstone(`"bitcask_tombstone2" + FileId32`)
+   - opts 加 `tombstone_version`,传 cask
+- [ ] `is_frozen/1` 暴露 cask 真实 freeze 状态(目前总 false)
+
+### M5.3 — 并发优化
 - [ ] KeyDir 改为 `std::shared_mutex` + 分桶(默认 64 桶,可配置)
 - [ ] 读路径(`get`、fold)走 `shared_lock`
 - [ ] 写路径(`put`、`delete`、`merge`)走桶级 `unique_lock`
-- [ ] 评估是否引入 `absl::flat_hash_map`(D3/D12)
+- [ ] 评估引入 `absl::flat_hash_map`(D3/D12)
 - [ ] `std::pmr` 或自定义 arena 优化变长 key 分配
 
-### CI / 工程化
+### M5.4 — CI / 工程化
 - [ ] GitHub Actions 矩阵新增:OTP 22 / 25 / 26 × GCC 13 / Clang 16
 - [ ] CI job:ASan
 - [ ] CI job:UBSan
 - [ ] CI job:TSan
 - [ ] CI job:覆盖率(gcov + codecov)
+
+### M5.5 — Benchmark + 文档 + 验收
 - [ ] Google Benchmark 接入,产出 get/put/fold/merge 的 p50/p99 报告
 - [ ] benchmark 基线归档,后续 PR 自动对比
-
-### 文档
 - [ ] `doc/cpp-arch.md`:架构图与扩展指引
-- [ ] `doc/migration.md`:从 1.x 迁移到 C++ 版本的注意事项
+- [ ] `doc/migration.md`:从 legacy 迁移到 cask_cpp 的注意事项
 - [ ] `doc/format.md`:磁盘格式规范(从代码反推为正式文档)
 - [ ] `README.md` 更新构建指引(cmake / rebar3 双入口)
+- [ ] **验收**:16 线程 get qps ≥ legacy 1.5x;TSan 无 race;行覆盖率 ≥ 80%
 
-### 验收
-- [ ] 16 线程 get qps ≥ 旧版 1.5x
-- [ ] TSan 无 race report
-- [ ] 行覆盖率 ≥ 80%(D13)
-- [ ] format_compat_test 通过(用 1.x 真实数据目录)
+### P2 — 已决定 wontfix(产品上线无影响)
+- `key_transform` 选项(高级,生产用例罕见)
+- `tombstone_version` 写 v1(v0/v2 已支持读;写 v0 默认,M5.2 加 v2 写)
+- `read_ahead` 选项(性能优化,不影响正确性)
+- `log_needs_merge` 选项(调试日志,可走 Erlang 端)
+- `fold_tombstones` 选项(legacy 测试用)
+- `iterator/3, iterator_next/1, iterator_release/1` 三件套(已有 fold/3 替代)
+- `fold/6, fold_keys/6` 的 MaxAge/MaxPut/SeeTombstones 三参数版本
+- `close_write_file/1`(legacy 测试用)
 
 ---
 
@@ -426,6 +475,6 @@
 | M2 KeyDir 下沉 | ✅ | 2026-04-29 | 2026-04-29 | M2.1–2.5 全部完成;C++ ctest 98/98、eunit 130/130;**`{nifs, cpp}` flag 让 bitcask:open 跑通 cpp NIF 业务路径** |
 | M3 Fileops + 合并核心下沉 | ✅ | 2026-04-29 | 2026-04-29 | M3.1–M3.5 全部完成;ctest 157/157、eunit 143/143;**`bitcask:open(Dir, [{nifs, cask_cpp}])` 业务流跑通粗粒度 cask_* API** |
 | M4 Erlang 层瘦身 | 🟨 | 2026-04-29 | | M4.1 done(production 默认 cask_cpp、test 默认 legacy、5 default-mode 测试);M4.2-4.4 待续 |
-| M5 并发优化 + 工程化 | ⬜ | | | |
+| M5 功能补齐 + 并发优化 + 工程化 | ⬜ | | | M5.1-5.5 五个子阶段;M5.1 起步 |
 
 > 状态图例:⬜ 未开始 · 🟨 进行中 · ✅ 完成 · ❌ 阻塞

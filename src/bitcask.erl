@@ -228,11 +228,84 @@ iterator(Ref, MaxAge, MaxPuts) -> bitcask_legacy:iterator(Ref, MaxAge, MaxPuts).
 iterator_next(Ref)             -> bitcask_legacy:iterator_next(Ref).
 iterator_release(Ref)          -> bitcask_legacy:iterator_release(Ref).
 
-%% Directory-level merge: legacy opens its own internal cask; cask facade
-%% does not yet expose a directory-level API. Keep the legacy path.
-merge(Dirname)                          -> bitcask_legacy:merge(Dirname).
-merge(Dirname, Opts)                    -> bitcask_legacy:merge(Dirname, Opts).
-merge(Dirname, Opts, FilesToMerge)      -> bitcask_legacy:merge(Dirname, Opts, FilesToMerge).
+%% Directory-level merge dispatcher.
+%%
+%% In cask_cpp mode (M5.1), bitcask:merge/1,2,3 opens a temporary Cask in
+%% read_write mode and drives the merge through cask_merge. This requires
+%% no other writer to be holding the directory's write.lock. If a live
+%% writer exists (single-process workflow where the same Erlang process
+%% has an open Ref), the caller should instead use the open Ref directly:
+%%
+%%     {true, {Files, _}} = bitcask:needs_merge(R),
+%%     bitcask_cpp_nifs:cask_merge(R, Files).
+%%
+%% In legacy/cpp modes, the long-standing behaviour is preserved:
+%% bitcask_legacy:merge acquires merge.lock and coordinates with a
+%% separately-held write.lock through the legacy keydir registry.
+merge(Dirname) -> merge(Dirname, []).
+
+merge(Dirname, Opts) ->
+    case merge_mode(Opts) of
+        cask_cpp -> cask_merge_dir(Dirname, Opts, all);
+        _        -> bitcask_legacy:merge(Dirname, Opts)
+    end.
+
+merge(Dirname, Opts, FilesToMerge) ->
+    case merge_mode(Opts) of
+        cask_cpp -> cask_merge_dir(Dirname, Opts, FilesToMerge);
+        _        -> bitcask_legacy:merge(Dirname, Opts, FilesToMerge)
+    end.
+
+%% Picks the merge backend based on opts (explicit > app env > default).
+merge_mode(Opts) ->
+    proplists:get_value(nifs, Opts, default_nif_mode()).
+
+%% all | [string()] | {[string()], [string()]} (legacy-shaped pair)
+%%
+%% Uses {merge_only, true} so a live writer (which holds bitcask.write.lock)
+%% can keep running concurrently — the merger acquires bitcask.merge.lock
+%% on a separate file.
+cask_merge_dir(Dirname, Opts, FilesArg) ->
+    OpenOpts = [merge_only | cask_open_opts(Opts)],
+    case bitcask_cpp_nifs:cask_open(Dirname, OpenOpts) of
+        {ok, R} ->
+            try cask_merge_run(R, FilesArg)
+            after bitcask_cpp_nifs:cask_close(R)
+            end;
+        {error, write_locked} ->
+            %% Another merger already holds bitcask.merge.lock — this is
+            %% a real concurrency conflict, not the writer's lock.
+            {error, {merge_locked,
+                     "another merger is already running on this dir",
+                     Dirname}};
+        {error, _} = E ->
+            E
+    end.
+
+cask_merge_run(R, all) ->
+    case bitcask_cpp_nifs:cask_needs_merge(R) of
+        false                  -> ok;
+        {true, Files, _Expired} -> cask_merge_call(R, Files)
+    end;
+cask_merge_run(R, {Files, _Expired}) when is_list(Files) ->
+    cask_merge_call(R, Files);
+cask_merge_run(R, Files) when is_list(Files) ->
+    cask_merge_call(R, Files).
+
+cask_merge_call(_R, []) -> ok;
+cask_merge_call(R, Files) ->
+    case bitcask_cpp_nifs:cask_merge(R, Files) of
+        {ok, _Stats}   -> ok;
+        {error, _} = E -> E
+    end.
+
+%% Build the cask_open option list given a legacy-style opts proplist.
+cask_open_opts(Opts) ->
+    Base = [read_write],
+    Extra = [{K, opt_value(K, Opts)} ||
+                K <- ?CASK_PASSTHROUGH_OPTS,
+                opt_value(K, Opts) =/= undefined],
+    Base ++ Extra.
 
 needs_merge(Ref) -> needs_merge(Ref, []).
 

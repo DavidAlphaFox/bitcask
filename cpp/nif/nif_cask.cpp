@@ -50,9 +50,13 @@ CaskOptions parse_options(ErlNifEnv* env, ERL_NIF_TERM list) {
     CaskOptions o;
     ERL_NIF_TERM head, tail = list;
     while (enif_get_list_cell(env, tail, &head, &tail)) {
-        // Atom-only option (e.g. read_write).
+        // Atom-only option (e.g. read_write, merge_only).
         if (enif_is_atom(env, head)) {
             if (head == atoms().read_write) o.read_write = true;
+            else if (head == atoms().merge_only) {
+                o.merge_only = true;
+                o.read_write = true;  // merger needs to write its output file
+            }
             continue;
         }
         // Tuple {Key, Value}.
