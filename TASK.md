@@ -240,10 +240,23 @@
 - [x] **冒烟测试**:`bitcask_cpp_nifs:cask_open + put + get + status + delete + fold` 完整链路从 Erlang 跑通
 - [x] ctest **157/157 全过**(no san + ASan+UBSan);eunit 不回归 **130/130**
 
-### M3.5 — Erlang shim + parity ⏳
-- [ ] `bitcask_cpp_nifs.erl` 增加 `cask_*` API
-- [ ] `bitcask:open/2` 增加 `{nifs, cask_cpp}` 选项,直接走 `cask_open` 而非 `keydir + 散件 NIF`
-- [ ] 业务流 parity 测试
+### M3.5 — Erlang shim + parity
+- [x] `bitcask_cpp_nifs.erl` 已暴露 13 个 `cask_*` API(M3.4 完成)
+- [x] **`bitcask:open/2` 加 `{nifs, cask_cpp}` 选项**:
+  - 命中后调 `bitcask_cpp_nifs:cask_open/2`,Cask 资源 Ref 直接作为 bitcask:* 的 Ref 用
+  - 设 `bitcask_use_cask=true` 在 process dict
+  - `close/1` 清理 dict
+- [x] 把原 `open/2` 的 body 重构成 `open_legacy/2`,新 `open` 是 dispatcher
+- [x] **公共 API 加 cask 分支**(13 个):
+  - `close/1` / `close_legacy/1`
+  - `get/2`(其余 try 计数路径不进 cask 模式)
+  - `put/3` / `put_legacy/3`(Value=tombstone 走 cask_delete)
+  - `delete/2`、`sync/1`、`list_keys/1`、`fold/3`、`fold_keys/3`、`status/1`、`is_empty_estimate/1`、`is_frozen/1`
+  - `cask_fold_collect/3` helper:wrap `cask_fold_start/next/release` 适配 legacy `Fun(K, V, Acc)` 签名
+- [x] `test/bitcask_cpp_cask_open_tests.erl`:**13 个业务流 parity 测试**(legacy + cask_cpp 双跑)
+  - put/get/overwrite/delete/list_keys/fold/reopen-persists/binary-NUL/500-key/status/is_empty/write-lock 互斥
+- [x] eunit 全套 **143/143 PASS**(原 81 legacy + 19 M1 + 20 M2.4 keydir + 10 M2.5 cpp open + 13 M3.5 cask open)
+- [x] ctest **157/157 PASS**(无 san + ASan+UBSan)
 
 ### NIF 粗粒度 API(D2 落地)
 - [ ] `cask_open/2`、`cask_close/1`
@@ -359,7 +372,7 @@
 | M0 脚手架 + 格式抓手 | ✅ | 2026-04-29 | 2026-04-29 | 工具链 + 格式 codec + sanitizer + rebar 双产出全部就绪;eunit 81/81、ctest 19/19 |
 | M1 文件 I/O + Lock 下沉 | ✅ | 2026-04-29 | 2026-04-29 | `bitcask_cpp_nifs` 与 `bitcask_nifs` parity 验证;eunit 100/100;ctest 38/38(三 sanitizer 全过) |
 | M2 KeyDir 下沉 | ✅ | 2026-04-29 | 2026-04-29 | M2.1–2.5 全部完成;C++ ctest 98/98、eunit 130/130;**`{nifs, cpp}` flag 让 bitcask:open 跑通 cpp NIF 业务路径** |
-| M3 Fileops + 合并核心下沉 | 🟨 | 2026-04-29 | | M3.1 done(DataFile + HintFile,12 单测全过);M3.2-3.5 进行中 |
+| M3 Fileops + 合并核心下沉 | ✅ | 2026-04-29 | 2026-04-29 | M3.1–M3.5 全部完成;ctest 157/157、eunit 143/143;**`bitcask:open(Dir, [{nifs, cask_cpp}])` 业务流跑通粗粒度 cask_* API** |
 | M4 Erlang 层瘦身 | ⬜ | | | |
 | M5 并发优化 + 工程化 | ⬜ | | | |
 

@@ -130,15 +130,44 @@ open(Dirname, Opts) ->
     %% Make sure bitcask app is started so we can pull defaults from env
     ok = start_app(),
 
-    %% Experimental: if the user passed {nifs, cpp}, route NIF dispatch
-    %% (?NIF macro in bitcask.hrl) to the C++ NIF module for this process.
-    %% The proc-dict slot is read on every NIF call site and falls back to
-    %% the legacy module when unset. close/1 erases it.
+    %% Three NIF dispatch modes (M2.5 + M3.5):
+    %%   legacy   — original C NIF, fine-grained keydir/file calls (default)
+    %%   cpp      — new C++ NIF, same fine-grained API; bitcask.erl logic unchanged
+    %%   cask_cpp — new C++ NIF, coarse-grained cask_* API; bitcask.erl logic
+    %%              short-circuits to cask_open/get/put/... on every public entry
     case proplists:get_value(nifs, Opts, legacy) of
-        cpp    -> erlang:put(bitcask_nif_mod, bitcask_cpp_nifs);
-        legacy -> erlang:erase(bitcask_nif_mod);
-        _      -> erlang:erase(bitcask_nif_mod)
-    end,
+        cask_cpp ->
+            erlang:put(bitcask_use_cask, true),
+            erlang:erase(bitcask_nif_mod),
+            return_cask_open(Dirname, Opts);
+        cpp ->
+            erlang:put(bitcask_nif_mod, bitcask_cpp_nifs),
+            erlang:erase(bitcask_use_cask),
+            open_legacy(Dirname, Opts);
+        legacy ->
+            erlang:erase(bitcask_nif_mod),
+            erlang:erase(bitcask_use_cask),
+            open_legacy(Dirname, Opts);
+        _ ->
+            erlang:erase(bitcask_nif_mod),
+            erlang:erase(bitcask_use_cask),
+            open_legacy(Dirname, Opts)
+    end.
+
+%% Shortcut for cask_cpp mode: a Cask handle IS the Ref. Returns the cask
+%% resource directly (or {error, _}).
+return_cask_open(Dirname, Opts) ->
+    CppOpts =
+        case proplists:get_bool(read_write, Opts) of
+            true  -> [read_write];
+            false -> []
+        end,
+    case bitcask_cpp_nifs:cask_open(Dirname, CppOpts) of
+        {ok, CaskRef} -> CaskRef;
+        {error, _} = E -> E
+    end.
+
+open_legacy(Dirname, Opts) ->
 
     %% Make sure the directory exists
     ok = filelib:ensure_dir(filename:join(Dirname, "bitcask")),
@@ -196,6 +225,15 @@ open(Dirname, Opts) ->
 %% @doc Close a bitcask data store and flush any pending writes to disk.
 -spec close(reference()) -> ok.
 close(Ref) ->
+    case erlang:get(bitcask_use_cask) of
+        true ->
+            erlang:erase(bitcask_use_cask),
+            bitcask_cpp_nifs:cask_close(Ref);
+        _ ->
+            close_legacy(Ref)
+    end.
+
+close_legacy(Ref) ->
     State = get_state(Ref),
     erlang:erase(Ref),
 
@@ -242,7 +280,12 @@ close_write_file(Ref) ->
 -spec get(reference(), binary()) ->
                  not_found | {ok, Value::binary()} | {error, Err::term()}.
 get(Ref, Key) ->
-    get(Ref, Key, 2).
+    case erlang:get(bitcask_use_cask) of
+        true ->
+            bitcask_cpp_nifs:cask_get(Ref, Key);
+        _ ->
+            get(Ref, Key, 2)
+    end.
 
 -spec get(reference(), binary(), integer()) ->
                  not_found | {ok, Value::binary()} | {error, Err::term()}.
@@ -298,6 +341,17 @@ get(Ref, Key, TryNum) ->
 
 %% @doc Store a key and value in a bitcase datastore.
 put(Ref, Key, Value) ->
+    case erlang:get(bitcask_use_cask) of
+        true ->
+            case Value of
+                tombstone -> bitcask_cpp_nifs:cask_delete(Ref, Key);
+                _         -> bitcask_cpp_nifs:cask_put(Ref, Key, Value)
+            end;
+        _ ->
+            put_legacy(Ref, Key, Value)
+    end.
+
+put_legacy(Ref, Key, Value) ->
     #bc_state { write_file = WriteFile } = State = get_state(Ref),
     %% 确保文件可写
     %% Make sure we have a file open to write
@@ -322,36 +376,76 @@ put(Ref, Key, Value) ->
 %% @doc Delete a key from a bitcask datastore.
 -spec delete(reference(), Key::binary()) -> ok.
 delete(Ref, Key) ->
-    put(Ref, Key, tombstone).
+    case erlang:get(bitcask_use_cask) of
+        true -> bitcask_cpp_nifs:cask_delete(Ref, Key);
+        _    -> put(Ref, Key, tombstone)
+    end.
 
 %% @doc Force any writes to sync to disk.
 -spec sync(reference()) -> ok.
 sync(Ref) ->
-    State = get_state(Ref),
-    case (State#bc_state.write_file) of
-        undefined ->
-            ok;
-        fresh ->
-            ok;
-        File ->
-            ok = bitcask_fileops:sync(File)
+    case erlang:get(bitcask_use_cask) of
+        true ->
+            bitcask_cpp_nifs:cask_sync(Ref);
+        _ ->
+            State = get_state(Ref),
+            case (State#bc_state.write_file) of
+                undefined -> ok;
+                fresh     -> ok;
+                File      -> ok = bitcask_fileops:sync(File)
+            end
     end.
 
 
 %% @doc List all keys in a bitcask datastore.
 -spec list_keys(reference()) -> [Key::binary()] | {error, any()}.
 list_keys(Ref) ->
-    fold_keys(Ref, fun(#bitcask_entry{key=K},Acc) -> [K|Acc] end, []).
+    case erlang:get(bitcask_use_cask) of
+        true ->
+            cask_fold_collect(Ref, fun(K, _V, Acc) -> [K | Acc] end, []);
+        _ ->
+            fold_keys(Ref, fun(#bitcask_entry{key=K},Acc) -> [K|Acc] end, [])
+    end.
 
 %% @doc Fold over all keys in a bitcask datastore.
 %% Must be able to understand the bitcask_entry record form.
 -spec fold_keys(reference(), Fun::fun(), Acc::term()) ->
                                                        term() | {error, any()}.
 fold_keys(Ref, Fun, Acc0) ->
-    State = get_state(Ref),
-    MaxAge = get_opt(max_fold_age, State#bc_state.opts) * 1000, % convert from ms to us
-    MaxPuts = get_opt(max_fold_puts, State#bc_state.opts),
-    fold_keys(Ref, Fun, Acc0, MaxAge, MaxPuts, false).
+    case erlang:get(bitcask_use_cask) of
+        true ->
+            %% Build #bitcask_entry-shaped records on the fly to keep the Fun
+            %% interface compatible. Offset/total_sz/file_id are not provided
+            %% by the cask fold (it deals in opaque (k,v) pairs); set to 0.
+            CaskFun = fun(K, _V, Acc) ->
+                E = #bitcask_entry{key = K, file_id = 0, total_sz = 0,
+                                   offset = 0, tstamp = 0},
+                Fun(E, Acc)
+            end,
+            cask_fold_collect(Ref, CaskFun, Acc0);
+        _ ->
+            State = get_state(Ref),
+            MaxAge = get_opt(max_fold_age, State#bc_state.opts) * 1000,
+            MaxPuts = get_opt(max_fold_puts, State#bc_state.opts),
+            fold_keys(Ref, Fun, Acc0, MaxAge, MaxPuts, false)
+    end.
+
+%% Helper: walk the cask iterator collecting via Fun((K, V, Acc) -> Acc).
+cask_fold_collect(Ref, Fun, Acc0) ->
+    case bitcask_cpp_nifs:cask_fold_start(Ref, -1, -1) of
+        {ok, IterRef} ->
+            try cask_fold_loop(IterRef, Fun, Acc0)
+            after bitcask_cpp_nifs:cask_fold_release(IterRef)
+            end;
+        {error, _} = E -> E
+    end.
+
+cask_fold_loop(IterRef, Fun, Acc) ->
+    case bitcask_cpp_nifs:cask_fold_next(IterRef) of
+        done            -> Acc;
+        {ok, K, V}      -> cask_fold_loop(IterRef, Fun, Fun(K, V, Acc));
+        {error, _} = E  -> E
+    end.
 
 %% @doc Fold over all keys in a bitcask datastore with limits on how out of date
 %%      the keydir is allowed to be.
@@ -392,8 +486,13 @@ fold_keys(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
            fun((binary(), binary(), any()) -> any()),
            any()) -> any() | {error, any()}.
 fold(Ref, Fun, Acc0) when is_reference(Ref)->
-    State = get_state(Ref),
-    fold(State, Fun, Acc0);
+    case erlang:get(bitcask_use_cask) of
+        true ->
+            cask_fold_collect(Ref, Fun, Acc0);
+        _ ->
+            State = get_state(Ref),
+            fold(State, Fun, Acc0)
+    end;
 fold(State, Fun, Acc0) ->
     MaxAge = get_opt(max_fold_age, State#bc_state.opts) * 1000, % convert from ms to us
     MaxPuts = get_opt(max_fold_puts, State#bc_state.opts),
@@ -1030,24 +1129,42 @@ expired_threshold(Cutoff) ->
 
 -spec is_empty_estimate(reference()) -> boolean().
 is_empty_estimate(Ref) ->
-    State = get_state(Ref),
-    {KeyCount, _, _, _, _} = ?NIF:keydir_info(State#bc_state.keydir),
-    KeyCount == 0.
+    case erlang:get(bitcask_use_cask) of
+        true ->
+            bitcask_cpp_nifs:cask_is_empty(Ref);
+        _ ->
+            State = get_state(Ref),
+            {KeyCount, _, _, _, _} = ?NIF:keydir_info(State#bc_state.keydir),
+            KeyCount == 0
+    end.
 
 -spec is_frozen(reference()) -> boolean().
 is_frozen(Ref) ->
-    #bc_state{keydir=Keydir} = get_state(Ref),
-    {_, _, _, {_, _, Frozen, _}, _} = ?NIF:keydir_info(Keydir),
-    Frozen.
+    case erlang:get(bitcask_use_cask) of
+        true ->
+            %% Cask facade does not expose freeze externally — surface as
+            %% always-false (a fold is short-lived from the caller's view).
+            false;
+        _ ->
+            #bc_state{keydir=Keydir} = get_state(Ref),
+            {_, _, _, {_, _, Frozen, _}, _} = ?NIF:keydir_info(Keydir),
+            Frozen
+    end.
 
 -spec status(reference()) -> {integer(), [{string(), integer(), integer(), integer()}]}.
 status(Ref) ->
-    %% Rewrite the new, record-style status from status_info into a backwards-compatible
-    %% call.
-    %% TODO: Next major revision should remove this variation on status
-    {KeyCount, Summary} = summary_info(Ref),
-    {KeyCount, [{F#file_status.filename, F#file_status.fragmented,
-                 F#file_status.dead_bytes, F#file_status.total_bytes} || F <- Summary]}.
+    case erlang:get(bitcask_use_cask) of
+        true ->
+            %% cask_status returns {KCount, KBytes, Epoch, Files};
+            %% reshape to the legacy 2-tuple {KCount, [{Fn, Frag, Dead, Total}]}.
+            {KCount, _KBytes, _Epoch, Files} = bitcask_cpp_nifs:cask_status(Ref),
+            {KCount, Files};
+        _ ->
+            {KeyCount, Summary} = summary_info(Ref),
+            {KeyCount, [{F#file_status.filename, F#file_status.fragmented,
+                         F#file_status.dead_bytes, F#file_status.total_bytes}
+                        || F <- Summary]}
+    end.
 
 current_files(Dirname, Keydir) ->
     {_, _, Fstats, {_, _, _, PendingEpoch}, Epoch} =
