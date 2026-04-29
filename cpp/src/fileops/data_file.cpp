@@ -124,7 +124,9 @@ DataFile::read(std::uint64_t offset, std::uint32_t total_size) {
 }
 
 std::expected<void, DataFileFault>
-DataFile::fold(FoldFn fn, bool tolerate_crc_errors) {
+DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
+                std::uint64_t* out_last_valid_end) {
+    if (out_last_valid_end) *out_last_valid_end = 0;
     // Snapshot file size; rewind to BOF.
     auto eof = file_.seek(0, SEEK_END);
     if (!eof) return std::unexpected(io_fault(eof.error()));
@@ -181,7 +183,25 @@ DataFile::fold(FoldFn fn, bool tolerate_crc_errors) {
         }
         fn(*rec, offset, rec_total);
         offset += rec_total;
+        if (out_last_valid_end) *out_last_valid_end = offset;
     }
+    return {};
+}
+
+std::expected<void, DataFileFault>
+DataFile::truncate_to(std::uint64_t new_size) {
+    if (mode_ == Mode::kRead) {
+        return std::unexpected(DataFileFault{DataFileError::kIo, 0});
+    }
+    auto s = file_.seek(static_cast<std::int64_t>(new_size), SEEK_SET);
+    if (!s) return std::unexpected(io_fault(s.error()));
+    auto t = file_.truncate_here();
+    if (!t) return std::unexpected(io_fault(t.error()));
+    // Move back to end-of-file so the next pwrite at current_offset_ is
+    // contiguous. (current_offset_ is set by the caller, e.g. recovery.)
+    auto e = file_.seek(0, SEEK_END);
+    if (!e) return std::unexpected(io_fault(e.error()));
+    current_offset_ = *e;
     return {};
 }
 

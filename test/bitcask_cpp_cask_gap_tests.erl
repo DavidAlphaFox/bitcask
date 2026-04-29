@@ -263,6 +263,60 @@ write_lock_records_active_file_path_test_() ->
         end)
     end}.
 
+%% ===================================================================
+%% M5.1 Task 3: sync_strategy passthrough
+%% ===================================================================
+
+sync_strategy_o_sync_open_works_test_() ->
+    {"open with {sync_strategy, o_sync} succeeds and round-trips", fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, [{sync_strategy, o_sync} | ?CASK]),
+            ok = bitcask:put(R, <<"k">>, <<"v">>),
+            ?assertEqual({ok, <<"v">>}, bitcask:get(R, <<"k">>)),
+            bitcask:close(R)
+        end)
+    end}.
+
+sync_strategy_none_open_works_test_() ->
+    {"open with {sync_strategy, none} (default semantics) round-trips",
+     fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, [{sync_strategy, none} | ?CASK]),
+            ok = bitcask:put(R, <<"k">>, <<"v">>),
+            ?assertEqual({ok, <<"v">>}, bitcask:get(R, <<"k">>)),
+            bitcask:close(R)
+        end)
+    end}.
+
+sync_strategy_seconds_open_works_test_() ->
+    {"{sync_strategy, {seconds, N}} is accepted; auto-sync is caller's job "
+     "(matches legacy semantics in bitcask.app.src)",
+     fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, [{sync_strategy, {seconds, 5}} | ?CASK]),
+            ok = bitcask:put(R, <<"k">>, <<"v">>),
+            %% Caller responsibility: explicit bitcask:sync/1.
+            ?assertEqual(ok, bitcask:sync(R)),
+            bitcask:close(R)
+        end)
+    end}.
+
+sync_strategy_app_env_test_() ->
+    {"{sync_strategy, _} read from application env when not in opts",
+     fun() ->
+        with_dir(fun(D) ->
+            application:set_env(bitcask, sync_strategy, o_sync),
+            try
+                R = bitcask:open(D, ?CASK),
+                ok = bitcask:put(R, <<"k">>, <<"v">>),
+                ?assertEqual({ok, <<"v">>}, bitcask:get(R, <<"k">>)),
+                bitcask:close(R)
+            after
+                application:unset_env(bitcask, sync_strategy)
+            end
+        end)
+    end}.
+
 second_concurrent_merger_blocked_by_merge_lock_test_() ->
     {timeout, 30,
      {"only one merger can run on a dir at a time (merge.lock is exclusive)",

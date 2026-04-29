@@ -394,14 +394,23 @@
    - NIF 层支持 `merge_only` atom
    - 3 个新增测试:writer holds + merge runs concurrently / write.lock format / second merger blocked
    - eunit **161/161** PASS;ctest **161/161** PASS
-- [ ] **`sync_strategy` 完整支持**
-   - `none`(默认):写入不主动 sync
-   - `o_sync`:打开文件时加 O_SYNC 标志 — 当前 `CaskOptions::o_sync` 已支持但未从 Erlang opt 解析
-   - `{seconds, N}`:在 Cask 内启动一个定时器线程,每 N 秒 fsync(可选,M5.1 可降级为不支持并文档说明)
-- [ ] **写中途崩溃 → 末尾半条 record 显式截断**
-   - Cask::open 加载阶段:fold data 文件,记录最后一条 valid record 的 offset
-   - 用 `truncate_here` 在那个 offset 截断
-   - 避免 fold 每次都跳过坏尾
+- [x] **`sync_strategy` 完整支持**(任务 3)
+   - 三种模式与 legacy 一致:
+     - `none`(默认):不主动 sync — 当前默认行为
+     - `o_sync`:O_SYNC 标志直通 PosixFile,每次 write 自动同步到 disk
+     - `{seconds, N}`:legacy 也是 caller 责任(见 bitcask.app.src 注释:"it is up to the API caller to execute the call on the interval");cask 接受不报错
+   - NIF `parse_options` 加分支识别 `{sync_strategy, V}`
+   - 新增 atoms:`sync_strategy / none / seconds`
+   - `?CASK_PASSTHROUGH_OPTS` 加 `sync_strategy`(自动从 app env 读)
+   - 4 个新增测试:o_sync / none / {seconds,N} / app env 覆盖
+   - eunit **165/165** PASS
+- [x] **写中途崩溃 → 末尾半条 record 显式截断**(任务 4)
+   - `DataFile::fold` 增加 `out_last_valid_end` 出参,每条记录解码成功后更新到 record 末尾
+   - 新增 `DataFile::truncate_to(uint64_t)`:seek + ftruncate 后回到 EOF,供恢复路径调用
+   - `Cask::load_keydir_from_disk` 在 fold 完一个 data 文件后,如果 `last_valid_end < actual_size` 且当前是 writer(`read_write && !merge_only`),用 kAppend 模式重开并 truncate
+   - 仅 writer 持有 write.lock 时才动文件;read-only / merge_only 不修改磁盘
+   - 2 个新增测试:`Cask.ReopenTruncatesTornWriteTail` / `Cask.ReadOnlyReopenLeavesTornTailIntact`
+   - ctest **163/163** PASS;eunit **91/91** PASS
 
 ### M5.2 — P1:行为差异修复 + 跨模式兼容 ⏳
 - [ ] `Cask::status` 暴露 KeyBytes 和 Epoch(底层已经有,只是 NIF 没传出)

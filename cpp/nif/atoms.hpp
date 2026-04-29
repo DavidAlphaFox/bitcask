@@ -46,6 +46,9 @@ struct Atoms {
     ERL_NIF_TERM merge_only;
     ERL_NIF_TERM max_file_size;
     ERL_NIF_TERM expiry_secs;
+    ERL_NIF_TERM sync_strategy;
+    ERL_NIF_TERM none;
+    ERL_NIF_TERM seconds;
     ERL_NIF_TERM key_too_large;
     ERL_NIF_TERM value_too_large;
     ERL_NIF_TERM read_only;

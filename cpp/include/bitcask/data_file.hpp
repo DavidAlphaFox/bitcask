@@ -92,11 +92,25 @@ public:
     // receives the decoded record. CRC errors stop the fold and propagate
     // unless `tolerate_crc_errors` is true (matches the legacy behaviour
     // that skips up to 20 corrupt records before bailing).
+    //
+    // If `out_last_valid_end` is non-null, on return it holds the file
+    // offset just past the last successfully-decoded record. Caller can
+    // compare to `size()` to detect a torn write at EOF and truncate.
     using FoldFn = std::function<void(const codec::DataRecordView& view,
                                        std::uint64_t offset,
                                        std::uint32_t total_size)>;
     [[nodiscard]] std::expected<void, DataFileFault>
-    fold(FoldFn fn, bool tolerate_crc_errors = false);
+    fold(FoldFn fn,
+         bool tolerate_crc_errors = false,
+         std::uint64_t* out_last_valid_end = nullptr);
+
+    // Truncate the file to `new_size`. Used by recovery to chop off a
+    // torn-write tail discovered by fold(). Caller must be in write/append
+    // mode (Mode::kAppend or kCreate); the file's seek position is
+    // restored to end-of-file after truncation so subsequent writes
+    // continue cleanly.
+    [[nodiscard]] std::expected<void, DataFileFault>
+    truncate_to(std::uint64_t new_size);
 
     // ---- Introspection ----
     [[nodiscard]] std::string_view path() const noexcept { return path_; }

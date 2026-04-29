@@ -73,6 +73,17 @@ CaskOptions parse_options(ErlNifEnv* env, ERL_NIF_TERM list) {
             if (enif_get_int(env, tup[1], &v) && v > 0) {
                 o.expiry_secs = static_cast<std::uint32_t>(v);
             }
+        } else if (tup[0] == atoms().sync_strategy) {
+            // Legacy semantics:
+            //   'none'        — let the OS decide; no special action
+            //   'o_sync'      — open files with O_SYNC, every write hits disk
+            //   {seconds, N}  — caller's responsibility to invoke bitcask:sync/1
+            //                   periodically (legacy and cask alike); option
+            //                   is a placeholder for downstream tools.
+            if (tup[1] == atoms().o_sync) {
+                o.o_sync = true;
+            }
+            // 'none' and {seconds, _} leave o.o_sync at its default (false).
         }
         // ---- merge policy options ----
         else if (tup[0] == atoms().frag_merge_trigger) {

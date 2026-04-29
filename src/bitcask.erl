@@ -105,6 +105,7 @@ default_nif_mode_compiled() -> cask_cpp.
 %% silently dropped (legacy did the same with unknown opts).
 -define(CASK_PASSTHROUGH_OPTS, [
     expiry_secs, max_file_size,
+    sync_strategy,
     frag_merge_trigger, dead_bytes_merge_trigger,
     frag_threshold, dead_bytes_threshold,
     small_file_threshold, expiry_grace_time,

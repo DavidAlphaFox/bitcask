@@ -360,12 +360,15 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
         }
         if (used_hint) continue;
 
-        // Fallback: fold the data file. Skip tombstones.
+        // Fallback: fold the data file. Skip tombstones. Track the last
+        // valid record end so we can chop off a torn-write tail (M5.1
+        // task 4) — but only when this Cask is the writer.
         auto df = fileops::DataFile::open(e.data_path,
                                            fileops::DataFile::Mode::kRead);
         if (!df) {
             return std::unexpected(io_fault(df.error().errnum, e.data_path));
         }
+        std::uint64_t last_valid_end = 0;
         auto fr = df->fold(
             [&](const codec::DataRecordView& view, std::uint64_t offset,
                 std::uint32_t total_size) {
@@ -379,9 +382,26 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
                 keydir_->put(bytes_to_view(view.key), static_cast<std::uint32_t>(e.tstamp),
                              total_size, offset, view.tstamp, /*now*/ 0,
                              /*newest*/ false, 0, 0);
-            }, /*tolerate_crc_errors*/ true);
+            }, /*tolerate_crc_errors*/ true,
+            /*out_last_valid_end*/ &last_valid_end);
         if (!fr) {
             return std::unexpected(err(CaskError::kBadCrc, e.data_path));
+        }
+        const std::uint64_t actual_size = df->size();
+        df->close();
+
+        // Torn-write recovery: if there are unparsable trailing bytes AND
+        // we own write.lock (writer mode, not merge_only), reopen the file
+        // in append mode and truncate to last_valid_end. A live writer's
+        // mid-record crash leaves bytes that fold has already skipped;
+        // trimming them frees disk and prevents bad fstats.
+        if (opts_.read_write && !opts_.merge_only &&
+            last_valid_end < actual_size) {
+            auto wdf = fileops::DataFile::open(
+                e.data_path, fileops::DataFile::Mode::kAppend);
+            if (wdf) {
+                (void)wdf->truncate_to(last_valid_end);  // best-effort
+            }
         }
     }
     return {};

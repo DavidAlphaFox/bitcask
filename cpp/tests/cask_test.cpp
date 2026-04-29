@@ -411,6 +411,113 @@ TEST(Cask, EmptyLockFileTreatedAsStale) {
     ASSERT_TRUE(c);
 }
 
+// ---------------------------------------------------------------------------
+// M5.1 task 4: a writer's mid-record crash leaves trailing bytes that fold()
+// can skip but that still consume disk and confuse fstats. Reopening the dir
+// in writer mode should chop the file back to the last valid record.
+
+namespace {
+fs::path only_data_file(const fs::path& dir) {
+    for (auto& e : fs::directory_iterator(dir)) {
+        auto s = e.path().filename().string();
+        if (s.size() > 13 &&
+            s.compare(s.size() - 13, 13, ".bitcask.data") == 0) {
+            return e.path();
+        }
+    }
+    return {};
+}
+
+// Strip every .bitcask.hint file so the next open is forced down the
+// data-file fold path (mimicking a crash that finalized no hint trailer).
+void remove_all_hints(const fs::path& dir) {
+    for (auto& e : fs::directory_iterator(dir)) {
+        auto s = e.path().filename().string();
+        if (s.size() > 13 &&
+            s.compare(s.size() - 13, 13, ".bitcask.hint") == 0) {
+            fs::remove(e.path());
+        }
+    }
+}
+}  // namespace
+
+TEST(Cask, ReopenTruncatesTornWriteTail) {
+    TempDir td;
+    {
+        auto c = Cask::open(td.path(), rw_opts());
+        ASSERT_TRUE(c);
+        ASSERT_TRUE((*c)->put(sb("k1"), sb("v1")));
+        ASSERT_TRUE((*c)->put(sb("k2"), sb("v2")));
+    }
+
+    // Simulate a writer crash: the in-flight hint trailer wasn't finalized
+    // and the data file got an unparsable trailing fragment.
+    remove_all_hints(td.path());
+    auto data_path = only_data_file(td.path());
+    ASSERT_FALSE(data_path.empty());
+    const auto good_size = fs::file_size(data_path);
+    {
+        std::FILE* fp = std::fopen(data_path.c_str(), "ab");
+        ASSERT_NE(fp, nullptr);
+        const unsigned char garbage[8] = {0,0,0,0, 0xFF,0xFF, 0xFF,0xFF};
+        ASSERT_EQ(8u, std::fwrite(garbage, 1, sizeof(garbage), fp));
+        std::fclose(fp);
+    }
+    ASSERT_EQ(fs::file_size(data_path), good_size + 8u);
+
+    // Reopen as writer: should truncate back to good_size.
+    {
+        auto c = Cask::open(td.path(), rw_opts());
+        ASSERT_TRUE(c);
+        EXPECT_EQ(fs::file_size(data_path), good_size);
+
+        auto v1 = (*c)->get(sb("k1"));
+        ASSERT_TRUE(v1);
+        EXPECT_EQ(vs(v1->value), "v1");
+        auto v2 = (*c)->get(sb("k2"));
+        ASSERT_TRUE(v2);
+        EXPECT_EQ(vs(v2->value), "v2");
+
+        // Subsequent writes still work and land cleanly at the trimmed end.
+        ASSERT_TRUE((*c)->put(sb("k3"), sb("v3")));
+        auto v3 = (*c)->get(sb("k3"));
+        ASSERT_TRUE(v3);
+        EXPECT_EQ(vs(v3->value), "v3");
+    }
+}
+
+// Read-only / merge_only opens must NOT mutate the file even when fold sees
+// trailing garbage — only the writer that owns write.lock may truncate.
+TEST(Cask, ReadOnlyReopenLeavesTornTailIntact) {
+    TempDir td;
+    {
+        auto c = Cask::open(td.path(), rw_opts());
+        ASSERT_TRUE(c);
+        ASSERT_TRUE((*c)->put(sb("k"), sb("v")));
+    }
+    remove_all_hints(td.path());
+    auto data_path = only_data_file(td.path());
+    ASSERT_FALSE(data_path.empty());
+    {
+        std::FILE* fp = std::fopen(data_path.c_str(), "ab");
+        ASSERT_NE(fp, nullptr);
+        const unsigned char garbage[8] = {0,0,0,0, 0xFF,0xFF, 0xFF,0xFF};
+        ASSERT_EQ(8u, std::fwrite(garbage, 1, sizeof(garbage), fp));
+        std::fclose(fp);
+    }
+    const auto torn_size = fs::file_size(data_path);
+
+    {
+        CaskOptions ro;  // read_only by default
+        auto c = Cask::open(td.path(), ro);
+        ASSERT_TRUE(c);
+        auto v = (*c)->get(sb("k"));
+        ASSERT_TRUE(v);
+        EXPECT_EQ(vs(v->value), "v");
+    }
+    EXPECT_EQ(fs::file_size(data_path), torn_size);
+}
+
 TEST(Cask, BinaryKeyAndValueWithNul) {
     TempDir td;
     auto c = Cask::open(td.path(), rw_opts());
