@@ -145,10 +145,28 @@
 - [x] eunit 全套 **120/120 PASS**(81 legacy + 19 M1 + 20 M2.4)
 - [x] C++ ctest **94/94 PASS**;ASan+UBSan 全过
 
-### M2.5 — EQC 5 分钟门槛 ⏳
-- [ ] EQC `bitcask_qc.erl` 跑 ≥ 5 分钟全过(**合并门槛**)
-- [ ] EQC `bitcask_qc_fsm.erl` 跑 ≥ 5 分钟全过
-- [ ] PULSE 30 秒不挂
+### M2.5 — 加强并发 stress 测试 + 真实业务路径接入(替代 EQC)
+> EQC 是 Quviq 商业版,本环境无授权。改用更激进的 GoogleTest 并发 fuzz +
+> 直接把 cpp NIF 接入 `bitcask:open/2` 让真实业务流跑,在生产路径上抓 bug。
+
+- [x] **C++ stress 测试**(`cpp/tests/keydir_stress_test.cpp`,4 个测试):
+  - `RandomOpsFuzz`:8 线程随机 put/get/remove/fold,~500k+ ops,验收 fold 观察到的 key 数 == info.key_count
+  - `ConcurrentFoldsSnapshotStable`:4 writer + 4 folder 并发,每个 fold 看到无重复无丢失的快照
+  - `RegistryAcquireReleaseChurn`:8 线程 churn registry,refcount 无泄漏
+  - `LongFoldStableUnderRapidRewrites`:fold 期间 5000 次同 key 改写,fold 始终看到原始快照
+  - **抓到一个真实 bug**:`remove()` 在 pending 是 tomb 时错误地继续检查 entries,导致 stale live revs 被误删 + key_count 双重 dec → 已修复
+- [x] 三 sanitizer 全过(无 san / ASan+UBSan / TSan):**98/98 PASS**
+- [x] **`bitcask_cpp_nifs.erl` 补齐** `keydir_fold/5` / `keydir_frozen/4` / `keydir_wait_pending/1`:
+  - `keydir_fold/keydir_frozen` 实现与 legacy 完全一致
+  - `keydir_wait_pending` 用 50ms polling 替代 NIF 端 `enif_send`(降级方案,功能正确,M5 可补真正实现)
+- [x] **`include/bitcask.hrl` 加 `?NIF` 宏**:用 fun-wrapped case 读 proc dict `bitcask_nif_mod`,默认 `bitcask_nifs`
+- [x] **`bitcask:open/2` 加 `{nifs, cpp}` 选项**:命中后设 proc dict 路由所有 NIF 到 `bitcask_cpp_nifs`;`close/1` 清理 proc dict
+- [x] **5 个核心模块 sed 替换** `bitcask_nifs:` → `?NIF:`(146 callsites):`bitcask.erl` 49 / `bitcask_fileops.erl` 2 / `bitcask_io.erl`(独立 file_module 路由) / `bitcask_lockops.erl` 10 / `bitcask_merge_delete.erl` 5
+- [x] **`bitcask_io:file_module/0` 也读 proc dict**:cpp 模式下 file I/O 也走 cpp NIF(否则混用不同 NIF 的资源会 badarg)
+- [x] **`nif_keydir_new1` 返回值修正**:与 legacy 对齐,改返回 `{ready, Ref}` / `{not_ready, Ref}`(不是 `{ok, Ref}`)
+- [x] `test/bitcask_cpp_open_tests.erl`:**10 个业务流 parity 测试**(legacy vs cpp 双跑,含 1000-key fold)
+- [x] eunit 全套 **130/130 PASS**
+- [x] 实测 `bitcask:open(Dir, [{nifs, cpp}, read_write])` 完整 put/get/list_keys/fold/delete 全流程通过
 
 ### 后续(放到 M5 性能优化)
 - [ ] `std::shared_mutex` + 桶级锁
@@ -287,7 +305,7 @@
 |--------|------|------|------|------|
 | M0 脚手架 + 格式抓手 | ✅ | 2026-04-29 | 2026-04-29 | 工具链 + 格式 codec + sanitizer + rebar 双产出全部就绪;eunit 81/81、ctest 19/19 |
 | M1 文件 I/O + Lock 下沉 | ✅ | 2026-04-29 | 2026-04-29 | `bitcask_cpp_nifs` 与 `bitcask_nifs` parity 验证;eunit 100/100;ctest 38/38(三 sanitizer 全过) |
-| M2 KeyDir 下沉 | 🟨 | 2026-04-29 | | M2.1 done(核心 ops + fstats + 27 单测 + 3 sanitizer 全过);M2.2–2.5 进行中 |
+| M2 KeyDir 下沉 | ✅ | 2026-04-29 | 2026-04-29 | M2.1–2.5 全部完成;C++ ctest 98/98、eunit 130/130;**`{nifs, cpp}` flag 让 bitcask:open 跑通 cpp NIF 业务路径** |
 | M3 Fileops + 合并核心下沉 | ⬜ | | | |
 | M4 Erlang 层瘦身 | ⬜ | | | |
 | M5 并发优化 + 工程化 | ⬜ | | | |
