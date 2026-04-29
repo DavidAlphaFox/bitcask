@@ -106,6 +106,7 @@ default_nif_mode_compiled() -> cask_cpp.
 -define(CASK_PASSTHROUGH_OPTS, [
     expiry_secs, max_file_size,
     sync_strategy,
+    tombstone_version,
     frag_merge_trigger, dead_bytes_merge_trigger,
     frag_threshold, dead_bytes_threshold,
     small_file_threshold, expiry_grace_time,
@@ -200,12 +201,7 @@ list_keys(Ref) ->
 fold_keys(Ref, Fun, Acc0) ->
     case is_cask() of
         true ->
-            CaskFun = fun(K, _V, Acc) ->
-                E = #bitcask_entry{key = K, file_id = 0, total_sz = 0,
-                                   offset = 0, tstamp = 0},
-                Fun(E, Acc)
-            end,
-            cask_fold_collect(Ref, CaskFun, Acc0);
+            cask_fold_keys_collect(Ref, Fun, Acc0);
         false ->
             bitcask_legacy:fold_keys(Ref, Fun, Acc0)
     end.
@@ -323,7 +319,7 @@ needs_merge(Ref, Opts) ->
 
 is_frozen(Ref) ->
     case is_cask() of
-        true  -> false;  %% cask facade does not expose freeze
+        true  -> bitcask_cpp_nifs:cask_is_frozen(Ref);
         false -> bitcask_legacy:is_frozen(Ref)
     end.
 
@@ -365,6 +361,29 @@ cask_fold_loop(IterRef, Fun, Acc) ->
         done            -> Acc;
         {ok, K, V}      -> cask_fold_loop(IterRef, Fun, Fun(K, V, Acc));
         {error, _} = E  -> E
+    end.
+
+%% fold_keys variant: rebuilds a #bitcask_entry from cask iterator entries
+%% so callers see the same shape as legacy (file_id / offset / total_sz / tstamp
+%% are real, not zero-filled stubs).
+cask_fold_keys_collect(Ref, Fun, Acc0) ->
+    case bitcask_cpp_nifs:cask_fold_start(Ref, -1, -1) of
+        {ok, IterRef} ->
+            try cask_fold_keys_loop(IterRef, Fun, Acc0)
+            after bitcask_cpp_nifs:cask_fold_release(IterRef)
+            end;
+        {error, _} = E -> E
+    end.
+
+cask_fold_keys_loop(IterRef, Fun, Acc) ->
+    case bitcask_cpp_nifs:cask_fold_next_full(IterRef) of
+        done -> Acc;
+        {ok, K, _V, FileId, Offset, TotalSz, Tstamp} ->
+            E = #bitcask_entry{key = K, file_id = FileId,
+                               total_sz = TotalSz, offset = Offset,
+                               tstamp = Tstamp},
+            cask_fold_keys_loop(IterRef, Fun, Fun(E, Acc));
+        {error, _} = Err -> Err
     end.
 
 %% Helpers required by other modules (bitcask_fileops, bitcask_merge_delete).

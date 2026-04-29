@@ -183,9 +183,12 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
             continue;
         }
         Entry e;
-        e.key    = std::move(rec->key);
-        e.value  = std::move(rec->value);
-        e.tstamp = rec->tstamp;
+        e.key      = std::move(rec->key);
+        e.value    = std::move(rec->value);
+        e.tstamp   = rec->tstamp;
+        e.file_id  = proxy->file_id;
+        e.offset   = proxy->offset;
+        e.total_sz = proxy->total_sz;
         return std::optional<Entry>{std::move(e)};
     }
 }
@@ -586,8 +589,31 @@ Cask::remove(std::span<const std::byte> key, std::uint32_t tstamp) {
     if (!opts_.read_write) return std::unexpected(err(CaskError::kReadOnly));
     if (tstamp == 0) tstamp = now_sec_default();
 
-    // Append a tombstone v0 record so a future scan rebuilds the same state.
-    const std::string tomb(format::kTombstoneV0);
+    // Build the tombstone value. v0 = bare prefix; v2 = prefix + shadowed
+    // file_id (BE uint32). The shadowed file_id comes from the current
+    // keydir entry; if the key isn't there (already deleted), fall back
+    // to v0 because there's nothing to point at.
+    std::string tomb;
+    if (opts_.tombstone_version == 2) {
+        std::uint32_t shadow = 0;
+        if (auto entry = keydir_->get(bytes_to_view(key))) {
+            shadow = entry->file_id;
+        }
+        if (shadow != 0) {
+            tomb.assign(format::kTombstoneV2);
+            const std::uint8_t be[4] = {
+                static_cast<std::uint8_t>((shadow >> 24) & 0xFF),
+                static_cast<std::uint8_t>((shadow >> 16) & 0xFF),
+                static_cast<std::uint8_t>((shadow >>  8) & 0xFF),
+                static_cast<std::uint8_t>( shadow        & 0xFF),
+            };
+            tomb.append(reinterpret_cast<const char*>(be), 4);
+        } else {
+            tomb.assign(format::kTombstoneV0);
+        }
+    } else {
+        tomb.assign(format::kTombstoneV0);
+    }
     auto tomb_bytes = str_to_bytes(tomb);
     const std::size_t about =
         format::kHeaderSize + key.size() + tomb_bytes.size();
@@ -629,6 +655,10 @@ StatusInfo Cask::status() {
 
 bool Cask::is_empty_estimate() {
     return keydir_->info().key_count == 0;
+}
+
+bool Cask::is_frozen() {
+    return keydir_->info().iter_info.frozen;
 }
 
 Cask::NeedsMerge Cask::needs_merge(std::uint32_t now_sec) {

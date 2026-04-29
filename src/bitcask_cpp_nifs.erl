@@ -39,8 +39,10 @@
          cask_sync/1,
          cask_fold_start/3,
          cask_fold_next/1,
+         cask_fold_next_full/1,
          cask_fold_release/1,
          cask_is_empty/1,
+         cask_is_frozen/1,
          cask_status/1,
          cask_needs_merge/1,
          cask_merge/2]).
@@ -274,8 +276,10 @@ cask_delete(_Ref, _Key)       -> erlang:nif_error({error, not_loaded}).
 cask_sync(_Ref)               -> erlang:nif_error({error, not_loaded}).
 cask_fold_start(_R, _MA, _MP) -> erlang:nif_error({error, not_loaded}).
 cask_fold_next(_IterRef)      -> erlang:nif_error({error, not_loaded}).
+cask_fold_next_full(_IterRef) -> erlang:nif_error({error, not_loaded}).
 cask_fold_release(_IterRef)   -> erlang:nif_error({error, not_loaded}).
 cask_is_empty(_Ref)           -> erlang:nif_error({error, not_loaded}).
+cask_is_frozen(_Ref)          -> erlang:nif_error({error, not_loaded}).
 cask_status(_Ref)             -> erlang:nif_error({error, not_loaded}).
 cask_needs_merge(_Ref)        -> erlang:nif_error({error, not_loaded}).
 cask_merge(_Ref, _Files)      -> erlang:nif_error({error, not_loaded}).

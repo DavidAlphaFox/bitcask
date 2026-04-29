@@ -73,6 +73,13 @@ CaskOptions parse_options(ErlNifEnv* env, ERL_NIF_TERM list) {
             if (enif_get_int(env, tup[1], &v) && v > 0) {
                 o.expiry_secs = static_cast<std::uint32_t>(v);
             }
+        } else if (tup[0] == atoms().tombstone_version) {
+            // Accept 0 (default), 2 (v2 with shadowed file_id). Any other
+            // value falls back to v0 silently — matches legacy leniency.
+            int v = 0;
+            if (enif_get_int(env, tup[1], &v) && v == 2) {
+                o.tombstone_version = 2;
+            }
         } else if (tup[0] == atoms().sync_strategy) {
             // Legacy semantics:
             //   'none'        — let the OS decide; no special action
@@ -250,6 +257,27 @@ ERL_NIF_TERM nif_cask_fold_next(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM
                              bytes_to_binary(env, (*r)->value));
 }
 
+// Full-form: returns {ok, K, V, FileId, Offset, TotalSz, Tstamp} so the
+// Erlang side can populate a real #bitcask_entry for fold_keys callbacks.
+ERL_NIF_TERM nif_cask_fold_next_full(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
+    auto* ih = cask_iter_handle(env, argv[0]);
+    if (!ih || !ih->iter) return enif_make_badarg(env);
+    auto r = ih->iter->next();
+    if (!r) return fault_to_term(env, r.error());
+    if (!r->has_value()) return atoms().done;
+    const auto& e = **r;
+    ERL_NIF_TERM tup[7] = {
+        atoms().ok,
+        bytes_to_binary(env, e.key),
+        bytes_to_binary(env, e.value),
+        enif_make_uint(env, e.file_id),
+        enif_make_uint64(env, e.offset),
+        enif_make_uint(env, e.total_sz),
+        enif_make_uint(env, e.tstamp),
+    };
+    return enif_make_tuple_from_array(env, tup, 7);
+}
+
 ERL_NIF_TERM nif_cask_fold_release(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
     auto* ih = cask_iter_handle(env, argv[0]);
     if (!ih) return enif_make_badarg(env);
@@ -268,6 +296,12 @@ ERL_NIF_TERM nif_cask_is_empty(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM 
     auto* h = cask_handle(env, argv[0]);
     if (!h || !h->cask) return enif_make_badarg(env);
     return h->cask->is_empty_estimate() ? atoms().atom_true : atoms().atom_false;
+}
+
+ERL_NIF_TERM nif_cask_is_frozen(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
+    auto* h = cask_handle(env, argv[0]);
+    if (!h || !h->cask) return enif_make_badarg(env);
+    return h->cask->is_frozen() ? atoms().atom_true : atoms().atom_false;
 }
 
 ERL_NIF_TERM nif_cask_status(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {

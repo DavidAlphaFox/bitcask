@@ -57,6 +57,15 @@ struct CaskOptions {
     // but does NOT provide a put/delete API on this Cask handle.
     bool          merge_only       = false;
 
+    // Which tombstone format remove() writes. Reads accept any of v0/v1/v2.
+    //   0 → "bitcask_tombstone"            (17 B)  default, simplest
+    //   2 → "bitcask_tombstone2" + FileId  (22 B)  enables merge-time
+    //                                              "delete only if shadowed
+    //                                              file_id still exists"
+    // (v1 has the same on-disk shape as v2 with a different prefix; legacy
+    //  uses it for an intermediate state, we don't write it.)
+    std::uint8_t  tombstone_version = 0;
+
     merge::PolicyOptions policy{};
 };
 
@@ -112,7 +121,10 @@ public:
     struct Entry {
         std::vector<std::byte> key;
         std::vector<std::byte> value;
-        std::uint32_t tstamp;
+        std::uint32_t tstamp = 0;
+        std::uint32_t file_id = 0;
+        std::uint64_t offset = 0;
+        std::uint32_t total_sz = 0;
     };
     [[nodiscard]] std::expected<std::optional<Entry>, CaskFault> next();
 
@@ -153,6 +165,7 @@ public:
 
     [[nodiscard]] StatusInfo status();
     [[nodiscard]] bool is_empty_estimate();
+    [[nodiscard]] bool is_frozen();
 
     // Returns (true, [files_to_merge]) or (false, {}) — wraps decide().
     struct NeedsMerge {

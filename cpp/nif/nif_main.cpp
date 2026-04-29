@@ -56,8 +56,10 @@ ERL_NIF_TERM nif_cask_delete       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_sync         (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_fold_start   (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_fold_next    (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_fold_next_full(ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_fold_release (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_is_empty     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_is_frozen    (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_status       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_needs_merge  (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_merge        (ErlNifEnv*, int, const ERL_NIF_TERM[]);
@@ -116,8 +118,10 @@ ErlNifFunc kNifFuncs[] = {
     {"cask_sync",          1, nif_cask_sync,        ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"cask_fold_start",    3, nif_cask_fold_start,  0},
     {"cask_fold_next",     1, nif_cask_fold_next,   0},
+    {"cask_fold_next_full",1, nif_cask_fold_next_full, 0},
     {"cask_fold_release",  1, nif_cask_fold_release,0},
     {"cask_is_empty",      1, nif_cask_is_empty,    0},
+    {"cask_is_frozen",     1, nif_cask_is_frozen,   0},
     {"cask_status",        1, nif_cask_status,      0},
     {"cask_needs_merge",   1, nif_cask_needs_merge, 0},
     {"cask_merge",         2, nif_cask_merge,       ERL_NIF_DIRTY_JOB_IO_BOUND},

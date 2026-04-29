@@ -46,6 +46,7 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     none            = a("none");
     seconds         = a("seconds");
     expiry_secs     = a("expiry_secs");
+    tombstone_version = a("tombstone_version");
     key_too_large   = a("key_too_large");
     value_too_large = a("value_too_large");
     read_only       = a("read_only");

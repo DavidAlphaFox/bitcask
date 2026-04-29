@@ -412,18 +412,31 @@
    - 2 个新增测试:`Cask.ReopenTruncatesTornWriteTail` / `Cask.ReadOnlyReopenLeavesTornTailIntact`
    - ctest **163/163** PASS;eunit **91/91** PASS
 
-### M5.2 — P1:行为差异修复 + 跨模式兼容 ⏳
-- [ ] `Cask::status` 暴露 KeyBytes 和 Epoch(底层已经有,只是 NIF 没传出)
-- [ ] `bitcask:status/1` cask 分支返回完整 5 元组
-- [ ] `cask_fold_next` 增加 `{ok, K, V, FileId, Offset, TotalSz, Tstamp}` 形态(可选第二函数 cask_fold_next_full)
-   - 让 `bitcask:fold_keys/3` 在 cask 下回 callback 时填上真实 #bitcask_entry 字段
-- [ ] **跨模式互通双向测试**
-   - 测试 1:cask_cpp 写 → close → legacy 重开 → 数据可读
-   - 测试 2:legacy 写 → close → cask_cpp 重开 → 数据可读
-- [ ] **tombstone v2 支持**(写)
-   - `Cask::remove` 接受可选 file_id 参数,写 v2 tombstone(`"bitcask_tombstone2" + FileId32`)
-   - opts 加 `tombstone_version`,传 cask
-- [ ] `is_frozen/1` 暴露 cask 真实 freeze 状态(目前总 false)
+### M5.2 — P1:行为差异修复 + 跨模式兼容 ✅
+- [x] **`Cask::status` 暴露 KeyBytes 和 Epoch**(任务 1)
+   - `StatusInfo` / NIF `cask_status` 已经返回 `{KCount, KBytes, Epoch, Files}` 4 元组
+   - `bitcask:status/1` 与 legacy 一致返回 2 元组 `{KCount, Files}`(legacy 本身就是这个 shape)
+   - 1 个新增 GoogleTest 验证 KeyBytes/Epoch 真实非零
+- [x] **`cask_fold_next_full` + `bitcask:fold_keys/3` 真实字段**(任务 2)
+   - 新 NIF `cask_fold_next_full/1` 返回 `{ok, K, V, FileId, Offset, TotalSz, Tstamp}`
+   - `CaskIter::Entry` 扩展 `file_id / offset / total_sz` 字段,`CaskIter::next` 从 keydir proxy 填入
+   - `bitcask:fold_keys/3` cask 分支用 `cask_fold_next_full`,callback 收到真实 #bitcask_entry
+   - 1 个新增 eunit 验证字段非零
+- [x] **跨模式互通双向测试**(任务 3)
+   - cask_cpp 写 → close → legacy 重开:get / overwrite 全 OK
+   - legacy 写 → close → cask_cpp 重开:get / delete / list_keys 全 OK
+   - 2 个新增 eunit
+- [x] **tombstone v2 支持**(任务 4)
+   - `CaskOptions::tombstone_version`(0 默认 / 2 = "bitcask_tombstone2" + FileId32 BE)
+   - `Cask::remove` 在 v2 模式下从 keydir 取 shadow file_id 并 BE 编码;键不存在时回退 v0
+   - 新增 atom `tombstone_version`,NIF parse_options 接受 `{tombstone_version, 2}`
+   - `?CASK_PASSTHROUGH_OPTS` 加 `tombstone_version`(自动从 app env 读)
+   - 2 个新增 GoogleTest 验证字节级 v2/v0 输出
+- [x] **`is_frozen/1` 真实 freeze 状态**(任务 5)
+   - `Cask::is_frozen()` 暴露 `KeyDirInfo::iter_info::frozen`
+   - 新 NIF `cask_is_frozen/1`,`bitcask:is_frozen/1` cask 分支不再硬编码 false
+   - 1 个新增 eunit
+- ctest **166/166** PASS;eunit **95/95** PASS
 
 ### M5.3 — 并发优化
 - [ ] KeyDir 改为 `std::shared_mutex` + 分桶(默认 64 桶,可配置)

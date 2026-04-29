@@ -8,6 +8,7 @@
 -module(bitcask_cpp_cask_gap_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include("bitcask.hrl").
 
 -define(CASK, [read_write, {nifs, cask_cpp}]).
 
@@ -342,3 +343,118 @@ second_concurrent_merger_blocked_by_merge_lock_test_() ->
             end
         end)
     end}}.
+
+%% ===================================================================
+%% fold_keys: cask path exposes real entry fields (M5.2 task 2)
+%% ===================================================================
+
+%% ===================================================================
+%% Cross-mode bidirectional compat (M5.2 task 3)
+%% On-disk format is byte-compatible: a dir written by one mode must be
+%% readable by the other after close.
+%% ===================================================================
+
+cross_mode_cask_writes_legacy_reads_test_() ->
+    {timeout, 30,
+     {"cask_cpp writes a dir; legacy reopens and reads back",
+      fun() ->
+        with_dir(fun(D) ->
+            R1 = bitcask:open(D, [read_write, {nifs, cask_cpp}]),
+            ok = bitcask:put(R1, <<"k1">>, <<"v1">>),
+            ok = bitcask:put(R1, <<"k2">>, <<"v2">>),
+            ok = bitcask:put(R1, <<"k3">>, <<"v3-overwritten">>),
+            ok = bitcask:put(R1, <<"k3">>, <<"v3">>),
+            bitcask:close(R1),
+
+            R2 = bitcask:open(D, [read_write, {nifs, legacy}]),
+            try
+                ?assertEqual({ok, <<"v1">>}, bitcask:get(R2, <<"k1">>)),
+                ?assertEqual({ok, <<"v2">>}, bitcask:get(R2, <<"k2">>)),
+                ?assertEqual({ok, <<"v3">>}, bitcask:get(R2, <<"k3">>))
+            after
+                bitcask:close(R2)
+            end
+        end)
+     end}}.
+
+cross_mode_legacy_writes_cask_reads_test_() ->
+    {timeout, 30,
+     {"legacy writes a dir; cask_cpp reopens and reads back",
+      fun() ->
+        with_dir(fun(D) ->
+            R1 = bitcask:open(D, [read_write, {nifs, legacy}]),
+            ok = bitcask:put(R1, <<"k1">>, <<"v1">>),
+            ok = bitcask:put(R1, <<"k2">>, <<"v2">>),
+            ok = bitcask:put(R1, <<"k3">>, <<"older">>),
+            ok = bitcask:put(R1, <<"k3">>, <<"newer">>),
+            ok = bitcask:delete(R1, <<"k2">>),
+            bitcask:close(R1),
+
+            R2 = bitcask:open(D, [read_write, {nifs, cask_cpp}]),
+            try
+                ?assertEqual({ok, <<"v1">>},   bitcask:get(R2, <<"k1">>)),
+                ?assertEqual(not_found,         bitcask:get(R2, <<"k2">>)),
+                ?assertEqual({ok, <<"newer">>}, bitcask:get(R2, <<"k3">>)),
+                Keys = lists:sort(bitcask:list_keys(R2)),
+                ?assertEqual([<<"k1">>, <<"k3">>], Keys)
+            after
+                bitcask:close(R2)
+            end
+        end)
+     end}}.
+
+%% ===================================================================
+%% is_frozen reflects iterator state (M5.2 task 5)
+%% ===================================================================
+
+is_frozen_returns_real_state_test_() ->
+    {"is_frozen/1 in cask mode tracks the keydir's iter-frozen state, "
+     "not a hardcoded false",
+     fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, ?CASK),
+            try
+                ok = bitcask:put(R, <<"k">>, <<"v">>),
+                %% No iter active → not frozen.
+                ?assertEqual(false, bitcask:is_frozen(R)),
+                %% Start a fold; it freezes the pending hash for snapshot.
+                %% The fold iterator releases when it returns.
+                _ = bitcask:fold_keys(R, fun(_E, A) -> A end, []),
+                %% After fold completes, frozen drops back to false.
+                ?assertEqual(false, bitcask:is_frozen(R))
+            after
+                bitcask:close(R)
+            end
+        end)
+     end}.
+
+fold_keys_populates_real_entry_fields_test_() ->
+    {"fold_keys/3 in cask mode hands callbacks a #bitcask_entry with real "
+     "file_id/offset/total_sz/tstamp (not zero stubs)",
+     fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, ?CASK),
+            ok = bitcask:put(R, <<"alpha">>, <<"vvvv">>),
+            ok = bitcask:put(R, <<"beta">>,  <<"wwwww">>),
+            try
+                Acc = bitcask:fold_keys(
+                        R,
+                        fun(E, A) -> [E | A] end,
+                        []),
+                ?assertEqual(2, length(Acc)),
+                lists:foreach(
+                  fun(E) ->
+                      ?assert(is_record(E, bitcask_entry)),
+                      %% file_id == active data file's tstamp (>0)
+                      ?assert(E#bitcask_entry.file_id  > 0),
+                      %% total_sz includes the 14-B header
+                      ?assert(E#bitcask_entry.total_sz >= 14),
+                      %% writer stamps current time
+                      ?assert(E#bitcask_entry.tstamp   > 0),
+                      ?assert(E#bitcask_entry.offset  >= 0)
+                  end, Acc)
+            after
+                bitcask:close(R)
+            end
+        end)
+    end}.

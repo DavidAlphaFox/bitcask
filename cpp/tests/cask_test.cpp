@@ -173,6 +173,20 @@ TEST(Cask, FoldVisitsLiveKeys) {
     EXPECT_EQ(seen[1].first,  "c"); EXPECT_EQ(seen[1].second, "3");
 }
 
+TEST(Cask, StatusReportsKeyBytesAndEpoch) {
+    TempDir td;
+    auto c = Cask::open(td.path(), rw_opts());
+    ASSERT_TRUE(c);
+    ASSERT_TRUE((*c)->put(sb("alpha"), sb("xx")));
+    ASSERT_TRUE((*c)->put(sb("beta"),  sb("yyy")));
+
+    auto s = (*c)->status();
+    EXPECT_EQ(s.key_count, 2u);
+    EXPECT_EQ(s.key_bytes, 9u);  // 5 + 4 = 9 bytes of key data
+    EXPECT_GT(s.epoch, 0u);      // monotonic clock advanced after puts
+    EXPECT_FALSE(s.files.empty());
+}
+
 TEST(Cask, RollsActiveFileAtMaxSize) {
     TempDir td;
     CaskOptions opts = rw_opts();
@@ -516,6 +530,75 @@ TEST(Cask, ReadOnlyReopenLeavesTornTailIntact) {
         EXPECT_EQ(vs(v->value), "v");
     }
     EXPECT_EQ(fs::file_size(data_path), torn_size);
+}
+
+// v2 tombstone: remove() writes "bitcask_tombstone2" + FileId32 (BE). The
+// bytes land in the active data file; reads still see not_found and any
+// future scan rebuilds the same delete.
+TEST(Cask, RemoveWritesTombstoneV2WhenConfigured) {
+    TempDir td;
+    CaskOptions opts = rw_opts();
+    opts.tombstone_version = 2;
+    auto c = Cask::open(td.path(), opts);
+    ASSERT_TRUE(c);
+    ASSERT_TRUE((*c)->put(sb("k"), sb("v")));
+
+    // Capture the file size BEFORE the delete so we can read just the
+    // tombstone record's value.
+    auto data_path = only_data_file(td.path());
+    ASSERT_FALSE(data_path.empty());
+    const auto pre_size = fs::file_size(data_path);
+
+    ASSERT_TRUE((*c)->remove(sb("k")));
+
+    auto post_size = fs::file_size(data_path);
+    ASSERT_GT(post_size, pre_size);
+
+    // The tombstone record on disk: 14B header + key("k", 1B) + value (22B v2).
+    // Read the last 22 bytes — the value.
+    std::FILE* fp = std::fopen(data_path.c_str(), "rb");
+    ASSERT_NE(fp, nullptr);
+    ASSERT_EQ(0, std::fseek(fp, static_cast<long>(post_size - 22), SEEK_SET));
+    char buf[22];
+    ASSERT_EQ(22u, std::fread(buf, 1, 22, fp));
+    std::fclose(fp);
+    EXPECT_EQ(0, std::memcmp(buf, "bitcask_tombstone2", 18));
+    // Trailing 4 bytes are the shadowed file_id (BE). Non-zero (we wrote
+    // the live record before deleting it).
+    const std::uint32_t shadow =
+        (static_cast<std::uint8_t>(buf[18]) << 24) |
+        (static_cast<std::uint8_t>(buf[19]) << 16) |
+        (static_cast<std::uint8_t>(buf[20]) <<  8) |
+        (static_cast<std::uint8_t>(buf[21]));
+    EXPECT_GT(shadow, 0u);
+
+    // Reopen — key still gone, no panics. Close the first writer so it
+    // releases bitcask.write.lock.
+    (*c)->close();
+    auto c2 = Cask::open(td.path(), rw_opts());
+    ASSERT_TRUE(c2);
+    auto g = (*c2)->get(sb("k"));
+    EXPECT_FALSE(g);
+    EXPECT_EQ(g.error().kind, CaskError::kNotFound);
+}
+
+TEST(Cask, RemoveWithoutOptStillWritesV0) {
+    TempDir td;
+    auto c = Cask::open(td.path(), rw_opts());  // tombstone_version default 0
+    ASSERT_TRUE(c);
+    ASSERT_TRUE((*c)->put(sb("k"), sb("v")));
+    ASSERT_TRUE((*c)->remove(sb("k")));
+
+    auto data_path = only_data_file(td.path());
+    ASSERT_FALSE(data_path.empty());
+    const auto sz = fs::file_size(data_path);
+    std::FILE* fp = std::fopen(data_path.c_str(), "rb");
+    ASSERT_NE(fp, nullptr);
+    ASSERT_EQ(0, std::fseek(fp, static_cast<long>(sz - 17), SEEK_SET));
+    char buf[17];
+    ASSERT_EQ(17u, std::fread(buf, 1, 17, fp));
+    std::fclose(fp);
+    EXPECT_EQ(0, std::memcmp(buf, "bitcask_tombstone", 17));
 }
 
 TEST(Cask, BinaryKeyAndValueWithNul) {
