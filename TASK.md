@@ -285,6 +285,58 @@
 ## 里程碑 4:Erlang 层瘦身 (3–4 天)
 
 > 目标:把 Erlang 层降到只剩"NIF 加载 + API 直通 + gen_server 调度"。
+> 拆 4 个子阶段以降低风险。
+
+### M4.1 — 切换默认 NIF 到 cask_cpp(production)
+- [x] `bitcask:open/2` 引入 `default_nif_mode/0` + `default_nif_mode_compiled/0`
+- [x] **production 默认 = `cask_cpp`**:`bitcask:open(D)` 透明走粗粒度 cask_* API,无需 opt-in
+- [x] **test profile (`-DTEST`) 默认 = `legacy`**:80+ 个老白盒测试(直接读 `#bc_state` / 调 `bitcask_fileops:fold`)保持原样,零侵入向后兼容
+- [x] `application:set_env(bitcask, default_nif_mode, M)` 可全局覆盖(legacy / cpp / cask_cpp)
+- [x] 显式 `{nifs, legacy}` opt-out 仍然可用
+- [x] `test/bitcask_default_mode_tests.erl`:**5 个测试**覆盖 (test-profile 默认 / app env 覆盖 cask_cpp / cpp / 显式 legacy / 垃圾值 fallback)
+- [x] eunit 全套 **148/148 PASS**(原 143 + 5 default-mode)
+
+### M4.2 — Cask-cpp 模式下补齐 legacy gap
+- [x] 写 `test/bitcask_cpp_cask_gap_tests.erl`(7 个测试)直接在 cask_cpp 模式下复刻 legacy 关键场景
+- [x] 跑出 3 个真实 gap:
+  - `expiry_secs` get 不过滤过期 key
+  - `expiry_secs` list_keys/fold 不过滤过期 key
+  - `bitcask:needs_merge/1` 没 dispatch 到 cask 模式
+- [x] **修复 #1+#2 (expiry_secs)**:
+  - `CaskOptions::expiry_secs` 字段
+  - `Cask::get()`:`entry.tstamp + expiry_secs <= now` → kNotFound
+  - `CaskIter::next()`:同上 + 跳过 tombstone-value 记录(legacy 同行为)
+  - NIF 选项解析支持 `{expiry_secs, N}`
+  - Erlang `return_cask_open/2` 把 `expiry_secs` / `max_file_size` 转传给 cask_open
+- [x] **修复 #3 (needs_merge dispatch)**:
+  - `bitcask:needs_merge/2` 加 cask 分支调 `cask_needs_merge`
+  - 重塑返回值为 legacy 的 `{true, {Files, Expired}}`
+- [x] 7 个 gap 测试全过;eunit 全套 **155/155 PASS**;ctest **157/157**(无回归)
+- [ ] 后续 gap(可选,按需补)
+  - `key_transform` 选项(legacy 在 keydir 操作前对 key 做变换)
+  - `fold_tombstones` 选项(legacy fold 可显式包含 tombstone)
+  - `bitcask:merge/1, /2, /3`(目录级 API,legacy 自己 open/close;cask 用 Ref)
+  - `is_frozen`(legacy 暴露 keydir freeze 状态;cask 总返回 false)
+
+### M4.3 — 缩减 `bitcask.erl`(3873 → 283 行,**-92.7%**)
+- [x] 创建 `src/bitcask_legacy.erl`(3881 行)= 原 `bitcask.erl` 完整复制 + module 名改名
+- [x] 修复 bitcask_legacy.erl 内 `?MODULE` 宏对 `application:get_env`/`application:start` 的 misexpand(改硬编码 `bitcask`)
+- [x] **重写 `bitcask.erl` 为 283 行薄 facade**:
+  - 公共 API 22 个 export(open/close/get/put/delete/sync/list_keys/fold*/iterator*/merge*/needs_merge*/is_frozen/is_empty_estimate/status)
+  - 4 个 helper re-export(get_opt/get_filestate/is_tombstone/has_pending_delete_bit → 转发到 bitcask_legacy)
+  - 单一 dispatch 入口 `is_cask()` 读 process dict
+  - cask_cpp 模式直接调 cask_* NIF;legacy/cpp 模式委托 `bitcask_legacy:*`
+  - 集中的 `default_nif_mode/0` + `-ifdef(TEST)` 编译期默认
+  - `cask_fold_collect/3` helper 统一 list_keys/fold/fold_keys 的 cask 路径
+- [x] 修复 bitcask_legacy 内部 `bitcask:readable_files / subfold` 自调用 → 改 `bitcask_legacy:`
+- [x] eunit 全套 **155/155 PASS**(原 155 不回归);ctest **157/157**
+- [x] 80+ 个 legacy 白盒测试 **零侵入** —— 它们继续在 `bitcask_legacy` 模块下跑,通过 `bitcask:open/2` facade 进入 legacy 路径
+
+### M4.4 — 删除 `c_src/` + 旧依赖 ⏳
+- [ ] 删除 `c_src/` 整个目录
+- [ ] 删除 `pc` 插件依赖
+- [ ] 删除 `khash.h` / `murmurhash.c` / `erl_nif_compat.h` / `erl_nif_util.*`
+- [ ] `rebar.config`:移除 `port_specs` / `port_env` / `pc` 相关段
 
 ### Erlang 改造
 - [ ] `bitcask.erl` 重写为 `cask_*` API 的薄包装(从 3692 行降到 ~300 行)
@@ -373,7 +425,7 @@
 | M1 文件 I/O + Lock 下沉 | ✅ | 2026-04-29 | 2026-04-29 | `bitcask_cpp_nifs` 与 `bitcask_nifs` parity 验证;eunit 100/100;ctest 38/38(三 sanitizer 全过) |
 | M2 KeyDir 下沉 | ✅ | 2026-04-29 | 2026-04-29 | M2.1–2.5 全部完成;C++ ctest 98/98、eunit 130/130;**`{nifs, cpp}` flag 让 bitcask:open 跑通 cpp NIF 业务路径** |
 | M3 Fileops + 合并核心下沉 | ✅ | 2026-04-29 | 2026-04-29 | M3.1–M3.5 全部完成;ctest 157/157、eunit 143/143;**`bitcask:open(Dir, [{nifs, cask_cpp}])` 业务流跑通粗粒度 cask_* API** |
-| M4 Erlang 层瘦身 | ⬜ | | | |
+| M4 Erlang 层瘦身 | 🟨 | 2026-04-29 | | M4.1 done(production 默认 cask_cpp、test 默认 legacy、5 default-mode 测试);M4.2-4.4 待续 |
 | M5 并发优化 + 工程化 | ⬜ | | | |
 
 > 状态图例:⬜ 未开始 · 🟨 进行中 · ✅ 完成 · ❌ 阻塞

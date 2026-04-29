@@ -41,6 +41,7 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     done            = a("done");
     read_write      = a("read_write");
     max_file_size   = a("max_file_size");
+    expiry_secs     = a("expiry_secs");
     key_too_large   = a("key_too_large");
     value_too_large = a("value_too_large");
     read_only       = a("read_only");

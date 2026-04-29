@@ -44,6 +44,7 @@ struct Atoms {
     ERL_NIF_TERM done;
     ERL_NIF_TERM read_write;
     ERL_NIF_TERM max_file_size;
+    ERL_NIF_TERM expiry_secs;
     ERL_NIF_TERM key_too_large;
     ERL_NIF_TERM value_too_large;
     ERL_NIF_TERM read_only;

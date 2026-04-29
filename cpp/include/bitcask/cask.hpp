@@ -38,6 +38,9 @@ struct CaskOptions {
     std::uint64_t max_file_size    = 2ULL * 1024ULL * 1024ULL * 1024ULL;  // 2 GiB
     bool          o_sync           = false;
     bool          require_hint_crc = false;  // legacy default; M5 may flip true
+    // Records older than (now_sec - expiry_secs) are filtered from get/fold
+    // and become candidates for the expiry merge trigger. 0 disables.
+    std::uint32_t expiry_secs      = 0;
     merge::PolicyOptions policy{};
 };
 

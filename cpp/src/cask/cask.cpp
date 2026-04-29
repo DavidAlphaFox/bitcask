@@ -57,31 +57,47 @@ CaskIter::start(int maxage, int maxputs, std::uint32_t now_sec) {
 std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
     if (!iter_ || !iter_->is_iterating()) return std::optional<Entry>{};
 
-    auto proxy = iter_->next();
-    if (!proxy) return std::optional<Entry>{};
+    const auto expiry = parent_->opts_.expiry_secs;
+    const auto now = (expiry > 0) ? now_sec_default() : 0;
 
-    // Fetch value from the data file pointed to by the proxy.
-    auto* df = parent_->read_file(proxy->file_id);
-    if (!df) {
-        return std::unexpected(err(CaskError::kIo,
-            "open read file_id=" + std::to_string(proxy->file_id)));
-    }
-    auto rec = df->read(proxy->offset, proxy->total_sz);
-    if (!rec) {
-        switch (rec.error().kind) {
-            case fileops::DataFileError::kBadCrc:
-                return std::unexpected(err(CaskError::kBadCrc));
-            case fileops::DataFileError::kIo:
-                return std::unexpected(io_fault(rec.error().errnum));
-            default:
-                return std::unexpected(err(CaskError::kIo, "read"));
+    // Skip entries that are expired or whose value record is a tombstone.
+    // Loop until we find a deliverable entry or hit end of iteration.
+    while (true) {
+        auto proxy = iter_->next();
+        if (!proxy) return std::optional<Entry>{};
+
+        if (expiry > 0 && proxy->tstamp + expiry <= now) {
+            continue;  // expired; skip
         }
+
+        auto* df = parent_->read_file(proxy->file_id);
+        if (!df) {
+            return std::unexpected(err(CaskError::kIo,
+                "open read file_id=" + std::to_string(proxy->file_id)));
+        }
+        auto rec = df->read(proxy->offset, proxy->total_sz);
+        if (!rec) {
+            switch (rec.error().kind) {
+                case fileops::DataFileError::kBadCrc:
+                    return std::unexpected(err(CaskError::kBadCrc));
+                case fileops::DataFileError::kIo:
+                    return std::unexpected(io_fault(rec.error().errnum));
+                default:
+                    return std::unexpected(err(CaskError::kIo, "read"));
+            }
+        }
+        // Tombstone records lose their place in fold (legacy hides them).
+        if (bitcask::format::is_tombstone_value(
+                std::string_view(reinterpret_cast<const char*>(rec->value.data()),
+                                  rec->value.size()))) {
+            continue;
+        }
+        Entry e;
+        e.key    = std::move(rec->key);
+        e.value  = std::move(rec->value);
+        e.tstamp = rec->tstamp;
+        return std::optional<Entry>{std::move(e)};
     }
-    Entry e;
-    e.key    = std::move(rec->key);
-    e.value  = std::move(rec->value);
-    e.tstamp = rec->tstamp;
-    return std::optional<Entry>{std::move(e)};
 }
 
 void CaskIter::release() noexcept {
@@ -307,6 +323,16 @@ std::expected<GetResult, CaskFault>
 Cask::get(std::span<const std::byte> key) {
     auto entry = keydir_->get(bytes_to_view(key));
     if (!entry) return std::unexpected(err(CaskError::kNotFound));
+
+    // Expiry filter: a record older than (now - expiry_secs) is invisible.
+    // We don't actively remove it from the keydir here (that would need to
+    // be a write op); merge will eventually GC it.
+    if (opts_.expiry_secs > 0) {
+        const auto now = now_sec_default();
+        if (entry->tstamp + opts_.expiry_secs <= now) {
+            return std::unexpected(err(CaskError::kNotFound));
+        }
+    }
 
     auto* df = read_file(entry->file_id);
     if (!df) return std::unexpected(err(CaskError::kIo,

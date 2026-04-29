@@ -64,8 +64,13 @@ CaskOptions parse_options(ErlNifEnv* env, ERL_NIF_TERM list) {
         } else if (tup[0] == atoms().max_file_size) {
             ErlNifUInt64 v = 0;
             if (enif_get_uint64(env, tup[1], &v)) o.max_file_size = v;
+        } else if (tup[0] == atoms().expiry_secs) {
+            int v = 0;
+            if (enif_get_int(env, tup[1], &v) && v > 0) {
+                o.expiry_secs = static_cast<std::uint32_t>(v);
+            }
         }
-        // M3.5 may extend with merge policy options.
+        // M4.x will extend further with merge policy options.
     }
     return o;
 }
