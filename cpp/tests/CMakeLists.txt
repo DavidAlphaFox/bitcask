@@ -88,6 +88,30 @@ target_link_libraries(bitcask_scanner_test PRIVATE
     bitcask_sanitizers
 )
 
+add_executable(bitcask_merge_policy_test merge_policy_test.cpp)
+target_link_libraries(bitcask_merge_policy_test PRIVATE
+    GTest::gtest_main
+    bitcask_merge
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
+add_executable(bitcask_merger_test merger_test.cpp)
+target_link_libraries(bitcask_merger_test PRIVATE
+    GTest::gtest_main
+    bitcask_merge
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
+add_executable(bitcask_cask_test cask_test.cpp)
+target_link_libraries(bitcask_cask_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 include(GoogleTest)
 gtest_discover_tests(bitcask_smoke_test)
 gtest_discover_tests(bitcask_codec_test)
@@ -99,3 +123,6 @@ gtest_discover_tests(bitcask_keydir_registry_test)
 gtest_discover_tests(bitcask_keydir_stress_test PROPERTIES TIMEOUT 60)
 gtest_discover_tests(bitcask_data_file_test)
 gtest_discover_tests(bitcask_scanner_test)
+gtest_discover_tests(bitcask_merge_policy_test)
+gtest_discover_tests(bitcask_merger_test)
+gtest_discover_tests(bitcask_cask_test)

@@ -37,6 +37,15 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     atom_true             = a("true");
     atom_false            = a("false");
     undefined             = a("undefined");
+
+    done            = a("done");
+    read_write      = a("read_write");
+    max_file_size   = a("max_file_size");
+    key_too_large   = a("key_too_large");
+    value_too_large = a("value_too_large");
+    read_only       = a("read_only");
+    write_locked    = a("write_locked");
+    bad_crc         = a("bad_crc");
 }
 
 Atoms& atoms() noexcept { return g_atoms; }

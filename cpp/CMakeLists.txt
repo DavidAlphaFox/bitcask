@@ -38,6 +38,32 @@ target_link_libraries(bitcask_fileops
 )
 
 # ---------------------------------------------------------------------------
+# bitcask_merge — merge policy + merger orchestration.
+# Depends on fileops (DataFile/HintFile) AND keydir (for liveness checks).
+# ---------------------------------------------------------------------------
+add_library(bitcask_merge STATIC
+    src/merge/merge_policy.cpp
+    src/merge/merger.cpp
+)
+target_include_directories(bitcask_merge PUBLIC include)
+target_link_libraries(bitcask_merge
+    PUBLIC bitcask_fileops bitcask_keydir
+    PRIVATE bitcask_warnings
+)
+
+# ---------------------------------------------------------------------------
+# bitcask_cask — high-level facade integrating keydir + fileops + merger.
+# ---------------------------------------------------------------------------
+add_library(bitcask_cask STATIC
+    src/cask/cask.cpp
+)
+target_include_directories(bitcask_cask PUBLIC include)
+target_link_libraries(bitcask_cask
+    PUBLIC  bitcask_fileops bitcask_keydir bitcask_merge bitcask_io
+    PRIVATE bitcask_warnings
+)
+
+# ---------------------------------------------------------------------------
 # bitcask_io — POSIX file + advisory lock primitives.
 # Pure C++. Used by the NIF translation layer and by C++ unit tests directly.
 # ---------------------------------------------------------------------------
@@ -71,6 +97,7 @@ add_library(bitcask_cpp MODULE
     nif/nif_io.cpp
     nif/nif_lock.cpp
     nif/nif_keydir.cpp
+    nif/nif_cask.cpp
     nif/atoms.cpp
     nif/resources.cpp
 )
@@ -79,6 +106,7 @@ target_link_libraries(bitcask_cpp
         Erlang::ERTS
         bitcask_io
         bitcask_keydir
+        bitcask_cask
         bitcask_warnings
 )
 set_target_properties(bitcask_cpp PROPERTIES

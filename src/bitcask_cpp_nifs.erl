@@ -30,6 +30,21 @@
          lock_readdata/1,
          lock_writedata/2]).
 
+%% Cask (M3.4 coarse-grained API)
+-export([cask_open/2,
+         cask_close/1,
+         cask_get/2,
+         cask_put/3,
+         cask_delete/2,
+         cask_sync/1,
+         cask_fold_start/3,
+         cask_fold_next/1,
+         cask_fold_release/1,
+         cask_is_empty/1,
+         cask_status/1,
+         cask_needs_merge/1,
+         cask_merge/2]).
+
 %% KeyDir
 -export([keydir_new/0, keydir_new/1,
          maybe_keydir_new/1,
@@ -245,3 +260,22 @@ increment_file_id(_Ref, _Cond)  -> erlang:nif_error({error, not_loaded}).
 update_fstats(_Ref, _FileId, _Tstamp, _Live, _Total, _LiveB, _TotalB, _SC) ->
     erlang:nif_error({error, not_loaded}).
 set_pending_delete(_Ref, _FileId) -> erlang:nif_error({error, not_loaded}).
+
+%% =============================================================================
+%% Coarse-grained Cask API. The bitcask:open/2 facade may dispatch through
+%% these (M3.5 wires it up); for now they're just exposed for direct callers
+%% / parity tests.
+%% =============================================================================
+cask_open(_Dir, _Opts)        -> erlang:nif_error({error, not_loaded}).
+cask_close(_Ref)              -> erlang:nif_error({error, not_loaded}).
+cask_get(_Ref, _Key)          -> erlang:nif_error({error, not_loaded}).
+cask_put(_Ref, _Key, _Val)    -> erlang:nif_error({error, not_loaded}).
+cask_delete(_Ref, _Key)       -> erlang:nif_error({error, not_loaded}).
+cask_sync(_Ref)               -> erlang:nif_error({error, not_loaded}).
+cask_fold_start(_R, _MA, _MP) -> erlang:nif_error({error, not_loaded}).
+cask_fold_next(_IterRef)      -> erlang:nif_error({error, not_loaded}).
+cask_fold_release(_IterRef)   -> erlang:nif_error({error, not_loaded}).
+cask_is_empty(_Ref)           -> erlang:nif_error({error, not_loaded}).
+cask_status(_Ref)             -> erlang:nif_error({error, not_loaded}).
+cask_needs_merge(_Ref)        -> erlang:nif_error({error, not_loaded}).
+cask_merge(_Ref, _Files)      -> erlang:nif_error({error, not_loaded}).

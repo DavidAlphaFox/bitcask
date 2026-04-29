@@ -40,6 +40,16 @@ struct Atoms {
     ERL_NIF_TERM atom_false;
     ERL_NIF_TERM undefined;
 
+    // cask_* atoms
+    ERL_NIF_TERM done;
+    ERL_NIF_TERM read_write;
+    ERL_NIF_TERM max_file_size;
+    ERL_NIF_TERM key_too_large;
+    ERL_NIF_TERM value_too_large;
+    ERL_NIF_TERM read_only;
+    ERL_NIF_TERM write_locked;
+    ERL_NIF_TERM bad_crc;
+
     void init(ErlNifEnv* env) noexcept;
 };
 

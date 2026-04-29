@@ -11,6 +11,7 @@
 
 #include <erl_nif.h>
 
+#include "bitcask/cask.hpp"
 #include "bitcask/file_lock.hpp"
 #include "bitcask/io.hpp"
 #include "bitcask/keydir.hpp"
@@ -40,6 +41,20 @@ struct KeyDirHandle {
 extern ErlNifResourceType* g_file_resource_type;
 extern ErlNifResourceType* g_lock_resource_type;
 extern ErlNifResourceType* g_keydir_resource_type;
+extern ErlNifResourceType* g_cask_resource_type;
+extern ErlNifResourceType* g_cask_iter_resource_type;
+
+// Wraps the C++ Cask object inside a NIF resource. Cask owns its KeyDir and
+// active write/hint files; the destructor handles teardown.
+struct CaskHandle {
+    std::unique_ptr<Cask> cask;
+};
+
+struct CaskIterHandle {
+    // Holds a non-owning pointer to the parent CaskHandle's resource via
+    // an opaque reference; cleanup is the iterator's own duty.
+    std::unique_ptr<CaskIter> iter;
+};
 
 // Register both resource types. Returns false if any registration failed.
 [[nodiscard]] bool register_resources(ErlNifEnv* env) noexcept;
@@ -61,5 +76,7 @@ ERL_NIF_TERM make_resource(ErlNifEnv* env, ErlNifResourceType* rt, Args&&... arg
 void file_resource_dtor(ErlNifEnv* env, void* obj) noexcept;
 void lock_resource_dtor(ErlNifEnv* env, void* obj) noexcept;
 void keydir_resource_dtor(ErlNifEnv* env, void* obj) noexcept;
+void cask_resource_dtor(ErlNifEnv* env, void* obj) noexcept;
+void cask_iter_resource_dtor(ErlNifEnv* env, void* obj) noexcept;
 
 }  // namespace bitcask::nif

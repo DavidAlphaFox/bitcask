@@ -205,14 +205,40 @@
 - [x] **8 个 GoogleTest** 覆盖空目录、不存在目录、排序、hint 配对、垃圾文件名、子目录过滤
 - [x] ctest **120/120 全过**(包括 ASan+UBSan);eunit **130/130** 不回归
 
-### M3.3 — Merge 策略 + merger 主体 ⏳
-- [ ] `cpp/include/bitcask/merge.hpp`:`MergePolicy` + `needs_merge(fstats, opts) -> {bool, [file_id]}`
-- [ ] `cpp/src/merge/merger.cpp`:`Merger` 类,合并旧 data 文件到新 file,更新 keydir,处理 tombstone
+### M3.3 — Merge 策略 + merger 主体
+- [x] `cpp/include/bitcask/merge_policy.hpp` + `cpp/src/merge/merge_policy.cpp`:
+  - `summarize(dirname, fstats) → FileStatus`(算 frag% / dead_bytes / 文件名)
+  - `per_file_reasons(file, opts, now) → [Reason]`(4 类:Fragmented / DeadBytes / SmallFile / DataExpired)
+  - `decide(summary, opts, now) → Decision{needs_merge, files, expired_files}`(legacy `run_merge_triggers` 等价)
+  - `cap_size(files, sizes, max_merge_size)`(legacy `cap_size`,严格不含越界文件)
+- [x] `cpp/include/bitcask/merger.hpp` + `cpp/src/merge/merger.cpp`:`run_merge`(简化版 Merger)
+  - 输入多 data 文件 → 输出单个 data + hint
+  - 每个 record 走 keydir.get 做 liveness check;只搬 (file_id, offset) 仍指向原位置的"live"记录
+  - tombstone records 跳过(M3.4 才补 tombstone v2 反写)
+  - 写完后 keydir.put CAS 更新到新 (output_file_id, new_offset)
+  - 返回统计:records_seen / kept / stale / tombs / bytes_written
+- [x] **22 个 GoogleTest**:
+  - 16 个 MergePolicy(summarize / 4 类 reason / decide 触发器 / 文件选择 / cap_size 三种边界)
+  - 6 个 Merger(单文件 happy path / stale / tombstone 跳过 / 跨文件去重 / hint trailer 有效 / 空输入)
+- [x] ctest **142/142 全过**(no san + ASan+UBSan);eunit 不回归 **130/130**
 
-### M3.4 — Cask 类 + 粗粒度 `cask_*` NIF ⏳
-- [ ] `cpp/include/bitcask/cask.hpp`:`Cask` 类(open/get/put/delete/sync/fold/merge/needs_merge/status/close)
-- [ ] `cpp/nif/nif_cask.cpp`:14 个 `cask_*` NIF
-- [ ] dirty scheduler 标记:open/merge/fold 走 `ERL_NIF_DIRTY_JOB_IO_BOUND`
+### M3.4 — Cask 类 + 粗粒度 `cask_*` NIF
+- [x] `cpp/include/bitcask/cask.hpp` + `cpp/src/cask/cask.cpp`:`Cask` 类整合 keydir + DataFile + HintFile + Scanner + Merger + FileLock
+  - `open(dirname, opts, registry?)`:扫目录 → keydir 加载(hint 优先 + tombstone 正确处理 + data fold fallback)→ 写锁(read_write 模式)
+  - `get` / `put` / `remove`(写 v0 tombstone)/ `sync`
+  - active 写文件 + max_file_size 滚动
+  - `read_files_` 缓存懒打开
+  - `make_iter()` → CaskIter:keydir snapshot iter + lazy 取 value
+  - `status()` / `is_empty_estimate()` / `needs_merge()` / `merge()`(包装 M3.3 的 run_merge)
+- [x] `cpp/nif/nif_cask.cpp`:13 个 `cask_*` NIF 函数
+  - `cask_open / close / get / put / delete / sync`
+  - `cask_fold_start / next / release`(粗粒度 fold,3 个 NIF 替代散件 itr 系列)
+  - `cask_status / is_empty / needs_merge / merge`
+- [x] **dirty scheduler 标记**:`cask_open` / `cask_sync` / `cask_merge` 走 `ERL_NIF_DIRTY_JOB_IO_BOUND`
+- [x] `bitcask_cpp_nifs.erl` 暴露 13 个 `cask_*` API
+- [x] **15 个 GoogleTest** 端到端验证(开/读/写/删/fold/重开/滚动/锁/registry 共享/二进制 key)
+- [x] **冒烟测试**:`bitcask_cpp_nifs:cask_open + put + get + status + delete + fold` 完整链路从 Erlang 跑通
+- [x] ctest **157/157 全过**(no san + ASan+UBSan);eunit 不回归 **130/130**
 
 ### M3.5 — Erlang shim + parity ⏳
 - [ ] `bitcask_cpp_nifs.erl` 增加 `cask_*` API

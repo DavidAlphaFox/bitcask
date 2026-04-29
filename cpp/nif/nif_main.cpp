@@ -48,6 +48,20 @@ ERL_NIF_TERM nif_increment_file_id (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_update_fstats     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_set_pending_delete(ErlNifEnv*, int, const ERL_NIF_TERM[]);
 
+ERL_NIF_TERM nif_cask_open         (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_close        (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_get          (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_put          (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_delete       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_sync         (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_fold_start   (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_fold_next    (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_fold_release (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_is_empty     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_status       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_needs_merge  (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_merge        (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+
 namespace {
 
 ErlNifFunc kNifFuncs[] = {
@@ -90,6 +104,23 @@ ErlNifFunc kNifFuncs[] = {
     {"increment_file_id",     2, nif_increment_file_id,  0},
     {"update_fstats",         8, nif_update_fstats,      0},
     {"set_pending_delete",    2, nif_set_pending_delete, 0},
+
+    // Coarse-grained cask_* (M3.4).
+    // Long-running ones go to dirty IO scheduler so the BEAM scheduler
+    // isn't blocked while a fold or merge processes a large dir.
+    {"cask_open",          2, nif_cask_open,        ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"cask_close",         1, nif_cask_close,       0},
+    {"cask_get",           2, nif_cask_get,         0},
+    {"cask_put",           3, nif_cask_put,         0},
+    {"cask_delete",        2, nif_cask_delete,      0},
+    {"cask_sync",          1, nif_cask_sync,        ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"cask_fold_start",    3, nif_cask_fold_start,  0},
+    {"cask_fold_next",     1, nif_cask_fold_next,   0},
+    {"cask_fold_release",  1, nif_cask_fold_release,0},
+    {"cask_is_empty",      1, nif_cask_is_empty,    0},
+    {"cask_status",        1, nif_cask_status,      0},
+    {"cask_needs_merge",   1, nif_cask_needs_merge, 0},
+    {"cask_merge",         2, nif_cask_merge,       ERL_NIF_DIRTY_JOB_IO_BOUND},
 };
 
 int on_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM /*load_info*/) {
