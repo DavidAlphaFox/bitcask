@@ -13,3 +13,29 @@ _build/*
 /current_counterexample.eqc
 .pulse
 rebar.lock
+
+# rebar3 plugin/runtime crash dump (e.g. eqc_rebar load failure when QuickCheck
+# is not installed). Harmless — does not indicate a compile failure.
+rebar3.crashdump
+erl_crash.dump
+
+# CMake / C++ build (M0+)
+build/
+cmake-build-*/
+CMakeUserPresets.json
+compile_commands.json
+.cache/
+.ccache/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*.iml
+
+# Coverage
+*.gcda
+*.gcno
+*.gcov
+coverage/

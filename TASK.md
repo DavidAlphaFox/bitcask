@@ -45,20 +45,20 @@
 - [x] 顶层 `CMakeLists.txt`,要求 cmake ≥ 3.20
 - [x] `cmake/FindErlang.cmake`:通过 `erl -eval` 探测 ERTS include / lib 路径
 - [x] `cmake/BitcaskWarnings.cmake`:`-Wall -Wextra -Wconversion -Wshadow -fvisibility=hidden`(暂内联在 `cpp/CMakeLists.txt`,后续如需复用再抽出)
-- [ ] `cmake/BitcaskSanitizers.cmake`:`-DBITCASK_SANITIZE=address|thread|undefined`
+- [x] `cmake/BitcaskSanitizers.cmake`:`-DBITCASK_SANITIZE=address,undefined,thread,leak`(三组合验证全过)
 - [x] `cpp/` 目录骨架(`include/`、`src/`、`nif/`、`tests/`)
 - [x] 编译产出空 stub `bitcask_stub.so` 到 `priv/`(暂不替换原 NIF)
 - [x] **端到端验证**:Erlang `erlang:load_nif/2` 加载 stub 成功并调用 `ping/0` 返回 `pong`
-- [ ] `rebar.config` 增加 cmake `pre_hooks`(双产出阶段:cmake + 原 `pc`)
+- [x] `rebar.config` 增加 cmake `pre_hooks` + `post_hooks`(双产出阶段:`bitcask.so` + `bitcask_stub.so` 共存,`rebar3 clean` 联动清理)
 - [x] `FetchContent` 接入 GoogleTest(v1.15.2),跑通 hello-world 单测
 - [x] `cpp/include/bitcask/format.hpp`:从 `include/bitcask.hrl` 移植所有二进制布局常量(kHeaderSize=14、kHintRecordSize=18、kMaxOffsetV2、tombstone v0/v1/v2 等)
 - [x] `cpp/include/bitcask/codec.hpp` + `cpp/src/fileops/codec.cpp`:数据文件 / hint 记录的 encode/decode + zlib CRC32
 - [x] `cpp/tests/codec_test.cpp`:byte-level golden tests(包含与 Erlang 实跑输出交叉验证的硬编码 hex,CRC 值精确到位)
 - [ ] `cpp/tests/fixtures/`:放入若干真实数据文件(M2 引入 keydir 时一并补)
-- [ ] `make compile && make test` 全绿(rebar hook 落地后)
+- [x] `rebar3 compile` 同时产出新旧两个 `.so`;`rebar3 eunit` 全部 **81/81** 测试通过
 - [x] `ctest --output-on-failure` 通过(**19/19 PASS**)
 
-**验收**:eunit 全套不受影响;codec golden test 通过。
+**验收**:✅ eunit 81/81 PASS;✅ ctest 19/19 PASS(无/ASan+UBSan/TSan 三组合都过);✅ `rebar3 compile` 双产出。
 
 ---
 
@@ -249,7 +249,7 @@
 
 | 里程碑 | 状态 | 起始 | 完成 | 备注 |
 |--------|------|------|------|------|
-| M0 脚手架 + 格式抓手 | 🟨 | 2026-04-29 | | 工具链已打通(cmake/gtest/NIF 加载),余:sanitizer cmake、rebar hook、format/codec |
+| M0 脚手架 + 格式抓手 | ✅ | 2026-04-29 | 2026-04-29 | 工具链 + 格式 codec + sanitizer + rebar 双产出全部就绪;eunit 81/81、ctest 19/19 |
 | M1 文件 I/O + Lock 下沉 | ⬜ | | | |
 | M2 KeyDir 下沉 | ⬜ | | | |
 | M3 Fileops + 合并核心下沉 | ⬜ | | | |

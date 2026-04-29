@@ -12,6 +12,7 @@ endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 find_package(Erlang REQUIRED)
+include(BitcaskSanitizers)
 
 # Output the NIF .so directly into priv/ alongside the existing one.
 # During M0–M1 the new artifact is named bitcask_stub.so so it can coexist

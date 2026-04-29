@@ -13,6 +13,7 @@ add_executable(bitcask_smoke_test smoke_test.cpp)
 target_link_libraries(bitcask_smoke_test PRIVATE
     GTest::gtest_main
     bitcask_warnings
+    bitcask_sanitizers
 )
 
 add_executable(bitcask_codec_test codec_test.cpp)
@@ -20,6 +21,7 @@ target_link_libraries(bitcask_codec_test PRIVATE
     GTest::gtest_main
     bitcask_format
     bitcask_warnings
+    bitcask_sanitizers
 )
 
 include(GoogleTest)
