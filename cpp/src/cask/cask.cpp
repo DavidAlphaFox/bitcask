@@ -1,5 +1,8 @@
 #include "bitcask/cask.hpp"
 
+#include <signal.h>     // ::kill for stale-lock detection
+#include <unistd.h>     // ::getpid, ::unlink
+
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -33,6 +36,65 @@ std::span<const std::byte> str_to_bytes(std::string_view s) {
 
 std::string_view bytes_to_view(std::span<const std::byte> b) {
     return {reinterpret_cast<const char*>(b.data()), b.size()};
+}
+
+// Returns true iff the OS process `pid` is still running. Mirrors legacy
+// bitcask_lockops:os_pid_exists/1, which uses `kill -0 <pid>`. We do the
+// equivalent via kill(pid, 0): returns 0 if the signal could be delivered;
+// -1 + ESRCH if the process is gone; -1 + EPERM if it exists but we
+// cannot signal (treated as "alive" — conservative).
+[[nodiscard]] bool process_alive(int pid) noexcept {
+    if (pid <= 0) return false;
+    if (::kill(pid, 0) == 0) return true;
+    return errno != ESRCH;
+}
+
+// Parse the leading positive integer from `bytes` (the lock-file payload
+// is "<pid> <activefile>\n" — we only care about the pid).
+[[nodiscard]] int parse_leading_pid(std::span<const std::byte> bytes) noexcept {
+    int pid = 0;
+    bool any_digit = false;
+    for (auto byte : bytes) {
+        char c = static_cast<char>(byte);
+        if (c >= '0' && c <= '9') {
+            pid = pid * 10 + (c - '0');
+            any_digit = true;
+            if (pid > (1 << 30)) return -1;  // overflow guard
+        } else {
+            break;
+        }
+    }
+    return any_digit ? pid : -1;
+}
+
+// Try to remove an existing lock file if its recorded PID is no longer
+// alive. Returns true iff we successfully unlinked it (caller may then
+// retry the O_EXCL acquire). Mirrors legacy bitcask_lockops:delete_stale_lock.
+//
+// Race window: between us reading the PID and us unlinking, another
+// process could have written a fresh lock — we'd then incorrectly remove
+// theirs. Legacy carries the same race; the practical exposure is tiny
+// (post-crash recovery only).
+[[nodiscard]] bool try_remove_stale_lock(const std::string& path) noexcept {
+    auto rl = lock::FileLock::acquire(path, /*write*/ false);
+    if (!rl) return false;  // file vanished or unreadable; the retry will surface the right error
+
+    auto data = rl->read_data();
+    bool dead = false;
+    if (data) {
+        const int pid = parse_leading_pid(
+            std::span<const std::byte>(data->data(), data->size()));
+        // pid == -1 means "no parseable PID" (e.g. legacy hadn't written
+        // it yet, or the writer crashed mid-write). Treat as stale.
+        if (pid == -1 || !process_alive(pid)) {
+            dead = true;
+        }
+    } else {
+        dead = true;  // can't read content; treat as stale
+    }
+    rl->release_quiet();  // closes fd; read locks don't unlink
+    if (!dead) return false;
+    return ::unlink(path.c_str()) == 0;
 }
 
 }  // namespace
@@ -125,19 +187,35 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
     fs::create_directories(cask->dirname_, ec);
 
     // Acquire write lock if read-write. The lock file holds the writer's
-    // PID so other processes can detect us; legacy uses bitcask.write.lock.
+    // PID so other processes can detect a stale lock left by a crashed
+    // owner. legacy uses bitcask.write.lock.
     if (opts.read_write) {
-        const auto lock_path = fs::path(cask->dirname_) / "bitcask.write.lock";
-        auto fl = lock::FileLock::acquire(lock_path.string(), /*write*/ true);
-        if (!fl) {
-            // EEXIST means somebody else holds it.
-            if (fl.error().errnum == EEXIST) {
-                return std::unexpected(err(CaskError::kWriteLocked,
-                                            lock_path.string()));
+        const auto lock_path = (fs::path(cask->dirname_) / "bitcask.write.lock").string();
+        auto fl = lock::FileLock::acquire(lock_path, /*write*/ true);
+        if (!fl && fl.error().errnum == EEXIST) {
+            // Possible stale lock from a previous crash. Inspect the
+            // recorded PID and remove it if the process is gone, then
+            // retry once. (Live writers stay locked.)
+            if (try_remove_stale_lock(lock_path)) {
+                fl = lock::FileLock::acquire(lock_path, /*write*/ true);
             }
-            return std::unexpected(io_fault(fl.error().errnum,
-                                             lock_path.string()));
         }
+        if (!fl) {
+            if (fl.error().errnum == EEXIST) {
+                return std::unexpected(err(CaskError::kWriteLocked, lock_path));
+            }
+            return std::unexpected(io_fault(fl.error().errnum, lock_path));
+        }
+
+        // Write our PID into the lock file so a future stale check can
+        // find us. Failure to write is non-fatal — legacy permits this and
+        // the lock file alone (without payload) still serves as a mutex.
+        const std::string pid_line = std::to_string(::getpid()) + "\n";
+        auto pid_bytes = std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(pid_line.data()),
+            pid_line.size());
+        (void)fl->write_data(pid_bytes);
+
         cask->write_lock_ = std::move(*fl);
     }
 
@@ -467,8 +545,10 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
     if (!r) {
         return std::unexpected(err(CaskError::kIo, r.error().detail));
     }
-    // Drop any cached read handle for the merged-away files; they'll be
-    // unlinked by the caller (or M3.5's merge_delete).
+
+    // Drop cached read handles for the merged-away files BEFORE unlink so
+    // we close the fds first (matters on systems where unlink-then-close
+    // leaves the file briefly visible via /proc/self/fd).
     {
         std::scoped_lock lk(read_cache_mu_);
         for (const auto& path : files) {
@@ -476,6 +556,27 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
                 read_files_.erase(static_cast<std::uint32_t>(*t));
             }
         }
+    }
+
+    // After run_merge, every live record from `files` has been CAS-rewritten
+    // into the new merge file, and stale records were already pointing
+    // elsewhere. So nothing in the keydir references these inputs anymore —
+    // safe to unlink the .data + .hint pair and drop the fstats entry.
+    //
+    // Failures here are best-effort: the keydir is already consistent. A
+    // residual file just wastes disk until the next process tries the same.
+    std::vector<std::uint32_t> trimmed_ids;
+    trimmed_ids.reserve(files.size());
+    for (const auto& path : files) {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        std::filesystem::remove(fileops::mk_hint_filename(path), ec);
+        if (auto t = fileops::parse_data_tstamp(path)) {
+            trimmed_ids.push_back(static_cast<std::uint32_t>(*t));
+        }
+    }
+    if (!trimmed_ids.empty()) {
+        (void)keydir_->trim_fstats(trimmed_ids);
     }
     return *r;
 }

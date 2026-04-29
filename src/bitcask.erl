@@ -101,23 +101,41 @@ default_nif_mode_compiled() -> cask_cpp.
 -endif.
 
 %% Cask-cpp-only entry: the Ref returned IS the cask resource handle.
+%% Whitelist of options the cask_cpp NIF understands. Anything else is
+%% silently dropped (legacy did the same with unknown opts).
+-define(CASK_PASSTHROUGH_OPTS, [
+    expiry_secs, max_file_size,
+    frag_merge_trigger, dead_bytes_merge_trigger,
+    frag_threshold, dead_bytes_threshold,
+    small_file_threshold, expiry_grace_time,
+    max_merge_size
+]).
+
 return_cask_open(Dirname, Opts) ->
     Base = case proplists:get_bool(read_write, Opts) of
                true  -> [read_write];
                false -> []
            end,
-    Extra =
-        lists:foldl(
-          fun({expiry_secs, V}, Acc) when is_integer(V), V > 0 ->
-                  [{expiry_secs, V} | Acc];
-             ({max_file_size, V}, Acc) when is_integer(V), V > 0 ->
-                  [{max_file_size, V} | Acc];
-             (_Other, Acc) ->
-                  Acc
-          end, [], Opts),
+    %% Translate any passthrough opt that's set in Opts; if missing in Opts,
+    %% fall back to the bitcask application env (so legacy `init_keydir`-style
+    %% configuration via app config still tunes the cask path).
+    Extra = [{K, opt_value(K, Opts)} ||
+                K <- ?CASK_PASSTHROUGH_OPTS,
+                opt_value(K, Opts) =/= undefined],
     case bitcask_cpp_nifs:cask_open(Dirname, Base ++ Extra) of
         {ok, CaskRef}  -> CaskRef;
         {error, _} = E -> E
+    end.
+
+%% Resolve an option: explicit Opts > app env > undefined.
+opt_value(Key, Opts) ->
+    case proplists:get_value(Key, Opts) of
+        undefined ->
+            case application:get_env(bitcask, Key) of
+                {ok, V} -> V;
+                _       -> undefined
+            end;
+        V -> V
     end.
 
 %% =========================================================================

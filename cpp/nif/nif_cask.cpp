@@ -70,8 +70,35 @@ CaskOptions parse_options(ErlNifEnv* env, ERL_NIF_TERM list) {
                 o.expiry_secs = static_cast<std::uint32_t>(v);
             }
         }
-        // M4.x will extend further with merge policy options.
+        // ---- merge policy options ----
+        else if (tup[0] == atoms().frag_merge_trigger) {
+            int v = 0;
+            if (enif_get_int(env, tup[1], &v)) o.policy.frag_merge_trigger = v;
+        } else if (tup[0] == atoms().dead_bytes_merge_trigger) {
+            ErlNifUInt64 v = 0;
+            if (enif_get_uint64(env, tup[1], &v)) o.policy.dead_bytes_merge_trigger = v;
+        } else if (tup[0] == atoms().frag_threshold) {
+            int v = 0;
+            if (enif_get_int(env, tup[1], &v)) o.policy.frag_threshold = v;
+        } else if (tup[0] == atoms().dead_bytes_threshold) {
+            ErlNifUInt64 v = 0;
+            if (enif_get_uint64(env, tup[1], &v)) o.policy.dead_bytes_threshold = v;
+        } else if (tup[0] == atoms().small_file_threshold) {
+            ErlNifUInt64 v = 0;
+            if (enif_get_uint64(env, tup[1], &v)) o.policy.small_file_threshold = v;
+        } else if (tup[0] == atoms().expiry_grace_time) {
+            int v = 0;
+            if (enif_get_int(env, tup[1], &v) && v >= 0) {
+                o.policy.expiry_grace_time = static_cast<std::uint32_t>(v);
+            }
+        } else if (tup[0] == atoms().max_merge_size) {
+            ErlNifUInt64 v = 0;
+            if (enif_get_uint64(env, tup[1], &v)) o.policy.max_merge_size = v;
+        }
     }
+    // expiry_secs in CaskOptions also drives PolicyOptions::expiry_secs so
+    // the merge trigger sees the same cutoff.
+    if (o.expiry_secs > 0) o.policy.expiry_secs = o.expiry_secs;
     return o;
 }
 

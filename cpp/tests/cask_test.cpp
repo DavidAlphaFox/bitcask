@@ -222,6 +222,72 @@ TEST(Cask, NeedsMergeOnFragmentedFiles) {
     EXPECT_FALSE(n.files.empty());
 }
 
+// Verifies merge actually unlinks the .data + .hint files it consumed —
+// previously the merge wrote a new file but left the old ones on disk.
+TEST(Cask, MergeUnlinksMergedAwayFiles) {
+    TempDir td;
+    CaskOptions opts = rw_opts();
+    opts.max_file_size               = 100;
+    opts.policy.frag_merge_trigger    = 30;
+    opts.policy.frag_threshold        = 30;
+    opts.policy.small_file_threshold  = 0;
+    auto c = Cask::open(td.path(), opts);
+    ASSERT_TRUE(c);
+
+    // Force several rollovers + heavy fragmentation by overwriting same key.
+    for (int i = 0; i < 30; ++i) {
+        std::string v = "v-" + std::string(i & 0x7, 'x');
+        ASSERT_TRUE((*c)->put(sb("k"), sb(v)));
+    }
+
+    auto count_data = [&] {
+        int n = 0;
+        for (auto& e : fs::directory_iterator(td.path())) {
+            if (e.path().extension() == ".data") ++n;
+        }
+        return n;
+    };
+    auto count_hint = [&] {
+        int n = 0;
+        for (auto& e : fs::directory_iterator(td.path())) {
+            if (e.path().extension() == ".hint") ++n;
+        }
+        return n;
+    };
+
+    const int data_before = count_data();
+    const int hint_before = count_hint();
+    ASSERT_GE(data_before, 2) << "test setup expected multiple data files";
+
+    // Take the snapshot of which files needs_merge picks; merge should
+    // unlink exactly those (+ their hints).
+    auto n = (*c)->needs_merge();
+    ASSERT_TRUE(n.needs);
+    const auto picked = n.files;
+    ASSERT_FALSE(picked.empty());
+
+    auto m = (*c)->merge();
+    ASSERT_TRUE(m);
+
+    // Each picked input must no longer exist; nor must its hint.
+    for (const auto& p : picked) {
+        EXPECT_FALSE(fs::exists(p)) << "data file should be unlinked: " << p;
+        const std::string h =
+            bitcask::fileops::mk_hint_filename(p);
+        EXPECT_FALSE(fs::exists(h)) << "hint file should be unlinked: " << h;
+    }
+
+    // Disk-level invariants: file count strictly decreased; the merge
+    // produced exactly one new (data, hint) pair, so net change is
+    // (added 1) - (removed |picked|).
+    EXPECT_EQ(count_data(), data_before + 1 - static_cast<int>(picked.size()));
+    EXPECT_EQ(count_hint(), hint_before + 1 - static_cast<int>(picked.size()));
+
+    // Live data still readable.
+    auto v = (*c)->get(sb("k"));
+    ASSERT_TRUE(v);
+}
+
 TEST(Cask, MergeKeepsLatestValueAndRemovesStale) {
     TempDir td;
     CaskOptions opts = rw_opts();
@@ -284,6 +350,65 @@ TEST(Cask, SharedKeydirAcrossCaskInstancesViaRegistry) {
     auto v = (*c2)->get(sb("k"));
     ASSERT_TRUE(v);
     EXPECT_EQ(vs(v->value), "v");
+}
+
+// Reproduces a real-world bug:
+//   1. Process A opens a cask read_write — write.lock created.
+//   2. A crashes, leaving the lock file behind.
+//   3. Process B (or A restarted) tries to open same dir read_write.
+//   Legacy uses `kill -0 <pid>` to detect the dead owner and wipe the
+//   stale lock; cask must do the same.
+TEST(Cask, StaleWriteLockFromDeadPidIsReclaimed) {
+    TempDir td;
+    const auto lock_path =
+        std::filesystem::path(td.path()) / "bitcask.write.lock";
+
+    // Simulate a previous crashed writer: hand-write a lock file containing
+    // a clearly-dead PID. PID 1 is init/systemd and always alive on Linux,
+    // so we use a synthesised never-allocated PID. /proc/sys/kernel/pid_max
+    // bounds future PIDs; 4194305 is past that on every default Linux.
+    {
+        std::FILE* fp = std::fopen(lock_path.c_str(), "wb");
+        ASSERT_NE(fp, nullptr);
+        const char* payload = "4194305\n";
+        std::fwrite(payload, 1, std::strlen(payload), fp);
+        std::fclose(fp);
+    }
+    ASSERT_TRUE(std::filesystem::exists(lock_path));
+
+    // Open should succeed by reclaiming the stale lock.
+    auto c = Cask::open(td.path(), rw_opts());
+    ASSERT_TRUE(c) << "expected stale lock to be reclaimed; got error "
+                    << static_cast<int>(c.error().kind);
+    ASSERT_TRUE((*c)->put(sb("k"), sb("v")));
+    ASSERT_TRUE((*c)->get(sb("k")));
+}
+
+// Same scenario, but the lock owner IS our own PID (so it's "alive"). We
+// must NOT reclaim it — a second writer in the same process must still
+// be rejected with kWriteLocked.
+TEST(Cask, LiveOwnerLockIsNotReclaimed) {
+    TempDir td;
+    auto c1 = Cask::open(td.path(), rw_opts());
+    ASSERT_TRUE(c1);
+    // Second open in same process: lock is live (we hold it), must fail.
+    auto c2 = Cask::open(td.path(), rw_opts());
+    ASSERT_FALSE(c2);
+    EXPECT_EQ(c2.error().kind, CaskError::kWriteLocked);
+}
+
+// An empty lock file (writer crashed before writing PID) is treated as stale.
+TEST(Cask, EmptyLockFileTreatedAsStale) {
+    TempDir td;
+    const auto lock_path =
+        std::filesystem::path(td.path()) / "bitcask.write.lock";
+    {
+        std::FILE* fp = std::fopen(lock_path.c_str(), "wb");
+        ASSERT_NE(fp, nullptr);
+        std::fclose(fp);
+    }
+    auto c = Cask::open(td.path(), rw_opts());
+    ASSERT_TRUE(c);
 }
 
 TEST(Cask, BinaryKeyAndValueWithNul) {

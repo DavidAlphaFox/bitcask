@@ -50,6 +50,14 @@ struct Atoms {
     ERL_NIF_TERM read_only;
     ERL_NIF_TERM write_locked;
     ERL_NIF_TERM bad_crc;
+    // merge policy atoms
+    ERL_NIF_TERM frag_merge_trigger;
+    ERL_NIF_TERM dead_bytes_merge_trigger;
+    ERL_NIF_TERM frag_threshold;
+    ERL_NIF_TERM dead_bytes_threshold;
+    ERL_NIF_TERM small_file_threshold;
+    ERL_NIF_TERM expiry_grace_time;
+    ERL_NIF_TERM max_merge_size;
 
     void init(ErlNifEnv* env) noexcept;
 };
