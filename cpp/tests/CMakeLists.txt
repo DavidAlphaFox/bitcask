@@ -80,6 +80,14 @@ target_link_libraries(bitcask_data_file_test PRIVATE
     bitcask_sanitizers
 )
 
+add_executable(bitcask_scanner_test scanner_test.cpp)
+target_link_libraries(bitcask_scanner_test PRIVATE
+    GTest::gtest_main
+    bitcask_fileops
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 include(GoogleTest)
 gtest_discover_tests(bitcask_smoke_test)
 gtest_discover_tests(bitcask_codec_test)
@@ -90,3 +98,4 @@ gtest_discover_tests(bitcask_keydir_iter_test)
 gtest_discover_tests(bitcask_keydir_registry_test)
 gtest_discover_tests(bitcask_keydir_stress_test PROPERTIES TIMEOUT 60)
 gtest_discover_tests(bitcask_data_file_test)
+gtest_discover_tests(bitcask_scanner_test)

@@ -190,12 +190,20 @@
 - [x] CRC32 复用 zlib;运行 CRC 在 HintFile 内部累积
 - [x] `validate_trailer`:O(filesize) 流式扫描,与 legacy `has_valid_hintfile` 行为对齐
 - [x] **12 个 GoogleTest**:filename helper、DataFile round-trip、CRC 检测、HintFile validate_trailer 三种场景、DataFile↔HintFile 配对一致性
-- [x] ctest **110/110 全过**(包括 ASan+UBSan)
+- [x] **Cross-language golden test**(`HintFileGolden.ReadsLegacyEncodedFile` + `EncodingMatchesLegacyByteForByte`):
+  - `scripts/gen_golden_hint.escript` 用 Erlang 生成 legacy 编码的 79 字节 hint(3 records + trailer,CRC=0xED5B567A)
+  - C++ 测试一是读 legacy 字节验证 trailer + 解出原始 records
+  - C++ 测试二是用 HintFile 写出后 byte-for-byte 与 legacy 一致
+- [x] ctest **120/120 全过**(包括 ASan+UBSan)
 - [x] eunit 不回归 **130/130**
 
-### M3.2 — 目录扫描器 ⏳
-- [ ] `cpp/include/bitcask/scanner.hpp`:`scan_dir(dirname)` 返回 `[(tstamp, data_path, hint_path?)]`
-- [ ] 跳过格式不正确的文件;按 tstamp 升序
+### M3.2 — 目录扫描器
+- [x] `cpp/include/bitcask/scanner.hpp` + `cpp/src/fileops/scanner.cpp`:`scan_dir(dirname)` 返回 `[DataFileEntry]`,按 tstamp 升序
+- [x] 每个 entry 含 `tstamp` / `data_path` / `has_hint` / `hint_path`
+- [x] 跳过格式不正确的文件名(非纯数字 tstamp、错误后缀);忽略子目录、符号链接
+- [x] uint64_max tstamp 不溢出
+- [x] **8 个 GoogleTest** 覆盖空目录、不存在目录、排序、hint 配对、垃圾文件名、子目录过滤
+- [x] ctest **120/120 全过**(包括 ASan+UBSan);eunit **130/130** 不回归
 
 ### M3.3 — Merge 策略 + merger 主体 ⏳
 - [ ] `cpp/include/bitcask/merge.hpp`:`MergePolicy` + `needs_merge(fstats, opts) -> {bool, [file_id]}`

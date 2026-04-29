@@ -29,6 +29,7 @@ target_link_libraries(bitcask_format
 add_library(bitcask_fileops STATIC
     src/fileops/data_file.cpp
     src/fileops/hint_file.cpp
+    src/fileops/scanner.cpp
 )
 target_include_directories(bitcask_fileops PUBLIC include)
 target_link_libraries(bitcask_fileops

@@ -286,6 +286,121 @@ TEST(HintFile, EmptyFileFoldReturnsNoRecords) {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-language golden:
+//   The hex below was emitted by Erlang (legacy bit-syntax encoding —
+//   identical to bitcask_fileops:hintfile_entry / close_hintfile) for three
+//   records and the trailer:
+//
+//     R1: key="a"    tstamp=100 totalsz=19 offset=0    tomb=false
+//     R2: key="bb"   tstamp=101 totalsz=20 offset=19   tomb=true
+//     R3: key="cccc" tstamp=102 totalsz=22 offset=39   tomb=false
+//     trailer:       tstamp=0   keysz=0   totalsz=CRC=0xED5B567A
+//                    tomb=0     offset=0x7FFFFFFFFFFFFFFF
+//
+// To regenerate:  escript scripts/gen_golden_hint.escript
+// ---------------------------------------------------------------------------
+namespace {
+
+std::vector<std::byte> hex_to_bytes(std::string_view h) {
+    auto nyb = [](char c) {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+        return 0;
+    };
+    std::vector<std::byte> out;
+    out.reserve(h.size() / 2);
+    for (std::size_t i = 0; i + 1 < h.size(); i += 2) {
+        out.push_back(static_cast<std::byte>((nyb(h[i]) << 4) | nyb(h[i + 1])));
+    }
+    return out;
+}
+
+std::string write_temp_with_bytes(const TempDir& td, std::string_view name,
+                                   std::span<const std::byte> bytes) {
+    const auto path = td / std::string(name);
+    std::FILE* fp = std::fopen(path.c_str(), "wb");
+    EXPECT_NE(fp, nullptr);
+    std::fwrite(bytes.data(), 1, bytes.size(), fp);
+    std::fclose(fp);
+    return path;
+}
+
+// Single literal to avoid splitting bugs. 158 chars = 79 bytes total.
+constexpr std::string_view kLegacyHintHex =
+    "00000064000100000013000000000000000061"            // R1: 19 B
+    "00000065000200000014800000000000001362"  "62"      // R2: 20 B
+    "00000066000400000016000000000000002763636363"      // R3: 22 B
+    "00000000" "0000" "ed5b567a" "7fffffffffffffff";    // trailer: 18 B
+
+}  // namespace
+
+TEST(HintFileGolden, ReadsLegacyEncodedFile) {
+    TempDir td;
+    auto bytes = hex_to_bytes(kLegacyHintHex);
+    ASSERT_EQ(bytes.size(), 79u);
+    const auto path = write_temp_with_bytes(td, "legacy.bitcask.hint", bytes);
+
+    auto h = HintFile::open(path, HintFile::Mode::kRead);
+    ASSERT_TRUE(h);
+
+    auto valid = h->validate_trailer();
+    ASSERT_TRUE(valid);
+    EXPECT_TRUE(*valid) << "trailer CRC must validate against legacy bytes";
+
+    struct R { std::string key; std::uint32_t ts; std::uint32_t sz;
+               std::uint64_t off; bool tomb; };
+    std::vector<R> seen;
+    auto fr = h->fold([&](const auto& rec) {
+        seen.push_back({view_str(rec.key), rec.tstamp, rec.total_sz,
+                        rec.offset, rec.tombstone});
+    });
+    ASSERT_TRUE(fr);
+
+    ASSERT_EQ(seen.size(), 3u);
+    EXPECT_EQ(seen[0].key, "a");    EXPECT_EQ(seen[0].ts, 100u);
+    EXPECT_EQ(seen[0].sz,  19u);    EXPECT_EQ(seen[0].off, 0u);
+    EXPECT_FALSE(seen[0].tomb);
+
+    EXPECT_EQ(seen[1].key, "bb");   EXPECT_EQ(seen[1].ts, 101u);
+    EXPECT_EQ(seen[1].sz,  20u);    EXPECT_EQ(seen[1].off, 19u);
+    EXPECT_TRUE (seen[1].tomb);
+
+    EXPECT_EQ(seen[2].key, "cccc"); EXPECT_EQ(seen[2].ts, 102u);
+    EXPECT_EQ(seen[2].sz,  22u);    EXPECT_EQ(seen[2].off, 39u);
+    EXPECT_FALSE(seen[2].tomb);
+}
+
+// Inverse direction: bytes our HintFile produces must match what legacy
+// would have produced for the same logical inputs.
+TEST(HintFileGolden, EncodingMatchesLegacyByteForByte) {
+    TempDir td;
+    const auto path = td / "ours.bitcask.hint";
+    auto h = HintFile::open(path, HintFile::Mode::kCreate);
+    ASSERT_TRUE(h);
+    ASSERT_TRUE(h->write(100, 19, 0,   false, as_bytes("a")));
+    ASSERT_TRUE(h->write(101, 20, 19,  true,  as_bytes("bb")));
+    ASSERT_TRUE(h->write(102, 22, 39,  false, as_bytes("cccc")));
+    ASSERT_TRUE(h->finalize());
+
+    // Slurp back the bytes and compare.
+    std::FILE* fp = std::fopen(path.c_str(), "rb");
+    ASSERT_NE(fp, nullptr);
+    std::fseek(fp, 0, SEEK_END);
+    const auto sz = static_cast<std::size_t>(std::ftell(fp));
+    std::fseek(fp, 0, SEEK_SET);
+    std::vector<std::byte> got(sz);
+    ASSERT_EQ(std::fread(got.data(), 1, sz, fp), sz);
+    std::fclose(fp);
+
+    auto expected = hex_to_bytes(kLegacyHintHex);
+    ASSERT_EQ(got.size(), expected.size());
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        EXPECT_EQ(got[i], expected[i])
+            << "mismatch at byte " << i << " (0x" << std::hex << i << ")";
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DataFile <-> HintFile pair (typical bitcask scenario)
 // ---------------------------------------------------------------------------
 TEST(DataAndHint, ParallelStreamsAreConsistent) {
