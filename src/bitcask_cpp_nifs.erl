@@ -42,6 +42,9 @@
          keydir_itr/3,
          keydir_itr_next/1,
          keydir_itr_release/1,
+         keydir_fold/5,
+         keydir_frozen/4,
+         keydir_wait_pending/1,
          keydir_info/1,
          keydir_release/1,
          keydir_trim_fstats/2,
@@ -186,6 +189,51 @@ keydir_itr_next(Ref) ->
     end.
 keydir_itr_next_int(_Ref) -> erlang:nif_error({error, not_loaded}).
 keydir_itr_release(_Ref)  -> erlang:nif_error({error, not_loaded}).
+
+%% =============================================================================
+%% Higher-level helpers — same shape as bitcask_nifs:keydir_fold/frozen/...
+%% Implemented in pure Erlang on top of the itr NIF, so the cpp NIF doesn't
+%% need its own pid-awaken machinery for now (M2.4 limitation; if perf
+%% requires we'll add enif_send-based wakeups later).
+%% =============================================================================
+
+keydir_fold(Ref, Fun, Acc0, MaxAge, MaxPuts) ->
+    FrozenFun = fun() -> keydir_fold_cont(keydir_itr_next(Ref), Ref, Fun, Acc0) end,
+    keydir_frozen(Ref, FrozenFun, MaxAge, MaxPuts).
+
+keydir_fold_cont(not_found, _Ref, _Fun, Acc) -> Acc;
+keydir_fold_cont(Entry, Ref, Fun, Acc0) when is_record(Entry, bitcask_entry) ->
+    keydir_fold_cont(keydir_itr_next(Ref), Ref, Fun, Fun(Entry, Acc0));
+keydir_fold_cont(Other, _Ref, _Fun, _Acc) ->
+    {error, Other}.
+
+keydir_frozen(Ref, FrozenFun, MaxAge, MaxPuts) ->
+    case keydir_itr(Ref, MaxAge, MaxPuts) of
+        ok ->
+            try FrozenFun()
+            after keydir_itr_release(Ref)
+            end;
+        out_of_date ->
+            ok = keydir_wait_pending(Ref),
+            keydir_frozen(Ref, FrozenFun, -1, -1);
+        {error, _} = Err -> Err
+    end.
+
+%% Polling fallback. The legacy NIF maintains a pid-awaken queue and sends a
+%% `ready` message when pending merges; we don't yet (would require enif_send
+%% from the C++ side). Polling at 50ms intervals is functionally equivalent
+%% but adds latency under heavy contention.
+keydir_wait_pending(Ref) ->
+    keydir_wait_pending(Ref, 200).
+
+keydir_wait_pending(_Ref, 0) -> {error, timeout};
+keydir_wait_pending(Ref, N) ->
+    case keydir_info(Ref) of
+        {_, _, _, {_, _, false, _}, _} -> ok;   % not frozen
+        _ ->
+            timer:sleep(50),
+            keydir_wait_pending(Ref, N - 1)
+    end.
 
 keydir_info(_Ref)              -> erlang:nif_error({error, not_loaded}).
 keydir_release(_Ref)           -> erlang:nif_error({error, not_loaded}).

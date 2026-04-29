@@ -351,9 +351,17 @@ bool KeyDir::remove(std::string_view key, std::uint32_t remove_time) {
     SingleEntry cur{};
     bool found = false;
 
+    // Mirror legacy find_keydir_entry: pending always shadows entries. If a
+    // key is present in pending — even as a tombstone — entries is NOT
+    // consulted. Otherwise stale live revisions left in entries (set during
+    // fold-time updates) would be visible to remove() as "live", causing a
+    // double-decrement of key_count_.
     if (pending_.has_value()) {
         auto p = pending_->find(std::string(key));
-        if (p != pending_->end() && !is_pending_tombstone(p->second)) {
+        if (p != pending_->end()) {
+            if (is_pending_tombstone(p->second)) {
+                return false;  // shadowed by pending tomb
+            }
             pending_entry = &p->second;
             cur = p->second;
             found = true;
@@ -375,6 +383,7 @@ bool KeyDir::remove(std::string_view key, std::uint32_t remove_time) {
     update_fstats_locked(cur.file_id, cur.tstamp, kMaxEpoch,
                          -1, 0, -static_cast<std::int32_t>(cur.total_sz), 0,
                          /*should_create*/ false);
+    assert(key_count_ > 0 && "remove found a live entry but key_count_ is 0");
     key_count_ -= 1;
     key_bytes_ -= key.size();
     if (keyfolders_ > 0) iter_mutation_ = true;
@@ -417,12 +426,16 @@ PutResult KeyDir::conditional_remove(std::string_view key,
                                       std::uint32_t remove_time) {
     {
         // Quick mismatch check before bumping the epoch.
+        // Same shadow rule as remove(): pending always shadows entries.
         std::scoped_lock lock(mutex_);
         SingleEntry cur{};
         bool found = false;
         if (pending_.has_value()) {
             auto p = pending_->find(std::string(key));
-            if (p != pending_->end() && !is_pending_tombstone(p->second)) {
+            if (p != pending_->end()) {
+                if (is_pending_tombstone(p->second)) {
+                    return PutResult::kOk;  // shadowed; not-found is success
+                }
                 cur = p->second; found = true;
             }
         }

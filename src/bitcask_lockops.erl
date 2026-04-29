@@ -28,6 +28,7 @@
          write_activefile/2]).
 
 -include_lib("kernel/include/logger.hrl").
+-include("bitcask.hrl").
 
 -ifdef(PULSE).
 -compile({parse_transform, pulse_instrument}).
@@ -42,10 +43,10 @@
 -spec acquire(Type::lock_types(), Dirname::string()) -> {ok, reference()} | {error, any()}.
 acquire(Type, Dirname) ->
     LockFilename = lock_filename(Type, Dirname),
-    case bitcask_nifs:lock_acquire(LockFilename, 1) of
+    case ?NIF:lock_acquire(LockFilename, 1) of
         {ok, Lock} ->
             %% Successfully acquired our lock. Update the file with our PID.
-            case bitcask_nifs:lock_writedata(Lock, iolist_to_binary([os:getpid(), " \n"])) of
+            case ?NIF:lock_writedata(Lock, iolist_to_binary([os:getpid(), " \n"])) of
                 ok ->
                     {ok, Lock};
                 {error, _} = Else ->
@@ -68,13 +69,13 @@ acquire(Type, Dirname) ->
 %% @doc Release a previously acquired write/merge lock.
 -spec release(reference()) -> ok.
 release(Lock) ->
-    bitcask_nifs:lock_release(Lock).
+    ?NIF:lock_release(Lock).
 
 %% @doc Read the active filename stored in a given lockfile.
 -spec read_activefile(Type::lock_types(), Dirname::string()) -> string() | undefined.
 read_activefile(Type, Dirname) ->
     LockFilename = lock_filename(Type, Dirname),
-    case bitcask_nifs:lock_acquire(LockFilename, 0) of
+    case ?NIF:lock_acquire(LockFilename, 0) of
         {ok, Lock} ->
             try
                 case read_lock_data(Lock) of
@@ -84,7 +85,7 @@ read_activefile(Type, Dirname) ->
                         undefined
                 end
             after
-                bitcask_nifs:lock_release(Lock)
+                ?NIF:lock_release(Lock)
             end;
         {error, _Reason} ->
             undefined
@@ -94,7 +95,7 @@ read_activefile(Type, Dirname) ->
 -spec write_activefile(reference(), string()) -> {ftruncate_error, integer()} | {pwrite_error, integer()} | ok | {error, lock_not_writable}.
 write_activefile(Lock, ActiveFilename) ->
     Contents = iolist_to_binary([os:getpid(), " ", ActiveFilename, "\n"]),
-    bitcask_nifs:lock_writedata(Lock, Contents).
+    ?NIF:lock_writedata(Lock, Contents).
 
 delete_stale_lock(Type, Dirname) ->
     delete_stale_lock(lock_filename(Type,Dirname)).
@@ -107,7 +108,7 @@ lock_filename(Type, Dirname) ->
     filename:join(Dirname, lists:concat(["bitcask.", Type, ".lock"])).
 
 read_lock_data(Lock) ->
-    case bitcask_nifs:lock_readdata(Lock) of
+    case ?NIF:lock_readdata(Lock) of
         {ok, Contents} ->
             case re:run(Contents, "([0-9]+) (.*)\n",
                         [{capture, all_but_first, list}]) of
@@ -133,7 +134,7 @@ delete_stale_lock(Filename) ->
     %% with other O/S processes that are attempting the same task. Opening a
     %% fd and holding it open until AFTER the unlink ensures that the file we
     %% initially read is the same one we are deleting.
-    case bitcask_nifs:lock_acquire(Filename, 0) of
+    case ?NIF:lock_acquire(Filename, 0) of
         {ok, Lock} ->
             try
                 case read_lock_data(Lock) of
@@ -154,7 +155,7 @@ delete_stale_lock(Filename) ->
                         not_stale
                 end
             after
-                bitcask_nifs:lock_release(Lock)
+                ?NIF:lock_release(Lock)
             end;
 
         {error, enoent} ->

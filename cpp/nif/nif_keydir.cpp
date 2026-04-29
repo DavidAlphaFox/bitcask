@@ -149,6 +149,7 @@ ERL_NIF_TERM nif_keydir_new1(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM ar
     if (r.status == AcquireStatus::kNotReady) {
         return enif_make_tuple2(env, atoms().error, atoms().not_ready);
     }
+    const bool was_ready = (r.status == AcquireStatus::kReady);
     KeyDirHandle h;
     h.keydir   = r.keydir;
     h.registry = &p->registry;
@@ -159,7 +160,10 @@ ERL_NIF_TERM nif_keydir_new1(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM ar
         p->registry.release(name);
         return enif_make_tuple2(env, atoms().error, atoms().allocation_error);
     }
-    return enif_make_tuple2(env, atoms().ok, ref);
+    // Match legacy: tag the tuple with ready / not_ready so the caller can
+    // skip the file scan when another opener already loaded the keydir.
+    ERL_NIF_TERM tag = was_ready ? atoms().ready : atoms().not_ready;
+    return enif_make_tuple2(env, tag, ref);
 }
 
 ERL_NIF_TERM nif_maybe_keydir_new1(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {

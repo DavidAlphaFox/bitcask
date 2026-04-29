@@ -64,3 +64,28 @@
 -define(MAX_CHUNK_SIZE, 134217728).
 
 -define(TEST_FILEPATH, "_build/test/log").
+
+%% NIF dispatcher (M2.4 experimental flag).
+%%
+%% bitcask:open/2 may be called with the option `{nifs, cpp}` to route all
+%% NIF calls through the new C++23 NIF module (`bitcask_cpp_nifs`). When
+%% set, open/2 stores the chosen module name in the calling process's
+%% process dictionary under the key `bitcask_nif_mod`. This macro reads
+%% that key on every call site, falling back to the legacy `bitcask_nifs`.
+%%
+%% NB: a Ref returned from `bitcask:open` carries a NIF resource type that
+%% MUST be operated on by the same NIF that created it — Erlang refs from
+%% the cpp NIF are not usable by the legacy NIF and vice versa. Therefore
+%% any process that handles a Ref must have its dispatcher set the same
+%% way the opener did. For now the experimental flag is intended for
+%% single-process usage; gen_server-driven flows (merge_worker / merge_delete)
+%% will be wired explicitly in M4.
+%% Wrap in a 0-arity fun so each macro expansion creates its own variable
+%% scope; without this, two ?NIF: calls in the same function would conflict
+%% on the variable bound by the inner case.
+-define(NIF, ((fun() ->
+                   case erlang:get(bitcask_nif_mod) of
+                       undefined -> bitcask_nifs;
+                       Mod0 -> Mod0
+                   end
+               end)())).

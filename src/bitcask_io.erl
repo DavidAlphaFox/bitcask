@@ -79,13 +79,20 @@ file_truncate(Ref) ->
     M:file_truncate(Ref).
 
 file_module() ->
-    case get(bitcask_file_mod) of
-        undefined ->
-            Mod = determine_file_module(),
-            put(bitcask_file_mod, Mod),
-            Mod;
-        Mod ->
-            Mod
+    %% Honour the experimental {nifs, cpp} flag set by bitcask:open/2: when
+    %% the cpp NIF module is selected, file I/O must also route through it
+    %% so we don't mix file resources from two distinct NIF instances.
+    case erlang:get(bitcask_nif_mod) of
+        bitcask_cpp_nifs -> bitcask_cpp_nifs;
+        _ ->
+            case get(bitcask_file_mod) of
+                undefined ->
+                    Mod = determine_file_module(),
+                    put(bitcask_file_mod, Mod),
+                    Mod;
+                Mod ->
+                    Mod
+            end
     end.
 
 -ifdef(TEST).

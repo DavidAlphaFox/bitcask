@@ -138,10 +138,10 @@ delete_ready_files(S, PendingQ) ->
         {empty, _} ->
             S#state{q = PendingQ};
         {{value, {Dirname, IterGeneration, Files} = Entry}, NewQ} ->
-            {_, KeyDir} = bitcask_nifs:keydir_new(Dirname),
+            {_, KeyDir} = ?NIF:keydir_new(Dirname),
             try
 
-                {_,_,_,IterStatus,_} = bitcask_nifs:keydir_info(KeyDir),
+                {_,_,_,IterStatus,_} = ?NIF:keydir_info(KeyDir),
                 ReadyToDelete =
                     case IterStatus of
                         {_, _, false, _} ->
@@ -155,7 +155,7 @@ delete_ready_files(S, PendingQ) ->
                 case ReadyToDelete of
                     true ->
                         delete_files(Files),
-                        bitcask_nifs:keydir_release(KeyDir),
+                        ?NIF:keydir_release(KeyDir),
                         delete_ready_files(S2, PendingQ);
                     false ->
                         delete_ready_files(S2, queue:in(Entry, PendingQ))
@@ -168,7 +168,7 @@ delete_ready_files(S, PendingQ) ->
                     %% let the next merge clean up.
                     S#state{q = NewQ}
             after
-                catch bitcask_nifs:keydir_release(KeyDir)
+                catch ?NIF:keydir_release(KeyDir)
             end
     end.
 

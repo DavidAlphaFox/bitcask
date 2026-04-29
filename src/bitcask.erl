@@ -130,6 +130,16 @@ open(Dirname, Opts) ->
     %% Make sure bitcask app is started so we can pull defaults from env
     ok = start_app(),
 
+    %% Experimental: if the user passed {nifs, cpp}, route NIF dispatch
+    %% (?NIF macro in bitcask.hrl) to the C++ NIF module for this process.
+    %% The proc-dict slot is read on every NIF call site and falls back to
+    %% the legacy module when unset. close/1 erases it.
+    case proplists:get_value(nifs, Opts, legacy) of
+        cpp    -> erlang:put(bitcask_nif_mod, bitcask_cpp_nifs);
+        legacy -> erlang:erase(bitcask_nif_mod);
+        _      -> erlang:erase(bitcask_nif_mod)
+    end,
+
     %% Make sure the directory exists
     ok = filelib:ensure_dir(filename:join(Dirname, "bitcask")),
 
@@ -202,10 +212,13 @@ close(Ref) ->
 
     %% Manually release the keydir. If, for some reason, this failed GC would
     %% still get the job done.
-    bitcask_nifs:keydir_release(State#bc_state.keydir),
+    ?NIF:keydir_release(State#bc_state.keydir),
 
     %% Clean up all the reading files
     bitcask_fileops:close_all(State#bc_state.read_files),
+
+    %% Clear the experimental NIF dispatch flag (set by open/2).
+    erlang:erase(bitcask_nif_mod),
 
     ok.
 
@@ -236,14 +249,14 @@ get(Ref, Key) ->
 get(_Ref, _Key, 0) -> {error, nofile};
 get(Ref, Key, TryNum) ->
     State = get_state(Ref),
-    case bitcask_nifs:keydir_get(State#bc_state.keydir, Key) of
+    case ?NIF:keydir_get(State#bc_state.keydir, Key) of
         not_found ->
             not_found;
         E when is_record(E, bitcask_entry) ->
             case E#bitcask_entry.tstamp < expiry_time(State#bc_state.opts) of
                 true ->
                     %% Expired entry; remove from keydir
-                    case bitcask_nifs:keydir_remove(State#bc_state.keydir, Key,
+                    case ?NIF:keydir_remove(State#bc_state.keydir, Key,
                                                     E#bitcask_entry.tstamp,
                                                     E#bitcask_entry.file_id,
                                                     E#bitcask_entry.offset) of
@@ -371,7 +384,7 @@ fold_keys(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
                 end
         end
     end,
-    bitcask_nifs:keydir_fold((get_state(Ref))#bc_state.keydir, RealFun, Acc0, MaxAge, MaxPut).
+    ?NIF:keydir_fold((get_state(Ref))#bc_state.keydir, RealFun, Acc0, MaxAge, MaxPut).
 
 %% @doc fold over all K/V pairs in a bitcask datastore.
 %% Fun is expected to take F(K,V,Acc0) -> Acc
@@ -419,7 +432,7 @@ fold(State, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
                                              {_, true} ->
                                                  Acc;
                                              {_, false} ->
-                                                 case bitcask_nifs:keydir_get(
+                                                 case ?NIF:keydir_get(
                                                         State#bc_state.keydir, K,
                                                         FoldEpoch) of
                                                      not_found ->
@@ -452,7 +465,7 @@ fold(State, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
                 end
         end,
     KeyDir = State#bc_state.keydir,
-    bitcask_nifs:keydir_frozen(KeyDir, FrozenFun, MaxAge, MaxPut).
+    ?NIF:keydir_frozen(KeyDir, FrozenFun, MaxAge, MaxPut).
 
 %%
 %% Get a list of readable files and attempt to open them for a fold. If we can't
@@ -481,7 +494,7 @@ maybe_log_missing_file(Dirname, Keydir, ErrFile, enoent) ->
             ?LOG_ERROR("Unexpectedly missing file ~s", [ErrFile]),
             FileId = bitcask_fileops:file_tstamp(ErrFile),
             %% Forget it to avoid retrying opening it
-            _ = bitcask_nifs:keydir_trim_fstats(Keydir, [FileId]),
+            _ = ?NIF:keydir_trim_fstats(Keydir, [FileId]),
             ok;
         false ->
             ok
@@ -536,7 +549,7 @@ subfold(SubFun,[FD | Rest],Acc0) ->
       ok | out_of_date | {error, iteration_in_process}.
 iterator(Ref, MaxAge, MaxPuts) ->
     KeyDir = (get_state(Ref))#bc_state.keydir,
-    bitcask_nifs:keydir_itr(KeyDir, MaxAge, MaxPuts).
+    ?NIF:keydir_itr(KeyDir, MaxAge, MaxPuts).
 
 %% @doc Get next entry from the iterator
 -spec iterator_next(reference()) ->
@@ -544,13 +557,13 @@ iterator(Ref, MaxAge, MaxPuts) ->
      {error, iteration_not_started} | allocation_error | not_found.
 iterator_next(Ref) ->
     KeyDir = (get_state(Ref))#bc_state.keydir,
-    bitcask_nifs:keydir_itr_next(KeyDir).
+    ?NIF:keydir_itr_next(KeyDir).
 
 %% @doc Release iterator
 -spec iterator_release(reference()) -> ok.
 iterator_release(Ref) ->
     KeyDir = (get_state(Ref))#bc_state.keydir,
-    bitcask_nifs:keydir_itr_release(KeyDir).
+    ?NIF:keydir_itr_release(KeyDir).
 
 %% @doc Merge several data files within a bitcask datastore
 %%      into a more compact form.
@@ -610,7 +623,7 @@ merge1(Dirname, Opts, FilesToMerge0, ExpiredFiles) ->
     end,
 
     %% Get the live keydir
-    case bitcask_nifs:maybe_keydir_new(Dirname) of
+    case ?NIF:maybe_keydir_new(Dirname) of
         {ready, LiveKeyDir} ->
             %% Simplest case; a key dir is already available and
             %% loaded. Go ahead and open just the files we wish to
@@ -684,7 +697,7 @@ merge1(Dirname, Opts, FilesToMerge0, ExpiredFiles) ->
                 end,
 
     %% Initialize the other keydirs we need.
-    {ok, DelKeyDir} = bitcask_nifs:keydir_new(),
+    {ok, DelKeyDir} = ?NIF:keydir_new(),
 
     %% Initialize our state for the merge
     State = #mstate { dirname = Dirname,
@@ -726,17 +739,17 @@ merge1(Dirname, Opts, FilesToMerge0, ExpiredFiles) ->
     %% Close the original input files, schedule them for deletion,
     %% close keydirs, and release our lock
     bitcask_fileops:close_all(State#mstate.input_files ++ ExpiredFilesFinished),
-    {_, _, _, {IterGeneration, _, _, _}, _} = bitcask_nifs:keydir_info(LiveKeyDir),
+    {_, _, _, {IterGeneration, _, _, _}, _} = ?NIF:keydir_info(LiveKeyDir),
     DelFiles = [F || F <- State1#mstate.delete_files ++ ExpiredFilesFinished],
     FileNames = [F#filestate.filename || F <- DelFiles],
     DelIds = [F#filestate.tstamp || F <- DelFiles],
-    _ = [bitcask_nifs:set_pending_delete(LiveKeyDir, DelId) || DelId <- DelIds],
+    _ = [?NIF:set_pending_delete(LiveKeyDir, DelId) || DelId <- DelIds],
     _ = [catch set_pending_delete_bit(F) || F <- FileNames],
     bitcask_merge_delete:defer_delete(Dirname, IterGeneration, FileNames),
 
     %% Explicitly release our keydirs instead of waiting for GC
-    bitcask_nifs:keydir_release(LiveKeyDir),
-    bitcask_nifs:keydir_release(DelKeyDir),
+    ?NIF:keydir_release(LiveKeyDir),
+    ?NIF:keydir_release(DelKeyDir),
 
     ok = bitcask_lockops:release(Lock).
 
@@ -778,7 +791,7 @@ needs_merge(Ref, Opts) ->
          || F <- DeadFiles],
     DeadIds = lists:usort(DeadIds0),
 
-    case bitcask_nifs:keydir_trim_fstats(State#bc_state.keydir,
+    case ?NIF:keydir_trim_fstats(State#bc_state.keydir,
                                          DeadIds) of
         {ok, 0} ->
             ok;
@@ -1018,13 +1031,13 @@ expired_threshold(Cutoff) ->
 -spec is_empty_estimate(reference()) -> boolean().
 is_empty_estimate(Ref) ->
     State = get_state(Ref),
-    {KeyCount, _, _, _, _} = bitcask_nifs:keydir_info(State#bc_state.keydir),
+    {KeyCount, _, _, _, _} = ?NIF:keydir_info(State#bc_state.keydir),
     KeyCount == 0.
 
 -spec is_frozen(reference()) -> boolean().
 is_frozen(Ref) ->
     #bc_state{keydir=Keydir} = get_state(Ref),
-    {_, _, _, {_, _, Frozen, _}, _} = bitcask_nifs:keydir_info(Keydir),
+    {_, _, _, {_, _, Frozen, _}, _} = ?NIF:keydir_info(Keydir),
     Frozen.
 
 -spec status(reference()) -> {integer(), [{string(), integer(), integer(), integer()}]}.
@@ -1038,7 +1051,7 @@ status(Ref) ->
 
 current_files(Dirname, Keydir) ->
     {_, _, Fstats, {_, _, _, PendingEpoch}, Epoch} =
-        bitcask_nifs:keydir_info(Keydir),
+        ?NIF:keydir_info(Keydir),
     CappedEpoch = min(PendingEpoch, Epoch),
     FStatus = [summarize(Dirname, F) || F <- Fstats],
     CurrentFiles = [F || F <- FStatus,
@@ -1057,7 +1070,7 @@ summary_info(Ref) ->
     %% OldestTstamp, NewestTstamp, ExpirationEpoch}]
     %% and is only an estimate/snapshot.
     {KeyCount, _KeyBytes, Fstats, _IterStatus, _Epoch} =
-        bitcask_nifs:keydir_info(State#bc_state.keydir),
+        ?NIF:keydir_info(State#bc_state.keydir),
 
     %% We want to ignore the file currently being written when
     %% considering status!
@@ -1189,7 +1202,7 @@ scan_key_files([Filename | Rest], KeyDir, Acc, CloseFile, KT) ->
             %% needs to know the file exists, even if it contains only
             %% tombstones or data errors.  Otherwise we risk of
             %% reusing the file id for new data.
-            _ = bitcask_nifs:increment_file_id(KeyDir, FileTstamp),
+            _ = ?NIF:increment_file_id(KeyDir, FileTstamp),
             F = fun({tombstone, K0}, _Tstamp, {_Offset, _TotalSz}, _) ->
                         K = try KT(K0) catch TxErr -> {key_tx_error, TxErr} end,
                         case K of
@@ -1198,7 +1211,7 @@ scan_key_files([Filename | Rest], KeyDir, Acc, CloseFile, KT) ->
                                                        [K0, KeyTxErr]),
                                 ok;
                             _ ->
-                                bitcask_nifs:keydir_remove(KeyDir, KT(K))
+                                ?NIF:keydir_remove(KeyDir, KT(K))
                         end,
                         ok;
                    (K0, Tstamp, {Offset, TotalSz}, _) ->
@@ -1208,7 +1221,7 @@ scan_key_files([Filename | Rest], KeyDir, Acc, CloseFile, KT) ->
                                 ?LOG_ERROR("Invalid key on load ~p: ~p",
                                                        [K0, KeyTxErr]);
                             _ ->
-                                bitcask_nifs:keydir_put(KeyDir,
+                                ?NIF:keydir_put(KeyDir,
                                                         K,
                                                         FileTstamp,
                                                         TotalSz,
@@ -1236,7 +1249,7 @@ init_keydir(Dirname, WaitTime, ReadWriteModeP, KT) ->
     %% Get the named keydir for this directory. If we get it and it's already
     %% marked as ready, that indicates another caller has already loaded
     %% all the data from disk and we can short-circuit scanning all the files.
-    case bitcask_nifs:keydir_new(Dirname) of
+    case ?NIF:keydir_new(Dirname) of
         {ready, KeyDir} ->
             %% A keydir already exists, nothing more to do here. We'll lazy
             %% open files as needed.
@@ -1282,12 +1295,12 @@ init_keydir(Dirname, WaitTime, ReadWriteModeP, KT) ->
 
             case ScanResult of
                 {error, _} ->
-                    ok = bitcask_nifs:keydir_release(KeyDir),
+                    ok = ?NIF:keydir_release(KeyDir),
                     ScanResult;
                 _ ->
                     %% Now that we loaded all the data, mark the keydir as ready
                     %% so other callers can use it
-                    ok = bitcask_nifs:keydir_mark_ready(KeyDir),
+                    ok = ?NIF:keydir_mark_ready(KeyDir),
                     {ok, KeyDir, []}
             end;
 
@@ -1323,7 +1336,7 @@ init_keydir_scan_key_files(Dirname, KeyDir, KT, Count) ->
             _ ->
                 MaxSetuid = lists:max([bitcask_fileops:file_tstamp(F) ||
                                           F <- SetuidFiles]),
-                bitcask_nifs:increment_file_id(KeyDir, MaxSetuid)
+                ?NIF:increment_file_id(KeyDir, MaxSetuid)
         end
     catch Class:Reason:Stacktrace ->
             error_msg_perhaps("scan_key_files: ~p ~p @ ~p\n",
@@ -1428,7 +1441,7 @@ merge_single_entry(K, V, Tstamp, FileId, {_, _, Offset, _} = Pos, State) ->
             %% value would expire soon too, but...
 
             %% Remove only if this is the current entry in the keydir
-            bitcask_nifs:keydir_remove(State#mstate.live_keydir, K,
+            ?NIF:keydir_remove(State#mstate.live_keydir, K,
                                        Tstamp, FileId, Offset),
             State;
         not_found ->
@@ -1442,7 +1455,7 @@ merge_single_entry(K, V, Tstamp, FileId, {_, _, Offset, _} = Pos, State) ->
                 true ->
                     %% We have seen a tombstone for this key before, but this
                     %% one is newer than that one.
-                    ok = bitcask_nifs:keydir_put(State#mstate.del_keydir, K,
+                    ok = ?NIF:keydir_put(State#mstate.del_keydir, K,
                                                  FileId, 0, Offset, Tstamp,
                                                  bitcask_time:tstamp()),
                     case State#mstate.merge_coverage of
@@ -1454,7 +1467,7 @@ merge_single_entry(K, V, Tstamp, FileId, {_, _, Offset, _} = Pos, State) ->
                             State
                     end;
                 false ->
-                    ok = bitcask_nifs:keydir_remove(State#mstate.del_keydir, K),
+                    ok = ?NIF:keydir_remove(State#mstate.del_keydir, K),
                     inner_merge_write(K, V, Tstamp, FileId, Offset, State)
             end
     end.
@@ -1465,7 +1478,7 @@ merge_single_tombstone(K,V, Tstamp, FileId, Offset, State) ->
             %% Version 1 tombstone, no info on deleted value
             %% Not in keydir and not already deleted.
             %% Remember we deleted this already during this merge.
-            ok = bitcask_nifs:keydir_put(State#mstate.del_keydir, K,
+            ok = ?NIF:keydir_put(State#mstate.del_keydir, K,
                                          FileId, 0, Offset, Tstamp,
                                          bitcask_time:tstamp()),
             case State#mstate.merge_coverage of
@@ -1505,7 +1518,7 @@ merge_single_tombstone(K,V, Tstamp, FileId, Offset, State) ->
                             {ok, TFile2, _, TSize} =
                                 bitcask_fileops:write(TFile, K, V,
                                                       Tstamp),
-                            ok = bitcask_nifs:update_fstats(
+                            ok = ?NIF:update_fstats(
                                    State#mstate.live_keydir,
                                    OldFileId, Tstamp,
                                    _LiveKeys = 0,
@@ -1585,7 +1598,7 @@ inner_merge_write(K, V, Tstamp, OldFileId, OldOffset, State) ->
                 %% file. It's possible that someone else may have written
                 %% a newer value whilst we were processing ... and if
                 %% they did, we need to undo our write here.
-                case bitcask_nifs:keydir_put(State1#mstate.live_keydir, K,
+                case ?NIF:keydir_put(State1#mstate.live_keydir, K,
                                              OutFileId,
                                              Size, Offset, Tstamp,
                                              bitcask_time:tstamp(),
@@ -1597,10 +1610,10 @@ inner_merge_write(K, V, Tstamp, OldFileId, OldOffset, State) ->
                         O
                 end;
            true ->
-                case bitcask_nifs:keydir_get(State1#mstate.live_keydir, K) of
+                case ?NIF:keydir_get(State1#mstate.live_keydir, K) of
                     not_found ->
                         % Update timestamp and total bytes stats
-                        ok = bitcask_nifs:update_fstats(
+                        ok = ?NIF:update_fstats(
                                State1#mstate.live_keydir,
                                OutFileId,
                                Tstamp,
@@ -1631,7 +1644,7 @@ out_of_date(_State, _Key, Tstamp, _FileId, _Pos, ExpiryTime,
     expired;
 out_of_date(State, Key, Tstamp, FileId, {_,_,Offset,_} = Pos,
             ExpiryTime, EverFound, [KeyDir|Rest]) ->
-    case bitcask_nifs:keydir_get(KeyDir, Key) of
+    case ?NIF:keydir_get(KeyDir, Key) of
         not_found ->
             out_of_date(State, Key, Tstamp, FileId, Pos, ExpiryTime,
                         EverFound, Rest);
@@ -1777,7 +1790,7 @@ do_put(Key, Value, #bc_state{write_file = WriteFile} = State,
         %% 如果是二进制文件
         BinValue when is_binary(BinValue) ->
             % Replacing value from a previous file, so write tombstone for it.
-            case bitcask_nifs:keydir_get(State2#bc_state.keydir, Key) of
+            case ?NIF:keydir_get(State2#bc_state.keydir, Key) of
                 #bitcask_entry{file_id=OldFileId}
                   when OldFileId > WriteFileId ->
                     State3 = wrap_write_file(State2),
@@ -1805,7 +1818,7 @@ do_put(Key, Value, #bc_state{write_file = WriteFile} = State,
             end;
 
         tombstone ->
-            case bitcask_nifs:keydir_get(State2#bc_state.keydir, Key) of
+            case ?NIF:keydir_get(State2#bc_state.keydir, Key) of
                 not_found ->
                     {ok, State2};
                 #bitcask_entry{file_id=OldFileId} when OldFileId > WriteFileId ->
@@ -1819,11 +1832,11 @@ do_put(Key, Value, #bc_state{write_file = WriteFile} = State,
                     case bitcask_fileops:write(State2#bc_state.write_file,
                                                Key, Tombstone, Tstamp) of
                         {ok, WriteFile2, _, TSize} ->
-                            ok = bitcask_nifs:update_fstats(
+                            ok = ?NIF:update_fstats(
                                    State2#bc_state.keydir,
                                    bitcask_fileops:file_tstamp(WriteFile2), Tstamp,
                                    0, 0, 0, TSize, _ShouldCreate = 1),
-                            case bitcask_nifs:keydir_remove(State2#bc_state.keydir,
+                            case ?NIF:keydir_remove(State2#bc_state.keydir,
                                                             Key, OldTstamp, OldFileId,
                                                             OldOffset) of
                                 already_exists ->
@@ -1850,7 +1863,7 @@ write_and_keydir_put(State2, Key, Value, Tstamp, Retries, NowTstamp, OldFileId, 
     case bitcask_fileops:write(State2#bc_state.write_file,
                                Key, Value, Tstamp) of
         {ok, WriteFile2, Offset, Size} ->
-            case bitcask_nifs:keydir_put(State2#bc_state.keydir, Key,
+            case ?NIF:keydir_put(State2#bc_state.keydir, Key,
                                          bitcask_fileops:file_tstamp(WriteFile2),
                                          Size, Offset, Tstamp,
                                          NowTstamp, true,
@@ -1985,7 +1998,7 @@ expiry_merge([File | Files], LiveKeyDir, KT, Acc0) ->
                           ?LOG_ERROR("Invalid key on merge ~p: ~p",
                                                  [K0, KeyTxErr]);
                       _ ->
-                          bitcask_nifs:keydir_remove(LiveKeyDir, K, Tstamp,
+                          ?NIF:keydir_remove(LiveKeyDir, K, Tstamp,
                                                      FileId, Offset)
                   end,
                   Acc
@@ -2280,7 +2293,7 @@ fold_visits_frozen_test2(RollOver) ->
                                  Ref2 = (get_state(B2))#bc_state.keydir,
                                  %% Start a function that waits in a frozen keydir for a message
                                  %% so the test fold can guarantee a frozen keydir
-                                 ok = bitcask_nifs:keydir_frozen(Ref2, FrozenFun, -1, -1),
+                                 ok = ?NIF:keydir_frozen(Ref2, FrozenFun, -1, -1),
                                  bitcask:close(B2)
                          end),
         receive
@@ -2319,7 +2332,7 @@ fold_visits_frozen_test2(RollOver) ->
 
         %% Unfreeze the keydir, waiting until complete
         FreezeWaiter ! done,
-        ok = bitcask_nifs:keydir_wait_pending(Ref),
+        ok = ?NIF:keydir_wait_pending(Ref),
         %% TODO: find some ironclad way of coordinating the disk and
         %% test state, instead of using sleeps.
         timer:sleep(900),
@@ -2793,7 +2806,7 @@ invalid_data_size_test2() ->
 
 testhelper_keydir_count(B) ->
     KD = (get_state(B))#bc_state.keydir,
-    {KeyCount,_,_,_,_} = bitcask_nifs:keydir_info(KD),
+    {KeyCount,_,_,_,_} = ?NIF:keydir_info(KD),
     KeyCount.
 
 expire_keydir_test_() ->
@@ -3303,7 +3316,7 @@ fold_itercount_test2() ->
          || _ <- Pids],
 
         KD = (get_state(Ref))#bc_state.keydir,
-        Info = bitcask_nifs:keydir_info(KD),
+        Info = ?NIF:keydir_info(KD),
         {_,_,_,{_,Count,_,_},_} = Info,
 
         ?assertEqual(length(Pids), Count),
@@ -3315,7 +3328,7 @@ fold_itercount_test2() ->
 
         %% collect the iterator information and make sure that the
         %% count is still 0
-        Info2 = bitcask_nifs:keydir_info(KD),
+        Info2 = ?NIF:keydir_info(KD),
         {_,_,_,{_,Count2,_,_},_} = Info2,
         ?assertEqual(0, Count2)
     after

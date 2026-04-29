@@ -75,7 +75,7 @@ create_file(DirName, Opts0, Keydir) ->
     case get_create_lock(DirName) of
         {ok, Lock} -> %%锁住特定目录
             try
-                {ok, Newest} = bitcask_nifs:increment_file_id(Keydir),
+                {ok, Newest} = ?NIF:increment_file_id(Keydir),
                 %% 得到新的文件ID，并建立文件
                 Filename = mk_filename(DirName, Newest),
                 ok = ensure_dir(Filename),
