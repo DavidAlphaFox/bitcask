@@ -15,5 +15,13 @@ target_link_libraries(bitcask_smoke_test PRIVATE
     bitcask_warnings
 )
 
+add_executable(bitcask_codec_test codec_test.cpp)
+target_link_libraries(bitcask_codec_test PRIVATE
+    GTest::gtest_main
+    bitcask_format
+    bitcask_warnings
+)
+
 include(GoogleTest)
 gtest_discover_tests(bitcask_smoke_test)
+gtest_discover_tests(bitcask_codec_test)

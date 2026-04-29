@@ -8,6 +8,21 @@ target_compile_options(bitcask_warnings INTERFACE
     -fvisibility=hidden -fvisibility-inlines-hidden
 )
 
+find_package(ZLIB REQUIRED)
+
+# ---------------------------------------------------------------------------
+# bitcask_format — codec for data file / hint file records.
+# Pure library, zero Erlang/OTP dependency. Reused by core lib + tests.
+# ---------------------------------------------------------------------------
+add_library(bitcask_format STATIC
+    src/fileops/codec.cpp
+)
+target_include_directories(bitcask_format PUBLIC include)
+target_link_libraries(bitcask_format
+    PUBLIC ZLIB::ZLIB
+    PRIVATE bitcask_warnings
+)
+
 # ---------------------------------------------------------------------------
 # bitcask_stub.so — empty NIF for M0 toolchain validation.
 # Coexists with the legacy priv/bitcask.so. To be replaced in M1.

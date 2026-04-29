@@ -51,12 +51,12 @@
 - [x] **端到端验证**:Erlang `erlang:load_nif/2` 加载 stub 成功并调用 `ping/0` 返回 `pong`
 - [ ] `rebar.config` 增加 cmake `pre_hooks`(双产出阶段:cmake + 原 `pc`)
 - [x] `FetchContent` 接入 GoogleTest(v1.15.2),跑通 hello-world 单测
-- [ ] `cpp/src/format/layout.hpp`:从 `include/bitcask.hrl` 移植所有二进制布局常量
-- [ ] `cpp/src/fileops/codec.cpp`:实现数据文件 / hint 记录的编解码
-- [ ] `cpp/tests/codec_test.cpp`:用真实数据文件 fixture 验证字节级一致
-- [ ] `cpp/tests/fixtures/`:放入若干已知数据文件(从现有 eunit 测试目录拷)
-- [ ] `make compile && make test` 全绿
-- [x] `ctest --output-on-failure` 通过(2/2 PASS)
+- [x] `cpp/include/bitcask/format.hpp`:从 `include/bitcask.hrl` 移植所有二进制布局常量(kHeaderSize=14、kHintRecordSize=18、kMaxOffsetV2、tombstone v0/v1/v2 等)
+- [x] `cpp/include/bitcask/codec.hpp` + `cpp/src/fileops/codec.cpp`:数据文件 / hint 记录的 encode/decode + zlib CRC32
+- [x] `cpp/tests/codec_test.cpp`:byte-level golden tests(包含与 Erlang 实跑输出交叉验证的硬编码 hex,CRC 值精确到位)
+- [ ] `cpp/tests/fixtures/`:放入若干真实数据文件(M2 引入 keydir 时一并补)
+- [ ] `make compile && make test` 全绿(rebar hook 落地后)
+- [x] `ctest --output-on-failure` 通过(**19/19 PASS**)
 
 **验收**:eunit 全套不受影响;codec golden test 通过。
 
