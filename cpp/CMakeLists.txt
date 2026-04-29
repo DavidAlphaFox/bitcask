@@ -41,6 +41,7 @@ target_link_libraries(bitcask_io PRIVATE bitcask_warnings)
 # ---------------------------------------------------------------------------
 add_library(bitcask_keydir STATIC
     src/keydir/keydir.cpp
+    src/keydir/keydir_registry.cpp
 )
 target_include_directories(bitcask_keydir PUBLIC include)
 target_link_libraries(bitcask_keydir PRIVATE bitcask_warnings)

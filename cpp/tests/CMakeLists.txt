@@ -56,6 +56,14 @@ target_link_libraries(bitcask_keydir_iter_test PRIVATE
     bitcask_sanitizers
 )
 
+add_executable(bitcask_keydir_registry_test keydir_registry_test.cpp)
+target_link_libraries(bitcask_keydir_registry_test PRIVATE
+    GTest::gtest_main
+    bitcask_keydir
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 include(GoogleTest)
 gtest_discover_tests(bitcask_smoke_test)
 gtest_discover_tests(bitcask_codec_test)
@@ -63,3 +71,4 @@ gtest_discover_tests(bitcask_posix_file_test)
 gtest_discover_tests(bitcask_file_lock_test)
 gtest_discover_tests(bitcask_keydir_test)
 gtest_discover_tests(bitcask_keydir_iter_test)
+gtest_discover_tests(bitcask_keydir_registry_test)

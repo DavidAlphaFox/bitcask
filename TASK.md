@@ -121,13 +121,16 @@
 - [ ] `pending_awaken` 队列(NIF 层职责,M2.4 加)
 - [ ] `perhaps_sweep_siblings` 惰性清扫(性能优化,M5)
 
-### M2.3 — 全局注册表 + 命名 KeyDir + Refcount ⏳
-- [ ] `KeyDirRegistry`:`std::unordered_map<std::string, std::shared_ptr<KeyDir>>` + 全局 mutex
-- [ ] `keydir_new/0`(匿名/私有) vs `keydir_new/1`(命名/共享 + refcount)
-- [ ] `maybe_keydir_new/1`:仅查询,不创建
-- [ ] `keydir_mark_ready` 与 `is_ready` 协议:第一个打开者负责 init,其他人等待
-- [ ] biggest_file_id 跨 close/reopen 持久化(`global_biggest_file_id`)
-- [ ] release 行为:refcount 减一,降到 0 才真正释放
+### M2.3 — 全局注册表 + 命名 KeyDir + Refcount
+- [x] `cpp/include/bitcask/keydir_registry.hpp` + `cpp/src/keydir/keydir_registry.cpp`:`KeyDirRegistry` 类
+- [x] `acquire(name)`:三态返回 `kCreated` / `kReady` / `kNotReady`
+- [x] `query(name)`:仅探测,不 bump refcount,不 create(对应 `maybe_keydir_new/1`)
+- [x] `release(name)`:refcount 减一;降到 0 持久化 `biggest_file_id+1` 并从 registry 删除
+- [x] mark_ready 协议:首个 acquirer 拿到 `kCreated` 必须调 `mark_ready()`,在此之前其他人得 `kNotReady`
+- [x] biggest_file_id 跨 close/reopen 持久化:**11 个测试**,验证多次 acquire/release 周期下单调
+- [x] **8 线程并发 acquire/release stress** 测试,registry 最终为空、状态正确分配
+- [x] ASan+UBSan / TSan **三组合全过 56/56**
+- [ ] 匿名 keydir(`keydir_new/0`):直接 `std::make_shared<KeyDir>()` 即可,无需 registry,等到 M2.4 NIF 接入时再做封装
 
 ### M2.4 — NIF wiring + Erlang shim + parity ⏳
 - [ ] `cpp/nif/nif_keydir.cpp`:维持现有 15+ 个 `keydir_*_int` 函数签名
