@@ -121,3 +121,12 @@ set_target_properties(bitcask_cpp PROPERTIES
 if(BUILD_TESTING)
     add_subdirectory(tests)
 endif()
+
+# ---------------------------------------------------------------------------
+# Benchmarks (Google Benchmark via FetchContent). Off by default — opt in
+# with -DBITCASK_BUILD_BENCHMARKS=ON to keep CI fast.
+# ---------------------------------------------------------------------------
+option(BITCASK_BUILD_BENCHMARKS "Build C++ micro-benchmarks" OFF)
+if(BITCASK_BUILD_BENCHMARKS)
+    add_subdirectory(bench)
+endif()

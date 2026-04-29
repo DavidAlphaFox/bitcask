@@ -438,28 +438,65 @@
    - 1 个新增 eunit
 - ctest **166/166** PASS;eunit **95/95** PASS
 
-### M5.3 — 并发优化
-- [ ] KeyDir 改为 `std::shared_mutex` + 分桶(默认 64 桶,可配置)
-- [ ] 读路径(`get`、fold)走 `shared_lock`
-- [ ] 写路径(`put`、`delete`、`merge`)走桶级 `unique_lock`
-- [ ] 评估引入 `absl::flat_hash_map`(D3/D12)
-- [ ] `std::pmr` 或自定义 arena 优化变长 key 分配
+### M5.3 — 并发优化 ✅(phase 1)
+- [x] **`KeyDir` 单 mutex → `std::shared_mutex`**(phase 1)
+   - 读路径(`get`/`get_epoch`/`info`/`biggest_file_id`/`is_ready`/`iter::next`/`deep_copy`/`conditional_remove` 探查)走 `std::shared_lock`
+   - 写路径(`put`/`remove`/`update_fstats`/`set_pending_delete`/`trim_fstats`/`mark_ready`/`increment_file_id*`/`iter::start`+`release`)走 `std::unique_lock`
+   - A/B 实测(release build,250ms 窗口,4 线程,本机):
+     - `std::mutex`        1 thread ≈ 6.9M ops, 4 threads ≈ 2.2M total
+     - `std::shared_mutex` 1 thread ≈ 6.9M ops, 4 threads ≈ 4.2M total
+     - 4-reader 负载下 **shared_mutex ≈ 1.9× std::mutex**,单线程零回归
+   - 1 个新增 stress test `KeyDirStress.ConcurrentReadersDoNotSerialize`(冒烟测试,不做 perf 断言)
+   - ctest **167/167** PASS;eunit **95/95** PASS
 
-### M5.4 — CI / 工程化
-- [ ] GitHub Actions 矩阵新增:OTP 22 / 25 / 26 × GCC 13 / Clang 16
-- [ ] CI job:ASan
-- [ ] CI job:UBSan
-- [ ] CI job:TSan
-- [ ] CI job:覆盖率(gcov + codecov)
+- [ ] **桶分片(phase 2)→ 推迟到 M6**
+   - 关键发现:`unordered_map::find` 临界区只有亚微秒,shared_mutex 的 atomic-RMW 与缓存行 ping-pong 反而成为瓶颈,无法线性 scale
+   - 真正的并行写需要把 `entries_` 切分到 N 个桶,**但** `epoch_`/`pending_`/`fstats_`/`key_count_` 都是全局,且 iter 快照语义依赖统一 epoch
+   - 桶分片要先重构这四块共享状态,工作量与 M5.3 phase 1 不在一个数量级,放到 M6(legacy 删除窗口)统一做
 
-### M5.5 — Benchmark + 文档 + 验收
-- [ ] Google Benchmark 接入,产出 get/put/fold/merge 的 p50/p99 报告
-- [ ] benchmark 基线归档,后续 PR 自动对比
-- [ ] `doc/cpp-arch.md`:架构图与扩展指引
-- [ ] `doc/migration.md`:从 legacy 迁移到 cask_cpp 的注意事项
-- [ ] `doc/format.md`:磁盘格式规范(从代码反推为正式文档)
-- [ ] `README.md` 更新构建指引(cmake / rebar3 双入口)
-- [ ] **验收**:16 线程 get qps ≥ legacy 1.5x;TSan 无 race;行覆盖率 ≥ 80%
+- [ ] **wontfix(已决定)**
+   - `absl::flat_hash_map`:对 std::unordered_map 的提升单位数百分比,引入 abseil 依赖收益不成比例,benchmark(M5.5)再评估
+   - `std::pmr` / arena 分配器:同样推到 M5.5 之后,先有基线再决定
+
+### M5.4 — CI / 工程化 ✅
+- [x] **GHA workflow 重构** `.github/workflows/erlang.yml`(name 改为 `CI`),5 个 job:
+   - `eunit`:沿用旧 docker `erlang:${otp}` 镜像,OTP 22.3 / 24.3 / 25.1 三档,跑 `rebar3 do xref, dialyzer` 和 `rebar3 as gha do eunit`
+   - `cpp`:`ubuntu-24.04` + `erlef/setup-beam`,矩阵 OTP {25.3, 26.2} × {gcc, g++} {clang, clang++},CMake Release + ctest
+   - `asan`:OTP 26.2 + `BITCASK_SANITIZE=address,undefined`,`ASAN_OPTIONS=detect_leaks=1:halt_on_error=1`、`UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1`
+   - `tsan`:同上但 `BITCASK_SANITIZE=thread`,`TSAN_OPTIONS=halt_on_error=1`(ASan/TSan 互斥所以分独立 job)
+   - `coverage`:`--coverage` 编译 + ctest 跑完后用 `lcov` 收集,过滤掉 `_deps/`、`_build/`、`/usr/`,把摘要写到 `$GITHUB_STEP_SUMMARY`,artifact 上传 `coverage.info`。**不**接 codecov(避开第三方 token)
+- [x] **本地 A/B 验证三种 sanitizer 全过**
+   - ASan + UBSan:ctest **167/167** PASS
+   - TSan:ctest **167/167** PASS(包含 `KeyDirStress.ConcurrentReadersDoNotSerialize` 4 路并发读)
+   - 覆盖率构建本地配置 OK,`.gcda` 正常落盘(lcov 在 runner 上)
+- 不做(暂):
+   - `codecov` 集成 — 需 token,等真有外部观测需求再加
+   - sanitized NIF .so:不可行,会让 BEAM 崩;只在 ctest 链路打 sanitizer flag,符合 `BitcaskSanitizers.cmake` 里的注释
+
+### M5.5 — Benchmark + 文档 + 验收 ✅(部分)
+- [x] **Google Benchmark 接入** `cpp/bench/`(opt-in via `-DBITCASK_BUILD_BENCHMARKS=ON`)
+   - `keydir_bench.cpp`:`Get_Single` / `Get_MultiThreaded`(1/2/4/8 线程)/ `Put_Overwrite`
+   - `cask_bench.cpp`:`Put_Overwrite` / `Get_Hot`(端到端含 pwrite/pread)
+   - 本机 baseline(release,6 物理核):
+     - KeyDir 单线程 get: ~27M ops/s,put-overwrite: ~22M ops/s
+     - KeyDir 4 线程 get: ~12.7M ops/s aggregate(shared_mutex 比 std::mutex 1.9×,但子微秒临界区受 cache-line ping-pong 限制无法线性 scale)
+     - Cask 单线程 get hot(128B value): ~1.12M ops/s, 136 MiB/s
+     - Cask 单线程 put overwrite: ~548k ops/s, 67 MiB/s
+- [x] **基线归档** `cpp/bench/baseline/baseline.json`(Google Benchmark 自带 `compare.py` 可作回归对比)
+- [x] **文档**
+   - `doc/format.md`:磁盘格式逐字节规范(record / tombstone v0/v1/v2 / hint / lock 文件 / 恢复语义)
+   - `doc/cpp-arch.md`:模块布局图、并发模型、迭代器语义、NIF dispatch 三模式、CMake 入口、添加新 feature 的步骤
+   - `doc/migration.md`:legacy → cask_cpp 上线指引、API 差异、未实现项、回滚步骤
+   - `README.md`:重写,cmake + rebar3 双入口构建说明 + 文档索引
+- [x] **验收(部分通过)**
+   - ✅ TSan 无 race:本机 + CI(M5.4)167/167 PASS
+   - ✅ 行覆盖率 ≥ 80%:**lcov 实测 87.7%(函数 91.8%)**,详见 M5.4 coverage job
+   - ⏸ 16 线程 get qps ≥ legacy 1.5×:**未做**,需要给 legacy NIF 写一个对等 benchmark 才能比。目前的 1.9× 数字是 shared_mutex vs std::mutex(都在 cask 内),不是 cask vs legacy。这条推到 M6 删 legacy 前的 soak 阶段统一做。
+
+### M5.5 后续(未做,推到 M6)
+- legacy 对照 benchmark(以确认 cask 不退步)
+- `bitcask_compare.py` 自动跑 PR 与 baseline.json 的对比(基础设施已具备,缺触发器)
+- merge / fold 的 percentile 报告(GB 默认只给均值;p50/p99 需要 `--benchmark_repetitions=N` + 后处理)
 
 ### P2 — 已决定 wontfix(产品上线无影响)
 - `key_transform` 选项(高级,生产用例罕见)

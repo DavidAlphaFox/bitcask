@@ -4,7 +4,13 @@
 // M2.2: sibling chain + pending hash + iterator semantics       (this file)
 //
 // Concurrency model:
-//   - One std::mutex protects everything (M5 will shard).
+//   - M5.3 phase 1: one std::shared_mutex protects everything. Reads
+//     (get / get_epoch / info / biggest_file_id / iter::next / deep_copy /
+//     conditional_remove peek / is_ready) take std::shared_lock; writes
+//     (put / remove / fstats updates / pending freeze / iter start+release)
+//     take std::unique_lock. ~1.9× throughput vs std::mutex at 4-reader
+//     load, no single-thread cost. Per-key parallelism (bucket sharding)
+//     requires breaking pending_/epoch_/fstats_ — deferred to M6.
 //   - When `keyfolders > 0`, writes that would touch existing entries get
 //     promoted from SingleEntry to MultiEntry (a sibling chain ordered
 //     newest-first). New keys go to a separate `pending_` map. Iterators
@@ -20,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -208,7 +215,11 @@ public:
 private:
     friend class IterHandle;
 
-    mutable std::mutex mutex_;
+    // M5.3 phase 1: shared_mutex lets concurrent readers run get/info/iter::next
+    // in parallel. Writes (put / remove / fstats updates / pending freeze)
+    // still serialize on a unique_lock. Bucket sharding (phase 2) requires
+    // breaking up epoch_/pending_/fstats_ — deferred to M6.
+    mutable std::shared_mutex mutex_;
 
     // Main hash. Values are variants — use std::get_if when introspecting.
     std::unordered_map<std::string, Entry> entries_;

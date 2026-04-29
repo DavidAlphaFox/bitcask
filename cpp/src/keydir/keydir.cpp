@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <shared_mutex>
 
 namespace bitcask::keydir {
 
@@ -116,21 +117,21 @@ void KeyDir::update_fstats(std::uint32_t file_id, std::uint32_t tstamp,
                             std::int32_t live_bytes_inc,
                             std::int32_t total_bytes_inc,
                             bool should_create) {
-    std::scoped_lock lock(mutex_);
+    std::unique_lock lock(mutex_);
     update_fstats_locked(file_id, tstamp, expiration_epoch,
                          live_inc, total_inc, live_bytes_inc, total_bytes_inc,
                          should_create);
 }
 
 void KeyDir::set_pending_delete(std::uint32_t file_id) {
-    std::scoped_lock lock(mutex_);
+    std::unique_lock lock(mutex_);
     update_fstats_locked(file_id, /*tstamp*/ 0,
                          /*expiration_epoch*/ epoch_,
                          0, 0, 0, 0, /*should_create*/ false);
 }
 
 std::uint32_t KeyDir::trim_fstats(std::span<const std::uint32_t> ids) {
-    std::scoped_lock lock(mutex_);
+    std::unique_lock lock(mutex_);
     std::uint32_t missing = 0;
     for (auto id : ids) {
         if (fstats_.erase(id) == 0) ++missing;
@@ -144,7 +145,7 @@ std::uint32_t KeyDir::trim_fstats(std::span<const std::uint32_t> ids) {
 
 std::optional<EntryProxy> KeyDir::get(std::string_view key,
                                        std::uint64_t target_epoch) const {
-    std::scoped_lock lock(mutex_);
+    std::shared_lock lock(mutex_);
 
     // Pending hash first if it exists and pending entry's epoch is visible
     // at the requested epoch (legacy find_keydir_entry rule).
@@ -167,7 +168,7 @@ std::optional<EntryProxy> KeyDir::get(std::string_view key,
 }
 
 std::uint64_t KeyDir::get_epoch() const {
-    std::scoped_lock lock(mutex_);
+    std::shared_lock lock(mutex_);
     return epoch_;
 }
 
@@ -177,7 +178,7 @@ PutResult KeyDir::put(std::string_view key,
                        std::uint32_t now_sec,
                        bool newest_put,
                        std::uint32_t old_file_id, std::uint64_t old_offset) {
-    std::scoped_lock lock(mutex_);
+    std::unique_lock lock(mutex_);
 
     // Resolve current state of this key (consulting pending then entries),
     // mirroring legacy find_keydir_entry with epoch == kMaxEpoch.
@@ -341,7 +342,7 @@ PutResult KeyDir::put(std::string_view key,
 }
 
 bool KeyDir::remove(std::string_view key, std::uint32_t remove_time) {
-    std::scoped_lock lock(mutex_);
+    std::unique_lock lock(mutex_);
 
     epoch_ += 1;
     const std::uint64_t this_epoch = epoch_;
@@ -427,7 +428,7 @@ PutResult KeyDir::conditional_remove(std::string_view key,
     {
         // Quick mismatch check before bumping the epoch.
         // Same shadow rule as remove(): pending always shadows entries.
-        std::scoped_lock lock(mutex_);
+        std::shared_lock lock(mutex_);
         SingleEntry cur{};
         bool found = false;
         if (pending_.has_value()) {
@@ -470,7 +471,7 @@ IterHandle::~IterHandle() noexcept {
 StartIterResult IterHandle::start(std::uint32_t now_sec,
                                    int maxage, int maxputs) {
     if (iterating_) return StartIterResult::kAlreadyIterating;
-    std::scoped_lock lock(parent_->mutex_);
+    std::unique_lock lock(parent_->mutex_);
 
     auto can_use_existing_freeze = [&]() -> bool {
         if (!parent_->pending_.has_value() || (maxage < 0 && maxputs < 0)) {
@@ -508,7 +509,9 @@ StartIterResult IterHandle::start(std::uint32_t now_sec,
 
 std::optional<EntryProxy> IterHandle::next() {
     if (!iterating_) return std::nullopt;
-    std::scoped_lock lock(parent_->mutex_);
+    // Reader lock: cursor_ advances inside this handle (per-iter state, not
+    // shared) and entries_/pending_ are only read here.
+    std::shared_lock lock(parent_->mutex_);
 
     while (cursor_ < keys_snapshot_.size()) {
         const std::string& k = keys_snapshot_[cursor_++];
@@ -524,7 +527,7 @@ std::optional<EntryProxy> IterHandle::next() {
 
 void IterHandle::release() {
     if (!iterating_) return;
-    std::scoped_lock lock(parent_->mutex_);
+    std::unique_lock lock(parent_->mutex_);
     iterating_ = false;
     iter_epoch_ = kMaxEpoch;
     keys_snapshot_.clear();
@@ -587,34 +590,34 @@ void KeyDir::merge_pending_and_collapse_locked() {
 // =============================================================================
 
 void KeyDir::mark_ready() {
-    std::scoped_lock lock(mutex_);
+    std::unique_lock lock(mutex_);
     is_ready_ = true;
 }
 
 bool KeyDir::is_ready() const {
-    std::scoped_lock lock(mutex_);
+    std::shared_lock lock(mutex_);
     return is_ready_;
 }
 
 std::uint32_t KeyDir::biggest_file_id() const {
-    std::scoped_lock lock(mutex_);
+    std::shared_lock lock(mutex_);
     return biggest_file_id_;
 }
 
 std::uint32_t KeyDir::increment_file_id() {
-    std::scoped_lock lock(mutex_);
+    std::unique_lock lock(mutex_);
     biggest_file_id_ += 1;
     return biggest_file_id_;
 }
 
 std::uint32_t KeyDir::increment_file_id_at_least(std::uint32_t conditional_id) {
-    std::scoped_lock lock(mutex_);
+    std::unique_lock lock(mutex_);
     if (conditional_id > biggest_file_id_) biggest_file_id_ = conditional_id;
     return biggest_file_id_;
 }
 
 KeyDirInfo KeyDir::info() const {
-    std::scoped_lock lock(mutex_);
+    std::shared_lock lock(mutex_);
     KeyDirInfo r;
     r.key_count = key_count_;
     r.key_bytes = key_bytes_;
@@ -632,7 +635,7 @@ KeyDirInfo KeyDir::info() const {
 
 std::shared_ptr<KeyDir> KeyDir::deep_copy() const {
     auto copy = std::make_shared<KeyDir>();
-    std::scoped_lock lock(mutex_);
+    std::shared_lock lock(mutex_);
     copy->entries_         = entries_;
     copy->pending_         = pending_;
     copy->fstats_          = fstats_;

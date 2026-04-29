@@ -1,4 +1,4 @@
-name: Erlang CI
+name: CI
 
 on:
   push:
@@ -6,13 +6,15 @@ on:
   pull_request:
     branches: [ develop ]
 
-
 jobs:
 
-  build:
-
+  # -------------------------------------------------------------------------
+  # Legacy Erlang path: eunit + xref + dialyzer across the supported OTP
+  # range. This is the long-standing pre-cask test gate.
+  # -------------------------------------------------------------------------
+  eunit:
+    name: eunit (OTP ${{ matrix.otp }})
     runs-on: ubuntu-latest
-
     strategy:
       fail-fast: false
       matrix:
@@ -20,16 +22,163 @@ jobs:
           - "25.1"
           - "24.3"
           - "22.3"
-
     container:
       image: erlang:${{ matrix.otp }}
-
     steps:
       - uses: lukka/get-cmake@latest
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Compile
         run: ./rebar3 compile
       - name: Run xref and dialyzer
         run: ./rebar3 do xref, dialyzer
       - name: Run eunit
         run: ./rebar3 as gha do eunit
+
+  # -------------------------------------------------------------------------
+  # C++ NIF: Release build + ctest. Matrix exercises GCC and Clang against
+  # the OTP version we ship against (headers are pulled via setup-beam).
+  # -------------------------------------------------------------------------
+  cpp:
+    name: cpp ${{ matrix.compiler }} OTP ${{ matrix.otp }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        otp: ["25.3", "26.2"]
+        compiler: ["gcc", "clang"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp }}
+          rebar3-version: "3.22.1"
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+      - name: Pick compiler
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            echo "CC=clang"  >> "$GITHUB_ENV"
+            echo "CXX=clang++" >> "$GITHUB_ENV"
+          else
+            echo "CC=gcc"  >> "$GITHUB_ENV"
+            echo "CXX=g++" >> "$GITHUB_ENV"
+          fi
+      - name: Configure
+        run: cmake -S . -B _build/cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+      - name: Build
+        run: cmake --build _build/cmake -j
+      - name: Run ctest
+        working-directory: _build/cmake
+        run: ctest --output-on-failure -j
+
+  # -------------------------------------------------------------------------
+  # Sanitizers. Each is its own job so a flake on one doesn't mask the rest.
+  # ASan + UBSan share a build (compatible); TSan is exclusive with ASan.
+  # The NIF .so is built without sanitizers (would crash BEAM); only the
+  # gtest binaries link them. We therefore only run ctest in these jobs.
+  # -------------------------------------------------------------------------
+  asan:
+    name: ASan + UBSan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "26.2"
+          rebar3-version: "3.22.1"
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+      - name: Configure
+        run: |
+          cmake -S . -B _build/asan -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DBUILD_TESTING=ON \
+            -DBITCASK_SANITIZE=address,undefined
+      - name: Build
+        run: cmake --build _build/asan -j
+      - name: Run ctest
+        working-directory: _build/asan
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --output-on-failure -j
+
+  tsan:
+    name: TSan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "26.2"
+          rebar3-version: "3.22.1"
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+      - name: Configure
+        run: |
+          cmake -S . -B _build/tsan -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DBUILD_TESTING=ON \
+            -DBITCASK_SANITIZE=thread
+      - name: Build
+        run: cmake --build _build/tsan -j
+      - name: Run ctest
+        working-directory: _build/tsan
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+        run: ctest --output-on-failure -j
+
+  # -------------------------------------------------------------------------
+  # Coverage: gcov + lcov. Reports a percentage in the run summary; not
+  # uploading to codecov to avoid third-party tokens. Threshold is advisory.
+  # -------------------------------------------------------------------------
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "26.2"
+          rebar3-version: "3.22.1"
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build lcov
+      - name: Configure
+        run: |
+          cmake -S . -B _build/cov -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DBUILD_TESTING=ON \
+            -DCMAKE_CXX_FLAGS="--coverage -O0 -g" \
+            -DCMAKE_EXE_LINKER_FLAGS="--coverage" \
+            -DCMAKE_SHARED_LINKER_FLAGS="--coverage"
+      - name: Build
+        run: cmake --build _build/cov -j
+      - name: Run ctest
+        working-directory: _build/cov
+        run: ctest --output-on-failure -j
+      - name: Collect coverage
+        run: |
+          lcov --capture --directory _build/cov --output-file coverage.info \
+               --ignore-errors mismatch,gcov,unused
+          lcov --remove coverage.info '*/_deps/*' '*/_build/*' '/usr/*' \
+               --output-file coverage.info --ignore-errors unused
+          lcov --list coverage.info | tee coverage-summary.txt
+      - name: Print summary
+        run: |
+          echo "## C++ coverage" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -n 20 coverage-summary.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.info

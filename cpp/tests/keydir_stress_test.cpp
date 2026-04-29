@@ -221,6 +221,80 @@ TEST(KeyDirStress, RegistryAcquireReleaseChurn) {
 }
 
 // ---------------------------------------------------------------------------
+// M5.3 phase 1: shared_mutex enables concurrent reader entry without any
+// data-layout change. Per-call critical sections (unordered_map::find) are
+// sub-microsecond, so cache-line contention on the mutex's atomic counters
+// dominates and prevents linear scaling — the lock-acquire overhead itself
+// becomes the bottleneck. The honest claim is NOT "readers scale linearly";
+// it is "concurrent readers do not fully serialize". Local A/B measurement
+// on this machine (release build, 250ms window):
+//
+//     std::mutex          1 thread ≈ 6.9M ops,  4 threads ≈ 2.2M total
+//     std::shared_mutex   1 thread ≈ 6.9M ops,  4 threads ≈ 4.2M total
+//
+// → shared_mutex ≈ 1.9× std::mutex at 4-reader load, with no single-thread
+// regression. Real per-bucket parallel scaling needs sharding (deferred to
+// M6 because pending_/epoch_/fstats_ are global by design).
+//
+// This is intentionally a smoke test, not a perf gate: hard scaling
+// thresholds would be flaky across CI hardware. We assert correctness +
+// non-trivial work; TSan + the random-fuzz test cover the race side.
+// ---------------------------------------------------------------------------
+TEST(KeyDirStress, ConcurrentReadersDoNotSerialize) {
+    KeyDir kd;
+    constexpr int kPopulate = 1024;
+    // Pre-build the key set so the hot loop does no allocation; otherwise
+    // glibc malloc's internal lock dominates and hides the keydir lock
+    // behaviour we want to exercise.
+    std::vector<std::string> keys;
+    keys.reserve(kPopulate);
+    for (int i = 0; i < kPopulate; ++i) {
+        keys.push_back(make_key(i));
+        kd.put(keys.back(), 1, 100,
+               static_cast<std::uint64_t>(i), 1, 0, /*newest*/ false, 0, 0);
+    }
+
+    constexpr int kThreads = 4;
+    std::atomic<bool> go{false};
+    std::atomic<bool> stop{false};
+    std::vector<std::uint64_t> per_thread(kThreads, 0);
+    std::vector<std::thread> ts;
+    ts.reserve(kThreads);
+
+    for (int t = 0; t < kThreads; ++t) {
+        ts.emplace_back([&, t]() {
+            std::mt19937 rng(0x1234u + static_cast<unsigned>(t));
+            std::uniform_int_distribution<int> key_dist(0, kPopulate - 1);
+            while (!go.load(std::memory_order_acquire)) { /* spin */ }
+            std::uint64_t local = 0;
+            while (!stop.load(std::memory_order_relaxed)) {
+                (void)kd.get(keys[static_cast<std::size_t>(key_dist(rng))]);
+                ++local;
+            }
+            per_thread[static_cast<std::size_t>(t)] = local;
+        });
+    }
+
+    go.store(true, std::memory_order_release);
+    std::this_thread::sleep_for(250ms);
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& t : ts) t.join();
+
+    std::uint64_t total = 0;
+    for (auto v : per_thread) total += v;
+
+    // Each thread did real work; no thread starved.
+    for (int t = 0; t < kThreads; ++t) {
+        EXPECT_GT(per_thread[static_cast<std::size_t>(t)], 10000u)
+            << "thread " << t << " starved";
+    }
+    // Aggregate sanity: at minimum each thread should clear ~10k ops in
+    // 250ms even if shared_mutex contention is heavy. 100k total is a very
+    // loose floor that won't false-fail on slow CI.
+    EXPECT_GT(total, 100000u);
+}
+
+// ---------------------------------------------------------------------------
 // Long-running ABA-style: same key gets put/removed many times during a
 // long-lived fold. The fold must consistently see the snapshot of the key
 // *as it was when the fold started*, regardless of how many revisions
