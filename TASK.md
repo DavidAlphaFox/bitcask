@@ -94,34 +94,54 @@
 ## 里程碑 2:KeyDir 下沉(最核心)(5–8 天)
 
 > 目标:复刻 keydir 的 sibling 链 + epoch + pending 表机制,EQC 必须全过。
+> 由于工作量大,M2 拆成 5 个子阶段;每个子阶段独立验收。
 
-### C++ 实现
-- [ ] `cpp/include/bitcask/keydir.hpp`:对外接口(put/get/remove/iter/fold/info/copy)
-- [ ] `cpp/src/keydir/entry.hpp`:`KeyDirEntry` 内嵌变长 key(对应 `bitcask_keydir_entry`)
-- [ ] `cpp/src/keydir/entry.hpp`:sibling 链表节点(对应 `bitcask_keydir_entry_sib`)
-- [ ] `cpp/src/keydir/keydir.cpp`:主体实现,初版**单 mutex** 等价语义
-- [ ] `cpp/src/keydir/iterator.cpp`:fold 快照迭代器(epoch 隔离)
-- [ ] `cpp/src/keydir/pending.cpp`:迭代期间的 pending 影子表与 merge 回写
-- [ ] `cpp/src/keydir/fstats.cpp`:`bitcask_fstats_entry` 等价实现
-- [ ] 全局注册表:`std::unordered_map<std::string, std::shared_ptr<KeyDir>>` + 全局 mutex,refcount 语义
-- [ ] `set_pending_delete` / `update_fstats` / `keydir_trim_fstats` 移植
+### M2.1 — 核心结构 + 简单 ops + fstats(单 mutex,无 sibling/pending)
+- [x] `cpp/include/bitcask/keydir.hpp`:`Entry` / `EntryProxy` / `FStatsEntry` / `KeyDir` API
+- [x] `cpp/src/keydir/keydir.cpp`:put/get/remove/conditional_remove/get_epoch/info/deep_copy
+- [x] put 的 staleness 检查 + merge race 检测(legacy `keydir_put_int` 的 4 类返回路径)
+- [x] fstats:update_fstats/set_pending_delete/trim_fstats(8-arg 接口与 legacy 对齐)
+- [x] biggest_file_id + increment_file_id (/at_least)
+- [x] 全部用 `std::scoped_lock` + `std::unordered_map` 起步
+- [x] **27 个 GoogleTest** 单测(含 8 线程并发 put);ctest **65/65**
+- [x] ASan+UBSan + TSan **三 sanitizer 全过**
 
-### NIF 翻译层
+### M2.2 — Sibling 链 + Pending 表 + 迭代器(并发 fold 语义)⏳
+- [ ] `Entry` 升级为 `std::variant<SingleRevision, MultiRevision>`,后者是按 epoch 倒序的 sibling 链
+- [ ] `pending_` 影子哈希:`keyfolders > 0` 且需要 rehash 时启用
+- [ ] `merge_pending_entries`:fold 全部结束时把 pending 合并回 entries
+- [ ] `set_entry_tombstone` / `update_kd_entry_list`:fold 期间的 in-place 更新
+- [ ] `perhaps_sweep_siblings`:迭代结束后的惰性 sibling 清扫
+- [ ] iter API:`itr_start(maxage, maxputs)` / `itr_next(handle)` / `itr_release(handle)`
+- [ ] `proxy_kd_entry_at_epoch` 等价:返回指定 epoch 的快照
+- [ ] `pending_awaken` 队列 + `wait_pending`(out_of_date 重试)
+- [ ] 测试:fold 期间并发 put/delete 不影响快照内容
+- [ ] 测试:多个并发 fold 共享同一 pending
+
+### M2.3 — 全局注册表 + 命名 KeyDir + Refcount ⏳
+- [ ] `KeyDirRegistry`:`std::unordered_map<std::string, std::shared_ptr<KeyDir>>` + 全局 mutex
+- [ ] `keydir_new/0`(匿名/私有) vs `keydir_new/1`(命名/共享 + refcount)
+- [ ] `maybe_keydir_new/1`:仅查询,不创建
+- [ ] `keydir_mark_ready` 与 `is_ready` 协议:第一个打开者负责 init,其他人等待
+- [ ] biggest_file_id 跨 close/reopen 持久化(`global_biggest_file_id`)
+- [ ] release 行为:refcount 减一,降到 0 才真正释放
+
+### M2.4 — NIF wiring + Erlang shim + parity ⏳
 - [ ] `cpp/nif/nif_keydir.cpp`:维持现有 15+ 个 `keydir_*_int` 函数签名
-- [ ] 资源类型 `bitcask_keydir_RESOURCE` 与 `bitcask_keydir_handle` 等价
-- [ ] 测试 `keydir_copy/1` 的深拷贝语义
+- [ ] `bitcask_keydir_resource`:placement-new 持有 `KeyDirHandle`(指向共享 `KeyDir`)
+- [ ] `bitcask_cpp_nifs.erl` 扩展 keydir API
+- [ ] `test/bitcask_cpp_nifs_keydir_tests.erl`:legacy vs C++ 行为 byte-level 对齐
 
-### 测试
-- [ ] `cpp/tests/keydir_test.cpp`:单线程 put/get/remove/iter 基础
-- [ ] `cpp/tests/concurrent_fold_test.cpp`:fold 期间并发 put/delete,验证快照
-- [ ] `cpp/tests/sibling_chain_test.cpp`:多 epoch 下 sibling 链行为
+### M2.5 — EQC 5 分钟门槛 ⏳
 - [ ] EQC `bitcask_qc.erl` 跑 ≥ 5 分钟全过(**合并门槛**)
 - [ ] EQC `bitcask_qc_fsm.erl` 跑 ≥ 5 分钟全过
+- [ ] PULSE 30 秒不挂
 
-### 切换 & 验收
-- [ ] 切换 `on_load`,删除 `c_src/bitcask_nifs.c` 的 keydir 段
-- [ ] 1M key benchmark:吞吐 ≥ 旧版 90%
-- [ ] TSan 无 race report
+### 后续(放到 M5 性能优化)
+- [ ] `std::shared_mutex` + 桶级锁
+- [ ] `absl::flat_hash_map` 替换
+- [ ] 1M key benchmark:吞吐 ≥ 旧版 90%(M2 不要求,M5 要求)
+- [ ] 删除 `c_src/bitcask_nifs.c` 的 keydir 段(M4 整体瘦身)
 
 **验收**:eunit + EQC 全绿;keydir 部分性能不退化。
 
@@ -254,7 +274,7 @@
 |--------|------|------|------|------|
 | M0 脚手架 + 格式抓手 | ✅ | 2026-04-29 | 2026-04-29 | 工具链 + 格式 codec + sanitizer + rebar 双产出全部就绪;eunit 81/81、ctest 19/19 |
 | M1 文件 I/O + Lock 下沉 | ✅ | 2026-04-29 | 2026-04-29 | `bitcask_cpp_nifs` 与 `bitcask_nifs` parity 验证;eunit 100/100;ctest 38/38(三 sanitizer 全过) |
-| M2 KeyDir 下沉 | ⬜ | | | |
+| M2 KeyDir 下沉 | 🟨 | 2026-04-29 | | M2.1 done(核心 ops + fstats + 27 单测 + 3 sanitizer 全过);M2.2–2.5 进行中 |
 | M3 Fileops + 合并核心下沉 | ⬜ | | | |
 | M4 Erlang 层瘦身 | ⬜ | | | |
 | M5 并发优化 + 工程化 | ⬜ | | | |

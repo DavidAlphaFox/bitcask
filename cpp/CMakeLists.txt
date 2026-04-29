@@ -35,6 +35,17 @@ target_include_directories(bitcask_io PUBLIC include)
 target_link_libraries(bitcask_io PRIVATE bitcask_warnings)
 
 # ---------------------------------------------------------------------------
+# bitcask_keydir — in-memory key directory.
+# M2.1 scope: single-mutex, single-revision. Multi-revision + pending hash
+# come in M2.2.
+# ---------------------------------------------------------------------------
+add_library(bitcask_keydir STATIC
+    src/keydir/keydir.cpp
+)
+target_include_directories(bitcask_keydir PUBLIC include)
+target_link_libraries(bitcask_keydir PRIVATE bitcask_warnings)
+
+# ---------------------------------------------------------------------------
 # bitcask_cpp.so — C++ NIF, registered as Erlang module bitcask_cpp_nifs.
 # M1 phase: implements the file_*_int / lock_*_int subset of the legacy NIF.
 # Coexists with priv/bitcask.so (legacy C). To eventually replace it in M4.
