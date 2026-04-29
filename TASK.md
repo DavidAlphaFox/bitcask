@@ -106,17 +106,20 @@
 - [x] **27 个 GoogleTest** 单测(含 8 线程并发 put);ctest **65/65**
 - [x] ASan+UBSan + TSan **三 sanitizer 全过**
 
-### M2.2 — Sibling 链 + Pending 表 + 迭代器(并发 fold 语义)⏳
-- [ ] `Entry` 升级为 `std::variant<SingleRevision, MultiRevision>`,后者是按 epoch 倒序的 sibling 链
-- [ ] `pending_` 影子哈希:`keyfolders > 0` 且需要 rehash 时启用
-- [ ] `merge_pending_entries`:fold 全部结束时把 pending 合并回 entries
-- [ ] `set_entry_tombstone` / `update_kd_entry_list`:fold 期间的 in-place 更新
-- [ ] `perhaps_sweep_siblings`:迭代结束后的惰性 sibling 清扫
-- [ ] iter API:`itr_start(maxage, maxputs)` / `itr_next(handle)` / `itr_release(handle)`
-- [ ] `proxy_kd_entry_at_epoch` 等价:返回指定 epoch 的快照
-- [ ] `pending_awaken` 队列 + `wait_pending`(out_of_date 重试)
-- [ ] 测试:fold 期间并发 put/delete 不影响快照内容
-- [ ] 测试:多个并发 fold 共享同一 pending
+### M2.2 — Sibling 链 + Pending 表 + 迭代器(并发 fold 语义)
+- [x] `Entry` 升级为 `std::variant<SingleEntry, MultiEntry>`,sibling 链按 epoch 倒序
+- [x] `pending_` 影子哈希(`std::optional<unordered_map>`):新 key 在 fold 期间写入时启用
+- [x] `merge_pending_and_collapse_locked`:最后一个 folder release 时把 pending 合并回 entries 并把所有 MultiEntry 折叠回 Single
+- [x] iter API:`make_iter()` 工厂 + `IterHandle::start/next/release`(析构自动 release)
+- [x] `entry_at_epoch` 等价 `proxy_kd_entry_at_epoch`:返回指定 epoch 的快照
+- [x] StartIterResult:`kOk` / `kAlreadyIterating` / `kOutOfDate`(maxage / maxputs 检查)
+- [x] put 4 路径都覆盖:pending 已存在 / pending 新建 / entries 加 sibling / entries 直接写
+- [x] remove 走 sibling tombstone 路径(语义等价于 legacy 的 set_entry_tombstone)
+- [x] **18 个 iter 测试 + 27 个原 keydir 测试 = 45 个**,ctest **83/83 PASS**
+- [x] ASan+UBSan / TSan 三组合 **45/45 全过**
+- [x] **stress test**:4 写线程 + 3 fold 线程并发,验证每次 fold 看到无重复无丢失的快照
+- [ ] `pending_awaken` 队列(NIF 层职责,M2.4 加)
+- [ ] `perhaps_sweep_siblings` 惰性清扫(性能优化,M5)
 
 ### M2.3 — 全局注册表 + 命名 KeyDir + Refcount ⏳
 - [ ] `KeyDirRegistry`:`std::unordered_map<std::string, std::shared_ptr<KeyDir>>` + 全局 mutex
