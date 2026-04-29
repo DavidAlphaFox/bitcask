@@ -24,6 +24,19 @@ target_link_libraries(bitcask_format
 )
 
 # ---------------------------------------------------------------------------
+# bitcask_fileops — DataFile + HintFile abstractions over PosixFile + codec.
+# ---------------------------------------------------------------------------
+add_library(bitcask_fileops STATIC
+    src/fileops/data_file.cpp
+    src/fileops/hint_file.cpp
+)
+target_include_directories(bitcask_fileops PUBLIC include)
+target_link_libraries(bitcask_fileops
+    PUBLIC bitcask_format bitcask_io
+    PRIVATE bitcask_warnings
+)
+
+# ---------------------------------------------------------------------------
 # bitcask_io — POSIX file + advisory lock primitives.
 # Pure C++. Used by the NIF translation layer and by C++ unit tests directly.
 # ---------------------------------------------------------------------------

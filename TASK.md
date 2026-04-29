@@ -181,16 +181,35 @@
 ## 里程碑 3:Fileops + 合并核心下沉 (5–7 天)
 
 > 目标:把 `bitcask_fileops.erl` 与 `bitcask.erl` 中的合并/扫描/状态计算迁到 C++,引入粗粒度 NIF API。
+> 仿 M2 拆 5 个子阶段;每个子阶段独立验收。
 
-### C++ 实现
-- [ ] `cpp/src/fileops/data_file.cpp`:数据文件读写、迭代、CRC 校验
-- [ ] `cpp/src/fileops/hint_file.cpp`:hint 文件读写、末尾 CRC 记录
-- [ ] `cpp/src/fileops/scanner.cpp`:目录扫描、`data_file_tstamps`、文件名解析
-- [ ] `cpp/src/merge/policy.cpp`:`needs_merge` 策略(frag/dead_bytes/small_file 阈值)
-- [ ] `cpp/src/merge/merger.cpp`:合并主体(读旧文件、写新文件、更新 keydir、写 tombstone)
-- [ ] `cpp/src/api/cask.cpp`:`Cask` 类,封装 `bc_state` 等价语义
-- [ ] `cpp/src/api/options.cpp`:配置项解析(从 Erlang term 翻译)
-- [ ] `cpp/src/api/status.cpp`:`status` / `is_empty_estimate` / `info`
+### M3.1 — DataFile + HintFile C++ 类(基于 M0 codec + M1 PosixFile)
+- [x] `cpp/include/bitcask/data_file.hpp` + `cpp/src/fileops/data_file.cpp`:`DataFile` 类(open/write/read/fold/sync/truncate_here)
+- [x] `cpp/include/bitcask/hint_file.hpp` + `cpp/src/fileops/hint_file.cpp`:`HintFile` 类(append/finalize/fold/validate_trailer)
+- [x] 文件名 helpers:`mk_data_filename`、`mk_hint_filename`、`parse_data_tstamp`(对应 legacy `mk_filename`/`hintfile_name`/`file_tstamp`)
+- [x] CRC32 复用 zlib;运行 CRC 在 HintFile 内部累积
+- [x] `validate_trailer`:O(filesize) 流式扫描,与 legacy `has_valid_hintfile` 行为对齐
+- [x] **12 个 GoogleTest**:filename helper、DataFile round-trip、CRC 检测、HintFile validate_trailer 三种场景、DataFile↔HintFile 配对一致性
+- [x] ctest **110/110 全过**(包括 ASan+UBSan)
+- [x] eunit 不回归 **130/130**
+
+### M3.2 — 目录扫描器 ⏳
+- [ ] `cpp/include/bitcask/scanner.hpp`:`scan_dir(dirname)` 返回 `[(tstamp, data_path, hint_path?)]`
+- [ ] 跳过格式不正确的文件;按 tstamp 升序
+
+### M3.3 — Merge 策略 + merger 主体 ⏳
+- [ ] `cpp/include/bitcask/merge.hpp`:`MergePolicy` + `needs_merge(fstats, opts) -> {bool, [file_id]}`
+- [ ] `cpp/src/merge/merger.cpp`:`Merger` 类,合并旧 data 文件到新 file,更新 keydir,处理 tombstone
+
+### M3.4 — Cask 类 + 粗粒度 `cask_*` NIF ⏳
+- [ ] `cpp/include/bitcask/cask.hpp`:`Cask` 类(open/get/put/delete/sync/fold/merge/needs_merge/status/close)
+- [ ] `cpp/nif/nif_cask.cpp`:14 个 `cask_*` NIF
+- [ ] dirty scheduler 标记:open/merge/fold 走 `ERL_NIF_DIRTY_JOB_IO_BOUND`
+
+### M3.5 — Erlang shim + parity ⏳
+- [ ] `bitcask_cpp_nifs.erl` 增加 `cask_*` API
+- [ ] `bitcask:open/2` 增加 `{nifs, cask_cpp}` 选项,直接走 `cask_open` 而非 `keydir + 散件 NIF`
+- [ ] 业务流 parity 测试
 
 ### NIF 粗粒度 API(D2 落地)
 - [ ] `cask_open/2`、`cask_close/1`
@@ -306,7 +325,7 @@
 | M0 脚手架 + 格式抓手 | ✅ | 2026-04-29 | 2026-04-29 | 工具链 + 格式 codec + sanitizer + rebar 双产出全部就绪;eunit 81/81、ctest 19/19 |
 | M1 文件 I/O + Lock 下沉 | ✅ | 2026-04-29 | 2026-04-29 | `bitcask_cpp_nifs` 与 `bitcask_nifs` parity 验证;eunit 100/100;ctest 38/38(三 sanitizer 全过) |
 | M2 KeyDir 下沉 | ✅ | 2026-04-29 | 2026-04-29 | M2.1–2.5 全部完成;C++ ctest 98/98、eunit 130/130;**`{nifs, cpp}` flag 让 bitcask:open 跑通 cpp NIF 业务路径** |
-| M3 Fileops + 合并核心下沉 | ⬜ | | | |
+| M3 Fileops + 合并核心下沉 | 🟨 | 2026-04-29 | | M3.1 done(DataFile + HintFile,12 单测全过);M3.2-3.5 进行中 |
 | M4 Erlang 层瘦身 | ⬜ | | | |
 | M5 并发优化 + 工程化 | ⬜ | | | |
 
