@@ -2,8 +2,9 @@
 
 namespace bitcask::nif {
 
-ErlNifResourceType* g_file_resource_type = nullptr;
-ErlNifResourceType* g_lock_resource_type = nullptr;
+ErlNifResourceType* g_file_resource_type   = nullptr;
+ErlNifResourceType* g_lock_resource_type   = nullptr;
+ErlNifResourceType* g_keydir_resource_type = nullptr;
 
 void file_resource_dtor(ErlNifEnv* /*env*/, void* obj) noexcept {
     static_cast<io::PosixFile*>(obj)->~PosixFile();
@@ -11,6 +12,12 @@ void file_resource_dtor(ErlNifEnv* /*env*/, void* obj) noexcept {
 
 void lock_resource_dtor(ErlNifEnv* /*env*/, void* obj) noexcept {
     static_cast<lock::FileLock*>(obj)->~FileLock();
+}
+
+void keydir_resource_dtor(ErlNifEnv* /*env*/, void* obj) noexcept {
+    auto* h = static_cast<KeyDirHandle*>(obj);
+    h->release_quiet();
+    h->~KeyDirHandle();
 }
 
 bool register_resources(ErlNifEnv* env) noexcept {
@@ -26,6 +33,11 @@ bool register_resources(ErlNifEnv* env) noexcept {
         env, /*module_str*/ nullptr, "bitcask_lock_resource",
         &lock_resource_dtor, flags, nullptr);
     if (!g_lock_resource_type) return false;
+
+    g_keydir_resource_type = enif_open_resource_type(
+        env, /*module_str*/ nullptr, "bitcask_cpp_keydir_resource",
+        &keydir_resource_dtor, flags, nullptr);
+    if (!g_keydir_resource_type) return false;
 
     return true;
 }

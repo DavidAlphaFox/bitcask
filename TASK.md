@@ -132,11 +132,18 @@
 - [x] ASan+UBSan / TSan **三组合全过 56/56**
 - [ ] 匿名 keydir(`keydir_new/0`):直接 `std::make_shared<KeyDir>()` 即可,无需 registry,等到 M2.4 NIF 接入时再做封装
 
-### M2.4 — NIF wiring + Erlang shim + parity ⏳
-- [ ] `cpp/nif/nif_keydir.cpp`:维持现有 15+ 个 `keydir_*_int` 函数签名
-- [ ] `bitcask_keydir_resource`:placement-new 持有 `KeyDirHandle`(指向共享 `KeyDir`)
-- [ ] `bitcask_cpp_nifs.erl` 扩展 keydir API
-- [ ] `test/bitcask_cpp_nifs_keydir_tests.erl`:legacy vs C++ 行为 byte-level 对齐
+### M2.4 — NIF wiring + Erlang shim + parity
+- [x] `cpp/nif/atoms.{hpp,cpp}` 扩展:`bitcask_entry / not_found / already_exists / not_ready / ready / out_of_date / iteration_in_process / iteration_not_started / true / false / undefined`
+- [x] `cpp/nif/term_conv.hpp` 扩展:`get_uint64_bin` / `make_uint64_bin`(8字节 native-endian offset 编解码,与 legacy 对齐)
+- [x] `cpp/nif/resources.{hpp,cpp}` 扩展:`KeyDirHandle` 资源(持 `shared_ptr<KeyDir>` + 可选 registry/name + iter)
+- [x] `cpp/nif/priv_data.hpp`:`PrivData{KeyDirRegistry}`,通过 `enif_priv_data` 持有
+- [x] `cpp/nif/nif_keydir.cpp`(~330 行):**19 个 `keydir_*` NIF 函数**全部实现
+- [x] `cpp/nif/nif_main.cpp` 扩展:21 个新 ErlNifFunc 注册 + on_unload 释放 PrivData
+- [x] `src/bitcask_cpp_nifs.erl` 扩展:`keydir_*` API,offset 自动 binary↔int 转换,与 `bitcask_nifs.erl` API 对齐
+- [x] `test/bitcask_cpp_nifs_keydir_tests.erl`:**20 个 parity 测试**(19 双跑 + 1 cpp-only)
+- [x] **意外收获**:发现 legacy `keydir_copy` 存在 14 年的旧 bug(memset 错了 handle 指针,把 source 清空),C++ 实现没有此 bug,我们用 cpp-only 测试明确防回归
+- [x] eunit 全套 **120/120 PASS**(81 legacy + 19 M1 + 20 M2.4)
+- [x] C++ ctest **94/94 PASS**;ASan+UBSan 全过
 
 ### M2.5 — EQC 5 分钟门槛 ⏳
 - [ ] EQC `bitcask_qc.erl` 跑 ≥ 5 分钟全过(**合并门槛**)

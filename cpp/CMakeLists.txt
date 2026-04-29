@@ -56,6 +56,7 @@ add_library(bitcask_cpp MODULE
     nif/nif_main.cpp
     nif/nif_io.cpp
     nif/nif_lock.cpp
+    nif/nif_keydir.cpp
     nif/atoms.cpp
     nif/resources.cpp
 )
@@ -63,6 +64,7 @@ target_link_libraries(bitcask_cpp
     PRIVATE
         Erlang::ERTS
         bitcask_io
+        bitcask_keydir
         bitcask_warnings
 )
 set_target_properties(bitcask_cpp PROPERTIES

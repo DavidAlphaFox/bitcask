@@ -25,6 +25,18 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     cur               = a("cur");
     bof               = a("bof");
     eof_whence        = eof;  // legacy uses the same `eof` atom for whence
+
+    bitcask_entry         = a("bitcask_entry");
+    not_found             = a("not_found");
+    already_exists        = a("already_exists");
+    not_ready             = a("not_ready");
+    ready                 = a("ready");
+    out_of_date           = a("out_of_date");
+    iteration_in_process  = a("iteration_in_process");
+    iteration_not_started = a("iteration_not_started");
+    atom_true             = a("true");
+    atom_false            = a("false");
+    undefined             = a("undefined");
 }
 
 Atoms& atoms() noexcept { return g_atoms; }

@@ -27,6 +27,19 @@ struct Atoms {
     ERL_NIF_TERM bof;
     ERL_NIF_TERM eof_whence;  // duplicate of `eof` but kept named for clarity
 
+    // keydir atoms
+    ERL_NIF_TERM bitcask_entry;
+    ERL_NIF_TERM not_found;
+    ERL_NIF_TERM already_exists;
+    ERL_NIF_TERM not_ready;
+    ERL_NIF_TERM ready;
+    ERL_NIF_TERM out_of_date;
+    ERL_NIF_TERM iteration_in_process;
+    ERL_NIF_TERM iteration_not_started;
+    ERL_NIF_TERM atom_true;
+    ERL_NIF_TERM atom_false;
+    ERL_NIF_TERM undefined;
+
     void init(ErlNifEnv* env) noexcept;
 };
 
