@@ -9,12 +9,12 @@
 
 ## 待确认的决策点(动手前必须拍板)
 
-- [ ] **D1 磁盘格式**:保持与现有版本逐字节兼容(数据文件 14B header / hint 18B / tombstone v0/v1/v2)
-- [ ] **D2 NIF 接口粒度**:粗粒度 API(`cask_open/get/put/del/fold/merge/...`,约 15 个函数),废弃现有 30+ 细粒度函数
+- [x] **D1 磁盘格式**:保持与现有版本逐字节兼容(数据文件 14B header / hint 18B / tombstone v0/v1/v2)
+- [x] **D2 NIF 接口粒度**:粗粒度 API(`cask_open/get/put/del/fold/merge/...`,约 15 个函数),废弃现有 30+ 细粒度函数
 - [ ] **D3 哈希实现**:`absl::flat_hash_map`(开放寻址,缓存友好);备选 `std::unordered_map`
 - [ ] **D4 并发模型**:`std::shared_mutex` + 分桶锁(默认 64 桶)
 - [ ] **D5 错误传递**:内部 `std::expected<T, Error>`(C++23);NIF 边界翻译为 `{ok,_}` / `{error,_}`
-- [ ] **D6 构建系统**:CMake 顶层产出 `priv/bitcask.so`;rebar3 通过 `pre_hooks` 调 cmake(替换 `pc` 插件)
+- [x] **D6 构建系统**:CMake 顶层产出 `priv/bitcask.so`;rebar3 通过 `pre_hooks` 调 cmake(替换 `pc` 插件)
 - [x] **D7 语言标准与编译器**:**C++23**(`-std=c++23`),最低 GCC 13 / Clang 16,目标环境 GCC 14.2(Debian 14.2.0-19)。可放心使用 `std::expected` / `std::print` / `std::flat_map` / `std::jthread` / `<ranges>`
 - [ ] **D8 依赖管理**:CMake `FetchContent` 拉 abseil + GoogleTest + Google Benchmark
 - [ ] **D9 合并执行模式**:由 `bitcask_merge_worker` gen_server 触发,NIF 内同步执行(走 dirty scheduler)
@@ -42,20 +42,21 @@
 
 > 目标:建立 CMake + GoogleTest 框架,拿到磁盘格式的 golden 测试。本里程碑对现有代码零侵入。
 
-- [ ] 顶层 `CMakeLists.txt`,要求 cmake ≥ 3.20
-- [ ] `cmake/FindErlang.cmake`:通过 `erl -eval` 探测 ERTS include / lib 路径
-- [ ] `cmake/BitcaskWarnings.cmake`:`-Wall -Wextra -Wconversion -Wshadow -fvisibility=hidden`
+- [x] 顶层 `CMakeLists.txt`,要求 cmake ≥ 3.20
+- [x] `cmake/FindErlang.cmake`:通过 `erl -eval` 探测 ERTS include / lib 路径
+- [x] `cmake/BitcaskWarnings.cmake`:`-Wall -Wextra -Wconversion -Wshadow -fvisibility=hidden`(暂内联在 `cpp/CMakeLists.txt`,后续如需复用再抽出)
 - [ ] `cmake/BitcaskSanitizers.cmake`:`-DBITCASK_SANITIZE=address|thread|undefined`
-- [ ] `cpp/` 目录骨架(`include/`、`src/`、`nif/`、`tests/`)
-- [ ] 编译产出空 stub `bitcask_stub.so` 到 `priv/`(暂不替换原 NIF)
+- [x] `cpp/` 目录骨架(`include/`、`src/`、`nif/`、`tests/`)
+- [x] 编译产出空 stub `bitcask_stub.so` 到 `priv/`(暂不替换原 NIF)
+- [x] **端到端验证**:Erlang `erlang:load_nif/2` 加载 stub 成功并调用 `ping/0` 返回 `pong`
 - [ ] `rebar.config` 增加 cmake `pre_hooks`(双产出阶段:cmake + 原 `pc`)
-- [ ] `FetchContent` 接入 GoogleTest,跑通 hello-world 单测
+- [x] `FetchContent` 接入 GoogleTest(v1.15.2),跑通 hello-world 单测
 - [ ] `cpp/src/format/layout.hpp`:从 `include/bitcask.hrl` 移植所有二进制布局常量
 - [ ] `cpp/src/fileops/codec.cpp`:实现数据文件 / hint 记录的编解码
 - [ ] `cpp/tests/codec_test.cpp`:用真实数据文件 fixture 验证字节级一致
 - [ ] `cpp/tests/fixtures/`:放入若干已知数据文件(从现有 eunit 测试目录拷)
 - [ ] `make compile && make test` 全绿
-- [ ] `ctest --output-on-failure` 通过
+- [x] `ctest --output-on-failure` 通过(2/2 PASS)
 
 **验收**:eunit 全套不受影响;codec golden test 通过。
 
@@ -248,7 +249,7 @@
 
 | 里程碑 | 状态 | 起始 | 完成 | 备注 |
 |--------|------|------|------|------|
-| M0 脚手架 + 格式抓手 | ⬜ | | | |
+| M0 脚手架 + 格式抓手 | 🟨 | 2026-04-29 | | 工具链已打通(cmake/gtest/NIF 加载),余:sanitizer cmake、rebar hook、format/codec |
 | M1 文件 I/O + Lock 下沉 | ⬜ | | | |
 | M2 KeyDir 下沉 | ⬜ | | | |
 | M3 Fileops + 合并核心下沉 | ⬜ | | | |
