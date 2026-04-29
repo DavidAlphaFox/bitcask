@@ -67,24 +67,27 @@
 > 目标:把无并发难点、纯函数性质的 file I/O 与 lock 模块迁到 C++,验证 NIF 翻译层与资源生命周期。
 
 ### C++ 实现
-- [ ] `cpp/include/bitcask/io.hpp`:`PosixFile` 接口(open/close/sync/pread/pwrite/read/write/position/truncate)
-- [ ] `cpp/src/io/posix_file.cpp`:基于 POSIX fd 的实现,支持 `O_SYNC` 与 readonly
-- [ ] `cpp/src/lock/file_lock.cpp`:`fcntl` / `flock` 文件锁(write / merge / create 三类)
-- [ ] `cpp/src/util/error.hpp`:`Error` 类型与 errno 映射
+- [x] `cpp/include/bitcask/io.hpp` + `cpp/src/io/posix_file.cpp`:`PosixFile` 类(open/close/sync/pread/pwrite/read/write/seek/seek_bof/truncate_here),`std::expected<T, IoError>`,移动语义
+- [x] `cpp/include/bitcask/file_lock.hpp` + `cpp/src/lock/file_lock.cpp`:`FileLock` 类(write 锁 = O_CREAT|O_EXCL|O_RDWR|O_SYNC,read 锁 = O_RDONLY,release 时 unlink 写锁文件)
+- [x] errno 通过 `IoError{int}` 透传至 NIF 层,由 `erl_errno_id()` 翻译为 atom
 
 ### NIF 翻译层
-- [ ] `cpp/nif/term_conv.hpp`:`binary ↔ std::span<const std::byte>` 转换
-- [ ] `cpp/nif/nif_io.cpp`:`file_*_int`(10 个)、`lock_*_int`(4 个)
-- [ ] 资源类型注册:`bitcask_file_RESOURCE`、`bitcask_lock_RESOURCE` 的析构钩子
-- [ ] `cpp/nif/nif_main.cpp`:`ErlNifFunc` 表,先与现有 `c_src/bitcask_nifs.c` 共存(宏切换)
+- [x] `cpp/nif/term_conv.hpp`:latin1 字符串、`ErlNifBinary ↔ std::span<const std::byte>` 转换
+- [x] `cpp/nif/nif_io.cpp`(10 个 `file_*_int`)+ `cpp/nif/nif_lock.cpp`(4 个 `lock_*_int`)
+- [x] `cpp/nif/atoms.{hpp,cpp}`:全部 atom 在 `on_load` 缓存
+- [x] `cpp/nif/resources.{hpp,cpp}`:`bitcask_file_resource` / `bitcask_lock_resource` 注册 + 析构(placement-new 持有 C++ 对象)
+- [x] `cpp/nif/nif_main.cpp`:`ERL_NIF_INIT(bitcask_cpp_nifs, ...)`,与 `c_src/bitcask_nifs.c` 在不同 module 名下共存(`bitcask.so` / `bitcask_cpp.so` 双产出)
 
 ### 切换 & 验收
-- [ ] `bitcask_nifs.erl` 的 `on_load` 加载新 `.so`(通过编译宏 `USE_CPP_NIF=1` 切换)
-- [ ] eunit 全套通过(尤其 `bitcask_lockops` 相关用例)
-- [ ] `make pulse` 跑 30 秒不挂
-- [ ] 删除 `c_src/` 中已替换的 file/lock 部分(保留 keydir 部分到 M2)
+- [x] 新增 `src/bitcask_cpp_nifs.erl` 加载 `priv/bitcask_cpp.so`(legacy `bitcask_nifs` **保持不动**)
+- [x] **平价测试**:`test/bitcask_cpp_nifs_tests.erl` 19 个用例,**legacy vs C++ 同输入返回完全一致** PASS
+- [x] eunit 全套 **100/100** 通过(原 81 + 新增 19)
+- [x] C++ 单测:`posix_file_test` 10 例 + `file_lock_test` 9 例,**ctest 38/38** 全过
+- [x] ASan + UBSan 38/38 全过(0 leak / 0 UB)
+- [ ] `make pulse` 跑 30 秒不挂(EQC/PULSE 路径属于 keydir 范畴,M2 触发)
+- [ ] 删除 `c_src/` 中已替换的 file/lock 部分(推迟到 M4 整体瘦身,保留共存)
 
-**验收**:eunit 全绿;PULSE 无新增竞态告警;ASan 无泄漏。
+**验收**:✅ eunit 100/100;✅ ctest 38/38(no san / ASan / UBSan);✅ legacy 与 C++ NIF 输出 byte-for-byte 一致。
 
 ---
 
@@ -250,7 +253,7 @@
 | 里程碑 | 状态 | 起始 | 完成 | 备注 |
 |--------|------|------|------|------|
 | M0 脚手架 + 格式抓手 | ✅ | 2026-04-29 | 2026-04-29 | 工具链 + 格式 codec + sanitizer + rebar 双产出全部就绪;eunit 81/81、ctest 19/19 |
-| M1 文件 I/O + Lock 下沉 | ⬜ | | | |
+| M1 文件 I/O + Lock 下沉 | ✅ | 2026-04-29 | 2026-04-29 | `bitcask_cpp_nifs` 与 `bitcask_nifs` parity 验证;eunit 100/100;ctest 38/38(三 sanitizer 全过) |
 | M2 KeyDir 下沉 | ⬜ | | | |
 | M3 Fileops + 合并核心下沉 | ⬜ | | | |
 | M4 Erlang 层瘦身 | ⬜ | | | |

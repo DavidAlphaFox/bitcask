@@ -24,14 +24,36 @@ target_link_libraries(bitcask_format
 )
 
 # ---------------------------------------------------------------------------
-# bitcask_stub.so — empty NIF for M0 toolchain validation.
-# Coexists with the legacy priv/bitcask.so. To be replaced in M1.
+# bitcask_io — POSIX file + advisory lock primitives.
+# Pure C++. Used by the NIF translation layer and by C++ unit tests directly.
 # ---------------------------------------------------------------------------
-add_library(bitcask_stub MODULE
-    nif/nif_stub.cpp
+add_library(bitcask_io STATIC
+    src/io/posix_file.cpp
+    src/lock/file_lock.cpp
 )
-target_link_libraries(bitcask_stub PRIVATE Erlang::ERTS bitcask_warnings)
-set_target_properties(bitcask_stub PROPERTIES
+target_include_directories(bitcask_io PUBLIC include)
+target_link_libraries(bitcask_io PRIVATE bitcask_warnings)
+
+# ---------------------------------------------------------------------------
+# bitcask_cpp.so — C++ NIF, registered as Erlang module bitcask_cpp_nifs.
+# M1 phase: implements the file_*_int / lock_*_int subset of the legacy NIF.
+# Coexists with priv/bitcask.so (legacy C). To eventually replace it in M4.
+# Sanitizers are NOT linked here — they would crash BEAM on load.
+# ---------------------------------------------------------------------------
+add_library(bitcask_cpp MODULE
+    nif/nif_main.cpp
+    nif/nif_io.cpp
+    nif/nif_lock.cpp
+    nif/atoms.cpp
+    nif/resources.cpp
+)
+target_link_libraries(bitcask_cpp
+    PRIVATE
+        Erlang::ERTS
+        bitcask_io
+        bitcask_warnings
+)
+set_target_properties(bitcask_cpp PROPERTIES
     PREFIX ""
     SUFFIX ".so"
     LIBRARY_OUTPUT_DIRECTORY "${BITCASK_PRIV_DIR}"
