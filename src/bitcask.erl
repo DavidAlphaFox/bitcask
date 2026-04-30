@@ -27,7 +27,7 @@
          list_keys/1,
          fold_keys/3, fold_keys/6,
          fold/3, fold/6,
-         iterator/3, iterator_next/1, iterator_release/1,
+         stream/1, next/1, stop/1, with_stream/2,
          merge/1, merge/2, merge/3,
          needs_merge/1,
          needs_merge/2,
@@ -176,37 +176,25 @@ fold(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
                        SeeTombstonesP).
 
 %% =========================================================================
-%% 状态化迭代器（每个 Ref 同时只能有一个）
+%% 流式迭代（替代旧的 iterator/3 + iterator_next/1 + iterator_release/1）
 %%
-%%   iterator/3        — 启动迭代；ok | out_of_date | {error, ...}
-%%   iterator_next/1   — 取下一项；#bitcask_entry{} | not_found | {error, ...}
-%%   iterator_release/1— 释放
+%%   stream(Ref)         开一个 producer 进程，返回 StreamRef
+%%   next(StreamRef)     拉一条；{ok, K, V} | done | {error, _}
+%%   stop(StreamRef)     显式结束；幂等
+%%   with_stream(Ref, F) 作用域包装，自动 stop
 %%
-%% out_of_date 出现在迭代器要求一个比 keydir 当前 epoch 更早的快照、
-%% 而该快照已经被回收的情况下；调用方通常重新开始迭代。
+%% 同 Ref 上可以同时开多个 stream（每个 producer 持独立 IterRef）。
+%% Producer 在消费者崩溃时通过 monitor 自动清理 cask_fold_release。
+%% 实现细节见 bitcask_stream 模块。
 %% =========================================================================
 
-iterator(Ref, MaxAge, MaxPuts) ->
-    case bitcask_cpp_nifs:cask_iterator(
-           Ref, cask_max_age(MaxAge), cask_max_put(MaxPuts)) of
-        ok             -> ok;
-        out_of_date    -> out_of_date;
-        {error, _} = E -> E
-    end.
+stream(Ref) -> bitcask_stream:stream(Ref).
 
-%% 把 NIF 返回的扁平元组组装成 #bitcask_entry 记录，保持外部接口不变。
-iterator_next(Ref) ->
-    case bitcask_cpp_nifs:cask_iterator_next(Ref) of
-        not_found    -> not_found;
-        {ok, K, _V, FileId, Offset, TotalSz, Tstamp} ->
-            #bitcask_entry{key = K, file_id = FileId,
-                           total_sz = TotalSz, offset = Offset,
-                           tstamp = Tstamp};
-        {error, _} = E -> E
-    end.
+next(S) -> bitcask_stream:next(S).
 
-iterator_release(Ref) ->
-    bitcask_cpp_nifs:cask_iterator_release(Ref).
+stop(S) -> bitcask_stream:stop(S).
+
+with_stream(Ref, Fun) -> bitcask_stream:with_stream(Ref, Fun).
 
 %% =========================================================================
 %% 目录级 merge

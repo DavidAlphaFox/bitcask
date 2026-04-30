@@ -435,12 +435,12 @@ close_write_file_on_readonly_returns_error_test_() ->
      end}.
 
 %% ===================================================================
-%% iterator/3 + iterator_next/1 + iterator_release/1 cask path
+%% stream/1 + next/1 + stop/1 + with_stream/2
+%% (替代旧的 iterator/3 + iterator_next/1 + iterator_release/1)
 %% ===================================================================
 
-iterator_walks_all_keys_test_() ->
-    {"iterator/3 + iterator_next/1 walk every live key once and end with "
-     "not_found",
+stream_walks_all_keys_test_() ->
+    {"stream + next 把所有活 key 走一遍后返回 done",
      fun() ->
         with_dir(fun(D) ->
             R = bitcask:open(D, ?CASK),
@@ -448,71 +448,155 @@ iterator_walks_all_keys_test_() ->
                 ok = bitcask:put(R, <<"a">>, <<"1">>),
                 ok = bitcask:put(R, <<"b">>, <<"2">>),
                 ok = bitcask:put(R, <<"c">>, <<"3">>),
-                ok = bitcask:iterator(R, -1, -1),
-                Acc = drain_iter(R, []),
-                ok = bitcask:iterator_release(R),
-                Keys = lists:sort([E#bitcask_entry.key || E <- Acc]),
-                ?assertEqual([<<"a">>, <<"b">>, <<"c">>], Keys),
-                %% real entry fields populated
-                lists:foreach(
-                  fun(E) ->
-                      ?assert(E#bitcask_entry.file_id  > 0),
-                      ?assert(E#bitcask_entry.total_sz >= 14),
-                      ?assert(E#bitcask_entry.tstamp   > 0)
-                  end, Acc)
+                {ok, S} = bitcask:stream(R),
+                Pairs = drain_stream(S, []),
+                ok = bitcask:stop(S),
+                Sorted = lists:sort(Pairs),
+                ?assertEqual([{<<"a">>, <<"1">>},
+                              {<<"b">>, <<"2">>},
+                              {<<"c">>, <<"3">>}], Sorted)
             after bitcask:close(R) end
         end)
      end}.
 
-iterator_next_without_start_returns_error_test_() ->
-    {"iterator_next/1 without iterator/3 returns "
-     "{error, iteration_not_started}",
-     fun() ->
-        with_dir(fun(D) ->
-            R = bitcask:open(D, ?CASK),
-            try
-                ?assertEqual({error, iteration_not_started},
-                             bitcask:iterator_next(R))
-            after bitcask:close(R) end
-        end)
-     end}.
-
-iterator_double_start_returns_iteration_in_process_test_() ->
-    {"calling iterator/3 while one is active returns "
-     "{error, iteration_in_process}",
+stream_next_after_done_is_idempotent_test_() ->
+    {"done 之后再 next 仍返回 done，不报错",
      fun() ->
         with_dir(fun(D) ->
             R = bitcask:open(D, ?CASK),
             try
                 ok = bitcask:put(R, <<"k">>, <<"v">>),
-                ok = bitcask:iterator(R, -1, -1),
-                ?assertEqual({error, iteration_in_process},
-                             bitcask:iterator(R, -1, -1)),
-                ok = bitcask:iterator_release(R),
-                %% After release a new iterator can start.
-                ok = bitcask:iterator(R, -1, -1),
-                ok = bitcask:iterator_release(R)
+                {ok, S} = bitcask:stream(R),
+                {ok, <<"k">>, <<"v">>} = bitcask:next(S),
+                ?assertEqual(done, bitcask:next(S)),
+                ?assertEqual(done, bitcask:next(S)),  %% 再调一次还是 done
+                ?assertEqual(done, bitcask:next(S)),
+                ok = bitcask:stop(S)
             after bitcask:close(R) end
         end)
      end}.
 
-iterator_release_idempotent_test_() ->
-    {"iterator_release/1 is safe to call without an active iterator",
+stream_early_stop_test_() ->
+    {"消费者中途 stop，producer 立刻清理；之后还能开新 stream",
      fun() ->
         with_dir(fun(D) ->
             R = bitcask:open(D, ?CASK),
             try
-                ?assertEqual(ok, bitcask:iterator_release(R)),
-                ?assertEqual(ok, bitcask:iterator_release(R))
+                [ok = bitcask:put(R, integer_to_binary(I), <<"v">>)
+                 || I <- lists:seq(1, 50)],
+                {ok, S1} = bitcask:stream(R),
+                {ok, _, _} = bitcask:next(S1),
+                {ok, _, _} = bitcask:next(S1),
+                ?assertEqual(ok, bitcask:stop(S1)),    %% 提前结束
+                ?assertEqual(ok, bitcask:stop(S1)),    %% 幂等
+                %% 同 Ref 上能立刻开第二个 stream
+                {ok, S2} = bitcask:stream(R),
+                Cnt = count_stream(S2, 0),
+                ok = bitcask:stop(S2),
+                ?assertEqual(50, Cnt)
             after bitcask:close(R) end
         end)
      end}.
 
-drain_iter(R, Acc) ->
-    case bitcask:iterator_next(R) of
-        not_found -> Acc;
-        E when is_record(E, bitcask_entry) -> drain_iter(R, [E | Acc]);
-        Other -> erlang:error({unexpected_iter_next, Other})
+with_stream_releases_on_normal_return_test_() ->
+    {"with_stream 在 Fun 正常返回后自动 stop",
+     fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, ?CASK),
+            try
+                ok = bitcask:put(R, <<"k">>, <<"v">>),
+                Result = bitcask:with_stream(R, fun(S) ->
+                    {ok, K, V} = bitcask:next(S),
+                    {K, V}
+                end),
+                ?assertEqual({<<"k">>, <<"v">>}, Result)
+            after bitcask:close(R) end
+        end)
+     end}.
+
+with_stream_releases_on_exception_test_() ->
+    {"with_stream 在 Fun 抛异常时也会 stop 流",
+     fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, ?CASK),
+            try
+                ok = bitcask:put(R, <<"k">>, <<"v">>),
+                ?assertError(boom,
+                    bitcask:with_stream(R, fun(_S) -> erlang:error(boom) end)),
+                %% 流应该已经清理，能开新的
+                {ok, S} = bitcask:stream(R),
+                ok = bitcask:stop(S)
+            after bitcask:close(R) end
+        end)
+     end}.
+
+stream_concurrent_streams_dont_interfere_test_() ->
+    {"同 Ref 上同时开两个 stream，互不干扰",
+     fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, ?CASK),
+            try
+                [ok = bitcask:put(R, integer_to_binary(I), <<"v">>)
+                 || I <- lists:seq(1, 10)],
+                {ok, S1} = bitcask:stream(R),
+                {ok, S2} = bitcask:stream(R),
+                A = lists:sort([K || {K, _} <- drain_stream(S1, [])]),
+                B = lists:sort([K || {K, _} <- drain_stream(S2, [])]),
+                ?assertEqual(A, B),
+                ?assertEqual(10, length(A)),
+                ok = bitcask:stop(S1),
+                ok = bitcask:stop(S2)
+            after bitcask:close(R) end
+        end)
+     end}.
+
+stream_consumer_crash_releases_iter_test_() ->
+    {"消费者进程崩溃 → producer monitor 触发 → 自动 release iter",
+     fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, ?CASK),
+            try
+                ok = bitcask:put(R, <<"k">>, <<"v">>),
+                Self = self(),
+                {Pid, MRef} = spawn_monitor(fun() ->
+                    {ok, S} = bitcask:stream(R),
+                    {bitcask_stream, ProducerPid, _} = S,
+                    Self ! {producer, ProducerPid},
+                    %% 拉一条然后故意 crash，不 stop
+                    {ok, _, _} = bitcask:next(S),
+                    erlang:error(simulated_crash)
+                end),
+                ProducerPid =
+                    receive {producer, P} -> P after 1000 -> error(timeout) end,
+                receive
+                    {'DOWN', MRef, process, Pid, _} -> ok
+                after 2000 -> error(consumer_didnt_die)
+                end,
+                %% 等 producer 通过 monitor 自己退出
+                ProdMon = erlang:monitor(process, ProducerPid),
+                receive
+                    {'DOWN', ProdMon, process, ProducerPid, _} -> ok
+                after 2000 -> error(producer_didnt_die)
+                end,
+                %% iter 应该已 release——能开新 stream 验证
+                {ok, S2} = bitcask:stream(R),
+                ok = bitcask:stop(S2)
+            after bitcask:close(R) end
+        end)
+     end}.
+
+drain_stream(S, Acc) ->
+    case bitcask:next(S) of
+        done -> Acc;
+        {ok, K, V} -> drain_stream(S, [{K, V} | Acc]);
+        Other -> erlang:error({unexpected_next, Other})
+    end.
+
+count_stream(S, N) ->
+    case bitcask:next(S) of
+        done -> N;
+        {ok, _, _} -> count_stream(S, N + 1);
+        Other -> erlang:error({unexpected_next, Other})
     end.
 
 %% ===================================================================
