@@ -1,35 +1,23 @@
-%% -------------------------------------------------------------------
+%% =========================================================================
+%% bitcask_app
 %%
-%% bitcask: Eric Brewer-inspired key/value store
+%%   OTP application 行为模块。bitcask 注册成 application 是为了让
+%%   bitcask:open/2 在 catch application:start(bitcask) 时把所有默认参数
+%%   （max_file_size、open_timeout、sync_strategy 之类）从 .app.src 的 env
+%%   段加载进来。
 %%
-%% Copyright (c) 2010 Basho Technologies, Inc. All Rights Reserved.
+%%   start/2 把控制权交给 bitcask_sup（顶层 supervisor）；该 supervisor 启
+%%   动 bitcask_merge_worker 单例。stop/1 是 OTP 要求的回调，bitcask 没有
+%%   需要在 application 下线时收尾的全局资源——sup 会自动 shutdown 子进
+%%   程；NIF 资源由 BEAM GC 兜底。
 %%
-%% This file is provided to you under the Apache License,
-%% Version 2.0 (the "License"); you may not use this file
-%% except in compliance with the License.  You may obtain
-%% a copy of the License at
-%%
-%%   http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing,
-%% software distributed under the License is distributed on an
-%% "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-%% KIND, either express or implied.  See the License for the
-%% specific language governing permissions and limitations
-%% under the License.
-%%
-%% -------------------------------------------------------------------
+%% Copyright (c) 2010 Basho Technologies, Inc. — Apache License 2.0.
+%% =========================================================================
 -module(bitcask_app).
 
 -behaviour(application).
 
-%% Application callbacks
 -export([start/2, stop/1]).
-
-
-%% ===================================================================
-%% Application callbacks
-%% ===================================================================
 
 start(_StartType, _StartArgs) ->
     bitcask_sup:start_link().

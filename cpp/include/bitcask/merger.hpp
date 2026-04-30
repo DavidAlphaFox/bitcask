@@ -1,20 +1,20 @@
-// Bitcask merger: consolidate fragmented data files into one fresh data
-// file (+ hint), then update the keydir to point at the new locations.
+// Bitcask merger：把若干 fragmented data file 合并成一个新 data file
+// （+ hint），然后 CAS 更新 keydir 指向新位置。
 //
-// M3.3 scope:
-//   - Single output data file (no rollover when output exceeds max_file_size;
-//     M3.4 will add it once Cask wires options end-to-end).
-//   - No concurrent-write CAS handling (legacy uses tombstone-v2 markers
-//     written back to the source files; deferred to M3.4).
-//   - No locks (caller must already hold the merge lock).
-//   - tombstone records in the source are SKIPPED (simple model).
+// M3.3 的精简范围（M3.4+ 在 cask.cpp 里包了完整功能）：
+//   - 输出单个 data file，不超过 max_file_size 也不切分
+//     （M3.4 在 cask 层补上 rollover）
+//   - 不处理跟并发写入的 race（legacy 用 v2 墓碑写回源文件标记，这里
+//     也由 cask 层在 merge 后置 stage 完成）
+//   - 不拿锁——caller 必须已经持有 merge.lock
+//   - 源文件里的墓碑 record 直接 SKIP（简化模型）
 //
-// Even with these simplifications, a successful merge run:
-//   1. Deduplicates: only keys whose keydir entry still points at the input
-//      (file_id, offset) are copied through.
-//   2. Writes a fresh hint file alongside the output data file.
-//   3. CAS-updates the keydir to point each surviving key at the new
-//      (output_file_id, new_offset) via keydir->put(..., old_file_id, old_offset).
+// 即使简化掉这些，run_merge 依然提供：
+//   1. 去重：只有 keydir 仍然指向 (file_id, offset) 的 key 才被复制——
+//      被覆盖 / 删除过的死 record 自然丢弃；
+//   2. 同步生成 hint 文件，加速下次 open 的 keydir 重建；
+//   3. 用 keydir->put(..., old_file_id, old_offset) 做 CAS 更新——
+//      避免跟其它 writer 抢同一个 key。
 
 #pragma once
 
@@ -40,23 +40,26 @@ enum class MergeError {
 struct MergeFault {
     MergeError kind;
     int errnum = 0;
-    std::string detail;  // optional path / context
+    std::string detail;  // 可选：路径 / 上下文，给日志用
 };
 
 struct MergeStats {
     std::string   output_data_path;
     std::string   output_hint_path;
     std::uint32_t output_file_id = 0;
-    std::uint64_t records_seen   = 0;   // total records walked across inputs
-    std::uint64_t records_kept   = 0;   // copied into output
-    std::uint64_t records_stale  = 0;   // skipped: keydir points elsewhere
-    std::uint64_t records_tombs  = 0;   // skipped: tombstone source record
+    std::uint64_t records_seen   = 0;   // 输入文件总扫过的 record 数
+    std::uint64_t records_kept   = 0;   // 实际复制到输出的
+    std::uint64_t records_stale  = 0;   // 跳过：keydir 已指向别处
+    std::uint64_t records_tombs  = 0;   // 跳过：源 record 是墓碑
     std::uint64_t bytes_written  = 0;
 };
 
-// Merges `input_data_paths` (must be data files, not hints) into a new
-// data file + hint inside `output_dir`. The output's file_id is taken by
-// calling keydir.increment_file_id() and is returned in `MergeStats`.
+// 把 input_data_paths（必须都是 data file，不是 hint）合并到 output_dir
+// 下一个新 data file + 新 hint。新文件的 file_id 通过
+// keydir.increment_file_id() 分配，写在 MergeStats 里返回。
+//
+// sync_output=true 让输出文件以 O_SYNC 打开——cask 的 sync_strategy=o_sync
+// 时使用，保证 merge 输出立刻落盘。
 [[nodiscard]] std::expected<MergeStats, MergeFault>
 run_merge(std::span<const std::string> input_data_paths,
           std::string_view output_dir,

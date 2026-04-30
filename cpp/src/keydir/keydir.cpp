@@ -7,13 +7,14 @@
 namespace bitcask::keydir {
 
 // =============================================================================
-// Helpers (no locking; assume the caller holds the keydir mutex)
+// 内部辅助函数（不做锁；caller 必须已持 keydir mutex）
 // =============================================================================
 
 namespace {
 
-// Sibling-tombstone marker matches legacy is_sib_tombstone():
-//   file_id == MAX_FILE_ID && total_sz == MAX_SIZE && offset == MAX_OFFSET.
+// sibling-tombstone：fold 期间删除已存在 key 时，往 sibling 链头部插入的
+// 「墓碑 revision」。三个 sentinel 字段同时取 MAX 是 legacy is_sib_tombstone
+// 的判别约定，沿用以保证跨实现互通。
 SingleEntry make_sibling_tombstone(std::uint64_t epoch, std::uint32_t tstamp) noexcept {
     return SingleEntry{kMaxFileId, kMaxSize, kMaxOffset, epoch, tstamp};
 }
@@ -21,13 +22,15 @@ SingleEntry make_sibling_tombstone(std::uint64_t epoch, std::uint32_t tstamp) no
     return s.file_id == kMaxFileId && s.total_sz == kMaxSize && s.offset == kMaxOffset;
 }
 
-// Pending-tombstone marker matches legacy is_pending_tombstone():
-//   offset == MAX_OFFSET (file_id/total_sz are inherited from a real entry).
+// pending-tombstone：写入 pending_ map 的墓碑标记。只用 offset==MAX 一个
+// 字段判别——legacy is_pending_tombstone 行为；file_id/total_sz 是从真实
+// entry 继承过来的，merge 后会被覆盖。
 [[nodiscard]] bool is_pending_tombstone(const SingleEntry& s) noexcept {
     return s.offset == kMaxOffset;
 }
 
-// Convert a SingleEntry to EntryProxy.
+// SingleEntry → EntryProxy 的字段拷贝。tombstone 标志由 caller 显式传，
+// 因为 SingleEntry 自身不知道自己在 sibling 链里是不是墓碑。
 [[nodiscard]] EntryProxy to_proxy(std::string_view key, const SingleEntry& s,
                                    bool tombstone) noexcept {
     return EntryProxy{
@@ -41,9 +44,11 @@ SingleEntry make_sibling_tombstone(std::uint64_t epoch, std::uint32_t tstamp) no
     };
 }
 
-// Find the revision visible at `target_epoch`. Returns {found, revision,
-// is_tombstone}. For a SingleEntry, simple epoch comparison. For MultiEntry,
-// scan newest-first for the first revision whose epoch <= target_epoch.
+// 找出 target_epoch 时能看到的 revision。
+//   SingleEntry：epoch 比较一下就完事；
+//   MultiEntry ：链是 newest-first 排序的，从头往后扫，第一个 epoch
+//                <= target_epoch 的就是那一刻的可见 revision。
+// 返回 {是否找到, revision 值, 是否墓碑}。
 struct EntryAt {
     bool found = false;
     SingleEntry rev{};
@@ -52,10 +57,10 @@ struct EntryAt {
 [[nodiscard]] EntryAt entry_at_epoch(const Entry& e, std::uint64_t target_epoch) noexcept {
     EntryAt out;
     if (const auto* s = std::get_if<SingleEntry>(&e)) {
-        if (target_epoch < s->epoch) return out;  // not yet existed
+        if (target_epoch < s->epoch) return out;  // 那一刻还没写入
         out.found = true;
         out.rev = *s;
-        out.is_tombstone = false;  // SingleEntry never holds a tombstone
+        out.is_tombstone = false;  // SingleEntry 从不直接表示墓碑
         return out;
     }
     const auto& m = std::get<MultiEntry>(e);
@@ -67,15 +72,28 @@ struct EntryAt {
             return out;
         }
     }
-    return out;  // target_epoch precedes the chain
+    return out;  // target_epoch 早于链中最早的 revision
 }
 
 }  // namespace
 
 // =============================================================================
-// fstats
+// 文件级统计 (fstats)
+//
+// 每个 file_id 一条 FStatsEntry，记录该 data file 的 live/total key 数和
+// 字节数。put / remove 的时候增量更新，merge 触发判断和 status() 都靠它。
+// expiration_epoch 用 set_pending_delete() 设：标记「等所有 < 这个 epoch
+// 的 fold 都收掉之后这个文件就可以删了」——避免迭代器中途被釜底抽薪。
 // =============================================================================
 
+// 增量更新某个 file_id 的 fstats 计数。计数字段全是无符号但 caller
+// 经常传负数（put 的 +live、remove 的 -live），所以这里走 int64 中转，
+// 让 wrap-around 在签名整数语义下完成——这是 legacy 一直在做的把戏，
+// 不要改成 saturating，否则会跟 legacy 字节级对账失败。
+//
+// should_create=false 时如果 file_id 不存在直接 return：set_pending_delete
+// 路径要这个语义——只对已知 file_id 标记 expiration_epoch，不为不存在的
+// file 凭空建一条 fstats。
 void KeyDir::update_fstats_locked(std::uint32_t file_id, std::uint32_t tstamp,
                                    std::uint64_t expiration_epoch,
                                    std::int32_t live_inc, std::int32_t total_inc,
@@ -111,6 +129,8 @@ void KeyDir::update_fstats_locked(std::uint32_t file_id, std::uint32_t tstamp,
     }
 }
 
+// 加锁版本对外入口。每个 put / remove 会调一次，put 一般 should_create=true
+// （首次写入新 file），remove 一般 should_create=false。
 void KeyDir::update_fstats(std::uint32_t file_id, std::uint32_t tstamp,
                             std::uint64_t expiration_epoch,
                             std::int32_t live_inc, std::int32_t total_inc,
@@ -123,6 +143,9 @@ void KeyDir::update_fstats(std::uint32_t file_id, std::uint32_t tstamp,
                          should_create);
 }
 
+// 标记某 file_id「等迭代结束就可以删」。把当前 epoch_ 写到该 file 的
+// expiration_epoch；后续 needs_merge 看到 expiration_epoch < newest fold
+// epoch 就把这个文件标记为「safe to delete」。
 void KeyDir::set_pending_delete(std::uint32_t file_id) {
     std::unique_lock lock(mutex_);
     update_fstats_locked(file_id, /*tstamp*/ 0,
@@ -130,6 +153,8 @@ void KeyDir::set_pending_delete(std::uint32_t file_id) {
                          0, 0, 0, 0, /*should_create*/ false);
 }
 
+// 一次性删一组 file_id 的 fstats（merge 完成后调用，回收旧统计）。
+// 返回找不到的 id 数——caller 用它做日志 / 测试断言；正常路径下应该是 0。
 std::uint32_t KeyDir::trim_fstats(std::span<const std::uint32_t> ids) {
     std::unique_lock lock(mutex_);
     std::uint32_t missing = 0;
@@ -141,14 +166,32 @@ std::uint32_t KeyDir::trim_fstats(std::span<const std::uint32_t> ids) {
 
 // =============================================================================
 // put / get / remove
+//
+// 这是 keydir 的核心。put 的逻辑分支最多：
+//   - 没在跑 fold (keyfolders_ == 0)：直接覆盖 entries_[key]，最简单
+//   - 在跑 fold，且新 key 还不在 entries_ 里：写到 pending_，迭代器看不到
+//   - 在跑 fold，且 key 已经在 entries_ 里：把旧 SingleEntry 升级成
+//     MultiEntry，把新 revision 插到链头——迭代器仍然看到自己 epoch 的
+//     那个 revision，新写入对它不可见
+// merge 路径走 newest_put=false 的「条件 put」：如果当前 entry 的
+// (file_id, offset) 跟 caller 期望的不一致（说明 race 中被覆盖了），
+// 返回 kAlreadyExists 让 merge 跳过。
 // =============================================================================
 
+// 在指定 epoch（默认 kMaxEpoch = 最新）查 key 的可见 revision。
+//
+// 查找顺序：
+//   1. pending_ 表（fold 期间新写入的 key 都在这里）
+//   2. entries_ 主表（可能是 SingleEntry 或 sibling 链 MultiEntry）
+// 任一处找到就返回；墓碑视作「不存在」（kNotFound）。
+//
+// 对应 legacy 的 find_keydir_entry 规则；epoch 比较语义保留：
+// pending entry 的 epoch <= target_epoch 才可见——确保 fold 期间不会
+// 被 fold 启动后才插入的 key 干扰。
 std::optional<EntryProxy> KeyDir::get(std::string_view key,
                                        std::uint64_t target_epoch) const {
     std::shared_lock lock(mutex_);
 
-    // Pending hash first if it exists and pending entry's epoch is visible
-    // at the requested epoch (legacy find_keydir_entry rule).
     if (pending_.has_value()) {
         auto p = pending_->find(std::string(key));
         if (p != pending_->end() && target_epoch >= p->second.epoch) {
@@ -172,6 +215,22 @@ std::uint64_t KeyDir::get_epoch() const {
     return epoch_;
 }
 
+// keydir 写入主入口。
+//
+// 大致控制流：
+//   1. 先把当前 key 在 pending_ + entries_ 里的「最新可见状态」找出来
+//   2. 三种情况分支处理：
+//      (A) key 不存在 / 已是墓碑
+//      (B) key 存在，无 fold 在跑：直接覆盖
+//      (C) key 存在，fold 在跑（keyfolders_ > 0）：升级 SingleEntry →
+//          MultiEntry，把新 revision 插到链头
+//   3. 在中间合适的位置 +1 epoch；这是 keydir 的全局逻辑时钟，
+//      用于 (a) 给新 entry 标记写入时刻，(b) iter 启动时拍快照
+//   4. 最后维护 fstats 计数（live ++、total ++、bytes 变化）
+//
+// 条件 put（old_file_id != 0）来自 merge 路径：只有当前 entry 仍指向
+// (old_file_id, old_offset) 才允许覆盖；不匹配返回 kAlreadyExists 让
+// merger 跳过——避免跟并发 put 抢同一个 key。
 PutResult KeyDir::put(std::string_view key,
                        std::uint32_t file_id, std::uint32_t total_sz,
                        std::uint64_t offset, std::uint32_t tstamp,
@@ -180,8 +239,9 @@ PutResult KeyDir::put(std::string_view key,
                        std::uint32_t old_file_id, std::uint64_t old_offset) {
     std::unique_lock lock(mutex_);
 
-    // Resolve current state of this key (consulting pending then entries),
-    // mirroring legacy find_keydir_entry with epoch == kMaxEpoch.
+    // ---- 阶段 1：探测当前状态 ----
+    // pending 优先，entries 次之；epoch 用 kMaxEpoch 拿最新可见 revision。
+    // 跟 legacy find_keydir_entry 的查找顺序保持一致。
     SingleEntry* pending_entry = nullptr;
     Entry* entries_entry = nullptr;
     EntryProxy current_proxy{};
@@ -210,17 +270,21 @@ PutResult KeyDir::put(std::string_view key,
         }
     }
 
-    // Conditional put on a missing/tombstoned key fails fast (legacy rule).
+    // 条件 put 但 key 不存在 / 已是墓碑：CAS 不可能成功——快速失败。
     if ((!found || current_is_tombstone) && old_file_id != 0) {
         return PutResult::kAlreadyExists;
     }
 
+    // 全局 epoch 计数器递增，作为本次写入的时间戳。
     epoch_ += 1;
     const std::uint64_t this_epoch = epoch_;
 
-    // ---- Path 1: key absent or tombstoned ----
+    // ---- 分支 (A)：key 不存在或当前是墓碑 ----
     if (!found || current_is_tombstone) {
-        // Merge race detection (legacy).
+        // merge race 检查：newest_put 路径上如果 file_id < biggest_file_id_，
+        // 说明并发 merger 已经把 file_id 推到更大的值，这次 put 是「向后」
+        // 写入，必须拒绝（caller 拿到 kAlreadyExists 后会 roll_active 切到
+        // 更大的 file_id 重试）。
         if ((newest_put && file_id < biggest_file_id_) || old_file_id != 0) {
             return PutResult::kAlreadyExists;
         }
@@ -228,25 +292,26 @@ PutResult KeyDir::put(std::string_view key,
         SingleEntry s{file_id, total_sz, offset, this_epoch, tstamp};
 
         if (pending_entry != nullptr) {
-            // Updating an existing pending tombstone — promote back to live.
+            // 之前在 pending 里是墓碑——直接覆盖成活的 entry。
             *pending_entry = s;
         } else if (pending_.has_value()) {
-            // Frozen, key not found anywhere — insert into pending.
+            // 已经 frozen 但这个 key 哪里都没——插入 pending。
             pending_->insert_or_assign(std::string(key), s);
             pending_updated_ += 1;
         } else if (entries_entry != nullptr) {
-            // Existed in entries as a tombstone (sibling chain). Append a new
-            // revision marking it live again.
+            // 在 entries_ 里是墓碑（必定是 sibling 链），插一条新 revision
+            // 放到链头标记它复活了。
             if (auto* multi = std::get_if<MultiEntry>(entries_entry)) {
                 multi->revisions.insert(multi->revisions.begin(), s);
             } else {
-                // Shouldn't happen — Single can't be a tombstone in our scheme.
+                // 理论不可达——SingleEntry 不存墓碑标记。
                 *entries_entry = s;
             }
         } else if (keyfolders_ > 0) {
-            // First mutation during a fold — freeze and divert to pending.
-            // (Legacy gates this on kh_put_will_resize; we always divert for
-            // simplicity — correctness-equivalent, slightly less optimal.)
+            // fold 期间第一次写入新 key——freeze 并把写入分流到 pending。
+            // legacy 这里靠 kh_put_will_resize 判断是否真的要分流（rehash
+            // 才会破坏迭代器），我们简化为「fold 期间一律分流」——正确性
+            // 等价，pending 表略大一点点。
             pending_.emplace();
             pending_start_epoch_ = this_epoch;
             pending_start_time_  = now_sec;
@@ -254,6 +319,7 @@ PutResult KeyDir::put(std::string_view key,
             pending_->insert_or_assign(std::string(key), s);
             pending_updated_ += 1;
         } else {
+            // 最常见路径：没 fold、key 全新——直接进 entries_。
             entries_.insert_or_assign(std::string(key), Entry{s});
         }
 
@@ -268,20 +334,25 @@ PutResult KeyDir::put(std::string_view key,
         return PutResult::kOk;
     }
 
-    // ---- Path 2: key currently live ----
+    // ---- 分支 (B)/(C)：key 当前是活的，可能要覆盖 ----
     const SingleEntry cur = SingleEntry{
         current_proxy.file_id, current_proxy.total_sz,
         current_proxy.offset, current_proxy.epoch,
         current_proxy.tstamp};
 
-    // Conditional put: must replace the exact (file_id, offset) we expect.
+    // 条件 put 校验：必须正好替换我们期望的 (file_id, offset)，否则失败。
+    // newest_put=true 时即使 (old_file_id, old_offset) 不匹配，只要 file_id
+    // 自身相同也允许（写入同一个文件的更新位置）。
     if (old_file_id != 0 &&
         (newest_put || file_id != cur.file_id) &&
         !(old_file_id == cur.file_id && old_offset == cur.offset)) {
         return PutResult::kAlreadyExists;
     }
 
-    // Staleness check (legacy rules).
+    // 「新 entry 比旧的更新吗？」三套判断（legacy 原样保留）：
+    //   - newest_put 模式：file_id >= biggest_file_id_ 即可（写入路径）
+    //   - 普通模式：tstamp 严格大、file_id 大、或同 file_id 但 offset 大
+    // 任一满足就接受新 entry，否则当作 stale 拒绝（CAS race 兜底）。
     const bool accept =
         (newest_put && file_id >= biggest_file_id_) ||
         (!newest_put && cur.tstamp < tstamp) ||
@@ -316,12 +387,13 @@ PutResult KeyDir::put(std::string_view key,
     SingleEntry next{file_id, total_sz, offset, this_epoch, tstamp};
 
     if (pending_entry != nullptr) {
+        // 已经在 pending 里——直接覆盖（pending 自身就是 fold 不可见的）。
         *pending_entry = next;
     } else {
-        // entries_entry is non-null here.
         assert(entries_entry != nullptr);
         if (keyfolders_ > 0) {
-            // Need to preserve old version for in-flight folds.
+            // fold 在跑——把旧 revision 留在链里给迭代器看，新 revision
+            // 插到链头。SingleEntry 自动升级成 MultiEntry。
             if (auto* multi = std::get_if<MultiEntry>(entries_entry)) {
                 multi->revisions.insert(multi->revisions.begin(), next);
             } else {
@@ -332,7 +404,7 @@ PutResult KeyDir::put(std::string_view key,
                 *entries_entry = std::move(promoted);
             }
         } else {
-            // No folders: replace in place (collapse multi if any).
+            // 没 fold 干扰——直接覆盖（如果之前是 MultiEntry 也会被折回 SingleEntry）。
             *entries_entry = next;
         }
     }
@@ -341,6 +413,10 @@ PutResult KeyDir::put(std::string_view key,
     return PutResult::kOk;
 }
 
+// 无条件 delete。返回 true 表示原本有这条 key（fstats 已减了一次 live）；
+// false 表示 key 不在 keydir 里，调用方一般也不需要管这个返回值。
+//
+// 跟 put 一样有三种存放路径：直接 erase / 升级 sibling 链 / 写 pending tomb。
 bool KeyDir::remove(std::string_view key, std::uint32_t remove_time) {
     std::unique_lock lock(mutex_);
 
@@ -352,11 +428,10 @@ bool KeyDir::remove(std::string_view key, std::uint32_t remove_time) {
     SingleEntry cur{};
     bool found = false;
 
-    // Mirror legacy find_keydir_entry: pending always shadows entries. If a
-    // key is present in pending — even as a tombstone — entries is NOT
-    // consulted. Otherwise stale live revisions left in entries (set during
-    // fold-time updates) would be visible to remove() as "live", causing a
-    // double-decrement of key_count_.
+    // 跟 legacy find_keydir_entry 完全一致：pending 永远 shadow entries。
+    // 即使 pending 里的是墓碑也不再去查 entries——否则 fold 期间被覆盖到
+    // entries 里的「旧 live revision」会被 remove 当成「活的」再减一次
+    // key_count_，造成 double-decrement bug。
     if (pending_.has_value()) {
         auto p = pending_->find(std::string(key));
         if (p != pending_->end()) {
@@ -390,21 +465,23 @@ bool KeyDir::remove(std::string_view key, std::uint32_t remove_time) {
     if (keyfolders_ > 0) iter_mutation_ = true;
 
     if (pending_entry != nullptr) {
-        // Convert in-pending live entry to pending tombstone.
+        // pending 里有 live entry——原地改成 pending 墓碑（offset = MAX）。
         pending_entry->offset = kMaxOffset;
         pending_entry->tstamp = remove_time;
         pending_entry->epoch  = this_epoch;
     } else if (pending_.has_value()) {
-        // Frozen; entry only exists in entries — divert tombstone to pending.
+        // 已 frozen 但 entry 只在 entries_ 里——分流写一条 pending 墓碑。
         SingleEntry t{cur.file_id, cur.total_sz, kMaxOffset, this_epoch, remove_time};
         pending_->insert_or_assign(std::string(key), t);
         pending_updated_ += 1;
     } else if (keyfolders_ == 0) {
-        // No folders: just erase.
+        // 没 fold 干扰——直接从 entries_ 抹掉。
         auto it = entries_.find(std::string(key));
         if (it != entries_.end()) entries_.erase(it);
     } else {
-        // Folders active, no pending yet — append a sibling tombstone in entries.
+        // 有 fold 但还没建 pending——往 entries 里插一条 sibling 墓碑
+        // （file_id/total_sz/offset 都是 MAX 的 sentinel revision），
+        // 把 SingleEntry 升级成 MultiEntry。
         assert(entries_entry != nullptr);
         SingleEntry t = make_sibling_tombstone(this_epoch, remove_time);
         if (auto* multi = std::get_if<MultiEntry>(entries_entry)) {
@@ -420,14 +497,21 @@ bool KeyDir::remove(std::string_view key, std::uint32_t remove_time) {
     return true;
 }
 
+// CAS-style remove：只有当前 entry 的 (tstamp, file_id, offset) 完全
+// 匹配才真的删；否则返回 kAlreadyExists 让 caller（一般是 merge / 内部
+// 清理）跳过。key 不存在视为「已经删了」——返回 kOk。
+//
+// 实现：先用 shared_lock 快速 peek 比对，匹配再 release shared_lock 升级
+// 成 unique_lock 真正调 remove。这样不匹配的常见路径无需独占锁。
 PutResult KeyDir::conditional_remove(std::string_view key,
                                       std::uint32_t tstamp,
                                       std::uint32_t file_id,
                                       std::uint64_t offset,
                                       std::uint32_t remove_time) {
     {
-        // Quick mismatch check before bumping the epoch.
-        // Same shadow rule as remove(): pending always shadows entries.
+        // 探测阶段：只读，避免没必要时占独占锁。
+        // 用跟 remove() 完全一样的 shadow 规则：pending 优先，pending 里有
+        // 墓碑就视为「key 已被 shadow 不存在」直接成功。
         std::shared_lock lock(mutex_);
         SingleEntry cur{};
         bool found = false;
@@ -459,7 +543,14 @@ PutResult KeyDir::conditional_remove(std::string_view key,
 }
 
 // =============================================================================
-// Iterator (defined in same TU; IterHandle dtor calls release())
+// 迭代器（IterHandle 实现放在同一个 TU；析构会调 release()）
+//
+// start() 做的关键事：
+//   1. 拿全部 entries_ 的 key 列表（snapshot）；
+//   2. 记录当前 epoch 作为 iter_epoch_，next() 用它过滤 revision；
+//   3. keyfolders_ ++；如果是第一个 folder，建立 pending_ map 接管新写入。
+// release() 做反向：keyfolders_ --；如果归零就把 pending_ merge 回 entries_
+// 并把全部 MultiEntry 折回 SingleEntry。
 // =============================================================================
 
 IterHandle::~IterHandle() noexcept {
@@ -468,17 +559,29 @@ IterHandle::~IterHandle() noexcept {
     }
 }
 
+// 启动迭代。语义比较微妙：
+//   1. 如果已经有别的 fold 在跑（pending_ 已建立），并且我们要求的
+//      maxage/maxputs 限制 pending 还能容忍——直接复用已存在的
+//      freeze（共享同一份 pending），iter_epoch_ 取最新 epoch。
+//   2. pending 太老（age > maxage 或 updated > maxputs）——返回
+//      kOutOfDate，让 caller 等待 pending 排空再重试。
+//   3. 通过的话拍一个 keys snapshot：枚举当前所有 entries_ 的 key，
+//      copy 进 keys_snapshot_。next() 后续从这个 snapshot 走，对
+//      rehash 完全免疫。
+//
+// 性能优化（key 直接 copy 一份）是 M5 之后的事——M5 阶段先求正确性。
 StartIterResult IterHandle::start(std::uint32_t now_sec,
                                    int maxage, int maxputs) {
     if (iterating_) return StartIterResult::kAlreadyIterating;
     std::unique_lock lock(parent_->mutex_);
 
+    // pending freeze 复用判断：现存 pending 是否仍然「足够新」给本次 fold 用。
     auto can_use_existing_freeze = [&]() -> bool {
         if (!parent_->pending_.has_value() || (maxage < 0 && maxputs < 0)) {
-            return true;
+            return true;  // 无 pending 或两个限制都禁用——必然能用
         }
         if (now_sec == 0 || now_sec < parent_->pending_start_time_) {
-            return false;  // clock skew or forced wait
+            return false;  // 时钟漂移或 caller 强制要求最新 freeze
         }
         const std::uint64_t age = now_sec - parent_->pending_start_time_;
         return ((maxage < 0 || age <= static_cast<std::uint64_t>(maxage)) &&
@@ -496,8 +599,7 @@ StartIterResult IterHandle::start(std::uint32_t now_sec,
     parent_->newest_folder_epoch_ = iter_epoch_;
     parent_->keyfolders_ += 1;
 
-    // Snapshot keys. O(n) at start; immune to subsequent rehash. Performance
-    // is M5's job — for now correctness wins.
+    // 拍 key snapshot——O(n) 一次性开销，之后对 entries_ 的 rehash 免疫。
     keys_snapshot_.clear();
     keys_snapshot_.reserve(parent_->entries_.size());
     for (const auto& [k, _] : parent_->entries_) {
@@ -507,16 +609,16 @@ StartIterResult IterHandle::start(std::uint32_t now_sec,
     return StartIterResult::kOk;
 }
 
+// 取下一项。读锁就够：cursor_ 是 per-handle 状态（不共享），entries_/
+// pending_ 在这里只读不改。snapshot 期间被 erase 的 key 直接跳过。
 std::optional<EntryProxy> IterHandle::next(bool include_tombstones) {
     if (!iterating_) return std::nullopt;
-    // Reader lock: cursor_ advances inside this handle (per-iter state, not
-    // shared) and entries_/pending_ are only read here.
     std::shared_lock lock(parent_->mutex_);
 
     while (cursor_ < keys_snapshot_.size()) {
         const std::string& k = keys_snapshot_[cursor_++];
         auto it = parent_->entries_.find(k);
-        if (it == parent_->entries_.end()) continue;  // erased between snapshots
+        if (it == parent_->entries_.end()) continue;  // 拍快照后被删了
 
         auto at = entry_at_epoch(it->second, iter_epoch_);
         if (!at.found) continue;
@@ -526,6 +628,8 @@ std::optional<EntryProxy> IterHandle::next(bool include_tombstones) {
     return std::nullopt;
 }
 
+// 结束迭代。最后一个 folder release 时触发 pending → entries 合并 +
+// MultiEntry 折叠。这两步是 fold 期间「写时复制」的反向收尾。
 void IterHandle::release() {
     if (!iterating_) return;
     std::unique_lock lock(parent_->mutex_);
@@ -542,15 +646,24 @@ void IterHandle::release() {
     }
 }
 
+// 把 fold 期间累积的 pending 表 merge 回 entries_，并把所有 sibling 链
+// 折回 SingleEntry。前置条件：caller 持 unique_lock(mutex_)，且 keyfolders_
+// 已经归零（即不会再有迭代器看老 revision）。
 void KeyDir::merge_pending_and_collapse_locked() {
     if (pending_.has_value()) {
+        // 第 1 步：把 pending 里的 entry 合并回 entries_。
+        // pending 墓碑的语义：
+        //   - entries 里没这个 key：什么都不做（fold 期间出现又消失的临时 key）
+        //   - entries 里有：直接 erase，相当于完成最终 delete
+        // pending 活 entry 直接覆盖进 entries（unconditional——fold 期间
+        // 这个 key 在 entries 里的旧 revision 已经没用了）。
         for (auto& [k, p_entry] : *pending_) {
             auto it = entries_.find(k);
             const bool is_tomb = is_pending_tombstone(p_entry);
 
             if (it == entries_.end()) {
                 if (is_tomb) {
-                    // Tombstone for a key that never settled in entries; drop.
+                    // 临时墓碑——丢弃即可。
                 } else {
                     entries_.emplace(k, Entry{p_entry});
                 }
@@ -568,17 +681,17 @@ void KeyDir::merge_pending_and_collapse_locked() {
         pending_updated_     = 0;
     }
 
-    // Collapse all multi-revision entries to single.
+    // 第 2 步：把所有 MultiEntry 折回 SingleEntry。
+    // 链头是最新 revision；如果链头本身是 sibling 墓碑，整个 entry 都消失。
     for (auto it = entries_.begin(); it != entries_.end(); ) {
         if (auto* m = std::get_if<MultiEntry>(&it->second)) {
-            // The newest revision wins; drop the chain. If the newest is a
-            // sibling tombstone, the entry itself is gone.
             if (m->revisions.empty() || is_sibling_tombstone(m->revisions.front())) {
                 it = entries_.erase(it);
                 continue;
             }
-            // CRITICAL: copy the front revision into a local before assigning
-            // back into the variant — the assignment destroys `m` first.
+            // 关键：必须先把 front 拷出来再覆盖回 variant！直接
+            // it->second = m->revisions.front() 会在赋值过程中析构 m，
+            // m->revisions.front() 引用的内存就被释放——经典悬垂引用。
             const SingleEntry winner = m->revisions.front();
             it->second = winner;
         }
@@ -587,7 +700,7 @@ void KeyDir::merge_pending_and_collapse_locked() {
 }
 
 // =============================================================================
-// Housekeeping / introspection
+// 杂项：is_ready / file_id 计数器 / info / deep_copy
 // =============================================================================
 
 void KeyDir::mark_ready() {
@@ -605,12 +718,18 @@ std::uint32_t KeyDir::biggest_file_id() const {
     return biggest_file_id_;
 }
 
+// 给新 active file / 新 merge 输出文件分配下一个 file_id。
+// 单调递增是 keydir 的核心不变量——put 的 staleness 判断依赖它。
 std::uint32_t KeyDir::increment_file_id() {
     std::unique_lock lock(mutex_);
     biggest_file_id_ += 1;
     return biggest_file_id_;
 }
 
+// 把计数器至少推到 conditional_id（不小于）。给两种场景：
+//   1. registry 重新 acquire 时从 saved_biggest_file_id_ 恢复；
+//   2. open 扫盘后发现磁盘上 max(file_id) 大于内存计数器（异常恢复），
+//      需要追上来。
 std::uint32_t KeyDir::increment_file_id_at_least(std::uint32_t conditional_id) {
     std::unique_lock lock(mutex_);
     if (conditional_id > biggest_file_id_) biggest_file_id_ = conditional_id;
@@ -634,6 +753,10 @@ KeyDirInfo KeyDir::info() const {
     return r;
 }
 
+// 全量深拷贝。给 legacy keydir_copy NIF 用（M6 之后不再 export 给 Erlang，
+// 但 cask 内部某些 merge 路径仍可能用类似的快照）。
+// 拷贝出来的 keydir keyfolders_ 强制清零——副本是「干净的全新 keydir」，
+// 不继承任何活跃 fold 状态，直接可以独立使用。
 std::shared_ptr<KeyDir> KeyDir::deep_copy() const {
     auto copy = std::make_shared<KeyDir>();
     std::shared_lock lock(mutex_);
@@ -646,7 +769,7 @@ std::shared_ptr<KeyDir> KeyDir::deep_copy() const {
     copy->biggest_file_id_ = biggest_file_id_;
     copy->is_ready_        = is_ready_;
     copy->iter_generation_ = iter_generation_;
-    copy->keyfolders_      = 0;  // copies do not inherit folders
+    copy->keyfolders_      = 0;  // 副本不继承 fold 状态
     copy->newest_folder_epoch_ = 0;
     copy->iter_mutation_   = false;
     copy->pending_start_epoch_ = pending_start_epoch_;

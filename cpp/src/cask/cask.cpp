@@ -38,23 +38,23 @@ std::string_view bytes_to_view(std::span<const std::byte> b) {
     return {reinterpret_cast<const char*>(b.data()), b.size()};
 }
 
-// Returns true iff the OS process `pid` is still running. Mirrors legacy
-// bitcask_lockops:os_pid_exists/1, which uses `kill -0 <pid>`. We do the
-// equivalent via kill(pid, 0): returns 0 if the signal could be delivered;
-// -1 + ESRCH if the process is gone; -1 + EPERM if it exists but we
-// cannot signal (treated as "alive" — conservative).
+// 探测 OS 进程 pid 是否还活着。对应 legacy bitcask_lockops:os_pid_exists/1
+// 用 `kill -0 <pid>` 的做法。kill(pid, 0)：
+//   返回 0   — 信号能投递，进程在
+//   -1 + ESRCH — 进程已死
+//   -1 + EPERM — 进程在但我们无权 signal（保守地视为「活着」，
+//                避免误删别人的 lock）
 [[nodiscard]] bool process_alive(int pid) noexcept {
     if (pid <= 0) return false;
     if (::kill(pid, 0) == 0) return true;
     return errno != ESRCH;
 }
 
-// Lock-file payload format (legacy + ours):
+// 锁文件内容格式（legacy 和我们都遵守）：
 //   "<pid> <active_data_file_path>\n"
-//   or just "<pid>\n" if the active path hasn't been recorded yet.
-// We extract the active file's tstamp/file_id from the path's basename,
-// using fileops::parse_data_tstamp. Returns 0 if no path is present or
-// it cannot be parsed.
+//   或者只有 "<pid>\n"（active 文件还没建好的时候）
+// 这个函数从路径 basename 里抠出 tstamp/file_id，给 merger 在 needs_merge
+// 时排除「writer 正在写的文件」用。返回 0 表示没路径或解不出来。
 [[nodiscard]] std::uint32_t
 parse_active_file_id_from_lock(std::span<const std::byte> bytes) noexcept {
     // Skip leading PID digits.
@@ -95,14 +95,12 @@ parse_active_file_id_from_lock(std::span<const std::byte> bytes) noexcept {
     return any_digit ? pid : -1;
 }
 
-// Try to remove an existing lock file if its recorded PID is no longer
-// alive. Returns true iff we successfully unlinked it (caller may then
-// retry the O_EXCL acquire). Mirrors legacy bitcask_lockops:delete_stale_lock.
+// 如果锁文件里记录的 pid 已死，尝试删掉它，让 caller 重试 O_EXCL acquire。
+// 对应 legacy bitcask_lockops:delete_stale_lock。
 //
-// Race window: between us reading the PID and us unlinking, another
-// process could have written a fresh lock — we'd then incorrectly remove
-// theirs. Legacy carries the same race; the practical exposure is tiny
-// (post-crash recovery only).
+// 竞态窗口：从我们读 pid 到我们 unlink 之间，另一个 writer 可能写了新 lock；
+// 我们会误删他的。legacy 也有同样的 race，实际暴露面极小——只发生在
+// crash recovery 路径上，正常运行不会碰到。
 [[nodiscard]] bool try_remove_stale_lock(const std::string& path) noexcept {
     auto rl = lock::FileLock::acquire(path, /*write*/ false);
     if (!rl) return false;  // file vanished or unreadable; the retry will surface the right error
@@ -125,10 +123,9 @@ parse_active_file_id_from_lock(std::span<const std::byte> bytes) noexcept {
     return ::unlink(path.c_str()) == 0;
 }
 
-// Acquire bitcask.write.lock with stale-lock reclaim. Writes the bare PID
-// line; the active-file path is appended later by ensure_active_writer
-// once the file id is known. Used by both Cask::open and the
-// close_write_file → next-put reacquire path.
+// 拿 bitcask.write.lock，自带 stale-lock 回收。先只写一行 pid；active
+// data file 路径要等 ensure_active_writer 创建文件后才能补上。
+// Cask::open 跟 close_write_file → 下一次 put 重新拿锁时都走这条路径。
 [[nodiscard]] std::expected<lock::FileLock, CaskFault>
 acquire_writer_lock(const std::string& dirname) {
     const auto lock_path = (fs::path(dirname) / "bitcask.write.lock").string();
@@ -155,7 +152,11 @@ acquire_writer_lock(const std::string& dirname) {
 }  // namespace
 
 // =============================================================================
-// CaskIter
+// CaskIter：fold 迭代器实现
+//
+// 把 keydir::IterHandle 包一层，加上「按 file_id 拿 DataFile 句柄、
+// 按 (offset, total_sz) pread 出 value」的能力。see_tombstones=true 时
+// 墓碑也作为带 is_tombstone 标志的 Entry 上交。
 // =============================================================================
 
 CaskIter::~CaskIter() noexcept { release(); }
@@ -178,11 +179,12 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
     const auto expiry = parent_->opts_.expiry_secs;
     const auto now = (expiry > 0) ? now_sec_default() : 0;
 
-    // Skip expired entries. Tombstone behaviour depends on see_tombstones_:
-    //   false (default) — skip tombstones entirely (legacy fold/3 behaviour)
-    //   true  — surface them with is_tombstone=true; sibling tombstones
-    //           don't have a real on-disk record so we synthesize a v0
-    //           marker value so callers always see a non-empty value.
+    // 跳过过期 entry；墓碑的处理由 see_tombstones_ 决定：
+    //   false（默认）— 墓碑直接跳过（legacy fold/3 行为）
+    //   true         — 墓碑也作为带 is_tombstone=true 的 Entry 上交。
+    //                  sibling 墓碑没有真实的磁盘 record，我们合成一条
+    //                  v0 marker 当 value 上交，避免给出空 value 让 caller
+    //                  困惑。
     while (true) {
         auto proxy = iter_->next(/*include_tombstones=*/ see_tombstones_);
         if (!proxy) return std::optional<Entry>{};
@@ -191,8 +193,8 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
             continue;  // expired; skip
         }
 
-        // Sibling tombstones live entirely in the keydir (file_id sentinel,
-        // no real record on disk). Skip the file read and synthesize.
+        // sibling 墓碑只活在 keydir 里（file_id 是 sentinel，磁盘上没
+        // 对应 record）。跳过文件读，合成一条 v0 墓碑 value 给 caller。
         if (proxy->is_tombstone) {
             Entry e;
             e.key.assign(reinterpret_cast<const std::byte*>(proxy->key.data()),
@@ -226,10 +228,9 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
                     return std::unexpected(err(CaskError::kIo, "read"));
             }
         }
-        // The on-disk record may itself encode a tombstone (key removed
-        // since this iter's snapshot was taken AND we're at fold epoch
-        // before the remove — or the record was already a tombstone in
-        // the file the keydir points at).
+        // 即使 keydir 没把它标成墓碑，磁盘 record 自己也可能是墓碑——
+        // keydir 指向的就是一条带墓碑前缀的 value。这种「磁盘墓碑」要
+        // 跟「sibling 墓碑」区分对待（前者有真实磁盘字节，后者纯内存）。
         const bool value_is_tomb = bitcask::format::is_tombstone_value(
             std::string_view(reinterpret_cast<const char*>(rec->value.data()),
                               rec->value.size()));
@@ -255,11 +256,25 @@ void CaskIter::release() noexcept {
 }
 
 // =============================================================================
-// Cask
+// Cask 主体实现
+//
+// open  ：拿锁 / 注册 keydir / 扫盘重建索引 / 准备 active writer
+// close ：finalize active writer + hint trailer，释放锁，registry release
+// get   ：keydir 查 → DataFile pread → 校验 → 返回 value
+// put   ：append 到 active data file → 写 hint → 更新 keydir
+// remove：append 一条墓碑 record → 更新 keydir 标记为墓碑
+// merge ：跑 run_merge → 合并完后从 read_files_ 缓存里淘汰旧句柄、
+//         然后 unlink 老文件
 // =============================================================================
 
 Cask::~Cask() { close(); }
 
+// Cask 启动入口。流程：
+//   1. ensure dir 存在
+//   2. 拿锁：read_write 拿 bitcask.write.lock；merge_only 拿 bitcask.merge.lock；
+//      只读模式不拿任何锁
+//   3. 拿 keydir：通过 registry 共享 / 单独 new；首次创建的需要 load_keydir_from_disk
+// 失败路径会回滚已分配的资源（unique_ptr 自带 RAII，锁也是 optional<FileLock> 自管）。
 std::expected<std::unique_ptr<Cask>, CaskFault>
 Cask::open(std::string_view dirname, const CaskOptions& opts,
             keydir::KeyDirRegistry* registry) {
@@ -267,22 +282,23 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
     cask->dirname_ = std::string(dirname);
     cask->opts_    = opts;
 
-    // Create directory if it doesn't exist.
+    // 目录不存在就建（mkdir -p 语义）。已存在不报错。
     std::error_code ec;
     fs::create_directories(cask->dirname_, ec);
 
-    // Lock acquisition: writer takes bitcask.write.lock; merger takes
-    // bitcask.merge.lock. Stale-lock detection (post-crash recovery) runs
-    // for both. Merger additionally reads write.lock (if any) to learn the
-    // live writer's active file id for needs_merge filtering.
+    // 锁分配：
+    //   - 普通 writer 拿 bitcask.write.lock；
+    //   - merger 拿 bitcask.merge.lock（独立文件，跟 writer 不互斥，
+    //     允许周期性 merge_worker 跟主 writer 并行）；
+    //   - 只读 cask 不拿任何锁。
+    // crash recovery 路径：两种锁都做 stale-lock 检查（看 pid 是否还活着）。
+    // merger 额外读一下 write.lock，把 live writer 当前的 active file id 抠
+    // 出来，下面 needs_merge 时排除掉——不能并别人正在写的文件。
     if (opts.read_write && !opts.merge_only) {
-        // Plain writer: bitcask.write.lock with PID line + stale reclaim.
         auto fl = acquire_writer_lock(cask->dirname_);
         if (!fl) return std::unexpected(fl.error());
         cask->write_lock_ = std::move(*fl);
     } else if (opts.merge_only) {
-        // Merger: bitcask.merge.lock (separate file from write.lock so the
-        // live writer can keep running). Same stale-reclaim policy.
         const auto lock_path =
             (fs::path(cask->dirname_) / "bitcask.merge.lock").string();
         auto fl = lock::FileLock::acquire(lock_path, /*write*/ true);
@@ -304,12 +320,11 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
         (void)fl->write_data(pid_bytes);
         cask->write_lock_ = std::move(*fl);
 
-        // For merger: snapshot the live writer's active file id from
-        // write.lock so needs_merge can exclude it. Race window: writer
-        // may roll over between us reading and merger picking files; that
-        // race exists in legacy too (bitcask_lockops:read_activefile),
-        // and the consequence is at most a missed merge of one freshly-
-        // rolled file (next round picks it up).
+        // 拍 live writer 的 active file id 快照，给 needs_merge 用。
+        // 竞态窗口：从我们读 write.lock 到 merger 真的选文件之间，writer
+        // 可能 roll 过去了——这个 race 在 legacy 里也有（见
+        // bitcask_lockops:read_activefile），后果最多是少并掉一个刚 roll 的
+        // 文件，下一轮 merge 自然会处理。
         if (opts.merge_only) {
             const auto wlock_path =
                 (fs::path(cask->dirname_) / "bitcask.write.lock").string();
@@ -327,13 +342,19 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
         }
     }
 
-    // Acquire / build the keydir.
+    // 拿 / 建 keydir。
+    //
+    // 走 registry：多个同目录的 Cask 共享同一个 keydir。
+    //   - kCreated：我们是初始化者，扫盘建 keydir 后调 mark_ready
+    //   - kReady：有其他 cask 已经初始化好了，直接拿来用
+    //   - kNotReady：别人正在初始化，最多等 40 × 50 ms = 2 秒
+    //
+    // 不走 registry：每个 cask 独占一个 keydir（unit test 常见）。
     if (registry != nullptr) {
         cask->registry_    = registry;
         cask->keydir_name_ = std::string(dirname);
         auto a = registry->acquire(cask->keydir_name_);
         if (a.status == keydir::AcquireStatus::kNotReady) {
-            // Wait briefly for the originator to mark_ready.
             for (int i = 0; i < 40; ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 a = registry->acquire(cask->keydir_name_);
@@ -357,8 +378,16 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
     return cask;
 }
 
+// 收尾顺序很关键：
+//   1. finalize active hint（写 trailer + running CRC，否则 hint 文件
+//      下次 open 时会被判失效，回退到全量 fold(data) 重建 keydir）；
+//   2. 关 active data；
+//   3. 清 read cache（关掉缓存的 fd，避免泄漏）；
+//   4. registry release（refcount -1，归零时 keydir 真正销毁）；
+//   5. 释放 write/merge lock。
+// 失败全部静默——close 路径上的错误没有合理的恢复动作，硬抛会让 Erlang
+// 进程意外崩溃。
 void Cask::close() noexcept {
-    // Finalize active writers.
     if (active_hint_) {
         (void)active_hint_->finalize();
         active_hint_.reset();
@@ -382,16 +411,22 @@ void Cask::close() noexcept {
     }
 }
 
-// ---- Keydir build at open ---------------------------------------------------
+// ---- open 时重建 keydir ----------------------------------------------------
+// 优先 fold(hint_file)，hint 缺失或 trailer CRC 校验不过时回退到 fold(data_file)
+// 重建。fold 顺序按 tstamp 升序——保证后写入的 entry 覆盖前面的。
 std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
     auto entries = fileops::scan_dir(dirname_);
     if (!entries) return std::unexpected(io_fault(entries.error().errnum, dirname_));
 
+    // 按 tstamp 升序遍历每个 data file。fold 顺序是关键：后写入的 entry
+    // 必须覆盖前面的，否则 keydir 重建出来会跟实际「最新值」不一致。
     for (const auto& e : *entries) {
-        // Determine biggest_file_id seed.
+        // 把 keydir 的 biggest_file_id 推到至少这个文件的 id——保证后续
+        // 分配新 file_id 时不会跟磁盘上已有的文件冲突。
         keydir_->increment_file_id_at_least(static_cast<std::uint32_t>(e.tstamp));
 
-        // Prefer the hint file when present and CRC-valid.
+        // 优先走 hint 文件加速路径（不读 value，省掉绝大部分 I/O）。
+        // hint 缺失或 trailer CRC 不通过则 fallback 到 fold(data) 全量重建。
         bool used_hint = false;
         if (e.has_hint) {
             auto hf = fileops::HintFile::open(e.hint_path,
@@ -401,8 +436,8 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
                 if (v && *v) {
                     auto fr = hf->fold([&](const auto& rec) {
                         if (rec.tombstone) {
-                            // Tombstone hints must flow through to the keydir
-                            // so a key written in an earlier file gets erased.
+                            // 墓碑 hint 必须执行——否则前一个 file 里的同 key
+                            // 活 entry 会被错误保留。
                             keydir_->remove(bytes_to_view(rec.key), rec.tstamp);
                             return;
                         }
@@ -417,9 +452,9 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
         }
         if (used_hint) continue;
 
-        // Fallback: fold the data file. Skip tombstones. Track the last
-        // valid record end so we can chop off a torn-write tail (M5.1
-        // task 4) — but only when this Cask is the writer.
+        // Fallback：fold 整个 data file。tolerate_crc_errors=true 让单条
+        // 损坏的 record 跳过而不是中断整个文件加载——legacy 也是这语义。
+        // out_last_valid_end 用于后续 torn-write 修复。
         auto df = fileops::DataFile::open(e.data_path,
                                            fileops::DataFile::Mode::kRead);
         if (!df) {
@@ -447,11 +482,12 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
         const std::uint64_t actual_size = df->size();
         df->close();
 
-        // Torn-write recovery: if there are unparsable trailing bytes AND
-        // we own write.lock (writer mode, not merge_only), reopen the file
-        // in append mode and truncate to last_valid_end. A live writer's
-        // mid-record crash leaves bytes that fold has already skipped;
-        // trimming them frees disk and prevents bad fstats.
+        // Torn-write 恢复：fold 已经跳过了文件尾部的损坏字节（可能是
+        // 前一次 writer 写到一半 crash 留下的），如果我们是正经的 writer
+        // 就把这些字节 truncate 掉——既释放磁盘，也避免后续 fstats 计算
+        // 把坏字节当成「合法死 record」算到 total_bytes 里。
+        // merge_only 不能这么干：它没有 write.lock，万一别的 writer 还在
+        // 同一个文件后面追写，这里 truncate 会切掉别人的数据。
         if (opts_.read_write && !opts_.merge_only &&
             last_valid_end < actual_size) {
             auto wdf = fileops::DataFile::open(
@@ -464,20 +500,25 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
     return {};
 }
 
-// ---- Active writer management -----------------------------------------------
+// ---- active writer 管理 ----------------------------------------------------
+// ensure_active_writer：第一次写入或 close_write_file 之后调用，
+// 创建新的 data + hint 文件、把路径补到 write.lock 内容里。
+// roll_active_if_needed：写之前判断是否会撑爆 max_file_size，是的话切下一个。
+// roll_active：无条件切——给 put 在 keydir.biggest_file_id 被并发 merger
+// 顶过去时使用。
 std::expected<void, CaskFault> Cask::ensure_active_writer() {
     if (active_data_) return {};
     if (!opts_.read_write) return std::unexpected(err(CaskError::kReadOnly));
     if (opts_.merge_only) {
-        // A merger never opens its own active writer; merge::run_merge
-        // creates its own output file via keydir->increment_file_id().
+        // merger 从不打开自己的 active writer——merge::run_merge 自己用
+        // keydir->increment_file_id() 分配输出文件。
         return std::unexpected(err(CaskError::kReadOnly,
                                      "merge_only mode: no active writer"));
     }
 
-    // Reacquire write_lock_ if a previous close_write_file() released it.
-    // Stale-lock reclaim runs identically to open(), so a crashed peer is
-    // handled the same way.
+    // close_write_file 之前可能已经把 write.lock 释放了；这里如果发现
+    // 锁不在就重新拿。stale-lock 回收逻辑跟 open 一样——上次崩溃的 writer
+    // 留下的锁会被探测到并回收。
     if (!write_lock_) {
         auto fl = acquire_writer_lock(dirname_);
         if (!fl) return std::unexpected(fl.error());
@@ -499,19 +540,21 @@ std::expected<void, CaskFault> Cask::ensure_active_writer() {
     active_data_ = std::make_unique<fileops::DataFile>(std::move(*df));
     active_hint_ = std::make_unique<fileops::HintFile>(std::move(*hf));
 
-    // Record the new active file path in write.lock so concurrent mergers
-    // (opened with merge_only=true) can read which file id we own. Format
-    // matches legacy: "<pid> <active_data_path>\n".
+    // 把新 active file 路径记到 write.lock 里：merger（merge_only=true）
+    // 通过读 write.lock 知道我们正在写哪个 file_id，从 needs_merge 候选里
+    // 排除它。格式跟 legacy 一致："<pid> <active_data_path>\n"。
     if (write_lock_) {
         const std::string line = std::to_string(::getpid()) + " " +
                                   data_path + "\n";
         auto bytes = std::span<const std::byte>(
             reinterpret_cast<const std::byte*>(line.data()), line.size());
-        (void)write_lock_->write_data(bytes);  // best-effort
+        (void)write_lock_->write_data(bytes);  // best-effort：失败不阻断
     }
     return {};
 }
 
+// 写入前的预检：要么没 active writer（首次写入或 close_write_file 之后），
+// 要么 active 写满了——两种情况都需要建一个新文件。
 std::expected<void, CaskFault>
 Cask::roll_active_if_needed(std::size_t about_to_write) {
     if (!active_data_) return ensure_active_writer();
@@ -519,6 +562,9 @@ Cask::roll_active_if_needed(std::size_t about_to_write) {
     return roll_active();
 }
 
+// 无条件 roll：先把 hint trailer finalize（保证下次 open 能用 hint 加速），
+// 然后丢掉 active data/hint 句柄，新建一个新 file_id 的 active writer。
+// put 在 keydir.biggest_file_id 被并发 merger 顶过去时也走这条路径。
 std::expected<void, CaskFault> Cask::roll_active() {
     if (active_hint_) {
         if (auto r = active_hint_->finalize(); !r) {
@@ -540,8 +586,9 @@ std::expected<void, CaskFault> Cask::close_write_file() {
         return std::unexpected(err(CaskError::kReadOnly,
                                      "close_write_file: merge_only handle"));
     }
-    // Finalize the hint trailer before dropping the handles so a future
-    // open of this dir doesn't have to re-fold the data file.
+    // 先 finalize hint trailer 再丢句柄——否则下次 open 这个目录时
+    // hint 校验失败，会被迫 fold 整个 data 文件重建 keydir，
+    // 大目录上代价非常高。
     if (active_hint_) {
         if (auto r = active_hint_->finalize(); !r) {
             return std::unexpected(io_fault(r.error().errnum,
@@ -555,19 +602,27 @@ std::expected<void, CaskFault> Cask::close_write_file() {
         write_lock_->release_quiet();
         write_lock_.reset();
     }
-    // The next put/delete reaches ensure_active_writer, which sees a
-    // null write_lock_ and reacquires before creating the new active
-    // file. No state to set here beyond the resets above.
+    // 之后的 put/delete 进 ensure_active_writer 会发现 write_lock_ 是空，
+    // 自动重新拿锁、创建新 active 文件——不需要在这里多设状态。
     return {};
 }
 
-// ---- read_file cache --------------------------------------------------------
+// ---- 按 file_id 缓存的 read 句柄 -------------------------------------------
+// get / fold 频繁通过 file_id 拿 DataFile 来 pread。每次都 open 太重，
+// 这里维护一个 unordered_map 做 lazy open；read_cache_mu_ 保护 map 本身，
+// DataFile::read 内部 thread-safe 所以多读者并发没问题。
+// merge 完成后会从这个 cache 里淘汰被合掉的旧 file_id。
+// 按 file_id 拿一个 DataFile 读句柄。优先：
+//   1. 缓存 hit
+//   2. 当前 active writer 自身（避免重复 open）
+//   3. 新 open 一个只读句柄并加入缓存
+// 失败返回 nullptr——caller 用 errno 包装。
 fileops::DataFile* Cask::read_file(std::uint32_t file_id) {
     std::scoped_lock lk(read_cache_mu_);
     auto it = read_files_.find(file_id);
     if (it != read_files_.end()) return it->second.get();
 
-    // Active writer doubles as a read source for itself.
+    // active writer 也能给自己当 reader 用——pread 不影响 append 写入位置。
     if (active_data_ && file_id == active_file_id_) {
         return active_data_.get();
     }
@@ -583,16 +638,25 @@ fileops::DataFile* Cask::read_file(std::uint32_t file_id) {
     return p;
 }
 
-// ---- get / put / delete -----------------------------------------------------
+// ---- get / put / delete ----------------------------------------------------
+// 写路径有个微妙之处：put 之前要判断 keydir.biggest_file_id() 是不是已经
+// 超过自己的 active_file_id_——如果超了，说明并发 merger 抢先把 file_id
+// 推进了；这时必须 roll_active() 切到一个比 biggest 更大的新 file_id，
+// 不然 keydir.put 时新 entry 会被认为「比当前 entry 旧」而拒绝。
 
+// 单 key 读：keydir 查 → DataFile 读 → 校验 → 返回 value。
+// 三层过滤：
+//   1. keydir 不存在 → kNotFound
+//   2. 过期（tstamp + expiry_secs <= now）→ kNotFound
+//      （不在这里主动删——这是写操作，留给 merge 异步 GC）
+//   3. 磁盘 record 是墓碑 value → kNotFound
+//      （keydir 里的墓碑已经在第 1 步被过滤；这层兜住「磁盘墓碑但 keydir
+//       还没合并掉」的窗口）
 std::expected<GetResult, CaskFault>
 Cask::get(std::span<const std::byte> key) {
     auto entry = keydir_->get(bytes_to_view(key));
     if (!entry) return std::unexpected(err(CaskError::kNotFound));
 
-    // Expiry filter: a record older than (now - expiry_secs) is invisible.
-    // We don't actively remove it from the keydir here (that would need to
-    // be a write op); merge will eventually GC it.
     if (opts_.expiry_secs > 0) {
         const auto now = now_sec_default();
         if (entry->tstamp + opts_.expiry_secs <= now) {
@@ -615,15 +679,21 @@ Cask::get(std::span<const std::byte> key) {
                 return std::unexpected(err(CaskError::kIo));
         }
     }
-    // Tombstone? legacy: a tombstone value is still "the latest write" but
-    // semantically deleted. Our keydir_->get already filters keydir tombs;
-    // here we additionally hide tombstone *values* (M3.4 simple tombstones).
+    // 磁盘墓碑：value 以 "bitcask_tombstone..." 开头。语义上仍然是「最新
+    // 写入」（记录上的 tstamp 比之前的活 entry 大），但表示删除。在 cask
+    // 层透明过滤掉。
     if (format::is_tombstone_value(bytes_to_view(rec->value))) {
         return std::unexpected(err(CaskError::kNotFound));
     }
     return GetResult{std::move(rec->value), rec->tstamp};
 }
 
+// put 流程：
+//   1. 校验权限 + key/value 大小
+//   2. 必要时 roll active 文件（写满 / 没建过 / 被 merger 抢 file_id）
+//   3. 写 data + hint
+//   4. 更新 keydir
+//   5. keydir 拒绝（merge race）→ 再 roll 一次重试一次；二次失败上报
 std::expected<void, CaskFault>
 Cask::put(std::span<const std::byte> key,
           std::span<const std::byte> value,
@@ -638,10 +708,10 @@ Cask::put(std::span<const std::byte> key,
     const std::size_t about = format::kHeaderSize + key.size() + value.size();
     if (auto r = roll_active_if_needed(about); !r) return std::unexpected(r.error());
 
-    // M5.1 task 2: a concurrent merger may have advanced biggest_file_id
-    // past our active_file_id_. If we wrote anyway, the keydir's merge-race
-    // detection would return kAlreadyExists and the put would be silently
-    // dropped. Roll over proactively so our active_file_id_ stays ≥ biggest.
+    // M5.1 task 2 关键 race：并发 merger 可能已经把 keydir.biggest_file_id
+    // 推过了我们的 active_file_id_。如果直接写，keydir 的 merge-race 检测
+    // (file_id < biggest_file_id_) 会返回 kAlreadyExists，put 就被静默丢了。
+    // 提前主动 roll 一次保证 active_file_id_ >= biggest，避免 silent drop。
     if (active_data_ && active_file_id_ < keydir_->biggest_file_id()) {
         if (auto r = roll_active(); !r) return std::unexpected(r.error());
     }
@@ -658,9 +728,8 @@ Cask::put(std::span<const std::byte> key,
                             w->total_size, w->offset, tstamp,
                             /*now*/ 0, /*newest*/ true, 0, 0);
     if (pr == keydir::PutResult::kAlreadyExists) {
-        // Lost a race with a concurrent merger between the rollover check
-        // above and the keydir update. Roll once more and retry; on second
-        // failure, surface the error to the caller.
+        // 上面的预 roll 跟 keydir 更新之间又有 merger 抢了一次 file_id——
+        // 罕见但必须处理。再 roll 一次重试；二次失败就把错误吐给 caller。
         if (auto r = roll_active(); !r) return std::unexpected(r.error());
         auto w2 = active_data_->write(tstamp, key, value);
         if (!w2) return std::unexpected(io_fault(w2.error().errnum));
@@ -677,15 +746,19 @@ Cask::put(std::span<const std::byte> key,
     return {};
 }
 
+// 软删除 = 写一条墓碑 record。
+//
+// 墓碑 value 编码：
+//   v0：纯前缀 "bitcask_tombstone"（17 字节）
+//   v2：前缀 + shadow file_id（22 字节，file_id 大端 4 字节）
+// shadow file_id 来自当前 keydir entry——告诉 merger「我是为这个 file_id
+// 里的某条 entry 而存在的墓碑，那条 entry 还在的话我才有意义」。如果
+// keydir 里 key 已经被删（找不到），shadow=0，回退到 v0 模式。
 std::expected<void, CaskFault>
 Cask::remove(std::span<const std::byte> key, std::uint32_t tstamp) {
     if (!opts_.read_write) return std::unexpected(err(CaskError::kReadOnly));
     if (tstamp == 0) tstamp = now_sec_default();
 
-    // Build the tombstone value. v0 = bare prefix; v2 = prefix + shadowed
-    // file_id (BE uint32). The shadowed file_id comes from the current
-    // keydir entry; if the key isn't there (already deleted), fall back
-    // to v0 because there's nothing to point at.
     std::string tomb;
     if (opts_.tombstone_version == 2) {
         std::uint32_t shadow = 0;
@@ -714,7 +787,7 @@ Cask::remove(std::span<const std::byte> key, std::uint32_t tstamp) {
 
     auto w = active_data_->write(tstamp, key, tomb_bytes);
     if (!w) return std::unexpected(io_fault(w.error().errnum));
-    // Also append a tombstone hint so the index reflects deletion.
+    // hint 文件也要追一条墓碑——下次 open fold(hint) 重建时才能正确删 key。
     auto h = active_hint_->write(tstamp, w->total_size, w->offset,
                                   /*tomb*/ true, key);
     if (!h) return std::unexpected(io_fault(h.error().errnum));
@@ -731,7 +804,12 @@ std::expected<void, CaskFault> Cask::sync() {
     return {};
 }
 
-// ---- status / fold / merge wrappers ----------------------------------------
+// ---- status / fold / merge 包装 --------------------------------------------
+// merge 这里是同步阻塞的——上层（NIF 注册了 ERL_NIF_DIRTY_JOB_IO_BOUND）
+// 把它放到 dirty 调度器，所以不会卡住 BEAM 主调度。merge 完成后：
+//   1. 从 fstats 里把已合并的 file_id 删掉（trim_fstats）
+//   2. 从 read_files_ 缓存淘汰对应句柄（防止 fd 泄漏）
+//   3. unlink 旧 data + hint 文件（节省磁盘）
 
 StatusInfo Cask::status() {
     StatusInfo s;
@@ -754,25 +832,23 @@ bool Cask::is_frozen() {
     return keydir_->info().iter_info.frozen;
 }
 
+// 包装 merge::decide。关键工作是「排除不该被合的 active file」：
+//   - 普通 writer 模式：排除自己的 active_file_id_（不能合自己正在写的）
+//   - merge_only 模式：排除 open 时从 write.lock 抠出来的「live writer 当
+//     前 active id」；为了应对「writer 在我们 snapshot 之后 roll 过去」，
+//     防御性地排除所有 file_id >= snapshot 的文件。代价是少并几个文件，
+//     下一轮 merge 自然处理。
 Cask::NeedsMerge Cask::needs_merge(std::uint32_t now_sec) {
     auto info = keydir_->info();
-    // Pick the file id to exclude:
-    //   - normal writer mode: our own active_file_id_
-    //   - merge_only mode: the live writer's active id, snapshotted from
-    //     write.lock at open time. If the writer rolled over after we
-    //     read, files newer than our snapshot may be the new active —
-    //     exclude EVERYTHING with file_id >= snapshot to be safe.
     const std::uint32_t exclude_id =
         opts_.merge_only ? merger_writer_active_id_ : active_file_id_;
     std::vector<merge::FileStatus> summary;
     summary.reserve(info.fstats.size());
     for (const auto& f : info.fstats) {
         if (opts_.merge_only) {
-            // Defensive: exclude the snapshot active AND any file rolled
-            // over since (file_id > snapshot).
             if (exclude_id != 0 && f.file_id >= exclude_id) continue;
         } else {
-            if (f.file_id == active_file_id_) continue;  // skip own writer
+            if (f.file_id == active_file_id_) continue;
         }
         summary.push_back(merge::summarize(dirname_, f));
     }
@@ -784,12 +860,19 @@ Cask::NeedsMerge Cask::needs_merge(std::uint32_t now_sec) {
     return n;
 }
 
+// 合并执行。files 为空时先 needs_merge 决定要并什么；非空就直接用
+// caller 给的列表。流程：
+//   1. run_merge 实际复制活的 record 到新文件
+//   2. 从 read_files_ 缓存里淘汰被合掉的 fd（必须在 unlink 之前关，
+//      否则在某些平台上文件会通过 /proc/self/fd 短暂残留）
+//   3. unlink 旧 data + hint 文件
+//   4. trim_fstats 把旧 fstats 条目清掉
 std::expected<merge::MergeStats, CaskFault>
 Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
     if (files.empty()) {
         auto n = needs_merge(now_sec);
         if (!n.needs) {
-            // No-op: return an empty MergeStats-like result.
+            // 不需要 merge——返回空 stats。
             return merge::MergeStats{};
         }
         files = std::move(n.files);
@@ -799,9 +882,7 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
         return std::unexpected(err(CaskError::kIo, r.error().detail));
     }
 
-    // Drop cached read handles for the merged-away files BEFORE unlink so
-    // we close the fds first (matters on systems where unlink-then-close
-    // leaves the file briefly visible via /proc/self/fd).
+    // 关键顺序：先关 fd 再 unlink。
     {
         std::scoped_lock lk(read_cache_mu_);
         for (const auto& path : files) {

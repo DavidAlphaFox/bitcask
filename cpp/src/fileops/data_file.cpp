@@ -13,8 +13,11 @@
 namespace bitcask::fileops {
 
 namespace {
-constexpr int kCrcSkipLimit = 20;  // legacy: bail after this many CRC errors
+// fold(tolerate_crc_errors=true) 模式下，连续遇到 CRC 错的 record 上限。
+// legacy 是 20 条——超过就认定文件损坏程度太重，放弃恢复整个文件。
+constexpr int kCrcSkipLimit = 20;
 
+// IoError → DataFileFault 的小适配器；只是把 errno 透传一下。
 DataFileFault io_fault(const io::IoError& e) noexcept {
     return DataFileFault{DataFileError::kIo, e.errnum};
 }
@@ -34,8 +37,8 @@ DataFile::open(std::string_view path, Mode mode, bool sync) {
     auto f = io::PosixFile::open(path, flags);
     if (!f) return std::unexpected(io_fault(f.error()));
 
-    // Discover existing size for both kRead (used by fold) and kAppend
-    // (used by write to position correctly even though O_APPEND ignores it).
+    // 同时给 kRead（fold 要用 size 划界）和 kAppend（write 用 pwrite，
+    // 不依赖 O_APPEND 的内核语义，要自己跟踪偏移）记录起始偏移。
     std::uint64_t initial_off = 0;
     if (mode != Mode::kCreate) {
         auto end = f->seek(0, SEEK_END);
@@ -46,9 +49,15 @@ DataFile::open(std::string_view path, Mode mode, bool sync) {
 }
 
 // ---------------------------------------------------------------------------
-// Writing
+// 写入
 // ---------------------------------------------------------------------------
 
+// append 一条 record 到当前 offset。流程：
+//   1. 校验权限 + 字段大小
+//   2. 在内存里 encode 整条 record
+//   3. pwrite 到 current_offset_，并把 current_offset_ 向前推
+// 注意是 pwrite 不是 write——即使打开时带了 O_APPEND，我们也要明确指定
+// offset 来支持「自己追踪写入位置」的语义（下一步 truncate_to 会用到）。
 std::expected<WriteResult, DataFileFault>
 DataFile::write(std::uint32_t tstamp,
                 std::span<const std::byte> key,
@@ -70,6 +79,9 @@ DataFile::write(std::uint32_t tstamp,
     return WriteResult{off, static_cast<std::uint32_t>(total)};
 }
 
+// 截到当前写入位置：先 lseek 到 current_offset_，再 ftruncate 到那里。
+// 用于 undo——caller 想撤销最近一次 write 的话，可以记下 write 前的
+// current_offset_，写完发现不对就 truncate_to(那个旧值)。
 std::expected<void, DataFileFault> DataFile::truncate_here() {
     auto s = file_.seek(static_cast<std::int64_t>(current_offset_), SEEK_SET);
     if (!s) return std::unexpected(io_fault(s.error()));
@@ -78,6 +90,8 @@ std::expected<void, DataFileFault> DataFile::truncate_here() {
     return {};
 }
 
+// fsync 包装。cask 的 sync_strategy=o_sync 模式下不会调到这里
+//（已经在 write 时直接落盘）；none 模式下由调用方在合适时机主动调。
 std::expected<void, DataFileFault> DataFile::sync() {
     auto s = file_.sync();
     if (!s) return std::unexpected(io_fault(s.error()));
@@ -85,9 +99,14 @@ std::expected<void, DataFileFault> DataFile::sync() {
 }
 
 // ---------------------------------------------------------------------------
-// Reading
+// 读取
 // ---------------------------------------------------------------------------
 
+// 在指定 offset 读 total_size 字节并 decode 一条 record。
+//
+// total_size 必须正好等于当时写入的字节数（keydir 存的就是这个值）；
+// 短读或 EOF 都翻成 kShortRead——意味着 keydir 跟磁盘不一致（极端情况
+// 下数据损坏或被截断）。CRC 不通过翻成 kBadCrc。
 std::expected<ReadRecord, DataFileFault>
 DataFile::read(std::uint64_t offset, std::uint32_t total_size) {
     auto r = file_.pread(offset, total_size);
@@ -127,7 +146,7 @@ std::expected<void, DataFileFault>
 DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
                 std::uint64_t* out_last_valid_end) {
     if (out_last_valid_end) *out_last_valid_end = 0;
-    // Snapshot file size; rewind to BOF.
+    // 进入 fold 时拍个文件大小快照（防止 fold 期间被人 append），再 seek 回头。
     auto eof = file_.seek(0, SEEK_END);
     if (!eof) return std::unexpected(io_fault(eof.error()));
     const std::uint64_t total = *eof;
@@ -136,7 +155,9 @@ DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
     std::uint64_t offset = 0;
     int crc_errors = 0;
 
-    // Read header first to learn the record's exact size, then read the body.
+    // 先读 header（14 字节）拿 KeySz / ValueSz 算出整条 record 的大小，
+    // 再一次 pread 把 body 读出来 decode。两次 pread 比一次大块读更省内存
+    // —— 大 value（几 MB）下避免提前分配。
     while (offset + format::kHeaderSize <= total) {
         auto hr = file_.pread(offset, format::kHeaderSize);
         if (!hr) return std::unexpected(io_fault(hr.error()));
@@ -144,12 +165,13 @@ DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
         auto& hdr = std::get<io::ReadOk>(*hr);
         if (hdr.data.size() < format::kHeaderSize) break;
 
-        // Parse just the sizes without verifying CRC yet.
+        // 只读出长度字段，CRC 等下读完整 record 再校验。手动做大端→主机
+        // 字节序转换（不复用 codec 的 be_load_u* 是因为这里只想要这两个
+        // 字段，不想 decode 整个 header）。
         std::uint16_t key_sz;
         std::uint32_t value_sz;
         std::memcpy(&key_sz,  hdr.data.data() + format::kKeySzOffset,  sizeof(key_sz));
         std::memcpy(&value_sz, hdr.data.data() + format::kValueSzOffset, sizeof(value_sz));
-        // Convert from BE on disk.
         key_sz   = static_cast<std::uint16_t>(((key_sz & 0xFF) << 8) | (key_sz >> 8));
         value_sz = ((value_sz & 0xFFu) << 24) | ((value_sz & 0xFF00u) << 8) |
                    ((value_sz & 0xFF0000u) >> 8) | (value_sz >> 24);
@@ -158,7 +180,10 @@ DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
             static_cast<std::uint32_t>(format::kHeaderSize) +
             static_cast<std::uint32_t>(key_sz) + value_sz;
 
-        if (offset + rec_total > total) break;  // truncated tail
+        // 文件尾被 torn write 截断——header 说有 N 字节 body 但磁盘上没那么多。
+        // 静默 break，out_last_valid_end 保持上一条 record 的末尾偏移；caller
+        // 拿这个值跟 size() 比较，不一致就 truncate_to(out_last_valid_end)。
+        if (offset + rec_total > total) break;
 
         auto br = file_.pread(offset, rec_total);
         if (!br) return std::unexpected(io_fault(br.error()));
@@ -188,6 +213,9 @@ DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
     return {};
 }
 
+// 截到指定大小（torn-write 修复用）：seek 到 new_size 然后 ftruncate。
+// 跟 truncate_here 区别：caller 显式给目标大小，不依赖当前 current_offset_。
+// 必须处于 write 模式——只读 cask 不该乱动磁盘。
 std::expected<void, DataFileFault>
 DataFile::truncate_to(std::uint64_t new_size) {
     if (mode_ == Mode::kRead) {
@@ -197,8 +225,9 @@ DataFile::truncate_to(std::uint64_t new_size) {
     if (!s) return std::unexpected(io_fault(s.error()));
     auto t = file_.truncate_here();
     if (!t) return std::unexpected(io_fault(t.error()));
-    // Move back to end-of-file so the next pwrite at current_offset_ is
-    // contiguous. (current_offset_ is set by the caller, e.g. recovery.)
+    // 截断后 seek 到文件尾，让下一次 pwrite(current_offset_) 紧接着写。
+    // current_offset_ 一般由 caller 主动设（恢复路径调用 truncate_to 时
+    // 会把 current_offset_ 同步到 new_size）。
     auto e = file_.seek(0, SEEK_END);
     if (!e) return std::unexpected(io_fault(e.error()));
     current_offset_ = *e;
@@ -206,7 +235,7 @@ DataFile::truncate_to(std::uint64_t new_size) {
 }
 
 // ---------------------------------------------------------------------------
-// Filename helpers
+// 文件名工具
 // ---------------------------------------------------------------------------
 
 std::string mk_data_filename(std::string_view dirname, std::uint64_t tstamp) {
@@ -216,7 +245,8 @@ std::string mk_data_filename(std::string_view dirname, std::uint64_t tstamp) {
 }
 
 std::string mk_hint_filename(std::string_view data_path) {
-    // Replace ".data" suffix with ".hint", matching legacy hintfile_name.
+    // 把后缀 ".data" 换成 ".hint"，跟 legacy hintfile_name 完全一致；
+    // 没有 ".data" 后缀就直接 append（兜底，正常路径不会走到）。
     constexpr std::string_view kData = ".data";
     constexpr std::string_view kHint = ".hint";
     std::string out(data_path);
@@ -231,7 +261,7 @@ std::string mk_hint_filename(std::string_view data_path) {
 
 std::optional<std::uint64_t>
 parse_data_tstamp(std::string_view filename) noexcept {
-    // Strip directory.
+    // 去掉目录前缀；没斜杠就当 basename 用。
     auto slash = filename.find_last_of('/');
     std::string_view base =
         (slash == std::string_view::npos) ? filename : filename.substr(slash + 1);

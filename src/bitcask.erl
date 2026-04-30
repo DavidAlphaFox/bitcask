@@ -1,16 +1,19 @@
-%% -------------------------------------------------------------------
+%% =========================================================================
+%% bitcask 模块
 %%
-%% bitcask: thin Erlang facade over the cask_cpp NIF.
+%%   bitcask 数据库的对外门面（facade）。M6 之后只剩一条调用路径：所有公共
+%%   API 都直接派发到 bitcask_cpp_nifs:cask_* 系列 NIF。Erlang 层只做三件事：
 %%
-%% The Ref returned by open/2 is the cask resource handle. Every public
-%% function below is a single dispatch into bitcask_cpp_nifs:cask_*.
+%%     1. 选项归一化（opt_value/2 处理 Opts > app env > undefined 的优先级）；
+%%     2. 把 bitcask_cpp_nifs:cask_iterator/cask_fold_* 返回的元组重新组装成
+%%        历史外部接口里出现的 #bitcask_entry 记录，保持调用方的兼容性；
+%%     3. 把 fold/6、fold_keys/6 里历史遗留的 µs/ms 单位换算成 cask_cpp 期望
+%%        的「秒」（cask_max_age/1）和「次数」（cask_max_put/1）。
 %%
-%% Iteration helpers (list_keys, fold, fold_keys) wrap a cask_fold_*
-%% iterator and reshape its tuples into the legacy bitcask_entry record
-%% so existing callers keep working.
+%%   open/2 返回的 Ref 本身就是 cask_cpp 资源句柄，BEAM 持有它的强引用；
+%%   GC 时由 cask_resource_dtor 析构。close/1 会立刻释放底层 Cask（不等 GC）。
 %%
 %% Copyright (c) 2010 Basho Technologies, Inc. — Apache License 2.0.
-%%
 %% =========================================================================
 -module(bitcask).
 
@@ -34,8 +37,8 @@
 
 -include("bitcask.hrl").
 
-%% Whitelist of options the cask_cpp NIF understands. Anything else is
-%% silently dropped (legacy did the same with unknown opts).
+%% cask_cpp NIF 能识别的选项白名单。Opts 里其它键会被静默丢弃
+%% （legacy 时代就是这个语义，新代码沿用以免破坏现有调用方）。
 -define(CASK_PASSTHROUGH_OPTS, [
     expiry_secs, max_file_size,
     sync_strategy,
@@ -50,18 +53,33 @@
 %% open / close
 %% =========================================================================
 
+%% 默认无选项打开（只读模式）。
 open(Dirname) -> open(Dirname, []).
 
+%% 在 Dirname 目录上开一个 Cask；返回的 Ref 是 cask_cpp 资源句柄。
+%%
+%%   Opts 关键项：
+%%     read_write           — 写权限；竞争 bitcask.write.lock
+%%     {expiry_secs, N}     — N 秒前的 entry 视作过期
+%%     {max_file_size, N}   — 写满 N 字节切下一个 active data file
+%%     {sync_strategy, X}   — none | o_sync | {seconds, N}
+%%     {tombstone_version, V} — 1 或 2，控制墓碑编码（默认 2）
+%%
+%%   返回:
+%%     reference()          — 成功
+%%     {error, Reason}      — 通常是 write_locked / enoent / 权限问题
 -spec open(Dirname::string(), Opts::[_]) -> reference() | {error, term()}.
 open(Dirname, Opts) ->
-    %% Defaults (open_timeout, max_file_size, sync_strategy, ...) live in
-    %% the bitcask application env; make sure it is loaded once up front.
+    %% 把 bitcask 应用启动起来——很多默认参数（open_timeout、
+    %% sync_strategy、各种合并阈值）都从 application:get_env 读，
+    %% 没启动 app 就读不到。catch 住失败：测试场景下 app 可能还没装。
     catch application:load(bitcask),
     catch application:start(bitcask),
     Base = case proplists:get_bool(read_write, Opts) of
                true  -> [read_write];
                false -> []
            end,
+    %% 选项归一化：Opts 显式给的 > app env > 不下传
     Extra = [{K, V} || K <- ?CASK_PASSTHROUGH_OPTS,
                        (V = opt_value(K, Opts)) =/= undefined],
     case bitcask_cpp_nifs:cask_open(Dirname, Base ++ Extra) of
@@ -69,7 +87,7 @@ open(Dirname, Opts) ->
         {error, _} = E -> E
     end.
 
-%% Resolve an option: explicit Opts > app env > undefined.
+%% 选项查询的统一入口：显式 Opts > application env > undefined。
 opt_value(Key, Opts) ->
     case proplists:get_value(Key, Opts) of
         undefined ->
@@ -80,61 +98,92 @@ opt_value(Key, Opts) ->
         V -> V
     end.
 
+%% 关闭 Cask：刷盘、释放 write.lock、清空 keydir。Ref 之后不可再用。
 close(Ref) ->
     bitcask_cpp_nifs:cask_close(Ref).
 
-%% close_write_file/1 finalizes the active hint trailer, releases
-%% bitcask.write.lock, and leaves the Ref usable: the next put/delete
-%% reacquires the lock and creates a fresh active file.
+%% 把当前 active 数据文件的 hint trailer 写完整、释放 bitcask.write.lock，
+%% 但 Ref 仍然可用：下一次 put/delete 会自动重新拿锁、新建 active file。
+%% 这中间的窗口里别的进程可能抢占 writer 角色——这是 legacy 历史行为，
+%% 调用方需要清楚后果。
 close_write_file(Ref) ->
     bitcask_cpp_nifs:cask_close_write_file(Ref).
 
 %% =========================================================================
-%% Read / write
+%% 单 key 读写
 %% =========================================================================
 
+%% 读 Key。返回 {ok, Value} | not_found | {error, Reason}。
+%% 过期或被墓碑覆盖的 entry 等同于 not_found。
 get(Ref, Key) ->
     bitcask_cpp_nifs:cask_get(Ref, Key).
 
+%% 写 Key。put(_, _, tombstone) 是历史接口，等价于 delete。
 put(Ref, Key, tombstone) ->
     bitcask_cpp_nifs:cask_delete(Ref, Key);
 put(Ref, Key, Value) ->
     bitcask_cpp_nifs:cask_put(Ref, Key, Value).
 
+%% 软删除：写一个墓碑 entry。空间在下一次 merge 时回收。
 delete(Ref, Key) ->
     bitcask_cpp_nifs:cask_delete(Ref, Key).
 
+%% fsync 当前 active data file（hintfile 不强制 fsync——hint 丢了
+%% 可以从 data file 重建）。{sync_strategy, o_sync} 模式下 put 已经
+%% O_SYNC 写入，sync 退化为 no-op。
 sync(Ref) ->
     bitcask_cpp_nifs:cask_sync(Ref).
 
 %% =========================================================================
-%% Folds / list_keys (built on a single cask_fold_* iterator)
+%% 折叠 / 列举
+%%
+%% 这一族函数全部建立在单条 cask_fold_* 迭代器之上：
+%%   cask_fold_start    — 开始迭代（拿快照）
+%%   cask_fold_next     — 取下一项（K, V）
+%%   cask_fold_next_full— 取下一项（K, V, FileId, Offset, Sz, Tstamp, IsTomb）
+%%   cask_fold_release  — 释放迭代器
+%%
+%% 迭代是基于 keydir 的快照，不会看见迭代开始之后的写入；底层用 epoch
+%% 实现，参见 cpp/src/keydir/keydir.cpp。
 %% =========================================================================
 
+%% 列出全部活跃 key，顺序未定义。墓碑被过滤。
 list_keys(Ref) ->
     cask_fold_collect(Ref, fun(K, _V, Acc) -> [K | Acc] end, []).
 
+%% fold_keys/3：回调签名 fun(#bitcask_entry{}, Acc) -> Acc'
 fold_keys(Ref, Fun, Acc0) ->
     cask_fold_keys_collect(Ref, Fun, Acc0).
 
+%% fold_keys/6：兼容 legacy 6 参版本。
+%%   MaxAge          — 微秒；负数表示无上限
+%%   MaxPut          — 这次 fold 期间允许的写入次数上限；超了则拒绝
+%%   SeeTombstonesP  — true 时墓碑以 {tombstone, BCEntry} 的形式上交回调
 fold_keys(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
     cask_fold_keys6_collect(Ref, Fun, Acc0,
                             cask_max_age(MaxAge), cask_max_put(MaxPut),
                             SeeTombstonesP).
 
+%% fold/3：回调签名 fun(K, V, Acc) -> Acc'
 fold(Ref, Fun, Acc0) ->
     cask_fold_collect(Ref, Fun, Acc0).
 
+%% fold/6：MaxAge / MaxPut 含义同 fold_keys/6；SeeTombstones=true 时墓碑
+%% 以 {tombstone, K} 的 key 形态上交，V 是墓碑值（通常是空 binary）。
 fold(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
     cask_fold6_collect(Ref, Fun, Acc0,
                        cask_max_age(MaxAge), cask_max_put(MaxPut),
                        SeeTombstonesP).
 
 %% =========================================================================
-%% Stateful iterator (one active per Ref).
-%%   iterator/3       -> ok | out_of_date | {error, iteration_in_process}
-%%   iterator_next/1  -> #bitcask_entry{} | not_found | {error, ...}
-%%   iterator_release/1
+%% 状态化迭代器（每个 Ref 同时只能有一个）
+%%
+%%   iterator/3        — 启动迭代；ok | out_of_date | {error, ...}
+%%   iterator_next/1   — 取下一项；#bitcask_entry{} | not_found | {error, ...}
+%%   iterator_release/1— 释放
+%%
+%% out_of_date 出现在迭代器要求一个比 keydir 当前 epoch 更早的快照、
+%% 而该快照已经被回收的情况下；调用方通常重新开始迭代。
 %% =========================================================================
 
 iterator(Ref, MaxAge, MaxPuts) ->
@@ -145,6 +194,7 @@ iterator(Ref, MaxAge, MaxPuts) ->
         {error, _} = E -> E
     end.
 
+%% 把 NIF 返回的扁平元组组装成 #bitcask_entry 记录，保持外部接口不变。
 iterator_next(Ref) ->
     case bitcask_cpp_nifs:cask_iterator_next(Ref) of
         not_found    -> not_found;
@@ -159,16 +209,16 @@ iterator_release(Ref) ->
     bitcask_cpp_nifs:cask_iterator_release(Ref).
 
 %% =========================================================================
-%% Directory-level merge
+%% 目录级 merge
 %%
-%% bitcask:merge/1,2,3 opens a temporary Cask in read_write mode and
-%% drives the merge through cask_merge. {merge_only, true} makes the
-%% merger acquire bitcask.merge.lock instead of bitcask.write.lock so a
-%% live writer can keep running concurrently. If a peer already holds
-%% merge.lock, returns {error, {merge_locked, ...}}.
+%% bitcask:merge/N 在 Dirname 上临时打开一个 read_write Cask，跑一次合并
+%% 然后关闭。关键参数 {merge_only, true}：让合并器去拿 bitcask.merge.lock
+%% 而不是 bitcask.write.lock，于是「正在写」的 writer 不会被合并阻塞。
+%% 但如果有别的 merger 已经持有 merge.lock，会返回
+%%   {error, {merge_locked, Reason, Dirname}}.
 %%
-%% A process that already holds an open writer Ref should drive the
-%% merge directly to avoid the temporary open:
+%% 注：如果调用方手里已经有一个 writer Ref，绕开这个临时 open 更高效——
+%% 直接调底层 NIF：
 %%
 %%     {true, {Files, _}} = bitcask:needs_merge(R),
 %%     bitcask_cpp_nifs:cask_merge(R, Files).
@@ -176,9 +226,12 @@ iterator_release(Ref) ->
 
 merge(Dirname) -> merge(Dirname, []).
 
+%% merge/2：扫描整个目录，由 cask 自己根据阈值挑要合并的文件。
 merge(Dirname, Opts) ->
     cask_merge_dir(Dirname, Opts, all).
 
+%% merge/3：调用方给定要合并的文件列表（绝对路径）。
+%% Files 也支持 legacy 形态 {Files, Expired} 二元组——expired 部分忽略。
 merge(Dirname, Opts, FilesToMerge) ->
     cask_merge_dir(Dirname, Opts, FilesToMerge).
 
@@ -190,6 +243,8 @@ cask_merge_dir(Dirname, Opts, FilesArg) ->
             after bitcask_cpp_nifs:cask_close(R)
             end;
         {error, write_locked} ->
+            %% 这条路径目前用 write_locked 作为「拿不到 merge.lock」的
+            %% 信号——legacy 沿用的 atom 名，没改是为了不破坏现有匹配。
             {error, {merge_locked,
                      "another merger is already running on this dir",
                      Dirname}};
@@ -197,6 +252,9 @@ cask_merge_dir(Dirname, Opts, FilesArg) ->
             E
     end.
 
+%% all：让 cask_needs_merge 决定该并哪些文件
+%% {Files, _Expired}：legacy 形态二元组，第二个元素被丢弃
+%% [Files]：调用方指定的文件名列表
 cask_merge_run(R, all) ->
     case bitcask_cpp_nifs:cask_needs_merge(R) of
         false                   -> ok;
@@ -207,6 +265,7 @@ cask_merge_run(R, {Files, _Expired}) when is_list(Files) ->
 cask_merge_run(R, Files) when is_list(Files) ->
     cask_merge_call(R, Files).
 
+%% 空列表早退；非空才进 NIF。
 cask_merge_call(_R, []) -> ok;
 cask_merge_call(R, Files) ->
     case bitcask_cpp_nifs:cask_merge(R, Files) of
@@ -214,6 +273,8 @@ cask_merge_call(R, Files) ->
         {error, _} = E -> E
     end.
 
+%% 给「临时 merge open」用的选项构造：强制 read_write，再带上调用方给的
+%% 阈值（frag_threshold 之类，用来决定要并什么）。
 cask_open_opts(Opts) ->
     Base = [read_write],
     Extra = [{K, V} || K <- ?CASK_PASSTHROUGH_OPTS,
@@ -221,32 +282,41 @@ cask_open_opts(Opts) ->
     Base ++ Extra.
 
 %% =========================================================================
-%% Small queries
+%% 杂项查询
 %% =========================================================================
 
 needs_merge(Ref) -> needs_merge(Ref, []).
 
+%% Opts 在新接口里没有任何作用——保留参数仅为兼容旧调用点。返回值跟
+%% legacy 一样保留 {true, {Files, Expired}} 的二元组，方便 needs_merge 的
+%% 结果直接喂给 merge/3。
 needs_merge(Ref, _Opts) ->
     case bitcask_cpp_nifs:cask_needs_merge(Ref) of
         false                  -> false;
         {true, Files, Expired} -> {true, {Files, Expired}}
     end.
 
+%% keydir 是否处于 frozen 状态（fold 在跑）。
 is_frozen(Ref) ->
     bitcask_cpp_nifs:cask_is_frozen(Ref).
 
+%% O(1) 估算：keydir 是否为空。打开过空目录之后会返回 true；写过任何 key
+%% 之后立刻 false（即使 key 又被删，估算仍认为非空——这是可以接受的近似）。
 is_empty_estimate(Ref) ->
     bitcask_cpp_nifs:cask_is_empty(Ref).
 
+%% 返回 {KeyCount, FilesInfo}，跟 legacy 形状一致。底层 NIF 还会返回
+%% KBytes 和 Epoch，这两个值 facade 层不外露——历史接口就只有 2 元组。
 status(Ref) ->
     {KCount, _KBytes, _Epoch, Files} = bitcask_cpp_nifs:cask_status(Ref),
     {KCount, Files}.
 
 %% =========================================================================
-%% Internal: cask iterator collectors + arg conversion
+%% 内部：cask 迭代器收集器 + 单位换算
 %% =========================================================================
 
-%% Walk a cask iterator, applying Fun(K, V, Acc).
+%% 通用「打开迭代器 → 循环收集 → 兜底释放」骨架。Fun 是
+%% fun(K, V, Acc) -> Acc'。任何 NIF 错误会原样返回（不抛异常）。
 cask_fold_collect(Ref, Fun, Acc0) ->
     case bitcask_cpp_nifs:cask_fold_start(Ref, -1, -1) of
         {ok, IterRef} ->
@@ -263,9 +333,10 @@ cask_fold_loop(IterRef, Fun, Acc) ->
         {error, _} = E  -> E
     end.
 
-%% fold_keys/3: walks the iterator, hands callbacks a fully-populated
-%% #bitcask_entry (file_id / offset / total_sz / tstamp from the cask
-%% entry, not zero stubs).
+%% fold_keys/3 用：每条记录都重新组装一个 #bitcask_entry，把 file_id /
+%% offset / total_sz / tstamp 全部填上真实值（不像有些后端会塞 0 占位）。
+%% 因为是 fold_keys/3，see_tombstones 默认 false，墓碑在 NIF 那边就过滤掉了，
+%% 所以这里收到的 IsTomb 一定是 false，匹配时把它丢弃。
 cask_fold_keys_collect(Ref, Fun, Acc0) ->
     case bitcask_cpp_nifs:cask_fold_start(Ref, -1, -1) of
         {ok, IterRef} ->
@@ -286,8 +357,9 @@ cask_fold_keys_loop(IterRef, Fun, Acc) ->
         {error, _} = Err -> Err
     end.
 
-%% fold_keys/6. SeeTombstonesP=true surfaces tombstones via
-%% callback shape `{tombstone, BCEntry}`.
+%% fold_keys/6 走完整 cask_fold_start/4——把 see_tombstones 标志传给 NIF，
+%% 这样遍历时 NIF 也会把墓碑送上来。SeeTombstonesP=true 时墓碑包成
+%% {tombstone, BCEntry} 给回调；false 时理论上这一支不会走到，留空兜底。
 cask_fold_keys6_collect(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
     case bitcask_cpp_nifs:cask_fold_start(Ref, MaxAge, MaxPut, SeeTombstonesP) of
         {ok, IterRef} ->
@@ -313,9 +385,10 @@ cask_fold_keys6_loop(IterRef, Fun, Acc, SeeTombstonesP) ->
         {error, _} = Err -> Err
     end.
 
-%% fold/6 callback contract:
-%%   normal:        Fun(K, V, Acc)
-%%   tombstone:     Fun({tombstone, K}, V, Acc)  (only when SeeTombstonesP=true)
+%% fold/6 的回调形态有点特殊：
+%%   普通 entry：Fun(K, V, Acc)
+%%   墓碑（仅当 SeeTombstones=true）：Fun({tombstone, K}, V, Acc)
+%% 这是 legacy 留下来的契约，不要改——下游可能在模式匹配 {tombstone, _}。
 cask_fold6_collect(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
     case bitcask_cpp_nifs:cask_fold_start(Ref, MaxAge, MaxPut, SeeTombstonesP) of
         {ok, IterRef} ->
@@ -338,8 +411,9 @@ cask_fold6_loop(IterRef, Fun, Acc, SeeTombstonesP) ->
         {error, _} = Err -> Err
     end.
 
-%% Legacy fold/6 takes MaxAge already-converted-to-µs (`* 1000` from the ms
-%% app env); cask iter wants seconds with -1 meaning "no limit".
+%% 单位换算：legacy fold/6 接收的 MaxAge 是「微秒」（来自 bitcask.app.src
+%% 里 max_fold_age 配置项乘以 1000 之后的结果），cask 迭代器要的是「秒」，
+%% -1 表示不限。MaxPut 没有单位变化，只把 undefined / 负数归一到 -1。
 cask_max_age(undefined) -> -1;
 cask_max_age(N) when is_integer(N), N < 0 -> -1;
 cask_max_age(N) when is_integer(N) -> N div 1000000.

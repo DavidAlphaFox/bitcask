@@ -22,6 +22,8 @@ run_merge(std::span<const std::string> input_data_paths,
           keydir::KeyDir& keydir,
           bool sync_output) {
     MergeStats stats;
+    // 给输出文件分配新 file_id；这一步必须在 open 前完成，
+    // 文件名直接拼成 "<id>.bitcask.data" / "<id>.bitcask.hint"。
     stats.output_file_id = keydir.increment_file_id();
     stats.output_data_path =
         fileops::mk_data_filename(output_dir, stats.output_file_id);
@@ -44,9 +46,9 @@ run_merge(std::span<const std::string> input_data_paths,
                                          stats.output_hint_path));
     }
 
-    // Walk every input file in order. For each record, ask the keydir whether
-    // the latest entry for that key still points to (input_file_id, offset);
-    // if so it's live and worth carrying over.
+    // 按顺序遍历每个输入文件。对每条 record 都问 keydir：「这个 key 当前
+    // 最新的 entry 是不是还指向 (in_file_id, offset)？」是的话就是活的，
+    // 复制到输出；否则跳过（已经被新 put 或 delete 覆盖了）。
     for (const auto& path : input_data_paths) {
         const auto in_tstamp = fileops::parse_data_tstamp(path);
         if (!in_tstamp) continue;
@@ -65,11 +67,12 @@ run_merge(std::span<const std::string> input_data_paths,
             [&](const codec::DataRecordView& view,
                 std::uint64_t offset,
                 std::uint32_t total_size) {
-                if (error.has_value() == false) return;  // already failed
+                if (error.has_value() == false) return;  // 之前 fold 中已出错，停止处理
                 stats.records_seen += 1;
 
-                // Tombstone? Skip in this simple merger (legacy emits a v2
-                // marker; we'll add that in M3.4).
+                // 墓碑：本简化版直接跳过。legacy 在 v2 模式下会回写一条
+                // 「shadow file_id」标记到源文件——cask 层 (M3.4+) 自己处理
+                // 这部分细节，merger 不再操心。
                 std::string_view value_sv(
                     reinterpret_cast<const char*>(view.value.data()),
                     view.value.size());
@@ -78,7 +81,9 @@ run_merge(std::span<const std::string> input_data_paths,
                     return;
                 }
 
-                // Liveness check: keydir.get must point exactly at (file_id, off).
+                // 活性检查：keydir 当前最新指向必须正好是 (in_file_id, offset)
+                // 才算这条 record 是活的。否则它已经被新写入覆盖了，merge
+                // 不要再保留——直接 records_stale +1 跳过。
                 std::string_view key_sv(
                     reinterpret_cast<const char*>(view.key.data()),
                     view.key.size());
@@ -90,7 +95,8 @@ run_merge(std::span<const std::string> input_data_paths,
                     return;
                 }
 
-                // Carry over: write to output, update keydir CAS.
+                // 复制到输出：先写新 data file，再写新 hint file，
+                // 最后 CAS 更新 keydir 指向新位置。
                 auto w = out_data->write(view.tstamp, view.key, view.value);
                 if (!w) {
                     error = std::unexpected(io_fault(
@@ -107,10 +113,12 @@ run_merge(std::span<const std::string> input_data_paths,
                     return;
                 }
 
-                // CAS-update keydir. Pass old_file_id + old_offset so a
-                // concurrent put doesn't get clobbered. `newest_put = true`
-                // so the new entry's file_id is accepted regardless of
-                // biggest_file_id (it IS the new biggest).
+                // CAS 更新 keydir。带上 old_file_id + old_offset：如果在
+                // 我们写 data/hint 的中途有别的 writer 把 key 又改了，
+                // CAS 会失败——data file 里那条 record 留着但成了 dead，
+                // 下一次 merge 自然会清。
+                // newest_put=true 让 keydir 接受 new entry 不管 biggest_file_id
+                // 的当前值（输出 file_id 就是新的 biggest）。
                 auto pr = keydir.put(
                     key_sv,
                     stats.output_file_id, w->total_size, w->offset,
@@ -118,11 +126,11 @@ run_merge(std::span<const std::string> input_data_paths,
                     /*newest_put*/ true,
                     /*old_file_id*/ in_file_id,
                     /*old_offset*/  offset);
-                (void)pr;  // CAS may legitimately fail under concurrent write; record stays in output.
+                (void)pr;  // 并发 put 时 CAS 失败是合法情况，不阻断 merge
 
                 stats.records_kept += 1;
                 stats.bytes_written += total_size;
-                (void)total_size;  // already accounted via w->total_size
+                (void)total_size;  // 已在 w->total_size 里记过
             },
             /*tolerate_crc_errors*/ true);
         if (!error) return std::unexpected(error.error());

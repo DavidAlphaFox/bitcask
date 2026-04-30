@@ -1,4 +1,5 @@
-// Helpers for converting between Erlang NIF terms and bitcask C++ types.
+// NIF term ↔ C++ 类型 的小工具集合。所有函数都 inline 到 header，
+// 没有翻译单元；避免引入额外 .cpp 增加编译开销。
 
 #pragma once
 
@@ -6,30 +7,33 @@
 #include <cstring>
 #include <span>
 #include <string>
-#include <vector>
 
 #include <erl_nif.h>
 
 namespace bitcask::nif {
 
-// Materialize an Erlang string (latin1 list-of-int) into std::string.
-// Returns false on failure (also sets badarg-style: caller decides).
+// 把 Erlang 的「latin1 字符列表」（即字符串 list-of-int）拷贝成 std::string。
+// 上限 4096 字节，跟 legacy NIF 的栈缓冲区一致；调用方一般是路径名/锁名，
+// 远不到这个上限。失败返回 false（调用方决定要不要 badarg）。
 inline bool get_latin1_string(ErlNifEnv* env, ERL_NIF_TERM term, std::string& out) {
-    constexpr std::size_t kMax = 4096;  // matches legacy buffer
+    constexpr std::size_t kMax = 4096;
     char buf[kMax];
     const int n = enif_get_string(env, term, buf, sizeof(buf), ERL_NIF_LATIN1);
     if (n <= 0) return false;
-    out.assign(buf, static_cast<std::size_t>(n - 1));  // n includes NUL
+    // enif_get_string 返回值包含末尾 NUL，所以这里减 1。
+    out.assign(buf, static_cast<std::size_t>(n - 1));
     return true;
 }
 
-// View into an ErlNifBinary as bytes. Lifetime is the binary's lifetime.
+// 把 ErlNifBinary 当作 byte 视图来用；生命周期跟着 binary 走，
+// 不要在 binary 析构后还持有这个 span。
 inline std::span<const std::byte> as_bytes(const ErlNifBinary& bin) noexcept {
     return {reinterpret_cast<const std::byte*>(bin.data), bin.size};
 }
 
-// Allocate an ErlNifBinary of `size`, copy `src` in, return the term.
-// Returns the allocation_error tuple on OOM.
+// 分配 size 字节的 ErlNifBinary，把 src 拷进去后返回 term。
+// 分配失败时返回调用方提供的 oom_term（一般是 atom allocation_error 或
+// {error, allocation_error} 元组）。
 inline ERL_NIF_TERM make_binary_from_bytes(ErlNifEnv* env,
                                             std::span<const std::byte> src,
                                             ERL_NIF_TERM oom_term) {
@@ -39,8 +43,10 @@ inline ERL_NIF_TERM make_binary_from_bytes(ErlNifEnv* env,
     return enif_make_binary(env, &bin);
 }
 
-// Read a uint64 from an 8-byte native-endian binary term. Mirrors legacy
-// enif_get_uint64_bin(): the Erlang side passes <<X:64/unsigned-native>>.
+// 从 8 字节 native-endian binary term 里读 uint64。Erlang 那边写
+// <<X:64/unsigned-native>> 过来，这里 memcpy 反向解出来。
+// 注意：endianness 跟运行平台一致——legacy NIF 一直这么做，跨架构传
+// 数据本来也不能通过 native 二进制做，所以保留同样的契约。
 inline bool get_uint64_bin(ErlNifEnv* env, ERL_NIF_TERM term, std::uint64_t* out) {
     ErlNifBinary bin;
     if (!enif_inspect_binary(env, term, &bin)) return false;
@@ -49,8 +55,8 @@ inline bool get_uint64_bin(ErlNifEnv* env, ERL_NIF_TERM term, std::uint64_t* out
     return true;
 }
 
-// Write a uint64 as an 8-byte native-endian binary term. Mirrors legacy
-// enif_make_uint64_bin().
+// uint64 → 8 字节 native-endian binary term。跟 get_uint64_bin/3 配对，
+// Erlang 侧拿 <<X:64/unsigned-native>> 模式匹配出来。
 inline ERL_NIF_TERM make_uint64_bin(ErlNifEnv* env, std::uint64_t value) {
     ErlNifBinary bin;
     enif_alloc_binary(sizeof(std::uint64_t), &bin);

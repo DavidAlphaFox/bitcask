@@ -1,4 +1,5 @@
-// Cached atoms used across NIF translation files. Populated in on_load.
+// 缓存的 atom 集合，跨多个 NIF 翻译文件复用。on_load 时一次性 enif_make_atom
+// 全部建好，避免每次 NIF 调用都重新创建 atom。
 
 #pragma once
 
@@ -6,6 +7,10 @@
 
 namespace bitcask::nif {
 
+// 所有 NIF 入口可能用到的 atom 都集中在这里。新增 atom 时记得：
+//   1. 在结构体里加字段；
+//   2. 在 atoms.cpp 的 init() 里赋值；
+//   3. 在 Erlang 侧确认这个 atom 的拼写一致。
 struct Atoms {
     ERL_NIF_TERM ok;
     ERL_NIF_TERM error;
@@ -17,17 +22,17 @@ struct Atoms {
     ERL_NIF_TERM pread_error;
     ERL_NIF_TERM pwrite_error;
 
-    // file_open option atoms
+    // file_open 的选项 atom
     ERL_NIF_TERM create;
     ERL_NIF_TERM readonly;
     ERL_NIF_TERM o_sync;
 
-    // file_position whence atoms
+    // file_position 的 whence atom
     ERL_NIF_TERM cur;
     ERL_NIF_TERM bof;
-    ERL_NIF_TERM eof_whence;  // duplicate of `eof` but kept named for clarity
+    ERL_NIF_TERM eof_whence;  // 跟 `eof` 是同一个 atom，仅为可读性单独命名
 
-    // keydir atoms
+    // keydir 相关
     ERL_NIF_TERM bitcask_entry;
     ERL_NIF_TERM not_found;
     ERL_NIF_TERM already_exists;
@@ -40,7 +45,7 @@ struct Atoms {
     ERL_NIF_TERM atom_false;
     ERL_NIF_TERM undefined;
 
-    // cask_* atoms
+    // cask_* 相关
     ERL_NIF_TERM done;
     ERL_NIF_TERM read_write;
     ERL_NIF_TERM merge_only;
@@ -55,7 +60,7 @@ struct Atoms {
     ERL_NIF_TERM read_only;
     ERL_NIF_TERM write_locked;
     ERL_NIF_TERM bad_crc;
-    // merge policy atoms
+    // merge 策略阈值
     ERL_NIF_TERM frag_merge_trigger;
     ERL_NIF_TERM dead_bytes_merge_trigger;
     ERL_NIF_TERM frag_threshold;
@@ -67,16 +72,18 @@ struct Atoms {
     void init(ErlNifEnv* env) noexcept;
 };
 
-// Returns the singleton atoms registered for this NIF instance.
+// NIF 实例级别的 atom 单例（每个 .so 加载一次）。
 Atoms& atoms() noexcept;
 
-// Map errno -> atom via erts-supplied erl_errno_id().
+// 把 errno 翻译成对应的 Erlang atom（enoent / eaccess / ...），
+// 直接复用 erts 提供的 erl_errno_id 表，与 Erlang 侧 file 模块的错误形态一致。
 ERL_NIF_TERM errno_atom(ErlNifEnv* env, int errnum) noexcept;
 
-// {error, ErrnoAtom}
+// 构造 {error, ErrnoAtom}，业务最常见的错误返回形态。
 ERL_NIF_TERM errno_error_tuple(ErlNifEnv* env, int errnum) noexcept;
 
-// {error, {Tag, ErrnoAtom}}
+// 构造 {error, {Tag, ErrnoAtom}}，给需要带上下文标签的错误用
+//（例如 {error, {pread_error, eio}}）。
 ERL_NIF_TERM tagged_errno_error_tuple(ErlNifEnv* env,
                                       ERL_NIF_TERM tag,
                                       int errnum) noexcept;

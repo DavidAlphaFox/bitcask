@@ -1,18 +1,23 @@
-// Process-global registry of named KeyDir instances.
+// 进程内全局的命名 KeyDir 注册表。
 //
-// Mirrors the legacy `bitcask_priv_data.global_keydirs` + `global_biggest_file_id`
-// pair. Multiple acquirers of the same name share the underlying KeyDir via
-// refcount; on full release the registry persists `biggest_file_id + 1` so a
-// later re-acquire never reuses an old file id.
+// 对应 legacy 的 bitcask_priv_data.global_keydirs + global_biggest_file_id。
+// 同一个名字（一般是 bitcask 目录的绝对路径）多次 acquire 会共享同一个底层
+// KeyDir，靠 refcount 管理生命周期；refcount 归零时把 biggest_file_id + 1
+// 存进 saved_biggest_file_id_，保证后续重新 acquire 同名 keydir 时，
+// 新分配的 file_id 不会跟历史文件冲突（避免 keydir 表里把旧 id 当新 id）。
 //
-// Initialization protocol:
-//   - First acquirer of a name receives status = kCreated and a fresh KeyDir
-//     with is_ready() == false. They MUST call kd->mark_ready() once the
-//     keydir is populated (typically after scanning data files at open time).
-//   - Subsequent acquirers while is_ready() == false receive status = kNotReady
-//     and a null pointer (legacy behaviour: they retry / wait).
-//   - Once mark_ready() has run, subsequent acquirers receive status = kReady
-//     and a shared pointer with the refcount bumped.
+// 初始化协议（关键，调用方必须遵守）：
+//   - 第一个 acquire 同一个 name 的人拿到 status = kCreated 和一个全新的、
+//     is_ready() == false 的 KeyDir。这个人是「初始化者」，必须在 keydir
+//     被填充完成后（一般是 open 时扫完全部 data file 后）调
+//     kd->mark_ready()。
+//   - 在 mark_ready() 之前，其它 acquire 同名 keydir 的请求会拿到
+//     status = kNotReady 和 nullptr——legacy 行为，调用方需要重试 / 等待。
+//   - mark_ready() 之后，所有后续 acquire 拿到 status = kReady 和共享指针，
+//     refcount 加 1。
+//
+// release(name) 必须配对调 acquire 时用过的 name；refcount 归零后从注册表
+// 删除该项，同时把当时的 biggest_file_id + 1 持久化到 saved_biggest_file_id_。
 
 #pragma once
 
@@ -29,14 +34,14 @@
 namespace bitcask::keydir {
 
 enum class AcquireStatus {
-    kCreated,    // fresh; caller is initialiser; must mark_ready() when done
-    kReady,      // existed and ready; refcount incremented
-    kNotReady,   // existed but not yet ready; caller should retry / wait
+    kCreated,    // 全新创建；caller 是初始化者，建索引完毕后必须 mark_ready()
+    kReady,      // 已存在且就绪；refcount 已自增
+    kNotReady,   // 名字存在但尚未 mark_ready（或不存在）；caller 应重试 / 等待
 };
 
 struct AcquireResult {
     AcquireStatus status;
-    std::shared_ptr<KeyDir> keydir;  // null when status == kNotReady
+    std::shared_ptr<KeyDir> keydir;  // status == kNotReady 时为 nullptr
 };
 
 class KeyDirRegistry {
@@ -47,20 +52,21 @@ public:
     KeyDirRegistry(const KeyDirRegistry&) = delete;
     KeyDirRegistry& operator=(const KeyDirRegistry&) = delete;
 
-    // Get-or-create a named KeyDir.
+    // 获取或新建一个命名 KeyDir。语义见文件头注释的初始化协议。
     [[nodiscard]] AcquireResult acquire(std::string_view name);
 
-    // Query without creating: returns kReady or kNotReady (the latter when
-    // either the name does not exist OR exists but is not ready).
+    // 不创建只查询：返回 kReady 或 kNotReady（后者既包含「名字不存在」
+    // 也包含「存在但未 ready」两种情况，调用方一般无需区分）。
     [[nodiscard]] AcquireResult query(std::string_view name) const;
 
-    // Release a previously-acquired keydir. Decrements refcount; if zero,
-    // the entry is removed from the registry and `biggest_file_id + 1` is
-    // saved so that a future acquirer of the same name starts at >= that id.
-    // `name` must match the name used at acquire time.
+    // 释放 acquire 拿到的 keydir。refcount 减一；归零则：
+    //   1) 从 entries_ 移除该项；
+    //   2) 把当时的 biggest_file_id + 1 存到 saved_biggest_file_id_，
+    //      保证后续重新 acquire 不会复用旧 file_id。
+    // name 必须跟 acquire 时一致。
     void release(std::string_view name);
 
-    // Test / introspection helpers.
+    // 测试 / 内省工具。
     [[nodiscard]] std::size_t size() const noexcept;
     [[nodiscard]] std::optional<std::uint32_t>
     saved_biggest_file_id(std::string_view name) const;
@@ -72,6 +78,8 @@ private:
     };
     mutable std::mutex mutex_;
     std::unordered_map<std::string, Slot> entries_;
+    // refcount=0 后保留的「最大 file_id 已用过的下一个值」；
+    // 重新 acquire 时让 KeyDir 从这里恢复 file_id 计数器。
     std::unordered_map<std::string, std::uint32_t> saved_biggest_file_id_;
 };
 

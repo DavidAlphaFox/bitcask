@@ -1,8 +1,17 @@
-// Decide which data files (if any) should be merged.
+// 决策：要不要 merge？要并哪些文件？
 //
-// Pure-function port of bitcask:run_merge_triggers/2 + summarize/2 from the
-// Erlang side. Inputs are raw fstats records (one per file_id) and an opts
-// bag; output is a per-file decision that the caller then feeds to Merger.
+// 这是 legacy bitcask:run_merge_triggers/2 + summarize/2 的纯函数移植。
+// 输入：原始 fstats 列表（每个 file_id 一条）+ 配置；输出：每个文件的
+// 决策结果。caller 拿这个 Decision 喂给 Merger 真正干活。
+//
+// 决策分两层：
+//   1. trigger（任一满足就触发整次 merge）：frag_merge_trigger /
+//      dead_bytes_merge_trigger
+//   2. per-file threshold（任一满足就把这个文件加入候选列表）：
+//      frag_threshold / dead_bytes_threshold / small_file_threshold / 过期
+//
+// 这种「先门槛后选文件」的两段决策保持跟 legacy 一致——不要破坏，
+// Riak 等下游有运维脚本依赖具体的触发行为。
 
 #pragma once
 
@@ -11,39 +20,39 @@
 #include <string>
 #include <vector>
 
-#include "bitcask/keydir.hpp"  // for FStatsEntry
+#include "bitcask/keydir.hpp"  // 需要 FStatsEntry
 
 namespace bitcask::merge {
 
-// Tunables. Defaults mirror priv/bitcask.app.src — keeping them in sync is
-// the application layer's job; Policy::decide only consumes the values.
+// 可调参数。默认值跟 priv/bitcask.app.src 对齐——保持同步是应用层的事，
+// 这里只消费传进来的值。
 struct PolicyOptions {
-    // ---- Triggers (any-of) — does the keydir need merging at all? ----
-    int        frag_merge_trigger          = 60;   // percent
+    // ---- trigger（任一满足整体就要 merge）----
+    int        frag_merge_trigger          = 60;   // 百分比
     std::uint64_t dead_bytes_merge_trigger = 512ULL * 1024ULL * 1024ULL;
 
-    // ---- Per-file thresholds (any-of) — which files to include? ----
+    // ---- per-file 阈值（任一满足该文件入选）----
     int        frag_threshold              = 40;
     std::uint64_t dead_bytes_threshold     = 128ULL * 1024ULL * 1024ULL;
-    // small_file_threshold == 0 disables the rule. Legacy uses the atom
-    // `disabled`; we collapse that to 0.
+    // small_file_threshold == 0 表示禁用该规则。legacy 用 atom `disabled`
+    // 表示禁用，这里统一折成 0。
     std::uint64_t small_file_threshold     = 10ULL * 1024ULL * 1024ULL;
 
-    // ---- Expiry ----
-    // expiry_secs == 0 disables; otherwise: any record older than
-    // (now_sec - expiry_secs) is considered expired.
+    // ---- 过期 ----
+    // expiry_secs == 0 禁用；否则任何 record 的 tstamp < (now - expiry_secs)
+    // 视为过期，整个文件可以被并掉。
     std::uint32_t expiry_secs              = 0;
-    std::uint32_t expiry_grace_time        = 0;  // legacy: avoid expiring continuous writes
+    std::uint32_t expiry_grace_time        = 0;  // legacy: 防止持续写入文件被错误判过期
 
-    // ---- Output cap ----
-    std::uint64_t max_merge_size           = 0;  // 0 = unlimited
+    // ---- 输出体积上限 ----
+    std::uint64_t max_merge_size           = 0;  // 0 = 无上限
 };
 
-// Per-file summary, equivalent to the `#file_status{}` record.
+// 单个文件的汇总。等价于 legacy `#file_status{}` 记录。
 struct FileStatus {
     std::uint32_t file_id;
     std::string   filename;
-    int           fragmented;        // 0..100, percent
+    int           fragmented;        // 0..100，碎片率百分比
     std::uint64_t dead_bytes;        // total_bytes - live_bytes
     std::uint64_t total_bytes;
     std::uint32_t oldest_tstamp;
@@ -51,14 +60,14 @@ struct FileStatus {
     std::uint64_t expiration_epoch;
 };
 
-// Result of Policy::decide.
+// Policy::decide 的结果。
 struct Decision {
     bool needs_merge = false;
-    std::vector<FileStatus> files;          // candidates, ordered as given
-    std::vector<FileStatus> expired_files;  // subset that hit the expired rule
+    std::vector<FileStatus> files;          // 要并的候选，保持输入顺序
+    std::vector<FileStatus> expired_files;  // 子集：因过期而入选
 };
 
-// One reason a per-file threshold fired. Useful for logging / tests.
+// 一个 per-file 触发原因。给日志 / 测试用。
 struct Reason {
     enum class Kind {
         kFragmented,
@@ -67,40 +76,34 @@ struct Reason {
         kDataExpired,
     };
     Kind kind;
-    std::uint64_t value = 0;          // % for kFragmented; bytes otherwise
-    std::uint64_t cutoff = 0;         // for kDataExpired
+    std::uint64_t value = 0;          // kFragmented 是百分比，其它是字节
+    std::uint64_t cutoff = 0;         // 仅 kDataExpired 用
 };
 
-// Convert one fstats record to a FileStatus. `dirname` is needed to
-// reconstruct the data-file path. Returns std::nullopt for fstats with
-// total_bytes == 0 AND total_keys == 0 (legacy filters these implicitly).
+// 把单条 fstats 转成 FileStatus。dirname 用于拼出 data file 路径。
+// total_bytes==0 && total_keys==0 的 fstats（空文件统计）legacy 隐式过滤
+// 掉了——这里也保持同样行为。
 [[nodiscard]] FileStatus
 summarize(std::string_view dirname, const keydir::FStatsEntry& f);
 
-// Returns the list of reasons a file hit ANY per-file threshold; empty if
-// the file should not be merged. Used by Policy::decide internally; exposed
-// for tests + log_needs_merge formatting.
+// 列出某文件命中了哪些 per-file 阈值；空列表表示该文件不参与 merge。
+// Policy::decide 内部用；测试 + log_needs_merge 也调它。
 [[nodiscard]] std::vector<Reason>
 per_file_reasons(const FileStatus& f, const PolicyOptions& opts,
                  std::uint32_t now_sec);
 
-// The full decision. `now_sec` is wall-clock seconds (0 disables expiry
-// path independent of opts.expiry_secs). `summary` is typically derived by
-// summarize() over fstats — but the caller may filter out the active
-// write file first.
+// 完整决策。now_sec 是 wall-clock 秒（0 表示无视 expiry，单测可用）；
+// summary 一般由 summarize() 在 fstats 上批量算出来——caller 通常先把
+// 当前 active write file 排除掉再传进来（不能并自己正在写的文件）。
 [[nodiscard]] Decision
 decide(const std::vector<FileStatus>& summary,
        const PolicyOptions& opts,
        std::uint32_t now_sec);
 
-// Apply max_merge_size: keep accumulating files while their cumulative
-// on-disk size stays within the cap; legacy semantics are "stop strictly
-// when a file would exceed the cap, and do NOT include that file". As a
-// special case the first file is always included (mirroring legacy's
-// fallthrough when read_file_info fails — caller passes in `sizes` directly,
-// so we don't have that fallthrough, but the legacy effectively keeps the
-// first file in the unlimited path). `sizes` is a parallel vector of the
-// on-disk file sizes (caller obtains via stat).
+// 应用 max_merge_size 上限：累加文件大小，超过上限就停（严格遵守 legacy
+// 「下一个文件会撑爆，就不要它」的语义）。第一个文件无条件保留——这是
+// legacy 的兜底行为（即使第一个就超过 cap）。
+// sizes 是跟 files 平行的 on-disk 大小列表，由 caller 通过 stat 拿到。
 [[nodiscard]] std::vector<FileStatus>
 cap_size(const std::vector<FileStatus>& files,
          const std::vector<std::uint64_t>& sizes,

@@ -1,6 +1,14 @@
-// File-based advisory lock used by bitcask for write/merge/create
-// serialization. NOT a POSIX flock or fcntl lock — bitcask only relies on
-// O_CREAT|O_EXCL atomicity and unlink-on-release.
+// 文件式咨询锁，用于 bitcask 的 write / merge / create 串行化。
+//
+// 注意：不是 POSIX flock 也不是 fcntl 锁，bitcask 只依赖
+// O_CREAT|O_EXCL 的原子性 + release 时 unlink 来达到「同时只有一个持有者」
+// 的语义。所以：
+//
+//   - 跨进程是安全的（O_EXCL 在内核层是原子的）
+//   - 持有进程崩溃后锁文件留在磁盘上，需要 stale-lock reclaim
+//     （cask 在 open 时会做：检查锁文件里的 pid 是否还活着，死了就接管）
+//   - NFS 上不可靠（O_EXCL 在 NFS 上有历史 bug，本来 bitcask 也不该跑
+//     在网络盘上）
 
 #pragma once
 
@@ -15,6 +23,7 @@
 
 namespace bitcask::lock {
 
+// fd + filename 的所有者；移动语义、析构 release。
 class FileLock {
 public:
     FileLock() noexcept = default;
@@ -42,25 +51,25 @@ public:
     [[nodiscard]] int  fd()            const noexcept { return fd_; }
     [[nodiscard]] const std::string& filename() const noexcept { return filename_; }
 
-    // Read-locks open existing file with O_RDONLY.
-    // Write-locks: O_CREAT | O_EXCL | O_RDWR | O_SYNC, mode 0600. EEXIST when
-    // another writer holds the lock.
+    // 读锁：O_RDONLY 打开已存在的锁文件——只是为了能读到当前持有者
+    //       写进去的元数据（pid、active file 路径），不阻止别人写。
+    // 写锁：O_CREAT | O_EXCL | O_RDWR | O_SYNC, mode 0600；EEXIST 表示
+    //       已经有别人持有。stale 检查由调用方在拿到 EEXIST 后自己做。
     [[nodiscard]] static std::expected<FileLock, io::IoError>
     acquire(std::string_view filename, bool is_write_lock) noexcept;
 
-    // Releases lock: closes fd; if write-lock, also unlinks the file. Errors
-    // are swallowed (matches legacy behavior — there is no recovery path).
+    // 释放锁：close fd；如果是 write lock 还会 unlink 锁文件。
+    // 错误吞掉——legacy 行为；这一步出错也没有恢复路径。
     void release_quiet() noexcept;
 
-    // Reads the entire lock file into a fresh buffer.
-    // Failure modes:
-    //   {fstat_error,  errno} | {pread_error, errno} | allocation_error.
+    // 把锁文件全部读出来。失败时 ReadError 区分 fstat / pread / 内存分配。
     enum class ReadErrorKind { kFstat, kPread, kAlloc };
     struct ReadError { ReadErrorKind kind; int errnum = 0; };
     [[nodiscard]] std::expected<std::vector<std::byte>, ReadError>
     read_data() noexcept;
 
-    // Truncates to 0 then pwrite at offset 0. Only valid for write-locks.
+    // truncate 到 0 然后 pwrite(offset=0, data)。仅写锁可用——读锁会返回
+    // kNotWritable。给 cask 写「我是当前 writer，pid=N，active=...」用。
     enum class WriteErrorKind { kNotWritable, kTruncate, kPwrite };
     struct WriteError { WriteErrorKind kind; int errnum = 0; };
     [[nodiscard]] std::expected<void, WriteError>

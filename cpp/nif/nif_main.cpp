@@ -1,6 +1,8 @@
-// Entry point for the C++ NIF (priv/bitcask_cpp.so).
-// Module name registered with ERL_NIF_INIT must match the Erlang module
-// that calls erlang:load_nif/2 — here that's `bitcask_cpp_nifs`.
+// priv/bitcask_cpp.so 入口。模块名必须与调用 erlang:load_nif/2
+// 的 Erlang 模块（bitcask_cpp_nifs）一致。
+//
+// M6 之后只剩 cask_* 粗粒度 NIF；旧的 file_* / lock_* / keydir_*
+// 细粒度入口随 legacy Erlang 端一并下线。
 
 #include <new>
 
@@ -11,42 +13,6 @@
 #include "resources.hpp"
 
 namespace bitcask::nif {
-
-// Forward declarations for the per-file NIF entry points.
-ERL_NIF_TERM nif_file_open    (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_file_close   (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_file_sync    (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_file_pread   (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_file_pwrite  (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_file_read    (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_file_write   (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_file_position(ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_file_seekbof (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_file_truncate(ErlNifEnv*, int, const ERL_NIF_TERM[]);
-
-ERL_NIF_TERM nif_lock_acquire  (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_lock_release  (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_lock_readdata (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_lock_writedata(ErlNifEnv*, int, const ERL_NIF_TERM[]);
-
-ERL_NIF_TERM nif_keydir_new0       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_keydir_new1       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_maybe_keydir_new1 (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_keydir_mark_ready (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_keydir_put_int    (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_keydir_get_int    (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_keydir_get_epoch  (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_keydir_remove     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_keydir_copy       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_keydir_itr_int    (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_keydir_itr_next_int(ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_keydir_itr_release(ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_keydir_info       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_keydir_release    (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_keydir_trim_fstats(ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_increment_file_id (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_update_fstats     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_set_pending_delete(ErlNifEnv*, int, const ERL_NIF_TERM[]);
 
 ERL_NIF_TERM nif_cask_open         (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_close        (ErlNifEnv*, int, const ERL_NIF_TERM[]);
@@ -71,50 +37,9 @@ ERL_NIF_TERM nif_cask_merge        (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 
 namespace {
 
+// 长耗时的 fold/merge/sync/open 必须挂到 dirty IO 调度器，
+// 否则会卡住 BEAM 主调度线程。
 ErlNifFunc kNifFuncs[] = {
-    // file I/O (M1)
-    {"file_open_int",      2, nif_file_open,     0},
-    {"file_close_int",     1, nif_file_close,    0},
-    {"file_sync_int",      1, nif_file_sync,     0},
-    {"file_pread_int",     3, nif_file_pread,    0},
-    {"file_pwrite_int",    3, nif_file_pwrite,   0},
-    {"file_read_int",      2, nif_file_read,     0},
-    {"file_write_int",     2, nif_file_write,    0},
-    {"file_position_int",  2, nif_file_position, 0},
-    {"file_seekbof_int",   1, nif_file_seekbof,  0},
-    {"file_truncate_int",  1, nif_file_truncate, 0},
-
-    // lock (M1)
-    {"lock_acquire_int",   2, nif_lock_acquire,   0},
-    {"lock_release_int",   1, nif_lock_release,   0},
-    {"lock_readdata_int",  1, nif_lock_readdata,  0},
-    {"lock_writedata_int", 2, nif_lock_writedata, 0},
-
-    // keydir (M2.4)
-    {"keydir_new",            0, nif_keydir_new0,        0},
-    {"keydir_new",            1, nif_keydir_new1,        0},
-    {"maybe_keydir_new",      1, nif_maybe_keydir_new1,  0},
-    {"keydir_mark_ready",     1, nif_keydir_mark_ready,  0},
-    {"keydir_put_int",       10, nif_keydir_put_int,     0},
-    {"keydir_get_int",        3, nif_keydir_get_int,     0},
-    {"keydir_get_epoch",      1, nif_keydir_get_epoch,   0},
-    {"keydir_remove",         3, nif_keydir_remove,      0},
-    {"keydir_remove_int",     6, nif_keydir_remove,      0},
-    {"keydir_copy",           1, nif_keydir_copy,        0},
-    {"keydir_itr_int",        4, nif_keydir_itr_int,     0},
-    {"keydir_itr_next_int",   1, nif_keydir_itr_next_int,0},
-    {"keydir_itr_release",    1, nif_keydir_itr_release, 0},
-    {"keydir_info",           1, nif_keydir_info,        0},
-    {"keydir_release",        1, nif_keydir_release,     0},
-    {"keydir_trim_fstats",    2, nif_keydir_trim_fstats, 0},
-    {"increment_file_id",     1, nif_increment_file_id,  0},
-    {"increment_file_id",     2, nif_increment_file_id,  0},
-    {"update_fstats",         8, nif_update_fstats,      0},
-    {"set_pending_delete",    2, nif_set_pending_delete, 0},
-
-    // Coarse-grained cask_* (M3.4).
-    // Long-running ones go to dirty IO scheduler so the BEAM scheduler
-    // isn't blocked while a fold or merge processes a large dir.
     {"cask_open",          2, nif_cask_open,        ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"cask_close",         1, nif_cask_close,       0},
     {"cask_get",           2, nif_cask_get,         0},

@@ -1,12 +1,15 @@
-// Bitcask data file: append-only sequence of records on disk.
-// Each record is encoded by bitcask::codec::encode_data_record (M0).
-// I/O goes through bitcask::io::PosixFile (M1).
+// bitcask data file 抽象：磁盘上 append-only 的 record 序列。
 //
-// Supported modes:
-//   - kRead:        existing file, read-only
-//   - kAppend:      existing file, append
-//   - kCreate:      brand-new file (O_EXCL)
-// Optional `kSync` adds O_SYNC for durability.
+//   - record 编码靠 codec::encode_data_record（见 format.hpp 的格式定义）
+//   - I/O 走 PosixFile（io.hpp）
+//
+// 三种打开模式：
+//   - kRead   ：已存在的文件，只读
+//   - kAppend ：已存在的文件，追加（current_offset_ 初始化为文件尾）
+//   - kCreate ：全新文件（O_EXCL，文件已存在会失败）
+//
+// 可选 `sync=true`：在底层 PosixFile 加 O_SYNC，每次 write 都同步落盘。
+// 跟 kCreate 配合使用就是 cask 的 sync_strategy=o_sync 模式。
 
 #pragma once
 
@@ -25,13 +28,15 @@
 
 namespace bitcask::fileops {
 
-// Result of a data-file write: where the record landed and how big it is.
+// write() 的结果：record 落在文件的哪个偏移、占了多少字节。
+// keydir 拿这两个值建索引（offset 给 get 用，total_size 给 read 用）。
 struct WriteResult {
-    std::uint64_t offset;     // byte offset in the file
-    std::uint32_t total_size; // bytes written (incl. 14B header)
+    std::uint64_t offset;     // 文件内字节偏移
+    std::uint32_t total_size; // 实际写入的字节数（含 14 字节 header）
 };
 
-// Read result: a fully decoded record at a given offset.
+// read() 的结果：解码完整的一条 record。key/value 是 owned vector
+// （不是 view），因为底层的 pread buffer 离开 read() 就析构了。
 struct ReadRecord {
     std::uint32_t tstamp;
     std::uint32_t total_size;
@@ -40,15 +45,15 @@ struct ReadRecord {
 };
 
 enum class DataFileError {
-    kIo,           // wraps an io::IoError
-    kBadCrc,       // CRC mismatch on read or fold
-    kShortRead,    // EOF mid-record
-    kTooLarge,     // key/value exceeds format limits
+    kIo,          // 包了一个 io::IoError；errnum 字段给出具体 errno
+    kBadCrc,      // 读取 / fold 时 CRC 校验不通过
+    kShortRead,   // record 中间 EOF（写到一半被 kill 之类）
+    kTooLarge,    // key/value 超过 format 字段上限（uint16/uint32）
 };
 
 struct DataFileFault {
     DataFileError kind;
-    int errnum = 0;  // populated when kind == kIo
+    int errnum = 0;  // 仅当 kind == kIo 有意义
 };
 
 class DataFile {
@@ -66,36 +71,38 @@ public:
     [[nodiscard]] static std::expected<DataFile, DataFileFault>
     open(std::string_view path, Mode mode, bool sync = false);
 
-    // ---- Writing (only valid for Mode::kAppend or kCreate) ----
+    // ---- 写入（仅 Mode::kAppend / kCreate 有效；kRead 调用是逻辑 bug）----
 
-    // Append one record. The implementation pwrites at `current_offset_` then
-    // advances; concurrent writers on the same DataFile are NOT supported.
+    // append 一条 record。内部先 pwrite 到 current_offset_ 然后推进；
+    // 不支持同一 DataFile 对象的并发写入——concurrency 在更上层（cask）控制。
     [[nodiscard]] std::expected<WriteResult, DataFileFault>
     write(std::uint32_t tstamp,
           std::span<const std::byte> key,
           std::span<const std::byte> value);
 
-    // Truncate to the current write offset. Used by undo paths.
+    // 截断到当前 write offset。给 undo / 部分写恢复用
+    // （比 truncate_to(current_offset_) 更明确意图）。
     [[nodiscard]] std::expected<void, DataFileFault> truncate_here();
 
-    // fsync(2).
+    // fsync(2)。
     [[nodiscard]] std::expected<void, DataFileFault> sync();
 
-    // ---- Reading ----
+    // ---- 读取 ----
 
-    // Read a record at the given offset (size must be the recorded total_size,
-    // i.e. 14 + key_sz + value_sz). Verifies CRC.
+    // 在 offset 处读一条 record，size 必须等于当时写入时记录的 total_size
+    // （即 14 + key_sz + value_sz）。CRC 会校验；不通过返回 kBadCrc。
     [[nodiscard]] std::expected<ReadRecord, DataFileFault>
     read(std::uint64_t offset, std::uint32_t total_size);
 
-    // Sequentially fold over every record in the file. Each call to fn
-    // receives the decoded record. CRC errors stop the fold and propagate
-    // unless `tolerate_crc_errors` is true (matches the legacy behaviour
-    // that skips up to 20 corrupt records before bailing).
+    // 顺序遍历整个文件的所有 record。fn 收到解码后的 view + 偏移 + 大小。
     //
-    // If `out_last_valid_end` is non-null, on return it holds the file
-    // offset just past the last successfully-decoded record. Caller can
-    // compare to `size()` to detect a torn write at EOF and truncate.
+    // CRC 错误默认会停下并 propagate；tolerate_crc_errors=true 时会继续
+    // 跳到下一个看似合法的 record（mirror legacy 「最多跳过 20 条损坏
+    // record 之后就放弃」的恢复策略；见 cpp/src/fileops/data_file.cpp）。
+    //
+    // out_last_valid_end 非空时回填最后一条成功解码 record 的「末尾偏移」；
+    // caller 拿它跟 size() 比较，不一致就说明文件尾有 torn write，可以
+    // truncate_to(out_last_valid_end) 修掉。
     using FoldFn = std::function<void(const codec::DataRecordView& view,
                                        std::uint64_t offset,
                                        std::uint32_t total_size)>;
@@ -104,15 +111,13 @@ public:
          bool tolerate_crc_errors = false,
          std::uint64_t* out_last_valid_end = nullptr);
 
-    // Truncate the file to `new_size`. Used by recovery to chop off a
-    // torn-write tail discovered by fold(). Caller must be in write/append
-    // mode (Mode::kAppend or kCreate); the file's seek position is
-    // restored to end-of-file after truncation so subsequent writes
-    // continue cleanly.
+    // 截断到 new_size。给 fold 发现 torn write 后做尾部修复用。
+    // caller 必须处于 write/append 模式；截断后内部 seek 到末尾，
+    // 后续 write 可以无缝继续。
     [[nodiscard]] std::expected<void, DataFileFault>
     truncate_to(std::uint64_t new_size);
 
-    // ---- Introspection ----
+    // ---- 内省 ----
     [[nodiscard]] std::string_view path() const noexcept { return path_; }
     [[nodiscard]] std::uint64_t    size() const noexcept { return current_offset_; }
 
@@ -130,11 +135,15 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Filename conventions: <dir>/<tstamp>.bitcask.data, .bitcask.hint
+// 文件名约定：<dir>/<tstamp>.bitcask.data 与 <dir>/<tstamp>.bitcask.hint
+// tstamp 是文件创建时刻的 monotonic counter（不是 wall clock，避免
+// 跨进程冲突；keydir_registry 全局递增）。
 // ---------------------------------------------------------------------------
 [[nodiscard]] std::string mk_data_filename(std::string_view dirname,
                                             std::uint64_t tstamp);
 [[nodiscard]] std::string mk_hint_filename(std::string_view data_path);
+
+// 从 "<tstamp>.bitcask.data" 解析出 tstamp；不匹配返回 nullopt。
 [[nodiscard]] std::optional<std::uint64_t>
 parse_data_tstamp(std::string_view filename) noexcept;
 

@@ -32,9 +32,11 @@ HintFile::open(std::string_view path, Mode mode, bool sync) {
 }
 
 // ---------------------------------------------------------------------------
-// Writing
+// 写入
 // ---------------------------------------------------------------------------
 
+// 追加一条 hint record。同步把刚写的字节也算进 running_crc_——finalize
+// 时会用这个累计值生成 trailer，下次 open 验文件完整性。
 std::expected<void, DataFileFault>
 HintFile::write(std::uint32_t tstamp, std::uint32_t total_sz,
                 std::uint64_t offset, bool tombstone,
@@ -56,6 +58,9 @@ HintFile::write(std::uint32_t tstamp, std::uint32_t total_sz,
     return {};
 }
 
+// 写 EOF sentinel 并把 running_crc_ 嵌进去。这是 hint 文件的「封口」操作；
+// 没封口的 hint 文件下次 open 会被 validate_trailer() 判失败，cask 会
+// fallback 到 fold(data) 重建——慢但可靠。
 std::expected<void, DataFileFault> HintFile::finalize() {
     std::vector<std::byte> buf;
     buf.reserve(format::kHintRecordSize);
@@ -66,7 +71,7 @@ std::expected<void, DataFileFault> HintFile::finalize() {
 }
 
 // ---------------------------------------------------------------------------
-// Reading
+// 读取
 // ---------------------------------------------------------------------------
 
 std::expected<void, DataFileFault> HintFile::fold(FoldFn fn) {
@@ -76,12 +81,12 @@ std::expected<void, DataFileFault> HintFile::fold(FoldFn fn) {
 
     std::uint64_t offset = 0;
 
-    // Stop one sentinel-record short — the trailer is not a real entry.
+    // 在文件尾留出 sentinel record 的位置——遇到 EOF sentinel 就停下，
+    // 不会把 sentinel 喂给 fn。
     while (offset + format::kHintRecordSize <= total) {
-        // First peek the 18-byte header to learn key_sz (offset 4..5, BE u16).
-        // We can't decode_hint_record on just the header because the decoder
-        // requires the full record (header + key) and would return
-        // kBufferTooShort here.
+        // 先读 18 字节固定 header 拿 key_sz（offset 4..5, BE u16）。
+        // 直接 decode_hint_record(header_only) 会被 kBufferTooShort 拒掉，
+        // 因为 decoder 要求 header + key 全部就位——所以分两次 pread。
         auto hdr = file_.pread(offset, format::kHintRecordSize);
         if (!hdr) return std::unexpected(io_fault(hdr.error()));
         if (std::holds_alternative<io::ReadEof>(*hdr)) break;
@@ -96,7 +101,7 @@ std::expected<void, DataFileFault> HintFile::fold(FoldFn fn) {
         const std::uint64_t rec_size =
             format::kHintRecordSize + static_cast<std::uint64_t>(key_sz);
 
-        if (offset + rec_size > total) break;  // truncated tail
+        if (offset + rec_size > total) break;  // 文件尾被截断
 
         auto full = file_.pread(offset, static_cast<std::size_t>(rec_size));
         if (!full) return std::unexpected(io_fault(full.error()));
@@ -106,7 +111,7 @@ std::expected<void, DataFileFault> HintFile::fold(FoldFn fn) {
         auto rec = codec::decode_hint_record(fb.data);
         if (!rec) return std::unexpected(DataFileFault{DataFileError::kShortRead});
 
-        // EOF sentinel ends iteration without invoking fn.
+        // 遇到 EOF sentinel 收工——不调 fn（它不是真正的 entry）。
         if (codec::is_hint_eof(*rec)) break;
 
         fn(*rec);
@@ -115,13 +120,16 @@ std::expected<void, DataFileFault> HintFile::fold(FoldFn fn) {
     return {};
 }
 
+// 单独验 trailer CRC：先读末尾的 sentinel 拿到 expected_crc，再从头流式
+// 算一遍前面所有字节的 CRC。两者一致才算 hint 文件健康，可以直接 fold；
+// 否则 caller 应该 fall back 到 fold(data_file) 重建。
 std::expected<bool, DataFileFault> HintFile::validate_trailer() {
     auto end = file_.seek(0, SEEK_END);
     if (!end) return std::unexpected(io_fault(end.error()));
     const std::uint64_t total = *end;
     if (total < format::kHintRecordSize) return false;
 
-    // Read trailer.
+    // 1) 先读末尾的 sentinel record 拿 expected_crc。
     auto t = file_.pread(total - format::kHintRecordSize,
                          format::kHintRecordSize);
     if (!t) return std::unexpected(io_fault(t.error()));
@@ -132,7 +140,7 @@ std::expected<bool, DataFileFault> HintFile::validate_trailer() {
     if (!codec::is_hint_eof(*trailer)) return false;
     const std::uint32_t expected_crc = trailer->total_sz;
 
-    // Now stream all bytes BEFORE the trailer to compute the CRC.
+    // 2) 流式扫 trailer 之前的全部字节算 CRC，64 KiB 一块。
     if (auto s = file_.seek_bof(); !s) return std::unexpected(io_fault(s.error()));
     std::uint64_t remaining = total - format::kHintRecordSize;
     std::uint32_t crc = 0;

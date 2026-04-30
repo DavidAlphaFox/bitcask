@@ -1,13 +1,21 @@
-// Bitcask facade: integrates keydir, data files, hint files, scanner and
-// merger into one process-level handle. Built for the coarse-grained NIF
-// exposure in M3.4 — one open/close/get/put/delete call instead of the
-// 30+ fine-grained `keydir_*_int` / `file_*_int` calls the legacy uses.
+// bitcask 高层门面：把 keydir、data file、hint file、scanner、merger 串起来，
+// 整合成一个进程级 handle。专为 M3.4 的「粗粒度 NIF 暴露」设计——
+// 一次 open / close / get / put / delete 就够，替代 legacy 那 30+ 个细粒度
+// keydir_*_int / file_*_int 调用。
 //
-// Threading: a Cask is owned by a single Erlang process that holds the
-// resource ref. Underlying KeyDir may be shared across Casks of the same
-// directory (KeyDirRegistry handles refcount). Concurrent writers to the
-// same active file are NOT supported by this class — callers must
-// serialize writes (the experimental flag uses one process per Cask).
+// === 线程模型 ===
+//
+// 一个 Cask 由单个 Erlang 进程持有 resource ref 拥有。底层 KeyDir 可能在
+// 同目录的多个 Cask 之间共享（KeyDirRegistry 管 refcount）——多写者要求
+// 调用方自己串行化（M5 的 cask_cpp 是「一个 Erlang 进程一个 Cask」模型，
+// 因此 Cask 自身不做内部并发写控制）。
+//
+// 读路径无锁：keydir get + DataFile 的 pread 是 thread-safe 的，read_files_
+// cache 由 read_cache_mu_ 保护。
+//
+// 写路径单线程：put / delete / sync / close_write_file 串行，由调用方
+// （单 Erlang 进程）保证。merge 在 dirty IO 调度器上跑，跟 put 共享
+// keydir 的 shared_mutex 做并发保护。
 
 #pragma once
 
@@ -32,53 +40,52 @@
 
 namespace bitcask {
 
-// --- Configuration -----------------------------------------------------------
+// --- 配置 --------------------------------------------------------------------
 struct CaskOptions {
     bool          read_write       = false;
     std::uint64_t max_file_size    = 2ULL * 1024ULL * 1024ULL * 1024ULL;  // 2 GiB
     bool          o_sync           = false;
-    bool          require_hint_crc = false;  // legacy default; M5 may flip true
-    // Records older than (now_sec - expiry_secs) are filtered from get/fold
-    // and become candidates for the expiry merge trigger. 0 disables.
+    bool          require_hint_crc = false;  // legacy 默认 false；M5 之后可能改 true
+    // tstamp < (now - expiry_secs) 的 record 在 get/fold 中被过滤，
+    // 同时进入「过期触发 merge」的候选。0 = 禁用。
     std::uint32_t expiry_secs      = 0;
 
-    // Merge-only mode (M5.1 task 2). When true:
-    //   - acquires bitcask.merge.lock instead of bitcask.write.lock, so a
-    //     live writer (which owns write.lock) can keep running concurrently;
-    //   - does NOT create an active writer file (run_merge produces its own
-    //     output file via keydir->increment_file_id());
-    //   - on open, reads bitcask.write.lock to learn the live writer's
-    //     active file id and excludes it from needs_merge candidates.
+    // merge_only 模式（M5.1 task 2）。true 时：
+    //   - 拿 bitcask.merge.lock 而不是 bitcask.write.lock：原 writer 仍能
+    //     正常运行（持有 write.lock），并发 merge 不冲突；
+    //   - 不创建 active writer 文件——merger 自己生成新输出文件
+    //     （keydir->increment_file_id()）；
+    //   - open 时读 bitcask.write.lock，得知 live writer 当前 active file id，
+    //     在 needs_merge 里把它从候选里排除（不能并别人正在写的文件）。
     //
-    // Used by bitcask:merge/N facade when dispatched in cask_cpp mode so
-    // a periodic merge_worker doesn't conflict with the main writer.
-    // Mutually exclusive with normal write_lock acquisition; merge_only
-    // implies read_write semantics for files (merge writes a new file),
-    // but does NOT provide a put/delete API on this Cask handle.
+    // 这是 bitcask:merge/N 在 cask_cpp 模式下的实现机制——周期性的
+    // merge_worker 不会跟主 writer 互相阻塞。
+    // 跟普通 read_write 模式互斥；merge_only 隐含 read_write 文件语义
+    // （要写新文件），但不在该 Cask handle 上提供 put/delete API。
     bool          merge_only       = false;
 
-    // Which tombstone format remove() writes. Reads accept any of v0/v1/v2.
-    //   0 → "bitcask_tombstone"            (17 B)  default, simplest
-    //   2 → "bitcask_tombstone2" + FileId  (22 B)  enables merge-time
-    //                                              "delete only if shadowed
-    //                                              file_id still exists"
-    // (v1 has the same on-disk shape as v2 with a different prefix; legacy
-    //  uses it for an intermediate state, we don't write it.)
+    // remove() 写入哪种墓碑格式。读时三种 (v0/v1/v2) 都接受。
+    //   0 → "bitcask_tombstone"            (17 B)  默认，最简单
+    //   2 → "bitcask_tombstone2" + FileId  (22 B)  支持「shadow file_id 仍存在
+    //                                              才允许 merge 时回收」的精细
+    //                                              并发控制
+    // (v1 在磁盘上跟 v2 同形不同前缀；legacy 用作中间态，cask 不写它，
+    //  只读时识别。)
     std::uint8_t  tombstone_version = 0;
 
     merge::PolicyOptions policy{};
 };
 
-// --- Errors ------------------------------------------------------------------
+// --- 错误码 ------------------------------------------------------------------
 enum class CaskError {
     kIo,
     kBadCrc,
-    kNotFound,            // get on missing key
+    kNotFound,            // get 不到 key
     kKeyTooLarge,
     kValueTooLarge,
     kAlreadyExists,       // CAS race
-    kReadOnly,            // write-op on a read-only cask
-    kWriteLocked,         // another writer already holds the lock
+    kReadOnly,            // 写操作给到只读 cask
+    kWriteLocked,         // 别人已经持有 write.lock / merge.lock
     kInvalidOption,
 };
 
@@ -102,10 +109,10 @@ struct StatusInfo {
 
 class Cask;
 
-// --- Fold iterator -----------------------------------------------------------
-// Walks every live (key, value) snapshot at the time of make_iter().
-// Uses KeyDir::IterHandle for snapshot semantics + a lazy data-file fetch
-// for each entry's value. Designed to be wrapped one-call-per-step by NIF.
+// --- fold 迭代器 -------------------------------------------------------------
+// 遍历 make_iter() 时刻的全部活跃 (key, value)。snapshot 语义靠
+// KeyDir::IterHandle 提供；每条 entry 的 value 在 next() 时按需 pread。
+// 设计上是「per-step 一次 NIF 调用」，方便上层在 BEAM scheduler 之间让出。
 class CaskIter {
 public:
     explicit CaskIter(Cask* parent) noexcept : parent_(parent) {}
@@ -113,22 +120,21 @@ public:
     CaskIter(const CaskIter&) = delete;
     CaskIter& operator=(const CaskIter&) = delete;
 
-    // `see_tombstones`: when true, deleted keys still emit an entry from
-    // next() with `is_tombstone=true` and `value` carrying the tombstone
-    // marker bytes (matches legacy fold/6 + fold_keys/6 SeeTombstones=true).
-    // When false (default), tombstones are silently skipped.
+    // see_tombstones：true 时被删除的 key 也会作为一条 entry 出现在
+    // next() 里——is_tombstone=true，value 是墓碑标记字节
+    // （对应 legacy fold/6 + fold_keys/6 的 SeeTombstones=true 行为）。
+    // false（默认）下墓碑被静默跳过。
     //
-    // Returns the underlying keydir StartIterResult. `kOk` means iteration
-    // actually started; `kOutOfDate` means the pending-hash freshness check
-    // failed and no iteration was initiated — caller should retry later.
-    // CaskFault errors are reserved for genuine failures (e.g. handle
-    // already iterating).
+    // 返回底层 keydir 的 StartIterResult：
+    //   kOk         — 真的开始迭代了
+    //   kOutOfDate  — pending 表 freshness 检查没过；caller 应稍后重试
+    // CaskFault 留给真正的失败（比如 handle 已经在迭代）。
     [[nodiscard]] std::expected<keydir::StartIterResult, CaskFault>
     start(int maxage = -1, int maxputs = -1, std::uint32_t now_sec = 0,
           bool see_tombstones = false);
 
-    // Returns the next entry, or std::nullopt at end. The returned vectors
-    // own their storage.
+    // 取下一项；end-of-iteration 返回 nullopt。Entry 内部的 vector 拥有
+    // 自己的存储，调用方持有期间可任意使用。
     struct Entry {
         std::vector<std::byte> key;
         std::vector<std::byte> value;
@@ -149,7 +155,7 @@ private:
     bool see_tombstones_ = false;
 };
 
-// --- The Cask ----------------------------------------------------------------
+// --- Cask ------------------------------------------------------------------
 class Cask {
 public:
     Cask() = default;
@@ -157,37 +163,45 @@ public:
     Cask(const Cask&) = delete;
     Cask& operator=(const Cask&) = delete;
 
+    // 打开一个 Cask。registry 非空时通过命名 keydir 跟同目录的其它 Cask
+    // 共享 keydir（典型生产形态：每个 NIF 实例一个全局 registry）。
     [[nodiscard]] static std::expected<std::unique_ptr<Cask>, CaskFault>
     open(std::string_view dirname, const CaskOptions& opts,
          keydir::KeyDirRegistry* registry = nullptr);
 
     void close() noexcept;
 
+    // 单 key 读：keydir.get → DataFile.read 一次 pread。kNotFound 用
+    // {error, not_found} 表达，对应 NIF 的 atom not_found。
     [[nodiscard]] std::expected<GetResult, CaskFault>
     get(std::span<const std::byte> key);
 
+    // 写入。tstamp=0 表示用当前 wall-clock 秒。
     [[nodiscard]] std::expected<void, CaskFault>
     put(std::span<const std::byte> key,
         std::span<const std::byte> value,
         std::uint32_t tstamp = 0);
 
+    // 软删除：写一条墓碑 record。空间在下一次 merge 时回收。
     [[nodiscard]] std::expected<void, CaskFault>
     remove(std::span<const std::byte> key, std::uint32_t tstamp = 0);
 
+    // fsync active data file。o_sync 模式下退化为 no-op。
     [[nodiscard]] std::expected<void, CaskFault> sync();
 
-    // Force-close the active write file: finalizes the hint trailer, drops
-    // the active data/hint handles, and releases bitcask.write.lock. The
-    // Cask remains usable — the next put/delete reacquires the lock and
-    // creates a fresh active file (mirrors legacy bitcask:close_write_file).
-    // Read-only or merge_only handles return kReadOnly.
+    // 强制关 active write file：finalize hint trailer、丢掉 active data/hint
+    // 句柄、释放 bitcask.write.lock。Cask 仍可用——下次 put/delete 自动
+    // 重新拿锁、新建 active file（对应 legacy bitcask:close_write_file 语义）。
+    // 只读 / merge_only 句柄返回 kReadOnly。
     [[nodiscard]] std::expected<void, CaskFault> close_write_file();
 
     [[nodiscard]] StatusInfo status();
+    // O(1) 估算「keydir 是否为空」。写过 key 后即使删光也不会再回 true。
     [[nodiscard]] bool is_empty_estimate();
+    // keydir 是否被某个 fold/iterator pin 住（影响 pending 表合并时机）。
     [[nodiscard]] bool is_frozen();
 
-    // Returns (true, [files_to_merge]) or (false, {}) — wraps decide().
+    // 包装 decide()：返回是否需要 merge + 候选文件列表。
     struct NeedsMerge {
         bool needs;
         std::vector<std::string> files;
@@ -195,8 +209,8 @@ public:
     };
     [[nodiscard]] NeedsMerge needs_merge(std::uint32_t now_sec = 0);
 
-    // Run a merge on the listed files. If `files.empty()`, runs needs_merge
-    // first. Caller is responsible for any external scheduling / locks.
+    // 在指定文件上跑 merge。files 为空时先调 needs_merge。caller 自己负责
+    // 外部调度 / 锁——这个方法只是把 run_merge 包了一层。
     [[nodiscard]] std::expected<merge::MergeStats, CaskFault>
     merge(std::vector<std::string> files = {}, std::uint32_t now_sec = 0);
 
@@ -214,40 +228,40 @@ private:
     std::string dirname_;
     CaskOptions opts_;
 
-    // Keydir (possibly shared via registry).
+    // keydir（多个 Cask 可能通过 registry 共享同一个）
     std::shared_ptr<keydir::KeyDir> keydir_;
     keydir::KeyDirRegistry* registry_ = nullptr;
     std::string keydir_name_;
 
-    // Active write file. nullptr if read-only.
+    // 当前 active write file。只读 / merge_only 时为 nullptr。
     std::unique_ptr<fileops::DataFile> active_data_;
     std::unique_ptr<fileops::HintFile> active_hint_;
     std::uint32_t active_file_id_ = 0;
 
-    // Read-side cache of per-file_id DataFile handles. Opened lazily.
+    // 按 file_id 缓存的 DataFile 读句柄。read 路径懒打开。
+    // 多读者并发，read_cache_mu_ 保护 unordered_map 本身；DataFile 内部
+    // 的 pread 是 thread-safe 的。
     std::mutex read_cache_mu_;
     std::unordered_map<std::uint32_t,
                         std::unique_ptr<fileops::DataFile>> read_files_;
 
-    // Directory lock. In normal read_write mode this is bitcask.write.lock
-    // (held by the live writer). In merge_only mode it is bitcask.merge.lock
-    // (held by a merger that runs alongside the writer).
+    // 目录锁。read_write 模式下是 bitcask.write.lock（live writer 持有），
+    // merge_only 模式下是 bitcask.merge.lock（merger 跟 writer 并行）。
     std::optional<lock::FileLock> write_lock_;
 
-    // In merge_only mode, the file id of the live writer's active data
-    // file (read once from write.lock at open time). needs_merge uses this
-    // — instead of our own active_file_id_, which is 0 for a merger — to
-    // exclude the live writer's still-being-written file from candidates.
-    // 0 means "no live writer detected" (safe: no extra exclusion).
+    // merge_only 模式下，open 时从 write.lock 里读出来的「live writer 的
+    // active file id」。needs_merge 用它把 live writer 正在写的文件从候选
+    // 里排除——不能并别人正在写的文件。
+    // 0 表示「没探测到 live writer」（保守：不额外排除）。
     std::uint32_t merger_writer_active_id_ = 0;
 
-    // Helpers.
+    // 内部辅助
     [[nodiscard]] std::expected<void, CaskFault> load_keydir_from_disk();
     [[nodiscard]] std::expected<void, CaskFault> ensure_active_writer();
     [[nodiscard]] std::expected<void, CaskFault> roll_active_if_needed(std::size_t about_to_write);
-    // Unconditionally finalize the current active writer and open a fresh
-    // one with a new (incremented) file_id. Used by put() to recover from
-    // a concurrent merger advancing biggest_file_id past us.
+    // 无条件 finalize 当前 active writer 并开新一轮（新 file_id）。
+    // put() 在 keydir.biggest_file_id 被并发 merger 顶过去时调用——
+    // 必须放弃当前文件，让出 file_id 单调递增的不变量。
     [[nodiscard]] std::expected<void, CaskFault> roll_active();
     [[nodiscard]] fileops::DataFile* read_file(std::uint32_t file_id);
 };

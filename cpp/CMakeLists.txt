@@ -88,15 +88,12 @@ target_link_libraries(bitcask_keydir PRIVATE bitcask_warnings)
 
 # ---------------------------------------------------------------------------
 # bitcask_cpp.so — C++ NIF, registered as Erlang module bitcask_cpp_nifs.
-# M1 phase: implements the file_*_int / lock_*_int subset of the legacy NIF.
-# Coexists with priv/bitcask.so (legacy C). To eventually replace it in M4.
-# Sanitizers are NOT linked here — they would crash BEAM on load.
+# 只暴露 cask_* 粗粒度入口；旧的 file_*/lock_*/keydir_* 细粒度 NIF 已随
+# legacy 一并下线（M6）。
+# Sanitizers 不要 link 进来——会在 BEAM 加载时直接 crash。
 # ---------------------------------------------------------------------------
 add_library(bitcask_cpp MODULE
     nif/nif_main.cpp
-    nif/nif_io.cpp
-    nif/nif_lock.cpp
-    nif/nif_keydir.cpp
     nif/nif_cask.cpp
     nif/atoms.cpp
     nif/resources.cpp
@@ -104,8 +101,6 @@ add_library(bitcask_cpp MODULE
 target_link_libraries(bitcask_cpp
     PRIVATE
         Erlang::ERTS
-        bitcask_io
-        bitcask_keydir
         bitcask_cask
         bitcask_warnings
 )

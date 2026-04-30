@@ -1,87 +1,57 @@
-// Erlang NIF resource type registration for C++ objects.
-// Uses placement-new into the resource buffer; destructor invoked from the
-// resource cleanup callback.
+// Erlang NIF 资源类型注册：把 C++ 对象 placement-new 到 BEAM 分配的资源
+// 缓冲区里，析构在资源 GC 回调里调用。
+//
+// M6 之后只剩 cask 自身和 cask 迭代器两种资源；旧的 file/lock/keydir
+// 资源类型随细粒度 NIF 一并下线。
 
 #pragma once
 
 #include <memory>
 #include <new>
-#include <string>
 #include <utility>
 
 #include <erl_nif.h>
 
 #include "bitcask/cask.hpp"
-#include "bitcask/file_lock.hpp"
-#include "bitcask/io.hpp"
-#include "bitcask/keydir.hpp"
-#include "bitcask/keydir_registry.hpp"
 
 namespace bitcask::nif {
 
-// Per-handle state held in a NIF resource. Mirrors legacy
-// bitcask_keydir_handle: pairs a keydir reference with iteration state, and
-// remembers the registry name so the resource dtor can release the refcount.
-struct KeyDirHandle {
-    std::shared_ptr<keydir::KeyDir> keydir;
-    keydir::KeyDirRegistry* registry = nullptr;  // null if anonymous
-    std::string name;                            // empty if anonymous
-    std::unique_ptr<keydir::IterHandle> iter;    // null when not iterating
-
-    // Legacy keydir_release / handle GC must be safe to call repeatedly.
-    void release_quiet() noexcept {
-        if (iter) { iter->release(); iter.reset(); }
-        if (registry && !name.empty()) registry->release(name);
-        registry = nullptr;
-        name.clear();
-        keydir.reset();
-    }
-};
-
-extern ErlNifResourceType* g_file_resource_type;
-extern ErlNifResourceType* g_lock_resource_type;
-extern ErlNifResourceType* g_keydir_resource_type;
 extern ErlNifResourceType* g_cask_resource_type;
 extern ErlNifResourceType* g_cask_iter_resource_type;
 
-// Wraps the C++ Cask object inside a NIF resource. Cask owns its KeyDir and
-// active write/hint files; the destructor handles teardown.
+// 包住 C++ Cask 对象的 NIF 资源。Cask 自己持有 KeyDir 和 active write/hint
+// file，析构会顺序释放它们。
 //
-// `iter` is the optional active iterator established by the legacy
-// `iterator/3` API (only one per cask, lives on the cask handle, not on a
-// separate resource). The fold/3 + fold/6 paths use the separate
-// CaskIterHandle resource and don't touch this slot.
+// `iter` 是给 legacy `iterator/3` API 用的「单 Ref 单活跃迭代器」槽位；
+// fold/3 + fold/6 走另一条 CaskIterHandle 资源链路，跟这里互不影响。
 struct CaskHandle {
     std::unique_ptr<Cask> cask;
     std::unique_ptr<CaskIter> iter;
 };
 
+// fold/3 + fold/6 用的独立迭代器资源；持有自己的 CaskIter，析构时由 iter
+// 对象自行收尾，不持有对父 cask 的引用（父 cask 的生命周期由 BEAM 管）。
 struct CaskIterHandle {
-    // Holds a non-owning pointer to the parent CaskHandle's resource via
-    // an opaque reference; cleanup is the iterator's own duty.
     std::unique_ptr<CaskIter> iter;
 };
 
-// Register both resource types. Returns false if any registration failed.
+// 注册全部资源类型；任一注册失败返回 false。
 [[nodiscard]] bool register_resources(ErlNifEnv* env) noexcept;
 
-// Allocate a resource holding T, placement-new constructed from `args`.
-// Returns the term (and releases the local resource ref). On allocation
-// failure returns 0 (and badarg has not been signaled — caller decides).
+// 在 BEAM 资源缓冲区里 placement-new 构造 T，然后返回对应的 Erlang term。
+// 内部会立即 release 本地 ref，剩下的生命周期完全由 BEAM 管。
+// 分配失败返回 0（且不会触发 badarg，由调用方决定怎么报错）。
 template <typename T, typename... Args>
 ERL_NIF_TERM make_resource(ErlNifEnv* env, ErlNifResourceType* rt, Args&&... args) {
     void* mem = enif_alloc_resource(rt, sizeof(T));
     if (!mem) return 0;
     new (mem) T(std::forward<Args>(args)...);
     ERL_NIF_TERM term = enif_make_resource(env, mem);
-    enif_release_resource(mem);  // BEAM owns the lifetime now
+    enif_release_resource(mem);
     return term;
 }
 
-// Cleanup callbacks (registered with enif_open_resource_type).
-void file_resource_dtor(ErlNifEnv* env, void* obj) noexcept;
-void lock_resource_dtor(ErlNifEnv* env, void* obj) noexcept;
-void keydir_resource_dtor(ErlNifEnv* env, void* obj) noexcept;
+// enif_open_resource_type 注册的析构回调。
 void cask_resource_dtor(ErlNifEnv* env, void* obj) noexcept;
 void cask_iter_resource_dtor(ErlNifEnv* env, void* obj) noexcept;
 

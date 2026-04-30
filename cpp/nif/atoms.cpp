@@ -5,6 +5,8 @@
 namespace bitcask::nif {
 
 namespace {
+// 模块内单例。BEAM 加载 .so 时调用 on_load → atoms().init(env)
+// 把所有 atom term 一次性建好；运行期间纯读，无锁。
 Atoms g_atoms;
 }
 
@@ -24,7 +26,7 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     o_sync            = a("o_sync");
     cur               = a("cur");
     bof               = a("bof");
-    eof_whence        = eof;  // legacy uses the same `eof` atom for whence
+    eof_whence        = eof;  // legacy 在 whence 位置也用 `eof` atom
 
     bitcask_entry         = a("bitcask_entry");
     not_found             = a("not_found");
@@ -64,6 +66,8 @@ void Atoms::init(ErlNifEnv* env) noexcept {
 
 Atoms& atoms() noexcept { return g_atoms; }
 
+// errno → atom：直接借用 erts 内置的 erl_errno_id，结果跟 Erlang
+// file:read_file_info 等接口看到的 atom 完全一致。
 ERL_NIF_TERM errno_atom(ErlNifEnv* env, int errnum) noexcept {
     return enif_make_atom(env, ::erl_errno_id(errnum));
 }

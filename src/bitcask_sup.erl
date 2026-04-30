@@ -1,24 +1,19 @@
-%% -------------------------------------------------------------------
+%% =========================================================================
+%% bitcask_sup
 %%
-%% bitcask: Eric Brewer-inspired key/value store
+%%   bitcask 的顶层 supervisor。M6 之后只剩一个 child：
 %%
-%% Copyright (c) 2010 Basho Technologies, Inc. All Rights Reserved.
+%%     bitcask_merge_worker  — 全局 merge 调度器（窗口 + 去重 + 限流）
 %%
-%% This file is provided to you under the Apache License,
-%% Version 2.0 (the "License"); you may not use this file
-%% except in compliance with the License.  You may obtain
-%% a copy of the License at
+%%   旧的 bitcask_merge_delete 已经随 legacy 一并删除——cask_cpp 在
+%%   merge 完成时直接 unlink 掉旧 data file，不需要单独的延迟删除 worker
+%%   来跟 fold 迭代器协调。
 %%
-%%   http://www.apache.org/licenses/LICENSE-2.0
+%%   重启策略 one_for_one：merge_worker 挂掉只重启它自己（也只可能它一个挂）。
+%%   maxR=5, maxT=10：10 秒内重启 5 次以上就放弃，让上层 application 决定怎么办。
 %%
-%% Unless required by applicable law or agreed to in writing,
-%% software distributed under the License is distributed on an
-%% "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-%% KIND, either express or implied.  See the License for the
-%% specific language governing permissions and limitations
-%% under the License.
-%%
-%% -------------------------------------------------------------------
+%% Copyright (c) 2010 Basho Technologies, Inc. — Apache License 2.0.
+%% =========================================================================
 -module(bitcask_sup).
 
 -behaviour(supervisor).
@@ -27,25 +22,15 @@
 -compile({parse_transform, pulse_instrument}).
 -include_lib("pulse_otp/include/pulse_otp.hrl").
 -endif.
-%% API
--export([start_link/0]).
 
-%% Supervisor callbacks
+-export([start_link/0]).
 -export([init/1]).
 
-%% Helper macro for declaring children of supervisor
+%% supervisor child spec 缩写：永久子进程，shutdown 等 5s。
 -define(CHILD(I, Type), {I, {I, start_link, []}, permanent, 5000, Type, [I]}).
 
-%% ===================================================================
-%% API functions
-%% ===================================================================
 start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
-
-
-%% ===================================================================
-%% Supervisor callbacks
-%% ===================================================================
 
 init([]) ->
     {ok, {{one_for_one, 5, 10}, [?CHILD(bitcask_merge_worker, worker)]}}.
