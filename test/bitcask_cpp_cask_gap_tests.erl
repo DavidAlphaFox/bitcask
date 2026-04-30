@@ -1,16 +1,14 @@
 %% -------------------------------------------------------------------
 %% bitcask_cpp_cask_gap_tests:
-%%   M4.2 — Drives features the legacy tests rely on but that may not yet
-%%   be implemented in cask_cpp. Each test reproduces a legacy scenario
-%%   under {nifs, cask_cpp} and asserts the same observable contract.
-%%   Failures here are real cask_cpp gaps.
+%%   Functional coverage for the cask_cpp backend — features the
+%%   pre-M6 legacy suite exercised that need to keep working.
 %% -------------------------------------------------------------------
 -module(bitcask_cpp_cask_gap_tests).
 
 -include_lib("eunit/include/eunit.hrl").
 -include("bitcask.hrl").
 
--define(CASK, [read_write, {nifs, cask_cpp}]).
+-define(CASK, [read_write]).
 
 with_dir(Fun) ->
     Dir = "/tmp/bitcask_cpp_gap_" ++ os:getpid() ++ "_" ++
@@ -156,7 +154,7 @@ bitcask_merge_facade_offline_test_() ->
             ?assert(length(FilesBefore) >= 2),
 
             %% bitcask:merge/2 should run via cask backend (default mode).
-            ?assertEqual(ok, bitcask:merge(D, [{nifs, cask_cpp},
+            ?assertEqual(ok, bitcask:merge(D, [
                                                 {frag_merge_trigger, 50},
                                                 {frag_threshold, 50}])),
 
@@ -176,7 +174,7 @@ bitcask_merge_facade_writer_does_not_block_test_() ->
                 %% Writer holds write.lock. Merger uses merge.lock.
                 %% Even with no fragmentation, merge runs and returns ok
                 %% (no candidate files, but no lock conflict).
-                ?assertEqual(ok, bitcask:merge(D, [{nifs, cask_cpp}]))
+                ?assertEqual(ok, bitcask:merge(D, []))
             after
                 bitcask:close(R)
             end
@@ -196,7 +194,7 @@ bitcask_merge_facade_explicit_files_test_() ->
             All = filelib:wildcard(filename:join(D, "*.bitcask.data")),
             %% Pass an explicit subset.
             ToMerge = lists:sublist(All, length(All) - 1),
-            ?assertEqual(ok, bitcask:merge(D, [{nifs, cask_cpp}], ToMerge))
+            ?assertEqual(ok, bitcask:merge(D, [], ToMerge))
         end)
     end}}.
 
@@ -222,7 +220,7 @@ merge_runs_while_writer_holds_lock_test_() ->
 
                 %% Writer is still open. Without two-lock model this would
                 %% return {error, {merge_locked, _, _}}. With it, ok.
-                Result = bitcask:merge(D, [{nifs, cask_cpp},
+                Result = bitcask:merge(D, [
                                             {frag_merge_trigger, 50},
                                             {frag_threshold, 50}]),
                 ?assertEqual(ok, Result),
@@ -333,7 +331,7 @@ second_concurrent_merger_blocked_by_merge_lock_test_() ->
                 {ok, M1} = bitcask_cpp_nifs:cask_open(D, [merge_only]),
                 try
                     %% Second merger via facade should be rejected.
-                    Result = bitcask:merge(D, [{nifs, cask_cpp}]),
+                    Result = bitcask:merge(D, []),
                     ?assertMatch({error, {merge_locked, _Msg, _Dir}}, Result)
                 after
                     bitcask_cpp_nifs:cask_close(M1)
@@ -354,54 +352,7 @@ second_concurrent_merger_blocked_by_merge_lock_test_() ->
 %% readable by the other after close.
 %% ===================================================================
 
-cross_mode_cask_writes_legacy_reads_test_() ->
-    {timeout, 30,
-     {"cask_cpp writes a dir; legacy reopens and reads back",
-      fun() ->
-        with_dir(fun(D) ->
-            R1 = bitcask:open(D, [read_write, {nifs, cask_cpp}]),
-            ok = bitcask:put(R1, <<"k1">>, <<"v1">>),
-            ok = bitcask:put(R1, <<"k2">>, <<"v2">>),
-            ok = bitcask:put(R1, <<"k3">>, <<"v3-overwritten">>),
-            ok = bitcask:put(R1, <<"k3">>, <<"v3">>),
-            bitcask:close(R1),
-
-            R2 = bitcask:open(D, [read_write, {nifs, legacy}]),
-            try
-                ?assertEqual({ok, <<"v1">>}, bitcask:get(R2, <<"k1">>)),
-                ?assertEqual({ok, <<"v2">>}, bitcask:get(R2, <<"k2">>)),
-                ?assertEqual({ok, <<"v3">>}, bitcask:get(R2, <<"k3">>))
-            after
-                bitcask:close(R2)
-            end
-        end)
-     end}}.
-
-cross_mode_legacy_writes_cask_reads_test_() ->
-    {timeout, 30,
-     {"legacy writes a dir; cask_cpp reopens and reads back",
-      fun() ->
-        with_dir(fun(D) ->
-            R1 = bitcask:open(D, [read_write, {nifs, legacy}]),
-            ok = bitcask:put(R1, <<"k1">>, <<"v1">>),
-            ok = bitcask:put(R1, <<"k2">>, <<"v2">>),
-            ok = bitcask:put(R1, <<"k3">>, <<"older">>),
-            ok = bitcask:put(R1, <<"k3">>, <<"newer">>),
-            ok = bitcask:delete(R1, <<"k2">>),
-            bitcask:close(R1),
-
-            R2 = bitcask:open(D, [read_write, {nifs, cask_cpp}]),
-            try
-                ?assertEqual({ok, <<"v1">>},   bitcask:get(R2, <<"k1">>)),
-                ?assertEqual(not_found,         bitcask:get(R2, <<"k2">>)),
-                ?assertEqual({ok, <<"newer">>}, bitcask:get(R2, <<"k3">>)),
-                Keys = lists:sort(bitcask:list_keys(R2)),
-                ?assertEqual([<<"k1">>, <<"k3">>], Keys)
-            after
-                bitcask:close(R2)
-            end
-        end)
-     end}}.
+%% cross-mode tests removed in M6 (legacy backend deleted)
 
 %% ===================================================================
 %% close_write_file/1 cask path: drops active writer + releases write lock,
@@ -476,7 +427,7 @@ close_write_file_on_readonly_returns_error_test_() ->
             ok = bitcask:put(Rw, <<"k">>, <<"v">>),
             ok = bitcask:close(Rw),
 
-            R = bitcask:open(D, [{nifs, cask_cpp}]),  % read-only
+            R = bitcask:open(D, []),  % read-only
             try
                 ?assertMatch({error, _}, bitcask:close_write_file(R))
             after bitcask:close(R) end
