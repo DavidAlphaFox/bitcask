@@ -1,5 +1,11 @@
 // 缓存的 atom 集合，跨多个 NIF 翻译文件复用。on_load 时一次性 enif_make_atom
 // 全部建好，避免每次 NIF 调用都重新创建 atom。
+//
+// === 线程模型 ===
+// atoms() 返回静态单例，仅在 on_load 阶段被 init() 写入；之后所有 NIF
+// 入口仅读取——「单写多读」且写入早于任何读取，是 race-free 的常见模式。
+//   - atoms().init(env)：仅 on_load 单线程调用一次。
+//   - atoms() / errno_*: 可重入、线程安全、无锁。
 
 #pragma once
 
@@ -69,21 +75,26 @@ struct Atoms {
     ERL_NIF_TERM expiry_grace_time;
     ERL_NIF_TERM max_merge_size;
 
+    // 线程安全: 否（写入静态状态）；仅 on_load 调用一次。
     void init(ErlNifEnv* env) noexcept;
 };
 
 // NIF 实例级别的 atom 单例（每个 .so 加载一次）。
+// 线程安全: 是（仅读静态对象）。
 Atoms& atoms() noexcept;
 
 // 把 errno 翻译成对应的 Erlang atom（enoent / eaccess / ...），
 // 直接复用 erts 提供的 erl_errno_id 表，与 Erlang 侧 file 模块的错误形态一致。
+// 线程安全: 是；不需任何锁。
 ERL_NIF_TERM errno_atom(ErlNifEnv* env, int errnum) noexcept;
 
 // 构造 {error, ErrnoAtom}，业务最常见的错误返回形态。
+// 线程安全: 是；不需任何锁。
 ERL_NIF_TERM errno_error_tuple(ErlNifEnv* env, int errnum) noexcept;
 
 // 构造 {error, {Tag, ErrnoAtom}}，给需要带上下文标签的错误用
 //（例如 {error, {pread_error, eio}}）。
+// 线程安全: 是；不需任何锁。
 ERL_NIF_TERM tagged_errno_error_tuple(ErlNifEnv* env,
                                       ERL_NIF_TERM tag,
                                       int errnum) noexcept;

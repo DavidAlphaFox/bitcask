@@ -6,6 +6,13 @@
 // 错误用 std::expected 返回（kBufferTooShort / kBadCrc / 字段越界），
 // 不抛异常——所有上层调用方需要在错误路径下做出选择（截断 / 拒绝整文件 /
 // 跳过当前 record 等）。
+//
+// === 线程模型 ===
+// 本模块所有函数均为纯函数：
+//   - 可重入 / 线程安全：是。多线程可在不同 buffer 上并发调用。
+//   - 锁要求：无。caller 自行保证「同一 buffer 在不同线程被并发改写」
+//     不会发生（标准 const-correct 约定即可）。
+//   - 不抛异常、不分配额外堆内存（除 encode_* 往 caller 的 vector 里 push）。
 
 #pragma once
 
@@ -52,6 +59,7 @@ struct HintRecord {
 // 编码一条 data record，append 到 out 末尾。返回写入字节数
 // （== kHeaderSize + key.size() + value.size()）。
 // CRC 在内部算好填到前 4 字节。
+// 线程安全: 是（纯函数，但写入 out 由 caller 串行保证）；不需任何锁。
 std::size_t encode_data_record(std::vector<std::byte>& out,
                                std::uint32_t tstamp,
                                std::span<const std::byte> key,
@@ -59,6 +67,7 @@ std::size_t encode_data_record(std::vector<std::byte>& out,
 
 // 从 buf 头部读一条 data record。CRC 会校验；不通过返回 kBadCrc。
 // 不修改 buf；caller 用 result.total_size 自己 advance。
+// 线程安全: 是（纯函数，只读 buf）；不需任何锁。
 [[nodiscard]] std::expected<DataRecordView, DecodeError>
 decode_data_record(std::span<const std::byte> buf);
 
@@ -68,6 +77,7 @@ decode_data_record(std::span<const std::byte> buf);
 
 // 编码一条 hint record。caller 必须保证 offset <= kMaxOffsetV2
 // （63-bit 上限）；超过的话 tombstone bit 会被覆盖污染。
+// 线程安全: 是（纯函数）；不需任何锁。
 std::size_t encode_hint_record(std::vector<std::byte>& out,
                                std::uint32_t tstamp,
                                std::uint32_t total_sz,
@@ -79,17 +89,21 @@ std::size_t encode_hint_record(std::vector<std::byte>& out,
 //   Tstamp=0, KeySz=0, TotalSz=running_crc, Tomb=0, Offset=kMaxOffsetV2
 // 解析方靠 (KeySz==0 && Offset==kMaxOffsetV2) 识别 sentinel；TotalSz
 // 被借来放整文件的 running CRC，给 has_valid_hintfile 用。
+// 线程安全: 是（纯函数）；不需任何锁。
 std::size_t encode_hint_eof(std::vector<std::byte>& out, std::uint32_t running_crc);
 
 // 从 buf 头部读一条 hint record。EOF sentinel 也作为 HintRecord 返回，
 // 调用方用 is_hint_eof() 判断（key 为空 + offset==kMaxOffsetV2）。
+// 线程安全: 是（纯函数）；不需任何锁。
 [[nodiscard]] std::expected<HintRecord, DecodeError>
 decode_hint_record(std::span<const std::byte> buf);
 
+// 线程安全: 是；不需任何锁。
 [[nodiscard]] bool is_hint_eof(const HintRecord& r) noexcept;
 
 // ---------------------------------------------------------------------------
 // CRC32 (zlib / IEEE 802.3 多项式，跟 erlang:crc32/1 一致)
+// 全部为纯函数，线程安全、可重入，不需任何锁。
 // ---------------------------------------------------------------------------
 
 // 一次性算一段。

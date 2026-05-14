@@ -3,6 +3,17 @@
 //
 // M6 之后只剩 cask_* 粗粒度 NIF；旧的 file_* / lock_* / keydir_*
 // 细粒度入口随 legacy Erlang 端一并下线。
+//
+// === 线程模型 ===
+// BEAM 会从多个调度线程上并发调用 NIF：
+//   - kNifFuncs 中 flag = ERL_NIF_DIRTY_JOB_IO_BOUND 的入口在 dirty IO
+//     scheduler 上运行，避免阻塞主调度线程（用于 open/sync/merge 等长耗时
+//     操作）；
+//   - flag = 0 的入口在主调度线程跑，必须 <1ms 完成，不得 block。
+//   - 资源回收（cask_resource_dtor / cask_iter_resource_dtor）由 BEAM 的
+//     回收线程调用，时机不可预测——析构内不得拿任何 BEAM 锁。
+// on_load 在加载时单线程执行；on_unload 在 .so 卸载时单线程执行。
+// 各 NIF 入口的可重入性 / 锁要求见对应的 nif_cask.cpp 函数注释。
 
 #include <new>
 

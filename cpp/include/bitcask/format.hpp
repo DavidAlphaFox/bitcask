@@ -4,6 +4,11 @@
 // 改一处就是 binary-incompatible 变更，必须同步更新 M0 黄金测试
 // （cpp/tests/codec_test.cpp、data_file_test.cpp 里有跟二进制 fixture 的
 // 字节级比对）。原 legacy 端 include/bitcask.hrl 已删，这里成了唯一来源。
+//
+// === 线程模型 ===
+// 全部为 inline constexpr 常量 + 一个 constexpr 纯函数。
+//   - 可重入 / 线程安全：是（无可变状态）。
+//   - 锁要求：无。
 
 #pragma once
 

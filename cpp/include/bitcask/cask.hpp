@@ -113,6 +113,11 @@ class Cask;
 // 遍历 make_iter() 时刻的全部活跃 (key, value)。snapshot 语义靠
 // KeyDir::IterHandle 提供；每条 entry 的 value 在 next() 时按需 pread。
 // 设计上是「per-step 一次 NIF 调用」，方便上层在 BEAM scheduler 之间让出。
+//
+// === 线程模型 ===
+// CaskIter 自身不持锁，方法非线程安全——同一对象只能由一个线程使用。
+// 但不同 CaskIter 对象之间可在多线程并发使用同一个 parent Cask
+// （读路径并行 + KeyDir::IterHandle 支持多 fold）。
 class CaskIter {
 public:
     explicit CaskIter(Cask* parent) noexcept : parent_(parent) {}
@@ -129,6 +134,7 @@ public:
     //   kOk         — 真的开始迭代了
     //   kOutOfDate  — pending 表 freshness 检查没过；caller 应稍后重试
     // CaskFault 留给真正的失败（比如 handle 已经在迭代）。
+    // 线程安全: 否（修改自身字段）；同一 CaskIter 不可并发使用。
     [[nodiscard]] std::expected<keydir::StartIterResult, CaskFault>
     start(int maxage = -1, int maxputs = -1, std::uint32_t now_sec = 0,
           bool see_tombstones = false);
@@ -144,8 +150,10 @@ public:
         std::uint32_t total_sz = 0;
         bool is_tombstone = false;
     };
+    // 线程安全: 否（推进 iter_ + 内部 pread）；同一对象不可并发使用。
     [[nodiscard]] std::expected<std::optional<Entry>, CaskFault> next();
 
+    // 线程安全: 否；幂等。同一对象的 start/next/release 串行调用。
     void release() noexcept;
     [[nodiscard]] bool is_iterating() const noexcept { return iter_ != nullptr; }
 
@@ -165,40 +173,59 @@ public:
 
     // 打开一个 Cask。registry 非空时通过命名 keydir 跟同目录的其它 Cask
     // 共享 keydir（典型生产形态：每个 NIF 实例一个全局 registry）。
+    // 线程安全: 是（每次调用产生独立的 Cask 对象）；registry 自身的并发
+    // 由 KeyDirRegistry 内部锁保证。
+    // 锁要求: 无。
     [[nodiscard]] static std::expected<std::unique_ptr<Cask>, CaskFault>
     open(std::string_view dirname, const CaskOptions& opts,
          keydir::KeyDirRegistry* registry = nullptr);
 
+    // 线程安全: 否（修改对象状态、释放资源）；caller 保证关闭时刻没有
+    // 其它线程仍在调用 get/put/remove/sync/iter。
     void close() noexcept;
 
     // 单 key 读：keydir.get → DataFile.read 一次 pread。kNotFound 用
     // {error, not_found} 表达，对应 NIF 的 atom not_found。
+    // 线程安全: 是（读路径无锁；read_files_ cache 受 read_cache_mu_ 保护，
+    // 底层 DataFile::read 用 pread 是 thread-safe 的）。
+    // 锁要求: 无外部锁；内部按需取 read_cache_mu_ + keydir mutex。
     [[nodiscard]] std::expected<GetResult, CaskFault>
     get(std::span<const std::byte> key);
 
     // 写入。tstamp=0 表示用当前 wall-clock 秒。
+    // 线程安全: 否（写路径要求「一个 Cask 同时只有一个写线程」——M5 通过
+    // 「一个 Erlang 进程独占一个 Cask」实现，本类不提供互斥）。
+    // 同一 Cask 与并发 merge_only 句柄安全（双方共享 keydir 的 shared_mutex
+    // 保护）。
+    // 锁要求: caller 串行化所有 put/remove/sync/close_write_file 调用。
     [[nodiscard]] std::expected<void, CaskFault>
     put(std::span<const std::byte> key,
         std::span<const std::byte> value,
         std::uint32_t tstamp = 0);
 
     // 软删除：写一条墓碑 record。空间在下一次 merge 时回收。
+    // 线程安全: 否（同 put）。锁要求: caller 串行化所有写操作。
     [[nodiscard]] std::expected<void, CaskFault>
     remove(std::span<const std::byte> key, std::uint32_t tstamp = 0);
 
     // fsync active data file。o_sync 模式下退化为 no-op。
+    // 线程安全: 否（操作 active_data_，与 put/remove 互斥）；caller 串行化。
     [[nodiscard]] std::expected<void, CaskFault> sync();
 
     // 强制关 active write file：finalize hint trailer、丢掉 active data/hint
     // 句柄、释放 bitcask.write.lock。Cask 仍可用——下次 put/delete 自动
     // 重新拿锁、新建 active file（对应 legacy bitcask:close_write_file 语义）。
     // 只读 / merge_only 句柄返回 kReadOnly。
+    // 线程安全: 否（操作 active_*）；caller 串行化所有写操作。
     [[nodiscard]] std::expected<void, CaskFault> close_write_file();
 
+    // 线程安全: 是（只读 keydir + opts 快照）；不需任何锁。
     [[nodiscard]] StatusInfo status();
     // O(1) 估算「keydir 是否为空」。写过 key 后即使删光也不会再回 true。
+    // 线程安全: 是（仅读 keydir info）；不需任何锁。
     [[nodiscard]] bool is_empty_estimate();
     // keydir 是否被某个 fold/iterator pin 住（影响 pending 表合并时机）。
+    // 线程安全: 是（仅读 keydir info）；不需任何锁。
     [[nodiscard]] bool is_frozen();
 
     // 包装 decide()：返回是否需要 merge + 候选文件列表。
@@ -207,13 +234,19 @@ public:
         std::vector<std::string> files;
         std::vector<std::string> expired_files;
     };
+    // 线程安全: 是（读 keydir info 拿快照 + 纯函数策略）；不需外部锁。
     [[nodiscard]] NeedsMerge needs_merge(std::uint32_t now_sec = 0);
 
     // 在指定文件上跑 merge。files 为空时先调 needs_merge。caller 自己负责
     // 外部调度 / 锁——这个方法只是把 run_merge 包了一层。
+    // 线程安全: 是（前提是只在 merge_only 模式下被调用，调用方持
+    // bitcask.merge.lock；read_write Cask 上的并发 merge() 与 put/remove 不
+    // 兼容——上层应避免）。
+    // 锁要求: caller 须保证同一 dirname 上同时仅一次 merge 在跑。
     [[nodiscard]] std::expected<merge::MergeStats, CaskFault>
     merge(std::vector<std::string> files = {}, std::uint32_t now_sec = 0);
 
+    // 线程安全: 是；不需任何锁。返回的 CaskIter 自身非线程安全。
     [[nodiscard]] std::unique_ptr<CaskIter> make_iter() {
         return std::make_unique<CaskIter>(this);
     }

@@ -18,6 +18,12 @@
 //
 // release(name) 必须配对调 acquire 时用过的 name；refcount 归零后从注册表
 // 删除该项，同时把当时的 biggest_file_id + 1 持久化到 saved_biggest_file_id_。
+//
+// === 线程模型 ===
+// 整个注册表受一把 std::mutex mutex_ 保护；所有 public 方法均「线程安全 /
+// 可重入」——多线程并发 acquire/release/query 同名或不同名 keydir 都安全。
+// 不要从 KeyDir 持锁的回调里反向调本注册表（会出现锁顺序倒置；目前没人
+// 这么做，注释作约束声明）。
 
 #pragma once
 
@@ -53,10 +59,12 @@ public:
     KeyDirRegistry& operator=(const KeyDirRegistry&) = delete;
 
     // 获取或新建一个命名 KeyDir。语义见文件头注释的初始化协议。
+    // 线程安全: 是。锁: 内部 std::lock_guard(mutex_)。
     [[nodiscard]] AcquireResult acquire(std::string_view name);
 
     // 不创建只查询：返回 kReady 或 kNotReady（后者既包含「名字不存在」
     // 也包含「存在但未 ready」两种情况，调用方一般无需区分）。
+    // 线程安全: 是。锁: 内部 std::lock_guard(mutex_)。
     [[nodiscard]] AcquireResult query(std::string_view name) const;
 
     // 释放 acquire 拿到的 keydir。refcount 减一；归零则：
@@ -64,9 +72,11 @@ public:
     //   2) 把当时的 biggest_file_id + 1 存到 saved_biggest_file_id_，
     //      保证后续重新 acquire 不会复用旧 file_id。
     // name 必须跟 acquire 时一致。
+    // 线程安全: 是。锁: 内部 std::lock_guard(mutex_)。
     void release(std::string_view name);
 
     // 测试 / 内省工具。
+    // 线程安全: 是。锁: 内部 std::lock_guard(mutex_)。
     [[nodiscard]] std::size_t size() const noexcept;
     [[nodiscard]] std::optional<std::uint32_t>
     saved_biggest_file_id(std::string_view name) const;

@@ -7,6 +7,20 @@
 //
 // 选项以 proplist 形式传入，parse_options 把已知键解析成 CaskOptions，
 // 未知键保持 legacy 的「静默忽略」语义（避免老调用方挂掉）。
+//
+// === 线程模型 ===
+// BEAM 调度器线程会并发地从不同 Erlang 进程进入这些 NIF。
+//   - 不同 CaskHandle / CaskIterHandle 对象之间的并发 NIF 入口完全独立——
+//     彼此线程安全。
+//   - 同一 CaskHandle 上的并发：读路径（get / is_empty / is_frozen / status
+//     / needs_merge）线程安全，可多调度线程同时进入；写路径（put / delete
+//     / sync / close_write_file / close）必须串行——M5 的契约是「一个
+//     Erlang 进程独占一个 Cask」，由 Erlang 侧保证，C++ 这层不做互斥。
+//   - 同一 CaskIterHandle 不允许并发使用（其 start/next/release 都是 stateful）。
+//   - 标记 ERL_NIF_DIRTY_JOB_IO_BOUND 的入口跑在 dirty IO 调度器上，可阻塞 I/O；
+//     其余入口必须 <1ms 完成。
+// 锁要求: NIF 自身不取锁；所需互斥已下沉到 KeyDir / Cask 内部，或由 caller
+// （Erlang 进程拓扑）保证。
 
 #include <cstring>
 #include <string>

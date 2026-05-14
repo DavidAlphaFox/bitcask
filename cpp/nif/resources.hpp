@@ -3,6 +3,16 @@
 //
 // M6 之后只剩 cask 自身和 cask 迭代器两种资源；旧的 file/lock/keydir
 // 资源类型随细粒度 NIF 一并下线。
+//
+// === 线程模型 ===
+//   - g_cask_resource_type / g_cask_iter_resource_type 仅在 on_load 阶段
+//     被赋值，之后所有 NIF 入口仅读取——单写多读，race-free。
+//   - register_resources：仅 on_load 调用一次，非线程安全。
+//   - make_resource<T>：可重入、线程安全（enif_alloc_resource / make_resource
+//     都是 BEAM 自身保证 thread-safe 的）。
+//   - cask_resource_dtor / cask_iter_resource_dtor：由 BEAM 资源回收线程
+//     调用，时机不可预测。必须线程安全且不可与持有该资源的 NIF 入口竞争
+//     （BEAM 保证「最后一个 ref 释放后」才调 dtor，所以业务上是安全的）。
 
 #pragma once
 
@@ -36,11 +46,14 @@ struct CaskIterHandle {
 };
 
 // 注册全部资源类型；任一注册失败返回 false。
+// 线程安全: 否；仅 on_load 单线程调用一次。
 [[nodiscard]] bool register_resources(ErlNifEnv* env) noexcept;
 
 // 在 BEAM 资源缓冲区里 placement-new 构造 T，然后返回对应的 Erlang term。
 // 内部会立即 release 本地 ref，剩下的生命周期完全由 BEAM 管。
 // 分配失败返回 0（且不会触发 badarg，由调用方决定怎么报错）。
+// 线程安全: 是（BEAM 的 enif_alloc_resource / enif_make_resource 自身
+// thread-safe；T 的构造函数自身需 thread-safe，由 caller 保证）。
 template <typename T, typename... Args>
 ERL_NIF_TERM make_resource(ErlNifEnv* env, ErlNifResourceType* rt, Args&&... args) {
     void* mem = enif_alloc_resource(rt, sizeof(T));
@@ -52,6 +65,8 @@ ERL_NIF_TERM make_resource(ErlNifEnv* env, ErlNifResourceType* rt, Args&&... arg
 }
 
 // enif_open_resource_type 注册的析构回调。
+// 线程安全: 是（BEAM 调用前保证无 ref，安全独占该对象）；
+// 调用线程不可预测，禁止内部反向调任何 BEAM 锁或拿任何阻塞资源。
 void cask_resource_dtor(ErlNifEnv* env, void* obj) noexcept;
 void cask_iter_resource_dtor(ErlNifEnv* env, void* obj) noexcept;
 

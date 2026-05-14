@@ -10,6 +10,18 @@
 //
 // 可选 `sync=true`：在底层 PosixFile 加 O_SYNC，每次 write 都同步落盘。
 // 跟 kCreate 配合使用就是 cask 的 sync_strategy=o_sync 模式。
+//
+// === 线程模型 ===
+// 类内部不持有互斥量，分两类方法看待并发：
+//   - 读路径 read() / fold()：用 PosixFile::pread，OS 层 thread-safe。
+//     允许多线程在同一 DataFile 对象上并发调用（典型场景：cask 多读者
+//     并发 get 同一个文件）。
+//   - 写路径 write() / truncate_here() / truncate_to() / sync()：
+//     更新 current_offset_ 状态，不可并发；caller 必须保证同一对象写操作
+//     串行（在 cask 里靠「单 Erlang 进程持有 active DataFile」保证）。
+//   - 跨对象：完全独立、线程安全。
+//   - 构造 / 析构 / open / close：单线程，由所有者控制。
+// 本类不提供内部锁——并发约束由 cask 层（read_cache_mu_ + 单写者模型）维护。
 
 #pragma once
 
@@ -68,6 +80,7 @@ public:
     DataFile(DataFile&&) noexcept = default;
     DataFile& operator=(DataFile&&) noexcept = default;
 
+    // 线程安全: 是（每次调用产出新对象）；不需任何锁。
     [[nodiscard]] static std::expected<DataFile, DataFileFault>
     open(std::string_view path, Mode mode, bool sync = false);
 
@@ -75,6 +88,7 @@ public:
 
     // append 一条 record。内部先 pwrite 到 current_offset_ 然后推进；
     // 不支持同一 DataFile 对象的并发写入——concurrency 在更上层（cask）控制。
+    // 线程安全: 否（修改 current_offset_）；caller 串行化对同一对象的写。
     [[nodiscard]] std::expected<WriteResult, DataFileFault>
     write(std::uint32_t tstamp,
           std::span<const std::byte> key,
@@ -82,15 +96,21 @@ public:
 
     // 截断到当前 write offset。给 undo / 部分写恢复用
     // （比 truncate_to(current_offset_) 更明确意图）。
+    // 线程安全: 否（依赖 current_offset_ + ftruncate）；与 write() 互斥串行。
     [[nodiscard]] std::expected<void, DataFileFault> truncate_here();
 
     // fsync(2)。
+    // 线程安全: 是（仅触发 fsync 系统调用）；可在多线程并发，但通常配合
+    // 写路径同步使用 → 实际由 caller 单线程触发。
     [[nodiscard]] std::expected<void, DataFileFault> sync();
 
     // ---- 读取 ----
 
     // 在 offset 处读一条 record，size 必须等于当时写入时记录的 total_size
     // （即 14 + key_sz + value_sz）。CRC 会校验；不通过返回 kBadCrc。
+    // 线程安全: 是（pread 不动 fd offset）；多读者并发 OK，且与并发的
+    // write()/truncate_*() 仅在「读到刚被改写的偏移段」时不一致——cask 通过
+    // 「读只读老文件」「写仅写 active」的拓扑避免该情况。
     [[nodiscard]] std::expected<ReadRecord, DataFileFault>
     read(std::uint64_t offset, std::uint32_t total_size);
 
@@ -106,6 +126,8 @@ public:
     using FoldFn = std::function<void(const codec::DataRecordView& view,
                                        std::uint64_t offset,
                                        std::uint32_t total_size)>;
+    // 线程安全: 是（pread + 一次性 stream 读取，不修改 current_offset_ 状态）；
+    // 多线程可并发 fold 同一对象，但 fn 自身需自带线程安全（caller 责任）。
     [[nodiscard]] std::expected<void, DataFileFault>
     fold(FoldFn fn,
          bool tolerate_crc_errors = false,
@@ -114,6 +136,7 @@ public:
     // 截断到 new_size。给 fold 发现 torn write 后做尾部修复用。
     // caller 必须处于 write/append 模式；截断后内部 seek 到末尾，
     // 后续 write 可以无缝继续。
+    // 线程安全: 否（修改 current_offset_ + ftruncate）；与 write 互斥串行。
     [[nodiscard]] std::expected<void, DataFileFault>
     truncate_to(std::uint64_t new_size);
 
@@ -138,6 +161,7 @@ private:
 // 文件名约定：<dir>/<tstamp>.bitcask.data 与 <dir>/<tstamp>.bitcask.hint
 // tstamp 是文件创建时刻的 monotonic counter（不是 wall clock，避免
 // 跨进程冲突；keydir_registry 全局递增）。
+// 以下都是纯字符串处理函数：线程安全、可重入、无锁。
 // ---------------------------------------------------------------------------
 [[nodiscard]] std::string mk_data_filename(std::string_view dirname,
                                             std::uint64_t tstamp);

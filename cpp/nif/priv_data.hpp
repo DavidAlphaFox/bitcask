@@ -3,6 +3,11 @@
 //
 // 目前 priv_data 只放了 KeyDirRegistry —— 一个跨进程的命名 keydir 注册表，
 // 让多个 Erlang 进程可以通过同一个目录名共享同一份 in-memory keydir。
+//
+// === 线程模型 ===
+//   - 对象构造 / 析构：仅 on_load / on_unload 单线程调用。
+//   - registry 字段：KeyDirRegistry 自身线程安全（内部 mutex_）。
+//   - priv(env)：只读 enif_priv_data 指针，可重入、线程安全、无锁。
 
 #pragma once
 

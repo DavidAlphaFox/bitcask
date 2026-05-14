@@ -15,6 +15,13 @@
 //   2. 同步生成 hint 文件，加速下次 open 的 keydir 重建；
 //   3. 用 keydir->put(..., old_file_id, old_offset) 做 CAS 更新——
 //      避免跟其它 writer 抢同一个 key。
+//
+// === 线程模型 ===
+//   - run_merge 自身不取任何锁；caller 必须在外部串行（典型做法：通过
+//     bitcask.merge.lock 文件锁保证同时仅一次 merge 在跑）。
+//   - 期间会反复调用 keydir 的 put/get/conditional_remove——这些方法
+//     自己内部加锁，并发写者可继续运行。
+//   - 同一进程内并发调用 run_merge（同一目录）= 数据腐败风险；caller 责任。
 
 #pragma once
 
@@ -60,6 +67,12 @@ struct MergeStats {
 //
 // sync_output=true 让输出文件以 O_SYNC 打开——cask 的 sync_strategy=o_sync
 // 时使用，保证 merge 输出立刻落盘。
+//
+// 线程安全: 单调用本身（同一目录、同一 keydir）必须串行——caller 用
+// merge.lock 文件锁仲裁；不同目录的 run_merge 互不冲突，可并发。
+// 锁要求: 调用方需已持 bitcask.merge.lock（或同等仲裁），且 keydir 已就绪
+// （is_ready() == true）。本函数内不取任何 mutex，但会通过 keydir 公共
+// API 间接持锁。
 [[nodiscard]] std::expected<MergeStats, MergeFault>
 run_merge(std::span<const std::string> input_data_paths,
           std::string_view output_dir,

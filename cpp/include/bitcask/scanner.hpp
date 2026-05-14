@@ -4,6 +4,12 @@
 // （等价于 legacy 的 data_file_tstamps）。每条 entry 同时给出对应的
 // .bitcask.hint 路径以及它是否真实存在——caller 用 has_hint 决定走
 // 「hint 加速重建」还是「扫整个 data file 重建 keydir」。
+//
+// === 线程模型 ===
+// 唯一对外函数 scan_dir：只读 opendir/stat，无共享状态。
+//   - 可重入 / 线程安全：是（OS 层 opendir 在 POSIX 下保证 readdir 在
+//     不同 DIR* 上并发安全；Linux 实现为 thread-safe）。
+//   - 锁要求：无。
 
 #pragma once
 

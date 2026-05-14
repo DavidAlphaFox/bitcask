@@ -1,5 +1,12 @@
 // NIF term ↔ C++ 类型 的小工具集合。所有函数都 inline 到 header，
 // 没有翻译单元；避免引入额外 .cpp 增加编译开销。
+//
+// === 线程模型 ===
+// 全部函数都仅操作 caller 提供的 env / term / 局部缓冲，没有共享可变状态。
+//   - 可重入 / 线程安全：是。
+//   - 锁要求：无。
+// 注意: 返回的 std::span<const std::byte> 生命周期跟 caller 的 ErlNifBinary
+// 同步，caller 责任保证 binary 不被提前释放。
 
 #pragma once
 
