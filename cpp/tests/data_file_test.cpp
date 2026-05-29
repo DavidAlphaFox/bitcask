@@ -17,6 +17,8 @@ using bitcask::fileops::DataFile;
 using bitcask::fileops::DataFileError;
 using bitcask::fileops::HintFile;
 using bitcask::fileops::ReadRecord;
+using bitcask::format::RecordType;
+using bitcask::format::kHeaderSize;
 
 namespace fs = std::filesystem;
 
@@ -76,23 +78,28 @@ TEST(DataFile, CreateAppendReadRoundTrip) {
     auto f = DataFile::open(path, DataFile::Mode::kCreate);
     ASSERT_TRUE(f);
 
-    auto w1 = f->write(/*tstamp*/ 100, as_bytes("k1"), as_bytes("v1"));
+    auto w1 = f->write(RecordType::kDoc, /*tstamp*/ 100, /*ord*/ 1,
+                       as_bytes("k1"), as_bytes("v1"));
     ASSERT_TRUE(w1);
     EXPECT_EQ(w1->offset, 0u);
 
-    auto w2 = f->write(/*tstamp*/ 101, as_bytes("k2"), as_bytes("vvv"));
+    auto w2 = f->write(RecordType::kDoc, /*tstamp*/ 101, /*ord*/ 2,
+                       as_bytes("k2"), as_bytes("vvv"));
     ASSERT_TRUE(w2);
     EXPECT_EQ(w2->offset, w1->total_size);
 
     auto r1 = f->read(w1->offset, w1->total_size);
     ASSERT_TRUE(r1);
+    EXPECT_EQ(r1->type, RecordType::kDoc);
     EXPECT_EQ(r1->tstamp, 100u);
+    EXPECT_EQ(r1->ord, 1u);
     EXPECT_EQ(view_str(r1->key),   "k1");
     EXPECT_EQ(view_str(r1->value), "v1");
 
     auto r2 = f->read(w2->offset, w2->total_size);
     ASSERT_TRUE(r2);
     EXPECT_EQ(r2->tstamp, 101u);
+    EXPECT_EQ(r2->ord, 2u);
     EXPECT_EQ(view_str(r2->key),   "k2");
     EXPECT_EQ(view_str(r2->value), "vvv");
 }
@@ -103,9 +110,9 @@ TEST(DataFile, FoldVisitsAllRecords) {
 
     auto f = DataFile::open(path, DataFile::Mode::kCreate);
     ASSERT_TRUE(f);
-    ASSERT_TRUE(f->write(1, as_bytes("a"),   as_bytes("AA")));
-    ASSERT_TRUE(f->write(2, as_bytes("b"),   as_bytes("BBBB")));
-    ASSERT_TRUE(f->write(3, as_bytes("ccc"), as_bytes(std::string(257, 'x'))));
+    ASSERT_TRUE(f->write(RecordType::kDoc, 1, 1, as_bytes("a"),   as_bytes("AA")));
+    ASSERT_TRUE(f->write(RecordType::kDoc, 2, 2, as_bytes("b"),   as_bytes("BBBB")));
+    ASSERT_TRUE(f->write(RecordType::kDoc, 3, 3, as_bytes("ccc"), as_bytes(std::string(257, 'x'))));
 
     std::vector<std::pair<std::string, std::string>> seen;
     auto fold_res = f->fold(
@@ -127,7 +134,7 @@ TEST(DataFile, OpenForReadAndFold) {
     {
         auto f = DataFile::open(path, DataFile::Mode::kCreate);
         ASSERT_TRUE(f);
-        ASSERT_TRUE(f->write(1, as_bytes("k"), as_bytes("v")));
+        ASSERT_TRUE(f->write(RecordType::kDoc, 1, 1, as_bytes("k"), as_bytes("v")));
     }
     auto r = DataFile::open(path, DataFile::Mode::kRead);
     ASSERT_TRUE(r);
@@ -143,7 +150,7 @@ TEST(DataFile, BadCrcReturnsKBadCrc) {
     {
         auto f = DataFile::open(path, DataFile::Mode::kCreate);
         ASSERT_TRUE(f);
-        auto w = f->write(1, as_bytes("k"), as_bytes("vvvv"));
+        auto w = f->write(RecordType::kDoc, 1, 1, as_bytes("k"), as_bytes("vvvv"));
         ASSERT_TRUE(w);
     }
     // Corrupt the value.
@@ -160,7 +167,7 @@ TEST(DataFile, BadCrcReturnsKBadCrc) {
     }
     auto r = DataFile::open(path, DataFile::Mode::kRead);
     ASSERT_TRUE(r);
-    auto rec = r->read(0, 14 + 1 + 4);
+    auto rec = r->read(0, kHeaderSize + 1 + 4);
     ASSERT_FALSE(rec);
     EXPECT_EQ(rec.error().kind, DataFileError::kBadCrc);
 }
@@ -170,10 +177,10 @@ TEST(DataFile, ReuseOffsetMatchesIndex) {
     const auto path = td / "5.bitcask.data";
     auto f = DataFile::open(path, DataFile::Mode::kCreate);
     ASSERT_TRUE(f);
-    auto w = f->write(7, as_bytes("hello"), as_bytes("world"));
+    auto w = f->write(RecordType::kDoc, 7, 1, as_bytes("hello"), as_bytes("world"));
     ASSERT_TRUE(w);
     EXPECT_EQ(w->offset, 0u);
-    EXPECT_EQ(w->total_size, 14u + 5u + 5u);
+    EXPECT_EQ(w->total_size, kHeaderSize + 5u + 5u);
     EXPECT_EQ(f->size(), w->total_size);
 
     auto rec = f->read(w->offset, w->total_size);
@@ -413,15 +420,15 @@ TEST(DataAndHint, ParallelStreamsAreConsistent) {
     auto hf = HintFile::open(hint_path, HintFile::Mode::kCreate);
     ASSERT_TRUE(hf);
 
-    struct Rec { std::string k, v; std::uint32_t ts; };
+    struct Rec { std::string k, v; std::uint32_t ts; std::uint64_t ord; };
     std::vector<Rec> input = {
-        {"alpha",   "1",   100},
-        {"bravo",   "22",  101},
-        {"charlie", "333", 102},
+        {"alpha",   "1",   100, 1},
+        {"bravo",   "22",  101, 2},
+        {"charlie", "333", 102, 3},
     };
 
     for (const auto& r : input) {
-        auto w = df->write(r.ts, as_bytes(r.k), as_bytes(r.v));
+        auto w = df->write(RecordType::kDoc, r.ts, r.ord, as_bytes(r.k), as_bytes(r.v));
         ASSERT_TRUE(w);
         ASSERT_TRUE(hf->write(r.ts, w->total_size, w->offset,
                               /*tomb*/ false, as_bytes(r.k)));

@@ -1,12 +1,12 @@
-// bitcask 磁盘格式常量。
+// bitcask 磁盘格式常量（向量库 typed record）。
 //
-// 这里的所有数字、字段顺序、tombstone 字符串都是「磁盘契约」的一部分，
-// 改一处就是 binary-incompatible 变更，必须同步更新 M0 黄金测试
+// 这里的所有数字、字段顺序都是「磁盘契约」的一部分，改一处就是
+// binary-incompatible 变更，必须同步更新黄金测试
 // （cpp/tests/codec_test.cpp、data_file_test.cpp 里有跟二进制 fixture 的
-// 字节级比对）。原 legacy 端 include/bitcask.hrl 已删，这里成了唯一来源。
+// 字节级比对）。设计见 doc/vector-db-design-zh.md §2。
 //
 // === 线程模型 ===
-// 全部为 inline constexpr 常量 + 一个 constexpr 纯函数。
+// 全部为 inline constexpr 常量 + enum。
 //   - 可重入 / 线程安全：是（无可变状态）。
 //   - 锁要求：无。
 
@@ -14,27 +14,39 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <string_view>
 
 namespace bitcask::format {
 
 // ---------------------------------------------------------------------------
-// 数据文件 record 布局：
-//   [0..3]   CRC32       (覆盖 Tstamp..Value 区段)
-//   [4..7]   Tstamp      u32 大端
-//   [8..9]   KeySz       u16 大端
-//   [10..13] ValueSz     u32 大端
-//   [14..]   Key | Value
+// 数据文件 record 布局（向量库 typed record，V1）：
+//   [0..3]   CRC32       (覆盖 Type..Value 区段，即 [4..] 全部)
+//   [4]      Type        u8   (RecordType：kDoc / kTombstone)
+//   [5..8]   Tstamp      u32 大端
+//   [9..16]  Ord         u64 大端 (引擎单调分配的写入序号，per-write，永不复用)
+//   [17..18] KeySz       u16 大端 (key == ext_id)
+//   [19..22] ValueSz     u32 大端 (kDoc 时是打包 value；kTombstone 时通常为 0)
+//   [23..]   Key | Value
 // 总长 = kHeaderSize + KeySz + ValueSz
+//
+// 设计依据见 doc/vector-db-design-zh.md §2.2。CRC 覆盖范围从 Type 开始
+// （含 ord），而非 legacy 的 Tstamp 起。
 // ---------------------------------------------------------------------------
-inline constexpr std::size_t kHeaderSize = 14;  // 4 + 4 + 2 + 4
+inline constexpr std::size_t kHeaderSize = 23;  // 4 + 1 + 4 + 8 + 2 + 4
 inline constexpr std::size_t kCrcOffset = 0;
-inline constexpr std::size_t kTstampOffset = 4;
-inline constexpr std::size_t kKeySzOffset = 8;
-inline constexpr std::size_t kValueSzOffset = 10;
+inline constexpr std::size_t kTypeOffset = 4;
+inline constexpr std::size_t kTstampOffset = 5;
+inline constexpr std::size_t kOrdOffset = 9;
+inline constexpr std::size_t kKeySzOffset = 17;
+inline constexpr std::size_t kValueSzOffset = 19;
 
 inline constexpr std::uint16_t kMaxKeySize = 0xFFFF;          // 16-bit 字段上限
 inline constexpr std::uint32_t kMaxValueSize = 0xFFFF'FFFFu;  // 32-bit 字段上限
+
+// record 类型（Type 字段，u8）。墓碑不再靠 value 魔法串识别，而是一等 record 类型。
+enum class RecordType : std::uint8_t {
+    kDoc       = 0,  // 一条文档：value 是 §2.4 打包的 {vector,text,meta}
+    kTombstone = 1,  // 删除标记：value 通常为空，target 由 Key=ext_id + Ord 确定
+};
 
 // ---------------------------------------------------------------------------
 // hint 文件 record 布局（用于 keydir 重建加速；不带 value）：
@@ -52,30 +64,26 @@ inline constexpr std::uint64_t kMaxOffsetV2 = 0x7FFF'FFFF'FFFF'FFFFull;
 inline constexpr std::uint64_t kTombMaskV2 = 0x8000'0000'0000'0000ull;
 
 // ---------------------------------------------------------------------------
-// 墓碑 value（写在 data record 的 VALUE 段，不是单独的 record 类型）：
-//   v0: "bitcask_tombstone"             (17 B)
-//   v1: "bitcask_tombstone1" + FileId32 (22 B) — 不再生成，仅识别
-//   v2: "bitcask_tombstone2" + FileId32 (22 B) — 当前默认
+// kDoc value 打包布局（写在 kDoc record 的 VALUE 段）。设计见 §2.4：
+//   [0]      Ver         u8   (布局版本号，当前 = kDocValueVersion)
+//   [1]      Flags       u8   (见下方 kFlag* 位)
+//   [可选] vector 段：  [Dim:u32 大端][ f32×Dim 小端  或  量化码字 ]
+//   [可选] text   段：  [Len:u32 大端][ utf8 字节 ]
+//   [可选] meta   段：  [Len:u32 大端][ 序列化字节(msgpack/CBOR) ]
+// 三段按 vector→text→meta 定序出现，由 Flags 决定是否存在（向量段放最前，
+// 便于 HNSW 重建按 Dim O(1) 切片）。
 //
-// v1/v2 在前缀后面跟 4 字节 file_id：用来区分「这条墓碑是为哪个 data file
-// 的某条 entry 而写的」，merge 时校验影子 file_id 仍存活才回收原 entry。
-// 详见 cpp/src/cask/cask.cpp 的 put_tombstone 与 merger 的 stale 判定。
+// 字节序：长度类整数(Dim/Len)大端，沿用本文件契约；向量 f32 数组固定小端
+// （x86/ARM64 原生零转换，见 §2.4）。
 // ---------------------------------------------------------------------------
-inline constexpr std::string_view kTombstonePrefix = "bitcask_tombstone";
-inline constexpr std::string_view kTombstoneV0 = "bitcask_tombstone";
-inline constexpr std::string_view kTombstoneV1 = "bitcask_tombstone1";
-inline constexpr std::string_view kTombstoneV2 = "bitcask_tombstone2";
+inline constexpr std::uint8_t kDocValueVersion   = 1;
+inline constexpr std::size_t  kDocValueHeaderSize = 2;  // Ver + Flags
+inline constexpr std::size_t  kSectionLenSize     = 4;  // 各段 Dim/Len 字段宽度
 
-inline constexpr std::size_t kTombstoneV0Size = 17;
-inline constexpr std::size_t kTombstoneV1Size = 22;  // 18 + 4
-inline constexpr std::size_t kTombstoneV2Size = 22;  // 18 + 4
-inline constexpr std::size_t kMaxTombstoneSize = kTombstoneV2Size;
-
-// 一条 record 的 value 是否是墓碑：只看 17 字节前缀，对 v0/v1/v2 一视同仁。
-[[nodiscard]] constexpr bool is_tombstone_value(std::string_view v) noexcept {
-    return v.size() >= kTombstonePrefix.size() &&
-           v.substr(0, kTombstonePrefix.size()) == kTombstonePrefix;
-}
+inline constexpr std::uint8_t kFlagHasVector    = 0x01;
+inline constexpr std::uint8_t kFlagHasText      = 0x02;
+inline constexpr std::uint8_t kFlagHasMeta      = 0x04;
+inline constexpr std::uint8_t kFlagVecQuantized = 0x08;
 
 // ---------------------------------------------------------------------------
 // hint 文件的 CRC chunk 大小（解析时做合理性边界检查）。

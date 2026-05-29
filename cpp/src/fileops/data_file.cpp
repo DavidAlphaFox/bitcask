@@ -59,7 +59,9 @@ DataFile::open(std::string_view path, Mode mode, bool sync) {
 // 注意是 pwrite 不是 write——即使打开时带了 O_APPEND，我们也要明确指定
 // offset 来支持「自己追踪写入位置」的语义（下一步 truncate_to 会用到）。
 std::expected<WriteResult, DataFileFault>
-DataFile::write(std::uint32_t tstamp,
+DataFile::write(format::RecordType type,
+                std::uint32_t tstamp,
+                std::uint64_t ord,
                 std::span<const std::byte> key,
                 std::span<const std::byte> value) {
     if (mode_ == Mode::kRead) {
@@ -70,7 +72,7 @@ DataFile::write(std::uint32_t tstamp,
 
     std::vector<std::byte> buf;
     buf.reserve(format::kHeaderSize + key.size() + value.size());
-    const std::size_t total = codec::encode_data_record(buf, tstamp, key, value);
+    const std::size_t total = codec::encode_data_record(buf, type, tstamp, ord, key, value);
 
     const std::uint64_t off = current_offset_;
     auto w = file_.pwrite(off, buf);
@@ -132,7 +134,9 @@ DataFile::read(std::uint64_t offset, std::uint32_t total_size) {
         }
     }
     ReadRecord out;
+    out.type       = rec->type;
     out.tstamp     = rec->tstamp;
+    out.ord        = rec->ord;
     if (rec->total_size > format::kMaxValueSize + format::kHeaderSize + format::kMaxKeySize) {
         return std::unexpected(DataFileFault{DataFileError::kTooLarge});
     }

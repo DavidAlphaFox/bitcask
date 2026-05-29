@@ -40,34 +40,18 @@ target_link_libraries(bitcask_file_lock_test PRIVATE
     bitcask_sanitizers
 )
 
-add_executable(bitcask_keydir_test keydir_test.cpp)
-target_link_libraries(bitcask_keydir_test PRIVATE
+add_executable(bitcask_index_test index_test.cpp)
+target_link_libraries(bitcask_index_test PRIVATE
     GTest::gtest_main
-    bitcask_keydir
+    bitcask_index
     bitcask_warnings
     bitcask_sanitizers
 )
 
-add_executable(bitcask_keydir_iter_test keydir_iter_test.cpp)
-target_link_libraries(bitcask_keydir_iter_test PRIVATE
+add_executable(bitcask_collection_test collection_test.cpp)
+target_link_libraries(bitcask_collection_test PRIVATE
     GTest::gtest_main
-    bitcask_keydir
-    bitcask_warnings
-    bitcask_sanitizers
-)
-
-add_executable(bitcask_keydir_registry_test keydir_registry_test.cpp)
-target_link_libraries(bitcask_keydir_registry_test PRIVATE
-    GTest::gtest_main
-    bitcask_keydir
-    bitcask_warnings
-    bitcask_sanitizers
-)
-
-add_executable(bitcask_keydir_stress_test keydir_stress_test.cpp)
-target_link_libraries(bitcask_keydir_stress_test PRIVATE
-    GTest::gtest_main
-    bitcask_keydir
+    bitcask_collection
     bitcask_warnings
     bitcask_sanitizers
 )
@@ -88,41 +72,14 @@ target_link_libraries(bitcask_scanner_test PRIVATE
     bitcask_sanitizers
 )
 
-add_executable(bitcask_merge_policy_test merge_policy_test.cpp)
-target_link_libraries(bitcask_merge_policy_test PRIVATE
-    GTest::gtest_main
-    bitcask_merge
-    bitcask_warnings
-    bitcask_sanitizers
-)
-
-add_executable(bitcask_merger_test merger_test.cpp)
-target_link_libraries(bitcask_merger_test PRIVATE
-    GTest::gtest_main
-    bitcask_merge
-    bitcask_warnings
-    bitcask_sanitizers
-)
-
-add_executable(bitcask_cask_test cask_test.cpp)
-target_link_libraries(bitcask_cask_test PRIVATE
-    GTest::gtest_main
-    bitcask_cask
-    bitcask_warnings
-    bitcask_sanitizers
-)
+# NOTE(V1): legacy 测试 keydir*/merge*/cask/NIF 已移除（见 cpp/CMakeLists.txt）。
 
 include(GoogleTest)
 gtest_discover_tests(bitcask_smoke_test)
 gtest_discover_tests(bitcask_codec_test)
 gtest_discover_tests(bitcask_posix_file_test)
 gtest_discover_tests(bitcask_file_lock_test)
-gtest_discover_tests(bitcask_keydir_test)
-gtest_discover_tests(bitcask_keydir_iter_test)
-gtest_discover_tests(bitcask_keydir_registry_test)
-gtest_discover_tests(bitcask_keydir_stress_test PROPERTIES TIMEOUT 60)
+gtest_discover_tests(bitcask_index_test)
+gtest_discover_tests(bitcask_collection_test)
 gtest_discover_tests(bitcask_data_file_test)
 gtest_discover_tests(bitcask_scanner_test)
-gtest_discover_tests(bitcask_merge_policy_test)
-gtest_discover_tests(bitcask_merger_test)
-gtest_discover_tests(bitcask_cask_test)

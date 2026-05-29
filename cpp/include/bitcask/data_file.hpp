@@ -50,7 +50,9 @@ struct WriteResult {
 // read() 的结果：解码完整的一条 record。key/value 是 owned vector
 // （不是 view），因为底层的 pread buffer 离开 read() 就析构了。
 struct ReadRecord {
+    format::RecordType type;
     std::uint32_t tstamp;
+    std::uint64_t ord;
     std::uint32_t total_size;
     std::vector<std::byte> key;
     std::vector<std::byte> value;
@@ -90,7 +92,9 @@ public:
     // 不支持同一 DataFile 对象的并发写入——concurrency 在更上层（cask）控制。
     // 线程安全: 否（修改 current_offset_）；caller 串行化对同一对象的写。
     [[nodiscard]] std::expected<WriteResult, DataFileFault>
-    write(std::uint32_t tstamp,
+    write(format::RecordType type,
+          std::uint32_t tstamp,
+          std::uint64_t ord,
           std::span<const std::byte> key,
           std::span<const std::byte> value);
 

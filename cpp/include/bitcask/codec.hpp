@@ -19,23 +19,29 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <span>
 #include <vector>
+
+#include "bitcask/format.hpp"  // RecordType + kDoc value 打包常量
 
 namespace bitcask::codec {
 
 enum class DecodeError {
-    kBufferTooShort,     // 输入不够长，连 header 都读不全
-    kBadCrc,             // CRC32 校验失败（数据损坏 / 写入到一半被 kill）
-    kKeySizeOverflow,    // KeySz 字段读出来后跟 buffer 实际长度不符
-    kValueSizeOverflow,  // ValueSz 同上
+    kBufferTooShort,      // 输入不够长，连 header 都读不全
+    kBadCrc,              // CRC32 校验失败（数据损坏 / 写入到一半被 kill）
+    kKeySizeOverflow,     // KeySz 字段读出来后跟 buffer 实际长度不符
+    kValueSizeOverflow,   // ValueSz 同上
+    kUnsupportedVersion,  // kDoc value 的 Ver 字段不被支持
 };
 
 // 解码后的 data record 视图。key/value 是 zero-copy span，生命周期跟着
 // 输入 buf 走——caller 持有 buf 的时候才能用 view。
 struct DataRecordView {
-    std::uint32_t crc;
-    std::uint32_t tstamp;
+    std::uint32_t      crc;
+    format::RecordType type;
+    std::uint32_t      tstamp;
+    std::uint64_t      ord;
     std::span<const std::byte> key;
     std::span<const std::byte> value;
     std::size_t total_size;  // kHeaderSize + key.size() + value.size()
@@ -58,10 +64,12 @@ struct HintRecord {
 
 // 编码一条 data record，append 到 out 末尾。返回写入字节数
 // （== kHeaderSize + key.size() + value.size()）。
-// CRC 在内部算好填到前 4 字节。
+// CRC 在内部算好填到前 4 字节（覆盖 Type..Value）。
 // 线程安全: 是（纯函数，但写入 out 由 caller 串行保证）；不需任何锁。
 std::size_t encode_data_record(std::vector<std::byte>& out,
+                               format::RecordType type,
                                std::uint32_t tstamp,
+                               std::uint64_t ord,
                                std::span<const std::byte> key,
                                std::span<const std::byte> value);
 
@@ -70,6 +78,42 @@ std::size_t encode_data_record(std::vector<std::byte>& out,
 // 线程安全: 是（纯函数，只读 buf）；不需任何锁。
 [[nodiscard]] std::expected<DataRecordView, DecodeError>
 decode_data_record(std::span<const std::byte> buf);
+
+// ---------------------------------------------------------------------------
+// kDoc value 打包/解包（§2.4）。仅用于 type==kDoc 的 record 的 VALUE 段。
+// ---------------------------------------------------------------------------
+
+// encode 输入：三段皆可选（nullopt = 该段缺省，不写 flag）。vector 是 f32
+// 向量（V1 不量化）。
+struct DocValueParts {
+    std::optional<std::span<const float>>      vector;
+    std::optional<std::span<const std::byte>>  text;
+    std::optional<std::span<const std::byte>>  meta;
+};
+
+// 解码后的 kDoc value 视图。各段是 zero-copy span，生命周期跟着输入 buf。
+// vector_raw 是原始字节（f32 小端，未量化时长度 == dim*4）；caller 在 LE 主机
+// 上可直接 memcpy 成 float[]。
+struct DocValueView {
+    std::uint8_t ver;
+    bool has_vector = false;
+    bool has_text   = false;
+    bool has_meta   = false;
+    bool vec_quantized = false;
+    std::uint32_t dim = 0;                  // 仅 has_vector 有效
+    std::span<const std::byte> vector_raw;
+    std::span<const std::byte> text;
+    std::span<const std::byte> meta;
+};
+
+// 把 {vector,text,meta} 打包成 kDoc value，append 到 out。返回写入字节数。
+// 线程安全: 是（纯函数）；不需任何锁。
+std::size_t encode_doc_value(std::vector<std::byte>& out, const DocValueParts& parts);
+
+// 解包 kDoc value。Ver 不支持返回 kUnsupportedVersion；截断返回 kBufferTooShort。
+// 线程安全: 是（纯函数，只读 buf）；不需任何锁。
+[[nodiscard]] std::expected<DocValueView, DecodeError>
+decode_doc_value(std::span<const std::byte> buf);
 
 // ---------------------------------------------------------------------------
 // hint 文件 record

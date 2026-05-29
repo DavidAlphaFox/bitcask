@@ -1,5 +1,6 @@
-// M0 codec golden test: locks the on-disk byte layout of bitcask data
-// records and hint records so subsequent C++ rewrites cannot drift.
+// codec golden test: locks the on-disk byte layout of bitcask typed-record
+// data records, kDoc value packing, and hint records so subsequent changes
+// cannot silently drift. See doc/vector-db-design-zh.md §2.
 
 #include <array>
 #include <cstddef>
@@ -56,85 +57,72 @@ std::string bytes_to_hex(std::span<const std::byte> b) {
 
 // ---------------------------------------------------------------------------
 // CRC32: must match erlang:crc32/1 (zlib / IEEE 802.3).
-// Reference vectors generated with: erl -eval 'io:format("~.16B~n",[erlang:crc32(<<"...">>)])'
 // ---------------------------------------------------------------------------
 TEST(Crc32, KnownVectors) {
-    // erlang:crc32(<<>>) = 0
     EXPECT_EQ(codec::crc32({}), 0u);
-    // erlang:crc32(<<"123456789">>) = 16#CBF43926
     EXPECT_EQ(codec::crc32(as_bytes("123456789")), 0xCBF43926u);
-    // erlang:crc32(<<"hello">>)     = 16#3610A686
     EXPECT_EQ(codec::crc32(as_bytes("hello")), 0x3610A686u);
 }
 
 // ---------------------------------------------------------------------------
 // Data record golden: byte-by-byte layout for known input.
+//   [CRC(4)] [Type(1)] [Tstamp(4)] [Ord(8)] [KeySz(2)] [ValueSz(4)] [Key][Value]
+//   CRC covers Type..Value.
 // ---------------------------------------------------------------------------
 TEST(DataRecord, GoldenLayout) {
-    const std::uint32_t tstamp = 0x12345678;
-    const std::string_view key = "k";
-    const std::string_view val = "vv";
-
     std::vector<std::byte> out;
-    const std::size_t n = codec::encode_data_record(out, tstamp,
-                                                    as_bytes(key),
-                                                    as_bytes(val));
-    ASSERT_EQ(n, kHeaderSize + key.size() + val.size());
-    ASSERT_EQ(out.size(), n);
+    codec::encode_data_record(out, RecordType::kDoc, /*tstamp*/ 0x12345678,
+                              /*ord*/ 1, as_bytes("k"), as_bytes("vv"));
+    ASSERT_EQ(out.size(), kHeaderSize + 1 + 2);
 
-    // Hand-checked layout:
-    //   crc32 over [Tstamp(4) KeySz(2) ValueSz(4) Key(1) Value(2)]
-    //   bytes after CRC:
-    //     12 34 56 78  00 01  00 00 00 02  6b  76 76
-    static constexpr std::array<std::byte, 10 + 1 + 2> covered = {
-        std::byte{0x12}, std::byte{0x34}, std::byte{0x56}, std::byte{0x78},
-        std::byte{0x00}, std::byte{0x01},
-        std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x02},
-        std::byte{'k'},
-        std::byte{'v'}, std::byte{'v'},
-    };
+    // Covered region (everything after the 4-byte CRC):
+    //   Type:    00
+    //   Tstamp:  12 34 56 78
+    //   Ord:     00 00 00 00 00 00 00 01
+    //   KeySz:   00 01
+    //   ValueSz: 00 00 00 02
+    //   Key:     6b
+    //   Value:   76 76
+    auto covered = hex_to_bytes("00" "12345678" "0000000000000001"
+                                "0001" "00000002" "6b" "7676");
     const std::uint32_t expected_crc = codec::crc32(covered);
 
     EXPECT_EQ(out[0], static_cast<std::byte>((expected_crc >> 24) & 0xFF));
     EXPECT_EQ(out[1], static_cast<std::byte>((expected_crc >> 16) & 0xFF));
     EXPECT_EQ(out[2], static_cast<std::byte>((expected_crc >> 8) & 0xFF));
     EXPECT_EQ(out[3], static_cast<std::byte>(expected_crc & 0xFF));
-
-    // Bytes 4..end must equal the covered region.
     for (std::size_t i = 0; i < covered.size(); ++i) {
         EXPECT_EQ(out[4 + i], covered[i]) << "mismatch at byte " << (4 + i);
     }
 }
 
-// Cross-validated against a live `erl` run (Tstamp=0x12345678, Key="k",
-// Value="vv") -> bytes `5bb76cce 12345678 0001 00000002 6b 7676`.
-// Pinning the exact hex (including CRC) makes any silent format drift fail.
-TEST(DataRecord, GoldenFromErlang) {
-    std::vector<std::byte> out;
-    codec::encode_data_record(out, 0x12345678,
+// Full pinned hex (incl. CRC) — any silent format drift fails here.
+TEST(DataRecord, GoldenHex) {
+    std::vector<std::byte> doc;
+    codec::encode_data_record(doc, RecordType::kDoc, 0x12345678, 1,
                               as_bytes("k"), as_bytes("vv"));
-    EXPECT_EQ(bytes_to_hex(out),
-              "5bb76cce123456780001000000026b7676");
-}
+    EXPECT_EQ(bytes_to_hex(doc),
+              "a391d9e0001234567800000000000000010001000000026b7676");
 
-TEST(HintRecord, GoldenFromErlang) {
-    // erl: <<16#deadbeef:32, 2:16, 16#10:32, 0:1, 16#01020304:63, "ab">>
-    std::vector<std::byte> out;
-    codec::encode_hint_record(out, 0xDEADBEEF, 0x10, 0x01020304ull, false,
-                              as_bytes("ab"));
-    EXPECT_EQ(bytes_to_hex(out),
-              "deadbeef00020000001000000000010203046162");
+    std::vector<std::byte> tomb;
+    codec::encode_data_record(tomb, RecordType::kTombstone, 7, 9,
+                              as_bytes("k"), {});
+    EXPECT_EQ(bytes_to_hex(tomb),
+              "993828e0010000000700000000000000090001000000006b");
 }
 
 TEST(DataRecord, RoundTrip) {
     std::vector<std::byte> out;
     const std::string key = "the-key";
     const std::string val(257, 'x');  // crosses the > 255 byte boundary
-    codec::encode_data_record(out, 42, as_bytes(key), as_bytes(val));
+    codec::encode_data_record(out, RecordType::kDoc, 42, 0xABCDEF0123,
+                              as_bytes(key), as_bytes(val));
 
     auto rec = codec::decode_data_record(out);
     ASSERT_TRUE(rec.has_value()) << "decode failed";
+    EXPECT_EQ(rec->type, RecordType::kDoc);
     EXPECT_EQ(rec->tstamp, 42u);
+    EXPECT_EQ(rec->ord, 0xABCDEF0123ull);
     EXPECT_EQ(rec->total_size, out.size());
     EXPECT_EQ(rec->key.size(), key.size());
     EXPECT_EQ(rec->value.size(), val.size());
@@ -142,9 +130,20 @@ TEST(DataRecord, RoundTrip) {
     EXPECT_EQ(0, std::memcmp(rec->value.data(), val.data(), val.size()));
 }
 
+TEST(DataRecord, TombstoneRoundTrip) {
+    std::vector<std::byte> out;
+    codec::encode_data_record(out, RecordType::kTombstone, 7, 9,
+                              as_bytes("k"), {});
+    auto rec = codec::decode_data_record(out);
+    ASSERT_TRUE(rec.has_value());
+    EXPECT_EQ(rec->type, RecordType::kTombstone);
+    EXPECT_EQ(rec->ord, 9u);
+    EXPECT_TRUE(rec->value.empty());
+}
+
 TEST(DataRecord, EmptyKeyAndValue) {
     std::vector<std::byte> out;
-    codec::encode_data_record(out, 7, {}, {});
+    codec::encode_data_record(out, RecordType::kDoc, 7, 0, {}, {});
     EXPECT_EQ(out.size(), kHeaderSize);
 
     auto rec = codec::decode_data_record(out);
@@ -156,8 +155,8 @@ TEST(DataRecord, EmptyKeyAndValue) {
 
 TEST(DataRecord, DetectsBadCrc) {
     std::vector<std::byte> out;
-    codec::encode_data_record(out, 1, as_bytes("k"), as_bytes("v"));
-    // Flip a bit in the value.
+    codec::encode_data_record(out, RecordType::kDoc, 1, 1,
+                              as_bytes("k"), as_bytes("v"));
     out.back() = static_cast<std::byte>(static_cast<std::uint8_t>(out.back()) ^ 0x01);
     auto rec = codec::decode_data_record(out);
     ASSERT_FALSE(rec.has_value());
@@ -173,7 +172,8 @@ TEST(DataRecord, ShortBufferBeforeHeader) {
 
 TEST(DataRecord, ShortBufferAfterHeader) {
     std::vector<std::byte> out;
-    codec::encode_data_record(out, 1, as_bytes("kkkk"), as_bytes("vvvvvv"));
+    codec::encode_data_record(out, RecordType::kDoc, 1, 1,
+                              as_bytes("kkkk"), as_bytes("vvvvvv"));
     out.resize(out.size() - 3);  // truncate value
     auto rec = codec::decode_data_record(out);
     ASSERT_FALSE(rec.has_value());
@@ -181,22 +181,113 @@ TEST(DataRecord, ShortBufferAfterHeader) {
 }
 
 // ---------------------------------------------------------------------------
-// Hint record golden.
+// kDoc value packing golden (§2.4).
+//   [Ver(1)] [Flags(1)] [vector: Dim(4) f32×Dim(LE)] [text: Len(4) bytes] [meta...]
+// ---------------------------------------------------------------------------
+TEST(DocValue, GoldenHex) {
+    // vector [1.0f, 2.0f], text "hi", no meta.
+    float vec[2] = {1.0f, 2.0f};
+    codec::DocValueParts parts;
+    parts.vector = std::span<const float>(vec, 2);
+    parts.text   = as_bytes("hi");
+
+    std::vector<std::byte> out;
+    codec::encode_doc_value(out, parts);
+    // 01           ver
+    // 03           flags = has_vector|has_text
+    // 00000002     dim = 2
+    // 0000803f     1.0f little-endian
+    // 00000040     2.0f little-endian
+    // 00000002     text len = 2
+    // 6869         "hi"
+    EXPECT_EQ(bytes_to_hex(out), "0103000000020000803f00000040000000026869");
+}
+
+TEST(DocValue, RoundTripAllSections) {
+    float vec[3] = {0.5f, -1.5f, 3.0f};
+    const std::string text = "美联储宣布降息";
+    const std::array<std::byte, 3> meta = {std::byte{1}, std::byte{2}, std::byte{3}};
+    codec::DocValueParts parts;
+    parts.vector = std::span<const float>(vec, 3);
+    parts.text   = as_bytes(text);
+    parts.meta   = std::span<const std::byte>(meta);
+
+    std::vector<std::byte> out;
+    codec::encode_doc_value(out, parts);
+
+    auto v = codec::decode_doc_value(out);
+    ASSERT_TRUE(v.has_value());
+    EXPECT_EQ(v->ver, kDocValueVersion);
+    ASSERT_TRUE(v->has_vector);
+    EXPECT_EQ(v->dim, 3u);
+    EXPECT_EQ(v->vector_raw.size(), 3u * sizeof(float));
+    float back[3];
+    std::memcpy(back, v->vector_raw.data(), sizeof(back));
+    EXPECT_FLOAT_EQ(back[0], 0.5f);
+    EXPECT_FLOAT_EQ(back[1], -1.5f);
+    EXPECT_FLOAT_EQ(back[2], 3.0f);
+    ASSERT_TRUE(v->has_text);
+    EXPECT_EQ(0, std::memcmp(v->text.data(), text.data(), text.size()));
+    ASSERT_TRUE(v->has_meta);
+    EXPECT_EQ(v->meta.size(), 3u);
+}
+
+TEST(DocValue, VectorOnly) {
+    float vec[1] = {42.0f};
+    codec::DocValueParts parts;
+    parts.vector = std::span<const float>(vec, 1);
+    std::vector<std::byte> out;
+    codec::encode_doc_value(out, parts);
+
+    auto v = codec::decode_doc_value(out);
+    ASSERT_TRUE(v.has_value());
+    EXPECT_TRUE(v->has_vector);
+    EXPECT_FALSE(v->has_text);
+    EXPECT_FALSE(v->has_meta);
+    EXPECT_EQ(v->dim, 1u);
+}
+
+TEST(DocValue, TextOnly) {
+    codec::DocValueParts parts;
+    parts.text = as_bytes("plain doc");
+    std::vector<std::byte> out;
+    codec::encode_doc_value(out, parts);
+
+    auto v = codec::decode_doc_value(out);
+    ASSERT_TRUE(v.has_value());
+    EXPECT_FALSE(v->has_vector);
+    EXPECT_TRUE(v->has_text);
+    EXPECT_EQ(v->text.size(), 9u);
+}
+
+TEST(DocValue, RejectsUnsupportedVersion) {
+    std::vector<std::byte> out;
+    out.push_back(std::byte{0xFE});  // bogus ver
+    out.push_back(std::byte{0x00});  // flags
+    auto v = codec::decode_doc_value(out);
+    ASSERT_FALSE(v.has_value());
+    EXPECT_EQ(v.error(), codec::DecodeError::kUnsupportedVersion);
+}
+
+TEST(DocValue, DetectsTruncation) {
+    float vec[4] = {1, 2, 3, 4};
+    codec::DocValueParts parts;
+    parts.vector = std::span<const float>(vec, 4);
+    std::vector<std::byte> out;
+    codec::encode_doc_value(out, parts);
+    out.resize(out.size() - 5);  // chop into the f32 payload
+    auto v = codec::decode_doc_value(out);
+    ASSERT_FALSE(v.has_value());
+    EXPECT_EQ(v.error(), codec::DecodeError::kBufferTooShort);
+}
+
+// ---------------------------------------------------------------------------
+// Hint record golden (format unchanged in V1).
 // ---------------------------------------------------------------------------
 TEST(HintRecord, GoldenLayoutNonTombstone) {
     std::vector<std::byte> out;
-    codec::encode_hint_record(out,
-                              /*tstamp*/ 0xDEADBEEF,
-                              /*total_sz*/ 0x00000010,
-                              /*offset*/   0x0000000001020304ull,
-                              /*tombstone*/ false,
-                              as_bytes("ab"));
-    // Expected layout:
-    //   Tstamp:   de ad be ef
-    //   KeySz:    00 02
-    //   TotalSz:  00 00 00 10
-    //   Tomb|Off: 00 00 00 00 01 02 03 04   (tomb bit clear)
-    //   Key:      'a' 'b'
+    codec::encode_hint_record(out, 0xDEADBEEF, 0x00000010,
+                              0x0000000001020304ull, false, as_bytes("ab"));
     auto expected = hex_to_bytes("deadbeef" "0002" "00000010"
                                  "0000000001020304" "6162");
     ASSERT_EQ(out.size(), expected.size());
@@ -205,11 +296,8 @@ TEST(HintRecord, GoldenLayoutNonTombstone) {
 
 TEST(HintRecord, GoldenLayoutTombstoneSetsHighBit) {
     std::vector<std::byte> out;
-    codec::encode_hint_record(out, 1, 22, /*offset*/ 0x10, /*tombstone*/ true,
-                              as_bytes("k"));
-    // First byte of packed offset must have the high bit set.
+    codec::encode_hint_record(out, 1, 22, 0x10, true, as_bytes("k"));
     EXPECT_EQ(static_cast<std::uint8_t>(out[10]) & 0x80u, 0x80u);
-    // Decoding round-trips both flags.
     auto rec = codec::decode_hint_record(out);
     ASSERT_TRUE(rec.has_value());
     EXPECT_TRUE(rec->tombstone);
@@ -234,8 +322,7 @@ TEST(HintRecord, EofSentinel) {
 
 TEST(HintRecord, OffsetBoundaryMaxV2) {
     std::vector<std::byte> out;
-    codec::encode_hint_record(out, 1, 14, kMaxOffsetV2, /*tomb*/ false,
-                              as_bytes("k"));
+    codec::encode_hint_record(out, 1, 14, kMaxOffsetV2, false, as_bytes("k"));
     auto rec = codec::decode_hint_record(out);
     ASSERT_TRUE(rec.has_value());
     EXPECT_EQ(rec->offset, kMaxOffsetV2);
@@ -244,9 +331,9 @@ TEST(HintRecord, OffsetBoundaryMaxV2) {
 
 TEST(HintRecord, RoundTripStreamOfRecords) {
     std::vector<std::byte> out;
-    codec::encode_hint_record(out, 1, 100, 0,    false, as_bytes("a"));
-    codec::encode_hint_record(out, 2, 200, 100,  true,  as_bytes("bb"));
-    codec::encode_hint_record(out, 3, 300, 300,  false, as_bytes("ccc"));
+    codec::encode_hint_record(out, 1, 100, 0,   false, as_bytes("a"));
+    codec::encode_hint_record(out, 2, 200, 100, true,  as_bytes("bb"));
+    codec::encode_hint_record(out, 3, 300, 300, false, as_bytes("ccc"));
 
     std::span<const std::byte> rest = out;
     auto r1 = codec::decode_hint_record(rest); ASSERT_TRUE(r1);
@@ -263,33 +350,20 @@ TEST(HintRecord, RoundTripStreamOfRecords) {
 }
 
 // ---------------------------------------------------------------------------
-// Tombstone value detection.
+// Layout constants are part of the on-disk contract.
 // ---------------------------------------------------------------------------
-TEST(Tombstone, DetectsAllVersions) {
-    EXPECT_TRUE(format::is_tombstone_value(format::kTombstoneV0));
-    EXPECT_TRUE(format::is_tombstone_value(format::kTombstoneV1));
-    EXPECT_TRUE(format::is_tombstone_value(format::kTombstoneV2));
-    // V1/V2 with FileId tail
-    EXPECT_TRUE(format::is_tombstone_value(
-        std::string(format::kTombstoneV1) + std::string(4, '\0')));
-    EXPECT_FALSE(format::is_tombstone_value("plain-value"));
-    EXPECT_FALSE(format::is_tombstone_value(""));
-    EXPECT_FALSE(format::is_tombstone_value("bitcask"));
-}
-
-TEST(Tombstone, SizeConstantsMatchHrl) {
-    EXPECT_EQ(format::kTombstoneV0Size, 17u);
-    EXPECT_EQ(format::kTombstoneV1Size, 22u);
-    EXPECT_EQ(format::kTombstoneV2Size, 22u);
-    EXPECT_EQ(format::kTombstoneV0.size(), format::kTombstoneV0Size);
-    EXPECT_EQ(format::kTombstoneV1.size() + 4, format::kTombstoneV1Size);
-    EXPECT_EQ(format::kTombstoneV2.size() + 4, format::kTombstoneV2Size);
-}
-
-TEST(Layout, ConstantsMatchHrl) {
-    EXPECT_EQ(format::kHeaderSize, 14u);
+TEST(Layout, ConstantsLocked) {
+    EXPECT_EQ(format::kHeaderSize, 23u);  // 4+1+4+8+2+4
+    EXPECT_EQ(format::kCrcOffset, 0u);
+    EXPECT_EQ(format::kTypeOffset, 4u);
+    EXPECT_EQ(format::kTstampOffset, 5u);
+    EXPECT_EQ(format::kOrdOffset, 9u);
+    EXPECT_EQ(format::kKeySzOffset, 17u);
+    EXPECT_EQ(format::kValueSzOffset, 19u);
     EXPECT_EQ(format::kHintRecordSize, 18u);
     EXPECT_EQ(format::kMaxOffsetV2, 0x7FFFFFFFFFFFFFFFull);
     EXPECT_EQ(format::kMaxKeySize, 0xFFFFu);
     EXPECT_EQ(format::kMaxValueSize, 0xFFFFFFFFu);
+    EXPECT_EQ(static_cast<std::uint8_t>(format::RecordType::kDoc), 0u);
+    EXPECT_EQ(static_cast<std::uint8_t>(format::RecordType::kTombstone), 1u);
 }

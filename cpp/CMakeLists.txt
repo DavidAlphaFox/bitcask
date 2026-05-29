@@ -38,34 +38,8 @@ target_link_libraries(bitcask_fileops
 )
 
 # ---------------------------------------------------------------------------
-# bitcask_merge — merge policy + merger orchestration.
-# Depends on fileops (DataFile/HintFile) AND keydir (for liveness checks).
-# ---------------------------------------------------------------------------
-add_library(bitcask_merge STATIC
-    src/merge/merge_policy.cpp
-    src/merge/merger.cpp
-)
-target_include_directories(bitcask_merge PUBLIC include)
-target_link_libraries(bitcask_merge
-    PUBLIC bitcask_fileops bitcask_keydir
-    PRIVATE bitcask_warnings
-)
-
-# ---------------------------------------------------------------------------
-# bitcask_cask — high-level facade integrating keydir + fileops + merger.
-# ---------------------------------------------------------------------------
-add_library(bitcask_cask STATIC
-    src/cask/cask.cpp
-)
-target_include_directories(bitcask_cask PUBLIC include)
-target_link_libraries(bitcask_cask
-    PUBLIC  bitcask_fileops bitcask_keydir bitcask_merge bitcask_io
-    PRIVATE bitcask_warnings
-)
-
-# ---------------------------------------------------------------------------
 # bitcask_io — POSIX file + advisory lock primitives.
-# Pure C++. Used by the NIF translation layer and by C++ unit tests directly.
+# Pure C++. Used by Collection and by C++ unit tests directly.
 # ---------------------------------------------------------------------------
 add_library(bitcask_io STATIC
     src/io/posix_file.cpp
@@ -75,40 +49,31 @@ target_include_directories(bitcask_io PUBLIC include)
 target_link_libraries(bitcask_io PRIVATE bitcask_warnings)
 
 # ---------------------------------------------------------------------------
-# bitcask_keydir — in-memory key directory.
-# M2.1 scope: single-mutex, single-revision. Multi-revision + pending hash
-# come in M2.2.
+# bitcask_index — in-memory Index side tables (vector DB V1, §3.1).
+# Replaces the legacy bitcask_keydir.
 # ---------------------------------------------------------------------------
-add_library(bitcask_keydir STATIC
-    src/keydir/keydir.cpp
-    src/keydir/keydir_registry.cpp
+add_library(bitcask_index STATIC
+    src/keydir/index.cpp
 )
-target_include_directories(bitcask_keydir PUBLIC include)
-target_link_libraries(bitcask_keydir PRIVATE bitcask_warnings)
+target_include_directories(bitcask_index PUBLIC include)
+target_link_libraries(bitcask_index PRIVATE bitcask_warnings)
 
 # ---------------------------------------------------------------------------
-# bitcask_cpp.so — C++ NIF, registered as Erlang module bitcask_cpp_nifs.
-# 只暴露 cask_* 粗粒度入口；旧的 file_*/lock_*/keydir_* 细粒度 NIF 已随
-# legacy 一并下线（M6）。
-# Sanitizers 不要 link 进来——会在 BEAM 加载时直接 crash。
+# bitcask_collection — vector DB facade (upsert/get/remove + recovery, §5/§8).
+# Replaces the legacy bitcask_cask. Reuses fileops + index + io.
 # ---------------------------------------------------------------------------
-add_library(bitcask_cpp MODULE
-    nif/nif_main.cpp
-    nif/nif_cask.cpp
-    nif/atoms.cpp
-    nif/resources.cpp
+add_library(bitcask_collection STATIC
+    src/cask/collection.cpp
 )
-target_link_libraries(bitcask_cpp
-    PRIVATE
-        Erlang::ERTS
-        bitcask_cask
-        bitcask_warnings
+target_include_directories(bitcask_collection PUBLIC include)
+target_link_libraries(bitcask_collection
+    PUBLIC  bitcask_fileops bitcask_index bitcask_io
+    PRIVATE bitcask_warnings
 )
-set_target_properties(bitcask_cpp PROPERTIES
-    PREFIX ""
-    SUFFIX ".so"
-    LIBRARY_OUTPUT_DIRECTORY "${BITCASK_PRIV_DIR}"
-)
+
+# NOTE(V1): legacy targets bitcask_keydir / bitcask_merge / bitcask_cask 及
+# bitcask_cpp NIF 已从构建移除——它们绑定旧的 record 格式与 KeyDir，不在向量库
+# V1 范围内（merge=V4，NIF 消费方将重做）。对应 src 仍在磁盘上，待 M6 正式清理。
 
 # ---------------------------------------------------------------------------
 # Tests (GoogleTest via FetchContent)
