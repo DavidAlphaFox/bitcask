@@ -92,6 +92,7 @@ target_link_libraries(bitcask_bm25 PRIVATE bitcask_warnings)
 # ---------------------------------------------------------------------------
 add_library(bitcask_collection STATIC
     src/cask/collection.cpp
+    src/cask/collection_registry.cpp
 )
 target_include_directories(bitcask_collection PUBLIC include)
 target_link_libraries(bitcask_collection
@@ -171,14 +172,17 @@ target_link_libraries(bitcask_text
 if(Erlang_INCLUDE_DIR)
     add_library(bitcask_cpp SHARED
         nif/nif_main.cpp
+        nif/nif_cask.cpp
+        nif/nif_cask_iter.cpp
+        nif/nif_cask_admin.cpp
+        nif/nif_helpers.cpp
         nif/nif_collection.cpp
-        nif/nif_collection_helpers.cpp
         nif/atoms.cpp
-        nif/resources_collection.cpp
+        nif/resources.cpp
     )
     target_include_directories(bitcask_cpp PRIVATE nif ${Erlang_INCLUDE_DIR})
     target_link_libraries(bitcask_cpp
-        PRIVATE bitcask_collection bitcask_fileops bitcask_index
+        PRIVATE bitcask_cask bitcask_collection bitcask_fileops bitcask_index
                 bitcask_io bitcask_text bitcask_bm25 bitcask_format
                 bitcask_warnings
     )
