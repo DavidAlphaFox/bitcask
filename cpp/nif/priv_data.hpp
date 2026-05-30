@@ -11,16 +11,16 @@
 
 #pragma once
 
+#include "bitcask/collection_registry.hpp"
 #include "bitcask/keydir_registry.hpp"
 
 namespace bitcask::nif {
 
 struct PrivData {
-    keydir::KeyDirRegistry registry;
+    keydir::KeyDirRegistry cask_registry;
+    CollectionRegistry     collection_registry;
 };
 
-// 从 NIF 环境拿到当前 NIF 实例的 PrivData 指针。
-// 不可能为 null：on_load 失败的话整个 .so 加载就失败了。
 inline PrivData* priv(ErlNifEnv* env) noexcept {
     return static_cast<PrivData*>(enif_priv_data(env));
 }

@@ -2,6 +2,7 @@
 
 #include "atoms.hpp"
 #include "nif_helpers.hpp"
+#include "priv_data.hpp"
 #include "resources.hpp"
 #include "term_conv.hpp"
 
@@ -14,7 +15,6 @@ ERL_NIF_TERM nif_collection_open(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
 
     CollectionOptions opts;
 
-    // 解析可选的第二个参数（proplist）。
     if (argc >= 2 && enif_is_list(env, argv[1])) {
         ERL_NIF_TERM head, tail = argv[1];
         while (enif_get_list_cell(env, tail, &head, &tail)) {
@@ -25,7 +25,6 @@ ERL_NIF_TERM nif_collection_open(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
             ERL_NIF_TERM key = tup[0];
             ERL_NIF_TERM val = tup[1];
 
-            // {analyzer, jieba | ngram | whitespace}
             if (key == enif_make_atom(env, "analyzer")) {
                 if (val == enif_make_atom(env, "jieba")) {
                     opts.analyzer_config.type = text::AnalyzerType::Jieba;
@@ -35,7 +34,6 @@ ERL_NIF_TERM nif_collection_open(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
                     opts.analyzer_config.type = text::AnalyzerType::Whitespace;
                 }
             }
-            // {dict_path, binary()}
             else if (key == enif_make_atom(env, "dict_path")) {
                 ErlNifBinary bin{};
                 if (enif_inspect_binary(env, val, &bin)) {
@@ -43,16 +41,21 @@ ERL_NIF_TERM nif_collection_open(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
                         reinterpret_cast<const char*>(bin.data), bin.size);
                 }
             }
-            // {enable_stop_words, boolean()}
             else if (key == enif_make_atom(env, "enable_stop_words")) {
                 if (val == enif_make_atom(env, "true")) {
                     opts.analyzer_config.enable_stop_words = true;
                 }
             }
+            else if (key == enif_make_atom(env, "read_write")) {
+                if (val == enif_make_atom(env, "true")) {
+                    opts.read_write = true;
+                }
+            }
         }
     }
 
-    auto c = Collection::open(dir, opts);
+    auto* p = priv(env);
+    auto c = Collection::open(dir, opts, &p->collection_registry);
     if (!c) return collection_fault_to_term(env, c.error());
 
     auto term = make_resource<CollectionHandle>(env, g_collection_resource_type,

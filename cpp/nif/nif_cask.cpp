@@ -24,7 +24,7 @@ ERL_NIF_TERM nif_cask_open(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv
 
     CaskOptions opts = parse_options(env, argv[1]);
     auto* p = priv(env);
-    auto c = Cask::open(dir, opts, &p->registry);
+    auto c = Cask::open(dir, opts, &p->cask_registry);
     if (!c) return fault_to_term(env, c.error());
 
     auto term = make_resource<CaskHandle>(env, g_cask_resource_type,
