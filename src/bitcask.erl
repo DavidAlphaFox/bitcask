@@ -33,7 +33,15 @@
          needs_merge/2,
          is_frozen/1,
          is_empty_estimate/1,
-         status/1]).
+         status/1,
+         collection_open/1, collection_open/2,
+         collection_close/1,
+         collection_put/3,
+         collection_get/2,
+         collection_delete/2,
+         collection_sync/1,
+         search_text/2, search_text/3,
+         search_phrase/2, search_phrase/3]).
 
 -include("bitcask.hrl").
 
@@ -409,3 +417,40 @@ cask_max_age(N) when is_integer(N) -> N div 1000000.
 cask_max_put(undefined) -> -1;
 cask_max_put(N) when is_integer(N), N < 0 -> -1;
 cask_max_put(N) when is_integer(N) -> N.
+
+%% =========================================================================
+%% Collection API (BM25 full-text search)
+%% =========================================================================
+
+collection_open(Dir) ->
+    collection_open(Dir, []).
+
+collection_open(Dir, _Opts) ->
+    bitcask_cpp_nifs:collection_open(Dir).
+
+collection_close(Ref) ->
+    bitcask_cpp_nifs:collection_close(Ref).
+
+collection_put(Ref, Key, Value) ->
+    bitcask_cpp_nifs:collection_put(Ref, Key, Value).
+
+collection_get(Ref, Key) ->
+    bitcask_cpp_nifs:collection_get(Ref, Key).
+
+collection_delete(Ref, Key) ->
+    bitcask_cpp_nifs:collection_delete(Ref, Key).
+
+collection_sync(Ref) ->
+    bitcask_cpp_nifs:collection_sync(Ref).
+
+search_text(Ref, Query) ->
+    search_text(Ref, Query, 10).
+
+search_text(Ref, Query, K) ->
+    bitcask_cpp_nifs:collection_search_text(Ref, Query, K).
+
+search_phrase(Ref, Query) ->
+    search_phrase(Ref, Query, 10).
+
+search_phrase(Ref, Query, K) ->
+    bitcask_cpp_nifs:collection_search_phrase(Ref, Query, K).

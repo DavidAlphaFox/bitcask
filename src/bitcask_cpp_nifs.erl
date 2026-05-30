@@ -28,7 +28,15 @@
          cask_is_frozen/1,
          cask_status/1,
          cask_needs_merge/1,
-         cask_merge/2]).
+         cask_merge/2,
+         collection_open/1,
+         collection_close/1,
+         collection_put/3,
+         collection_get/2,
+         collection_delete/2,
+         collection_sync/1,
+         collection_search_text/3,
+         collection_search_phrase/3]).
 
 -on_load(init/0).
 
@@ -74,3 +82,12 @@ cask_is_frozen(_Ref)          -> erlang:nif_error({error, not_loaded}).
 cask_status(_Ref)             -> erlang:nif_error({error, not_loaded}).
 cask_needs_merge(_Ref)        -> erlang:nif_error({error, not_loaded}).
 cask_merge(_Ref, _Files)      -> erlang:nif_error({error, not_loaded}).
+
+collection_open(_Dir)              -> erlang:nif_error({error, not_loaded}).
+collection_close(_Ref)             -> erlang:nif_error({error, not_loaded}).
+collection_put(_Ref, _Key, _Val)   -> erlang:nif_error({error, not_loaded}).
+collection_get(_Ref, _Key)         -> erlang:nif_error({error, not_loaded}).
+collection_delete(_Ref, _Key)      -> erlang:nif_error({error, not_loaded}).
+collection_sync(_Ref)              -> erlang:nif_error({error, not_loaded}).
+collection_search_text(_Ref, _Q, _K)    -> erlang:nif_error({error, not_loaded}).
+collection_search_phrase(_Ref, _Q, _K)  -> erlang:nif_error({error, not_loaded}).
