@@ -8,11 +8,50 @@
 namespace bitcask::nif {
 using namespace detail;
 
-ERL_NIF_TERM nif_collection_open(ErlNifEnv* env, int, const ERL_NIF_TERM argv[]) {
+ERL_NIF_TERM nif_collection_open(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
     std::string dir;
     if (!get_latin1_string(env, argv[0], dir)) return enif_make_badarg(env);
 
     CollectionOptions opts;
+
+    // 解析可选的第二个参数（proplist）。
+    if (argc >= 2 && enif_is_list(env, argv[1])) {
+        ERL_NIF_TERM head, tail = argv[1];
+        while (enif_get_list_cell(env, tail, &head, &tail)) {
+            int arity = 0;
+            const ERL_NIF_TERM* tup = nullptr;
+            if (!enif_get_tuple(env, head, &arity, &tup) || arity != 2) continue;
+
+            ERL_NIF_TERM key = tup[0];
+            ERL_NIF_TERM val = tup[1];
+
+            // {analyzer, jieba | ngram | whitespace}
+            if (key == enif_make_atom(env, "analyzer")) {
+                if (val == enif_make_atom(env, "jieba")) {
+                    opts.analyzer_config.type = text::AnalyzerType::Jieba;
+                } else if (val == enif_make_atom(env, "ngram")) {
+                    opts.analyzer_config.type = text::AnalyzerType::Ngram;
+                } else if (val == enif_make_atom(env, "whitespace")) {
+                    opts.analyzer_config.type = text::AnalyzerType::Whitespace;
+                }
+            }
+            // {dict_path, binary()}
+            else if (key == enif_make_atom(env, "dict_path")) {
+                ErlNifBinary bin{};
+                if (enif_inspect_binary(env, val, &bin)) {
+                    opts.analyzer_config.dict_path = std::string(
+                        reinterpret_cast<const char*>(bin.data), bin.size);
+                }
+            }
+            // {enable_stop_words, boolean()}
+            else if (key == enif_make_atom(env, "enable_stop_words")) {
+                if (val == enif_make_atom(env, "true")) {
+                    opts.analyzer_config.enable_stop_words = true;
+                }
+            }
+        }
+    }
+
     auto c = Collection::open(dir, opts);
     if (!c) return collection_fault_to_term(env, c.error());
 

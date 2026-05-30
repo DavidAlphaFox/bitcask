@@ -44,6 +44,7 @@ namespace {
 
 ErlNifFunc kNifFuncs[] = {
     {"collection_open",         1, nif_collection_open,        ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"collection_open",         2, nif_collection_open,        ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"collection_close",        1, nif_collection_close,       0},
     {"collection_put",          3, nif_collection_put,         0},
     {"collection_get",          2, nif_collection_get,         0},

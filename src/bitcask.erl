@@ -425,8 +425,8 @@ cask_max_put(N) when is_integer(N) -> N.
 collection_open(Dir) ->
     collection_open(Dir, []).
 
-collection_open(Dir, _Opts) ->
-    bitcask_cpp_nifs:collection_open(Dir).
+collection_open(Dir, Opts) when is_list(Opts) ->
+    bitcask_cpp_nifs:collection_open(Dir, Opts).
 
 collection_close(Ref) ->
     bitcask_cpp_nifs:collection_close(Ref).
