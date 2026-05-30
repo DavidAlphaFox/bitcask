@@ -38,6 +38,13 @@ inline std::span<const std::byte> as_bytes(const ErlNifBinary& bin) noexcept {
     return {reinterpret_cast<const std::byte*>(bin.data), bin.size};
 }
 
+// 把 ErlNifBinary 当作 string_view 来用；生命周期跟着 binary 走，
+// 不要在 binary 析构后还持有这个 view。用于把 binary key/value 转成
+// std::string_view，避免在 NIF 层面手动 reinterpret_cast。
+inline std::string_view as_string_view(const ErlNifBinary& bin) noexcept {
+    return {reinterpret_cast<const char*>(bin.data), bin.size};
+}
+
 // 分配 size 字节的 ErlNifBinary，把 src 拷进去后返回 term。
 // 分配失败时返回调用方提供的 oom_term（一般是 atom allocation_error 或
 // {error, allocation_error} 元组）。

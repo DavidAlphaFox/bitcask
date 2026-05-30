@@ -7,6 +7,8 @@
 
 #include "atoms.hpp"
 #include "bitcask/cask.hpp"
+#include "bitcask/collection.hpp"
+#include "bitcask/text/analyzer.hpp"
 #include "resources.hpp"
 #include "term_conv.hpp"
 
@@ -17,10 +19,21 @@ namespace detail {
 // 资源句柄提取
 // ---------------------------------------------------------------------------
 
-CaskHandle* cask_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept {
+// 模板化的资源句柄提取实现。
+template <typename T>
+T* get_resource_handle(ErlNifEnv* env, ERL_NIF_TERM term, ErlNifResourceType* rt) noexcept {
     void* obj = nullptr;
-    if (!enif_get_resource(env, term, g_cask_resource_type, &obj)) return nullptr;
-    return static_cast<CaskHandle*>(obj);
+    if (!enif_get_resource(env, term, rt, &obj)) return nullptr;
+    return static_cast<T*>(obj);
+}
+
+// 显式实例化，避免链接错误。
+template CaskHandle* get_resource_handle<CaskHandle>(ErlNifEnv*, ERL_NIF_TERM, ErlNifResourceType*) noexcept;
+template CaskIterHandle* get_resource_handle<CaskIterHandle>(ErlNifEnv*, ERL_NIF_TERM, ErlNifResourceType*) noexcept;
+template CollectionHandle* get_resource_handle<CollectionHandle>(ErlNifEnv*, ERL_NIF_TERM, ErlNifResourceType*) noexcept;
+
+CaskHandle* cask_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept {
+    return get_resource_handle<CaskHandle>(env, term, g_cask_resource_type);
 }
 
 CaskHandle* checked_cask_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept {
@@ -29,15 +42,16 @@ CaskHandle* checked_cask_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept {
 }
 
 CaskIterHandle* cask_iter_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept {
-    void* obj = nullptr;
-    if (!enif_get_resource(env, term, g_cask_iter_resource_type, &obj)) return nullptr;
-    return static_cast<CaskIterHandle*>(obj);
+    return get_resource_handle<CaskIterHandle>(env, term, g_cask_iter_resource_type);
 }
 
 CollectionHandle* collection_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept {
-    void* obj = nullptr;
-    if (!enif_get_resource(env, term, g_collection_resource_type, &obj)) return nullptr;
-    return static_cast<CollectionHandle*>(obj);
+    return get_resource_handle<CollectionHandle>(env, term, g_collection_resource_type);
+}
+
+CollectionHandle* checked_collection_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept {
+    auto* h = collection_handle(env, term);
+    return (h && h->collection) ? h : nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -132,6 +146,41 @@ CaskOptions parse_options(ErlNifEnv* env, ERL_NIF_TERM list) {
     return o;
 }
 
+CollectionOptions parse_collection_options(ErlNifEnv* env, ERL_NIF_TERM list) {
+    CollectionOptions o;
+    ERL_NIF_TERM head, tail = list;
+    while (enif_get_list_cell(env, tail, &head, &tail)) {
+        int arity = 0;
+        const ERL_NIF_TERM* tup = nullptr;
+        if (!enif_get_tuple(env, head, &arity, &tup) || arity != 2) continue;
+
+        if (tup[0] == atoms().analyzer) {
+            if (tup[1] == atoms().jieba) {
+                o.analyzer_config.type = text::AnalyzerType::Jieba;
+            } else if (tup[1] == atoms().ngram) {
+                o.analyzer_config.type = text::AnalyzerType::Ngram;
+            } else if (tup[1] == atoms().whitespace) {
+                o.analyzer_config.type = text::AnalyzerType::Whitespace;
+            }
+        } else if (tup[0] == atoms().dict_path) {
+            ErlNifBinary bin{};
+            if (enif_inspect_binary(env, tup[1], &bin)) {
+                o.analyzer_config.dict_path = std::string(
+                    reinterpret_cast<const char*>(bin.data), bin.size);
+            }
+        } else if (tup[0] == atoms().enable_stop_words) {
+            if (tup[1] == atoms().atom_true) {
+                o.analyzer_config.enable_stop_words = true;
+            }
+        } else if (tup[0] == atoms().read_write) {
+            if (tup[1] == atoms().atom_true) {
+                o.read_write = true;
+            }
+        }
+    }
+    return o;
+}
+
 // ---------------------------------------------------------------------------
 // 错误翻译
 // ---------------------------------------------------------------------------
@@ -195,6 +244,23 @@ ERL_NIF_TERM make_string_list(ErlNifEnv* env,
     for (auto it = v.rbegin(); it != v.rend(); ++it) {
         list = enif_make_list_cell(env,
             enif_make_string(env, it->c_str(), ERL_NIF_LATIN1), list);
+    }
+    return list;
+}
+
+ERL_NIF_TERM make_search_hits(ErlNifEnv* env,
+                               const std::vector<TextHit>& hits) {
+    ERL_NIF_TERM list = enif_make_list(env, 0);
+    for (auto it = hits.rbegin(); it != hits.rend(); ++it) {
+        ErlNifBinary id_bin;
+        if (!enif_alloc_binary(it->ext_id.size(), &id_bin)) continue;
+        if (!it->ext_id.empty()) {
+            std::memcpy(id_bin.data, it->ext_id.data(), it->ext_id.size());
+        }
+        ERL_NIF_TERM tuple = enif_make_tuple2(env,
+            enif_make_binary(env, &id_bin),
+            enif_make_double(env, static_cast<double>(it->score)));
+        list = enif_make_list_cell(env, tuple, list);
     }
     return list;
 }
