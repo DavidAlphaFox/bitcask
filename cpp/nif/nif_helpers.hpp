@@ -44,13 +44,20 @@ CaskIterHandle* cask_iter_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept;
 // 不识别的键静默跳过，与 legacy 语义一致。
 CaskOptions parse_options(ErlNifEnv* env, ERL_NIF_TERM list);
 
-// 解析 collection_open 的选项列表到 CollectionOptions。
-// 支持的键：analyzer, dict_path, enable_stop_words, read_write。
-CollectionOptions parse_collection_options(ErlNifEnv* env, ERL_NIF_TERM list);
-
 // CaskFault → Erlang 错误 term。
 // kNotFound / kAlreadyExists 返回裸 atom（legacy 契约），其余返回 {error, Tag}。
 ERL_NIF_TERM fault_to_term(ErlNifEnv* env, const CaskFault& f) noexcept;
+
+// 从 Erlang map 中提取 DocInput（text 和可选 meta 字段）。
+// map 必须包含 text 二进制字段，meta 二进制字段可选。
+// 提取成功返回 true；字段缺失或类型不对时返回 false。
+bool parse_doc_map(ErlNifEnv* env, ERL_NIF_TERM map_term, DocInput& doc);
+
+// 搜索 NIF 共用实现：提取 handle + query + k，调用 search_fn，构造结果。
+// search_fn 是指向 Cask::search_text 或 Cask::search_phrase 的成员函数指针。
+using SearchFn = std::expected<TextSearchResult, CaskFault> (Cask::*)(std::string_view, std::size_t);
+ERL_NIF_TERM search_impl(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[],
+                          SearchFn search_fn);
 
 // fold_start / fold_start4 共用实现。
 // 创建迭代器、启动快照、包装成 NIF 资源 term。

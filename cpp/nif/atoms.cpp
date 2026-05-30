@@ -49,7 +49,6 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     expiry_grace_time        = a("expiry_grace_time");
     max_merge_size           = a("max_merge_size");
 
-    // collection_open 选项
     analyzer           = a("analyzer");
     jieba              = a("jieba");
     ngram              = a("ngram");

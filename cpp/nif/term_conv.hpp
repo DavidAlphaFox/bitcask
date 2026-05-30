@@ -45,6 +45,29 @@ inline std::string_view as_string_view(const ErlNifBinary& bin) noexcept {
     return {reinterpret_cast<const char*>(bin.data), bin.size};
 }
 
+// 从 Erlang list term 中提取 latin1 字符串列表到 std::vector<std::string>。
+// 返回 true 表示全部成功；遇到无法解析的元素返回 false。
+inline bool get_latin1_string_list(ErlNifEnv* env, ERL_NIF_TERM list,
+                                    std::vector<std::string>& out) {
+    ERL_NIF_TERM head, tail = list;
+    while (enif_get_list_cell(env, tail, &head, &tail)) {
+        std::string s;
+        if (!get_latin1_string(env, head, s)) return false;
+        out.push_back(std::move(s));
+    }
+    return true;
+}
+
+// 从 Erlang integer term 中解析 int 值，失败时返回 default_val。
+inline int get_int_with_default(ErlNifEnv* env, ERL_NIF_TERM term,
+                                 int default_val) noexcept {
+    int v = default_val;
+    if (enif_is_number(env, term)) {
+        enif_get_int(env, term, &v);
+    }
+    return v;
+}
+
 // 分配 size 字节的 ErlNifBinary，把 src 拷进去后返回 term。
 // 分配失败时返回调用方提供的 oom_term（一般是 atom allocation_error 或
 // {error, allocation_error} 元组）。

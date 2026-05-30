@@ -19,7 +19,6 @@ namespace detail {
 // 资源句柄提取
 // ---------------------------------------------------------------------------
 
-// 模板化的资源句柄提取实现。
 template <typename T>
 T* get_resource_handle(ErlNifEnv* env, ERL_NIF_TERM term, ErlNifResourceType* rt) noexcept {
     void* obj = nullptr;
@@ -27,7 +26,6 @@ T* get_resource_handle(ErlNifEnv* env, ERL_NIF_TERM term, ErlNifResourceType* rt
     return static_cast<T*>(obj);
 }
 
-// 显式实例化，避免链接错误。
 template CaskHandle* get_resource_handle<CaskHandle>(ErlNifEnv*, ERL_NIF_TERM, ErlNifResourceType*) noexcept;
 template CaskIterHandle* get_resource_handle<CaskIterHandle>(ErlNifEnv*, ERL_NIF_TERM, ErlNifResourceType*) noexcept;
 
@@ -48,17 +46,15 @@ CaskIterHandle* cask_iter_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept {
 // 选项解析
 // ---------------------------------------------------------------------------
 
-// 处理单 atom 形式的选项：read_write | merge_only。
 static void parse_atom_option(ERL_NIF_TERM head, CaskOptions& o) {
     if (head == atoms().read_write) {
         o.read_write = true;
     } else if (head == atoms().merge_only) {
         o.merge_only = true;
-        o.read_write = true;  // merger 需要写输出文件
+        o.read_write = true;
     }
 }
 
-// 处理 {Key, Value} 二元组形式的 merge 策略选项。
 static void parse_merge_option(ErlNifEnv* env, const ERL_NIF_TERM* tup,
                                 merge::PolicyOptions& p) {
     if (tup[0] == atoms().frag_merge_trigger) {
@@ -87,8 +83,6 @@ static void parse_merge_option(ErlNifEnv* env, const ERL_NIF_TERM* tup,
     }
 }
 
-// 分析器选项辅助函数：设置 o.search_config 和 o.enable_search。
-// 仅在检测到 search 相关选项时调用。
 static void parse_analyzer_option(ErlNifEnv* env, const ERL_NIF_TERM* tup,
                                   CaskOptions& o) {
     if (tup[0] == atoms().analyzer) {
@@ -112,8 +106,6 @@ static void parse_analyzer_option(ErlNifEnv* env, const ERL_NIF_TERM* tup,
     }
 }
 
-// 处理 {Key, Value} 二元组形式的选项（文件/同步/cask 级别）。
-// merge 策略选项委托给 parse_merge_option。
 static void parse_tuple_option(ErlNifEnv* env, const ERL_NIF_TERM* tup,
                                 CaskOptions& o) {
     if (tup[0] == atoms().read_write) {
@@ -163,6 +155,28 @@ CaskOptions parse_options(ErlNifEnv* env, ERL_NIF_TERM list) {
 }
 
 // ---------------------------------------------------------------------------
+// DocInput 解析
+// ---------------------------------------------------------------------------
+
+bool parse_doc_map(ErlNifEnv* env, ERL_NIF_TERM map_term, DocInput& doc) {
+    ERL_NIF_TERM text_val;
+    if (enif_get_map_value(env, map_term, enif_make_atom(env, "text"), &text_val)) {
+        ErlNifBinary tb{};
+        if (enif_inspect_binary(env, text_val, &tb)) {
+            doc.text = as_bytes(tb);
+        }
+    }
+    ERL_NIF_TERM meta_val;
+    if (enif_get_map_value(env, map_term, enif_make_atom(env, "meta"), &meta_val)) {
+        ErlNifBinary mb{};
+        if (enif_inspect_binary(env, meta_val, &mb)) {
+            doc.meta = as_bytes(mb);
+        }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // 错误翻译
 // ---------------------------------------------------------------------------
 
@@ -179,10 +193,38 @@ ERL_NIF_TERM fault_to_term(ErlNifEnv* env, const CaskFault& f) noexcept {
         case CaskError::kWriteLocked:    tag = atoms().write_locked; break;
         case CaskError::kNoIndex:        return atoms().no_index;
         case CaskError::kModeMismatch:  return atoms().mode_mismatch;
+        case CaskError::kAnalyzerMismatch:
         case CaskError::kInvalidOption:
         default:                          tag = atoms().error; break;
     }
     return enif_make_tuple2(env, atoms().error, tag);
+}
+
+// ---------------------------------------------------------------------------
+// 搜索 NIF 共用实现
+// ---------------------------------------------------------------------------
+
+ERL_NIF_TERM search_impl(ErlNifEnv* env, int, const ERL_NIF_TERM argv[],
+                          SearchFn search_fn) {
+    auto* h = checked_cask_handle(env, argv[0]);
+    ErlNifBinary query_bin{};
+    if (!h || !enif_inspect_binary(env, argv[1], &query_bin)) {
+        return enif_make_badarg(env);
+    }
+
+    int k = get_int_with_default(env, argv[2], 10);
+    if (k <= 0) k = 10;
+
+    if (!h->cask->has_search()) {
+        return enif_make_tuple2(env, atoms().error, atoms().no_index);
+    }
+
+    std::string_view query(
+        reinterpret_cast<const char*>(query_bin.data), query_bin.size);
+    auto r = (h->cask->*search_fn)(query, static_cast<std::size_t>(k));
+    if (!r) return fault_to_term(env, r.error());
+
+    return enif_make_tuple2(env, atoms().ok, make_search_hits(env, r->hits));
 }
 
 // ---------------------------------------------------------------------------

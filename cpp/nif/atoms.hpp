@@ -46,7 +46,8 @@ struct Atoms {
     ERL_NIF_TERM bad_crc;
     ERL_NIF_TERM no_index;
     ERL_NIF_TERM mode_mismatch;
-    // merge 策略阈值
+
+    // 合并策略阈值
     ERL_NIF_TERM frag_merge_trigger;
     ERL_NIF_TERM dead_bytes_merge_trigger;
     ERL_NIF_TERM frag_threshold;
@@ -55,7 +56,7 @@ struct Atoms {
     ERL_NIF_TERM expiry_grace_time;
     ERL_NIF_TERM max_merge_size;
 
-    // collection_open 选项
+    // 索引模式选项
     ERL_NIF_TERM analyzer;
     ERL_NIF_TERM jieba;
     ERL_NIF_TERM ngram;
