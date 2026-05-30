@@ -74,6 +74,14 @@ target_link_libraries(bitcask_scanner_test PRIVATE
 
 # NOTE(V1): legacy 测试 keydir*/merge*/cask/NIF 已移除（见 cpp/CMakeLists.txt）。
 
+add_executable(bitcask_analyzer_test analyzer_test.cpp)
+target_link_libraries(bitcask_analyzer_test PRIVATE
+    GTest::gtest_main
+    bitcask_text
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 include(GoogleTest)
 gtest_discover_tests(bitcask_smoke_test)
 gtest_discover_tests(bitcask_codec_test)
@@ -83,3 +91,4 @@ gtest_discover_tests(bitcask_index_test)
 gtest_discover_tests(bitcask_collection_test)
 gtest_discover_tests(bitcask_data_file_test)
 gtest_discover_tests(bitcask_scanner_test)
+gtest_discover_tests(bitcask_analyzer_test)
