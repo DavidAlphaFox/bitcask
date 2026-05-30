@@ -64,9 +64,10 @@ inline bool get_uint64_bin(ErlNifEnv* env, ERL_NIF_TERM term, std::uint64_t* out
 
 // uint64 → 8 字节 native-endian binary term。跟 get_uint64_bin/3 配对，
 // Erlang 侧拿 <<X:64/unsigned-native>> 模式匹配出来。
+// 分配失败返回 0（无效 term），调用方须检查。
 inline ERL_NIF_TERM make_uint64_bin(ErlNifEnv* env, std::uint64_t value) {
     ErlNifBinary bin;
-    enif_alloc_binary(sizeof(std::uint64_t), &bin);
+    if (!enif_alloc_binary(sizeof(std::uint64_t), &bin)) return 0;
     std::memcpy(bin.data, &value, sizeof(std::uint64_t));
     return enif_make_binary(env, &bin);
 }

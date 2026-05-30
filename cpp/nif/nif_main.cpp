@@ -4,6 +4,12 @@
 // M6 之后只剩 cask_* 粗粒度 NIF；旧的 file_* / lock_* / keydir_*
 // 细粒度入口随 legacy Erlang 端一并下线。
 //
+// NIF 函数实现分布在三个文件中：
+//   nif_cask.cpp       — CRUD：open / close / get / put / delete / sync / close_write_file
+//   nif_cask_iter.cpp  — 迭代：fold_* 系列 + iterator_* 系列
+//   nif_cask_admin.cpp — 管理：status / needs_merge / merge / is_empty / is_frozen
+// 共用辅助函数在 nif_helpers.hpp / nif_helpers.cpp（detail 命名空间）。
+//
 // === 线程模型 ===
 // BEAM 会从多个调度线程上并发调用 NIF：
 //   - kNifFuncs 中 flag = ERL_NIF_DIRTY_JOB_IO_BOUND 的入口在 dirty IO
@@ -13,7 +19,7 @@
 //   - 资源回收（cask_resource_dtor / cask_iter_resource_dtor）由 BEAM 的
 //     回收线程调用，时机不可预测——析构内不得拿任何 BEAM 锁。
 // on_load 在加载时单线程执行；on_unload 在 .so 卸载时单线程执行。
-// 各 NIF 入口的可重入性 / 锁要求见对应的 nif_cask.cpp 函数注释。
+// 各 NIF 入口的可重入性 / 锁要求见对应的实现文件注释。
 
 #include <new>
 

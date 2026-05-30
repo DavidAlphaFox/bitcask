@@ -20,38 +20,38 @@ namespace bitcask::nif {
 struct Atoms {
     ERL_NIF_TERM ok;
     ERL_NIF_TERM error;
-    ERL_NIF_TERM eof;
     ERL_NIF_TERM allocation_error;
-    ERL_NIF_TERM lock_not_writable;
-    ERL_NIF_TERM fstat_error;
-    ERL_NIF_TERM ftruncate_error;
-    ERL_NIF_TERM pread_error;
-    ERL_NIF_TERM pwrite_error;
 
-    // file_open 的选项 atom
-    ERL_NIF_TERM create;
-    ERL_NIF_TERM readonly;
+    // ---- legacy: 以下 atom 为旧 file_* / keydir_* 细粒度 NIF 保留 ----
+    // M6 正式下线 legacy NIF 时一并清理。
+    ERL_NIF_TERM eof;              // legacy file_* NIF
+    ERL_NIF_TERM lock_not_writable; // legacy lock NIF
+    ERL_NIF_TERM fstat_error;      // legacy file_* NIF
+    ERL_NIF_TERM ftruncate_error;  // legacy file_* NIF
+    ERL_NIF_TERM pread_error;      // legacy file_* NIF
+    ERL_NIF_TERM pwrite_error;     // legacy file_* NIF
+    ERL_NIF_TERM create;           // legacy file_open 选项
+    ERL_NIF_TERM readonly;         // legacy file_open 选项
+    ERL_NIF_TERM cur;              // legacy file_position whence
+    ERL_NIF_TERM bof;              // legacy file_position whence
+    ERL_NIF_TERM eof_whence;       // legacy file_position whence（等同 eof）
+    ERL_NIF_TERM bitcask_entry;    // legacy keydir NIF
+    ERL_NIF_TERM not_ready;        // legacy keydir NIF
+    ERL_NIF_TERM ready;            // legacy keydir NIF
+    ERL_NIF_TERM none;             // legacy sync_strategy 选项
+    ERL_NIF_TERM seconds;          // legacy sync_strategy 选项
+    // ---- legacy end ----
+
+    // 当前 cask_* NIF 使用的 atom
     ERL_NIF_TERM o_sync;
-
-    // file_position 的 whence atom
-    ERL_NIF_TERM cur;
-    ERL_NIF_TERM bof;
-    ERL_NIF_TERM eof_whence;  // 跟 `eof` 是同一个 atom，仅为可读性单独命名
-
-    // keydir 相关
-    ERL_NIF_TERM bitcask_entry;
     ERL_NIF_TERM not_found;
     ERL_NIF_TERM already_exists;
-    ERL_NIF_TERM not_ready;
-    ERL_NIF_TERM ready;
     ERL_NIF_TERM out_of_date;
     ERL_NIF_TERM iteration_in_process;
     ERL_NIF_TERM iteration_not_started;
     ERL_NIF_TERM atom_true;
     ERL_NIF_TERM atom_false;
     ERL_NIF_TERM undefined;
-
-    // cask_* 相关
     ERL_NIF_TERM done;
     ERL_NIF_TERM read_write;
     ERL_NIF_TERM merge_only;
@@ -59,8 +59,6 @@ struct Atoms {
     ERL_NIF_TERM expiry_secs;
     ERL_NIF_TERM sync_strategy;
     ERL_NIF_TERM tombstone_version;
-    ERL_NIF_TERM none;
-    ERL_NIF_TERM seconds;
     ERL_NIF_TERM key_too_large;
     ERL_NIF_TERM value_too_large;
     ERL_NIF_TERM read_only;
