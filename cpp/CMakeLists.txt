@@ -1,3 +1,13 @@
+# 允许 cpp/ 子目录独立构建（不经过顶层 CMake）。
+if(NOT DEFINED CMAKE_CXX_STANDARD)
+    cmake_minimum_required(VERSION 3.20)
+    project(bitcask_cpp CXX)
+    set(CMAKE_CXX_STANDARD 23)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_CXX_EXTENSIONS OFF)
+    enable_testing()
+endif()
+
 # Common warning flags for all bitcask C++ targets.
 add_library(bitcask_warnings INTERFACE)
 target_compile_options(bitcask_warnings INTERFACE
@@ -9,6 +19,12 @@ target_compile_options(bitcask_warnings INTERFACE
 )
 
 find_package(ZLIB REQUIRED)
+
+# 当从 cpp/ 子目录独立构建时（不经过顶层 CMake），提供 bitcask_sanitizers
+# 的空壳 target，使测试 target 能正常链接。
+if(NOT TARGET bitcask_sanitizers)
+    add_library(bitcask_sanitizers INTERFACE)
+endif()
 
 # ---------------------------------------------------------------------------
 # bitcask_format — codec for data file / hint file records.
@@ -68,6 +84,37 @@ add_library(bitcask_collection STATIC
 target_include_directories(bitcask_collection PUBLIC include)
 target_link_libraries(bitcask_collection
     PUBLIC  bitcask_fileops bitcask_index bitcask_io
+    PRIVATE bitcask_warnings
+)
+
+# ---------------------------------------------------------------------------
+# utf8proc — Unicode NFKC 归一化 + case fold（via FetchContent）。
+# ---------------------------------------------------------------------------
+include(FetchContent)
+FetchContent_Declare(
+    utf8proc
+    GIT_REPOSITORY https://github.com/JuliaStrings/utf8proc.git
+    GIT_TAG        v2.10.0
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(utf8proc)
+
+# ---------------------------------------------------------------------------
+# bitcask_text — 文本分词器（Analyzer 抽象基类 + NgramAnalyzer + 工厂）。
+# V2.1：NFKC 归一 + CJK bi/tri-gram + 拉丁空白切分。
+# ---------------------------------------------------------------------------
+add_library(bitcask_text STATIC
+    src/text/analyzer.cpp
+)
+target_include_directories(bitcask_text PUBLIC include)
+# utf8proc FetchContent 导出的 target 名与上游 CMakeLists 一致。
+if(TARGET utf8proc::utf8proc)
+    set(UTF8PROC_TARGET utf8proc::utf8proc)
+else()
+    set(UTF8PROC_TARGET utf8proc)
+endif()
+target_link_libraries(bitcask_text
+    PUBLIC  ${UTF8PROC_TARGET}
     PRIVATE bitcask_warnings
 )
 

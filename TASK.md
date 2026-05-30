@@ -20,19 +20,19 @@ upsert/get/remove/update + 崩溃恢复 + 文件滚动；文本与向量存取�
 
 ---
 
-## ▶ V2 — BM25 原生倒排 + `search_text`（下一步）
+## ▶ V2 — BM25 原生倒排 + `search_text`（进行中）
 
 目标：文本可按 BM25 检索。设计依据 §3.2 / §3.4 / §6。
 
-| # | 目标 | 新建/改动 | 关键内容 | 测试 |
-|---|---|---|---|---|
-| **V2.1** | analyzer | `analyzer.hpp/.cpp`（新，`bitcask::text`） | NFKC 归一 + 小写 → **CJK 字符 bi/tri-gram**、拉丁空白切分 →（可选停用词）。输出 `term → tf`。参数 `min_n/max_n/analyzer` | 切词/ngram/中英文混合 |
-| **V2.2** | 倒排结构 | `inverted.hpp/.cpp`（新，`bitcask::bm25`） | `term → PostingList[(ord,tf)]`(按 ord 升序)；`add_doc(ord, terms)`/`remove_doc(ord)`；全局 `N`/`sum_doc_len`；按 term hash 分片锁(§4) | add/remove、posting 有序 |
-| **V2.3** | doc_len 回填 | `index.hpp/.cpp` | `put_doc` 增 `doc_len` 入参（或单独 setter），填 `slots[ord].doc_len`（V1 恒 0） | doc_len 持久于侧表 |
-| **V2.4** | BM25 评分 + 查询 | `inverted.cpp` | DAAT：query 切词 → 取 posting → 累加 `IDF·tf·(k1+1)/(tf+k1·(1−b+b·dl/avgdl))`，**跳过 `live=0`** → top-k 堆。`k1/b` 可配 | 已知语料打分/排序 |
-| **V2.5** | 接入 Collection | `collection.hpp/.cpp` | upsert：切词 → `inverted.add_doc` + 写 doc_len；remove：`inverted.remove_doc`（或靠 live 过滤）；新增 `search_text(query,k) → [{ext_id,score}]`（经 `ord→ext_id` 翻译） | 端到端 search_text |
-| **V2.6** | 恢复重建倒排 | `collection.cpp` `recover()` | 侧表重建后，遍历 live 文档读 value→切词→`add_doc`（V2 先全量重切词；**倒排段持久化留作后续**） | 重开后 search_text 一致 |
-| **V2.7** | 接线 | `CMakeLists.txt`、`tests/` | 新 target `bitcask_text`/`bitcask_bm25`；新增测试目标；全量 ctest 绿 | — |
+| # | 目标 | 新建/改动 | 关键内容 | 测试 | 状态 |
+|---|---|---|---|---|---|
+| **V2.1** | analyzer | `analyzer.hpp`（抽象基类+工厂）、`ngram_analyzer.hpp`、`whitespace_analyzer.hpp`、`cjk_detect.hpp`、`src/text/analyzer.cpp`、utf8proc(FetchContent) | NFKC+casefold → CJK bi/tri-gram + 拉丁空白切分 → term→tf。抽象工厂模式：`AnalyzerFactory::create(config)` → `NgramAnalyzer`/`WhitespaceAnalyzer` | 22/22 测试通过（CJK/拉丁/混合/标点/工厂） | ✅ |
+| **V2.2** | 倒排结构 | `inverted.hpp/.cpp`（新，`bitcask::bm25`） | `term → PostingList[(ord,tf)]`(按 ord 升序)；`add_doc(ord, terms)`/`remove_doc(ord)`；全局 `N`/`sum_doc_len`；按 term hash 分片锁(§4) | add/remove、posting 有序 | |
+| **V2.3** | doc_len 回填 | `index.hpp/.cpp` | `put_doc` 增 `doc_len` 入参（或单独 setter），填 `slots[ord].doc_len`（V1 恒 0） | doc_len 持久于侧表 | |
+| **V2.4** | BM25 评分 + 查询 | `inverted.cpp` | DAAT：query 切词 → 取 posting → 累加 `IDF·tf·(k1+1)/(tf+k1·(1−b+b·dl/avgdl))`，**跳过 `live=0`** → top-k 堆。`k1/b` 可配 | 已知语料打分/排序 | |
+| **V2.5** | 接入 Collection | `collection.hpp/.cpp` | upsert：切词 → `inverted.add_doc` + 写 doc_len；remove：`inverted.remove_doc`（或靠 live 过滤）；新增 `search_text(query,k) → [{ext_id,score}]`（经 `ord→ext_id` 翻译） | 端到端 search_text | |
+| **V2.6** | 恢复重建倒排 | `collection.cpp` `recover()` | 侧表重建后，遍历 live 文档读 value→切词→`add_doc`（V2 先全量重切词；**倒排段持久化留作后续**） | 重开后 search_text 一致 | |
+| **V2.7** | 接线 | `CMakeLists.txt`、`tests/` | 新 target `bitcask_text`/`bitcask_bm25`；新增测试目标；全量 ctest 绿 | — | ✅ (bitcask_text) |
 
 **不在 V2**：HNSW/向量检索、merge 时重算 df、Block-Max WAND、倒排段持久化
 （恢复先全量重切词）。df 漂移：V2 查询过滤死点 + 接受漂移（merge 重算在 V4）。
@@ -76,6 +76,40 @@ upsert/get/remove/update + 崩溃恢复 + 文件滚动；文本与向量存取�
 - V6.2 Block-Max WAND 加速 BM25 top-k。
 - V6.3 倒排 posting 内存分块压缩（§3.2 内存预算）；`live` 改 Roaring。
 - V6.4 量化(scalar/PQ)、IVF、外存等超百万预留点的评估（接口已留）。
+
+---
+
+## NIF 层重构（cpp/nif/）
+
+重构 C++ NIF 桥接层，目标：消除代码重复、修复安全缺陷、统一资源管理模式。
+当前 8 文件 ~1025 行。
+
+### P0 — 安全缺陷修复
+
+| # | 改动 | 文件 | 状态 |
+|---|------|------|------|
+| N0.1 | `bytes_to_binary` 缺少 `enif_alloc_binary` 返回值检查（OOM 时 memcpy 空指针） | `nif_cask.cpp` | ✅ 由 N1.3 合并解决 |
+| N0.2 | `make_uint64_bin` 缺少 `enif_alloc_binary` 返回值检查 | `term_conv.hpp` | ✅ |
+
+### P1 — 消除代码重复
+
+| # | 改动 | 描述 | 文件 | 状态 |
+|---|------|------|------|------|
+| N1.1 | 统一资源分配 | 删除 `make_cask_resource`/`make_iter_resource`，改用 `resources.hpp` 中已有的泛型 `make_resource<T>` 模板 | `nif_cask.cpp` | ✅ |
+| N1.2 | 合并 fold_start / fold_start4 | 提取 `fold_start_impl` 内部函数，两个入口仅做参数解析 | `nif_cask.cpp` | ✅ |
+| N1.3 | 合并 bytes_to_binary / make_binary_from_bytes | 删除 `bytes_to_binary`，统一用 `term_conv.hpp` 的 `make_binary_from_bytes`（同时修复 N0.1） | `nif_cask.cpp`, `term_conv.hpp` | ✅ |
+| N1.4 | 提取 handle 验证辅助 | 对 6 个纯 handle 验证函数提取 `checked_cask_handle` 辅助 | `nif_cask.cpp` | ✅ |
+
+### P2 — 模块拆分 + 函数长度控制
+
+| # | 改动 | 状态 |
+|---|------|------|
+| N2.1 | 创建 `nif_helpers.hpp/cpp` — 共享辅助函数到 `detail` 命名空间 | ✅ |
+| N2.2 | 拆分 `nif_cask.cpp` → CRUD + `nif_cask_iter.cpp`（迭代）+ `nif_cask_admin.cpp`（管理） | ✅ |
+| N2.3 | 重构 `parse_options` → `parse_atom_option` + `parse_tuple_option` + `parse_merge_option` | ✅ |
+| N2.4 | 更新 `nif_main.cpp` 文件分布注释 | ✅ |
+| N2.5 | 清理 `atoms.hpp/cpp` — 标记 legacy atom（M6 后下线） | ✅ |
+| N2.6 | `nif_cask_admin.cpp` 中 `needs_merge` 提取 `make_string_list` 到 `detail` 复用 | ✅ |
 
 ---
 
