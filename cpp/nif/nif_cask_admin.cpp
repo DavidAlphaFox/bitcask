@@ -70,12 +70,7 @@ ERL_NIF_TERM nif_cask_merge(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM arg
     if (!h || !h->cask || !enif_is_list(env, argv[1])) return enif_make_badarg(env);
 
     std::vector<std::string> files;
-    ERL_NIF_TERM head, tail = argv[1];
-    while (enif_get_list_cell(env, tail, &head, &tail)) {
-        std::string s;
-        if (!get_latin1_string(env, head, s)) return enif_make_badarg(env);
-        files.push_back(std::move(s));
-    }
+    if (!get_latin1_string_list(env, argv[1], files)) return enif_make_badarg(env);
 
     auto r = h->cask->merge(std::move(files));
     if (!r) return fault_to_term(env, r.error());
