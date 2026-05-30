@@ -453,4 +453,153 @@ TEST_F(CaskMergeSearchTest, MergeUpdatesOverwrittenKey) {
     (*c)->close();
 }
 
+class CaskUpgradeTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        tmpdir_ = std::filesystem::temp_directory_path() /
+                  ("cask_upgrade_test_" + std::to_string(::getpid()));
+        std::error_code ec;
+        std::filesystem::remove_all(tmpdir_, ec);
+        std::filesystem::create_directories(tmpdir_, ec);
+    }
+
+    void TearDown() override {
+        std::error_code ec;
+        std::filesystem::remove_all(tmpdir_, ec);
+    }
+
+    std::filesystem::path tmpdir_;
+};
+
+TEST_F(CaskUpgradeTest, UpgradeKVToIndex) {
+    auto bytes = [](std::string_view s) {
+        return std::vector<std::byte>(
+            reinterpret_cast<const std::byte*>(s.data()),
+            reinterpret_cast<const std::byte*>(s.data()) + s.size());
+    };
+
+    {
+        CaskOptions opts;
+        opts.read_write = true;
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+
+        auto k1 = bytes("key1");
+        auto v1 = bytes("hello world");
+        auto r1 = (*c)->put(k1, v1);
+        ASSERT_TRUE(r1);
+
+        auto k2 = bytes("key2");
+        auto v2 = bytes("hello again");
+        auto r2 = (*c)->put(k2, v2);
+        ASSERT_TRUE(r2);
+
+        (*c)->close();
+    }
+
+    SearchLayerConfig search_cfg;
+    search_cfg.analyzer_config.type = AnalyzerType::Ngram;
+    search_cfg.analyzer_config.min_n = 2;
+    search_cfg.analyzer_config.max_n = 3;
+    auto upg = Cask::upgrade(tmpdir_.string(), search_cfg);
+    ASSERT_TRUE(upg) << "upgrade failed";
+
+    auto sr = (*upg)->search_text("hello", 10);
+    ASSERT_TRUE(sr);
+    EXPECT_EQ(sr->hits.size(), 2u);
+
+    auto g1 = (*upg)->get(bytes("key1"));
+    ASSERT_TRUE(g1);
+    EXPECT_EQ(g1->value, bytes("hello world"));
+
+    (*upg)->close();
+
+    {
+        CaskOptions opts;
+        opts.read_write = true;
+        opts.enable_search = true;
+        opts.search_config = search_cfg;
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+
+        auto sr2 = (*c)->search_text("hello", 10);
+        ASSERT_TRUE(sr2);
+        EXPECT_EQ(sr2->hits.size(), 2u);
+
+        (*c)->close();
+    }
+}
+
+TEST_F(CaskUpgradeTest, UpgradeFailsOnNonexistentDir) {
+    SearchLayerConfig search_cfg;
+    search_cfg.analyzer_config.type = AnalyzerType::Ngram;
+    auto upg = Cask::upgrade("/tmp/no_such_bitcask_dir_12345", search_cfg);
+    EXPECT_FALSE(upg);
+}
+
+TEST_F(CaskUpgradeTest, UpgradeFailsOnAlreadyIndexMode) {
+    auto bytes = [](std::string_view s) {
+        return std::vector<std::byte>(
+            reinterpret_cast<const std::byte*>(s.data()),
+            reinterpret_cast<const std::byte*>(s.data()) + s.size());
+    };
+
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.enable_search = true;
+    SearchLayerConfig search_cfg;
+    search_cfg.analyzer_config.type = AnalyzerType::Ngram;
+    opts.search_config = search_cfg;
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+    (*c)->put(bytes("k"), bytes("v"));
+    (*c)->close();
+
+    auto upg = Cask::upgrade(tmpdir_.string(), search_cfg);
+    EXPECT_FALSE(upg);
+}
+
+TEST_F(CaskUpgradeTest, UpgradePreservesDeletes) {
+    auto bytes = [](std::string_view s) {
+        return std::vector<std::byte>(
+            reinterpret_cast<const std::byte*>(s.data()),
+            reinterpret_cast<const std::byte*>(s.data()) + s.size());
+    };
+
+    {
+        CaskOptions opts;
+        opts.read_write = true;
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+
+        (*c)->put(bytes("keep"), bytes("kept value"));
+        (*c)->put(bytes("remove"), bytes("removed value"));
+        (*c)->remove(bytes("remove"));
+        (*c)->close();
+    }
+
+    SearchLayerConfig search_cfg;
+    search_cfg.analyzer_config.type = AnalyzerType::Ngram;
+    search_cfg.analyzer_config.min_n = 2;
+    search_cfg.analyzer_config.max_n = 3;
+    auto upg = Cask::upgrade(tmpdir_.string(), search_cfg);
+    ASSERT_TRUE(upg);
+
+    auto g_keep = (*upg)->get(bytes("keep"));
+    ASSERT_TRUE(g_keep);
+
+    auto g_rm = (*upg)->get(bytes("remove"));
+    EXPECT_FALSE(g_rm);
+
+    auto sr = (*upg)->search_text("kept", 10);
+    ASSERT_TRUE(sr);
+    EXPECT_EQ(sr->hits.size(), 1u);
+
+    auto sr_rm = (*upg)->search_text("removed", 10);
+    ASSERT_TRUE(sr_rm);
+    EXPECT_EQ(sr_rm->hits.size(), 0u);
+
+    (*upg)->close();
+}
+
 }  // namespace

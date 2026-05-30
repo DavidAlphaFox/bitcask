@@ -201,6 +201,15 @@ public:
     open(std::string_view dirname, const CaskOptions& opts,
          keydir::KeyDirRegistry* registry = nullptr);
 
+    // 离线升级：将 KV 模式目录升级为索引模式。
+    // 前提条件：目录必须存在且当前为 KV 模式；目录必须处于离线状态（无活跃 writer）。
+    // 流程：读取 bitcask.meta 验证 KV 模式 → 写入新 meta 标记为索引模式 →
+    //       创建 SearchLayer → 扫描所有数据文件重建索引 → 返回只读索引模式 Cask。
+    // 线程安全: 是（产生独立的 Cask 对象）。
+    // 锁要求: 无（离线操作，不获取 write.lock 或 merge.lock）。
+    [[nodiscard]] static std::expected<std::unique_ptr<Cask>, CaskFault>
+    upgrade(std::string_view dirname, const search::SearchLayerConfig& search_config);
+
     // 线程安全: 否（修改对象状态、释放资源）；caller 保证关闭时刻没有
     // 其它线程仍在调用 get/put/remove/sync/iter。
     void close() noexcept;

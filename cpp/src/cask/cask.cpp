@@ -256,16 +256,65 @@ void CaskIter::release() noexcept {
 // =============================================================================
 // Cask 主体实现
 //
-// open  ：拿锁 / 注册 keydir / 扫盘重建索引 / 准备 active writer
-// close ：finalize active writer + hint trailer，释放锁，registry release
-// get   ：keydir 查 → DataFile pread → 校验 → 返回 value
-// put   ：append 到 active data file → 写 hint → 更新 keydir
-// remove：append 一条墓碑 record → 更新 keydir 标记为墓碑
-// merge ：跑 run_merge → 合并完后从 read_files_ 缓存里淘汰旧句柄、
-//         然后 unlink 老文件
+// open   ：拿锁 / 注册 keydir / 扫盘重建索引 / 准备 active writer
+// upgrade：离线 KV→索引升级（不拿锁，只读扫盘重建索引）
+// close  ：finalize active writer + hint trailer，释放锁，registry release
+// get    ：keydir 查 → DataFile pread → 校验 → 返回 value
+// put    ：append 到 active data file → 写 hint → 更新 keydir
+// remove ：append 一条墓碑 record → 更新 keydir 标记为墓碑
+// merge  ：跑 run_merge → 合并完后从 read_files_ 缓存里淘汰旧句柄、
+//          然后 unlink 老文件
 // =============================================================================
 
 Cask::~Cask() { close(); }
+
+// 离线升级：将 KV 模式目录转为索引模式。
+// 不获取任何锁——要求目录处于离线状态（无活跃 writer/merger）。
+// 步骤：验证 meta 是 KV → 覆写 meta 为 kIndex → 创建 SearchLayer →
+//       新建 KeyDir + load_keydir_from_disk(search_layer) → mark_ready
+// 返回的 Cask 是只读的（无 active writer），调用方可以 close 后
+// 再用 open(dirname, {enable_search=true, read_write=true}) 正常使用。
+std::expected<std::unique_ptr<Cask>, CaskFault>
+Cask::upgrade(std::string_view dirname,
+              const search::SearchLayerConfig& search_config) {
+    if (!fs::exists(dirname)) {
+        return std::unexpected(err(CaskError::kIo, "directory does not exist"));
+    }
+
+    if (!meta::meta_exists(std::string(dirname))) {
+        return std::unexpected(err(CaskError::kModeMismatch,
+                                    "no bitcask.meta found — not a valid bitcask directory"));
+    }
+    auto mc = meta::read_meta(std::string(dirname));
+    if (!mc) {
+        return std::unexpected(err(CaskError::kIo, "read meta failed"));
+    }
+    if (mc->mode == meta::Mode::kIndex) {
+        return std::unexpected(err(CaskError::kModeMismatch,
+                                    "directory is already in index mode"));
+    }
+
+    meta::MetaConfig new_mc;
+    new_mc.mode = meta::Mode::kIndex;
+    auto wr = meta::write_meta(std::string(dirname), new_mc);
+    if (!wr) {
+        return std::unexpected(err(CaskError::kIo, "write meta failed"));
+    }
+
+    auto cask = std::make_unique<Cask>();
+    cask->dirname_ = std::string(dirname);
+    cask->meta_config_ = new_mc;
+
+    cask->search_ = std::make_unique<search::SearchLayer>(search_config);
+
+    cask->keydir_ = std::make_shared<keydir::KeyDir>();
+    if (auto r = cask->load_keydir_from_disk(cask->search_.get()); !r) {
+        return std::unexpected(r.error());
+    }
+    cask->keydir_->mark_ready();
+
+    return cask;
+}
 
 // Cask 启动入口。流程：
 //   1. ensure dir 存在
