@@ -37,6 +37,8 @@
 #include "bitcask/keydir_registry.hpp"
 #include "bitcask/merge_policy.hpp"
 #include "bitcask/merger.hpp"
+#include "bitcask/meta_file.hpp"
+#include "bitcask/search_layer.hpp"
 
 namespace bitcask {
 
@@ -74,6 +76,10 @@ struct CaskOptions {
     std::uint8_t  tombstone_version = 0;
 
     merge::PolicyOptions policy{};
+    // Phase 4: enable_search 用于 meta 检查；search_config 用于 SearchLayer 创建。
+    // search_config.has_value() 时才真正创建 SearchLayer。
+    bool enable_search = false;
+    std::optional<search::SearchLayerConfig> search_config;
 };
 
 // --- 错误码 ------------------------------------------------------------------
@@ -87,6 +93,9 @@ enum class CaskError {
     kReadOnly,            // 写操作给到只读 cask
     kWriteLocked,         // 别人已经持有 write.lock / merge.lock
     kInvalidOption,
+    kNoIndex,           // KV 模式下调用了 search 接口
+    kModeMismatch,      // 文件模式与打开选项不匹配
+    kAnalyzerMismatch,  // 分析器类型不匹配
 };
 
 struct CaskFault {
@@ -96,8 +105,19 @@ struct CaskFault {
 };
 
 struct GetResult {
-    std::vector<std::byte> value;
-    std::uint32_t tstamp;
+    std::vector<std::byte> value;  // DocValue 解码后的 text 段（纯 binary）
+    std::uint32_t tstamp = 0;
+    std::uint64_t ord = 0;
+};
+
+struct TextSearchResult {
+    std::vector<search::SearchHit> hits;
+};
+
+// put_doc 的输入结构：text 是必须的，meta 可选。
+struct DocInput {
+    std::span<const std::byte> text;    // required
+    std::span<const std::byte> meta;    // optional
 };
 
 struct StatusInfo {
@@ -149,6 +169,7 @@ public:
         std::uint64_t offset = 0;
         std::uint32_t total_sz = 0;
         bool is_tombstone = false;
+        std::uint64_t ord = 0;
     };
     // 线程安全: 否（推进 iter_ + 内部 pread）；同一对象不可并发使用。
     [[nodiscard]] std::expected<std::optional<Entry>, CaskFault> next();
@@ -207,6 +228,26 @@ public:
     // 线程安全: 否（同 put）。锁要求: caller 串行化所有写操作。
     [[nodiscard]] std::expected<void, CaskFault>
     remove(std::span<const std::byte> key, std::uint32_t tstamp = 0);
+
+    // 写入结构化文档（text + 选填 meta）。用于索引模式。
+    // 线程安全: 否（同 put）。
+    [[nodiscard]] std::expected<void, CaskFault>
+    put_doc(std::span<const std::byte> key, const DocInput& doc,
+            std::uint32_t tstamp = 0);
+
+    // BM25 文本搜索（词袋模式）。
+    // 线程安全: 否（search_ 非线程安全）。
+    [[nodiscard]] std::expected<TextSearchResult, CaskFault>
+    search_text(std::string_view query, std::size_t k = 10);
+
+    // BM25 文本搜索（短语模式）。
+    // 线程安全: 否（search_ 非线程安全）。
+    [[nodiscard]] std::expected<TextSearchResult, CaskFault>
+    search_phrase(std::string_view query, std::size_t k = 10);
+
+    // 访问内部 SearchLayer（用于 NIF 层）。
+    [[nodiscard]] bool has_search() const { return search_ != nullptr; }
+    [[nodiscard]] search::SearchLayer* search() { return search_.get(); }
 
     // fsync active data file。o_sync 模式下退化为 no-op。
     // 线程安全: 否（操作 active_data_，与 put/remove 互斥）；caller 串行化。
@@ -288,8 +329,14 @@ private:
     // 0 表示「没探测到 live writer」（保守：不额外排除）。
     std::uint32_t merger_writer_active_id_ = 0;
 
+    // bitcask.meta 配置（open 时读写）
+    meta::MetaConfig meta_config_{};
+
+    // SearchLayer 实例（enable_search 时创建）
+    std::unique_ptr<search::SearchLayer> search_;
+
     // 内部辅助
-    [[nodiscard]] std::expected<void, CaskFault> load_keydir_from_disk();
+    [[nodiscard]] std::expected<void, CaskFault> load_keydir_from_disk(search::SearchLayer* search_layer);
     [[nodiscard]] std::expected<void, CaskFault> ensure_active_writer();
     [[nodiscard]] std::expected<void, CaskFault> roll_active_if_needed(std::size_t about_to_write);
     // 无条件 finalize 当前 active writer 并开新一轮（新 file_id）。

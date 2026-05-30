@@ -20,7 +20,10 @@ using Utf8ProcBuf = std::unique_ptr<uint8_t[], Utf8ProcDeleter>;
 [[nodiscard]] inline std::string nfkc_fold(std::string_view input) {
     if (input.empty()) return {};
 
-    auto* raw = reinterpret_cast<const utf8proc_uint8_t*>(input.data());
+    // utf8proc_NFKC_Casefold 要求 null-terminated 输入；string_view 不保证
+    // 末尾有 \0，必须拷贝到 std::string（c_str() 保证 null-terminated）。
+    std::string owned(input);
+    auto* raw = reinterpret_cast<const utf8proc_uint8_t*>(owned.c_str());
     auto* out = utf8proc_NFKC_Casefold(raw);
     if (out == nullptr) return {};
 

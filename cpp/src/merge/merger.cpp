@@ -5,6 +5,7 @@
 #include "bitcask/data_file.hpp"
 #include "bitcask/format.hpp"
 #include "bitcask/hint_file.hpp"
+#include "bitcask/search_layer.hpp"
 
 namespace bitcask::merge {
 
@@ -20,7 +21,8 @@ std::expected<MergeStats, MergeFault>
 run_merge(std::span<const std::string> input_data_paths,
           std::string_view output_dir,
           keydir::KeyDir& keydir,
-          bool sync_output) {
+          bool sync_output,
+          search::SearchLayer* search_layer) {
     MergeStats stats;
     // 给输出文件分配新 file_id；这一步必须在 open 前完成，
     // 文件名直接拼成 "<id>.bitcask.data" / "<id>.bitcask.hint"。
@@ -73,10 +75,7 @@ run_merge(std::span<const std::string> input_data_paths,
                 // 墓碑：本简化版直接跳过。legacy 在 v2 模式下会回写一条
                 // 「shadow file_id」标记到源文件——cask 层 (M3.4+) 自己处理
                 // 这部分细节，merger 不再操心。
-                std::string_view value_sv(
-                    reinterpret_cast<const char*>(view.value.data()),
-                    view.value.size());
-                if (format::is_tombstone_value(value_sv)) {
+                if (view.type == format::RecordType::kTombstone) {
                     stats.records_tombs += 1;
                     return;
                 }
@@ -97,7 +96,9 @@ run_merge(std::span<const std::string> input_data_paths,
 
                 // 复制到输出：先写新 data file，再写新 hint file，
                 // 最后 CAS 更新 keydir 指向新位置。
-                auto w = out_data->write(view.tstamp, view.key, view.value);
+                auto w = out_data->write(format::RecordType::kDoc,
+                                          view.tstamp, view.ord,
+                                          view.key, view.value);
                 if (!w) {
                     error = std::unexpected(io_fault(
                         MergeError::kOutputWriteFailed, 0,
@@ -125,8 +126,16 @@ run_merge(std::span<const std::string> input_data_paths,
                     view.tstamp, /*now_sec*/ 0,
                     /*newest_put*/ true,
                     /*old_file_id*/ in_file_id,
-                    /*old_offset*/  offset);
+                    /*old_offset*/  offset,
+                    /*ord*/ view.ord);
                 (void)pr;  // 并发 put 时 CAS 失败是合法情况，不阻断 merge
+
+                // 通知 SearchLayer：文档 ord 不变，存储定位更新到新文件。
+                if (search_layer) {
+                    search_layer->on_relocate(key_sv, view.ord,
+                                              stats.output_file_id,
+                                              w->offset, w->total_size);
+                }
 
                 stats.records_kept += 1;
                 stats.bytes_written += total_size;

@@ -34,6 +34,8 @@
 
 #include "bitcask/keydir.hpp"
 
+namespace bitcask::search { class SearchLayer; }
+
 namespace bitcask::merge {
 
 enum class MergeError {
@@ -73,10 +75,13 @@ struct MergeStats {
 // 锁要求: 调用方需已持 bitcask.merge.lock（或同等仲裁），且 keydir 已就绪
 // （is_ready() == true）。本函数内不取任何 mutex，但会通过 keydir 公共
 // API 间接持锁。
+// search_layer: 可选的 SearchLayer 指针。非空时，merge 复制活 record 后
+// 会调用 on_relocate() 更新索引定位。空时跳过搜索通知（纯 KV merge）。
 [[nodiscard]] std::expected<MergeStats, MergeFault>
 run_merge(std::span<const std::string> input_data_paths,
           std::string_view output_dir,
           keydir::KeyDir& keydir,
-          bool sync_output = false);
+          bool sync_output = false,
+          search::SearchLayer* search_layer = nullptr);
 
 }  // namespace bitcask::merge
