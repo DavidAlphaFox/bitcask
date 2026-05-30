@@ -14,25 +14,11 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     auto a = [env](const char* s) { return enif_make_atom(env, s); };
     ok                = a("ok");
     error             = a("error");
-    eof               = a("eof");
     allocation_error  = a("allocation_error");
-    lock_not_writable = a("lock_not_writable");
-    fstat_error       = a("fstat_error");
-    ftruncate_error   = a("ftruncate_error");
-    pread_error       = a("pread_error");
-    pwrite_error      = a("pwrite_error");
-    create            = a("create");
-    readonly          = a("readonly");
-    o_sync            = a("o_sync");
-    cur               = a("cur");
-    bof               = a("bof");
-    eof_whence        = eof;  // legacy 在 whence 位置也用 `eof` atom
 
-    bitcask_entry         = a("bitcask_entry");
+    o_sync            = a("o_sync");
     not_found             = a("not_found");
     already_exists        = a("already_exists");
-    not_ready             = a("not_ready");
-    ready                 = a("ready");
     out_of_date           = a("out_of_date");
     iteration_in_process  = a("iteration_in_process");
     iteration_not_started = a("iteration_not_started");
@@ -45,8 +31,6 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     merge_only      = a("merge_only");
     max_file_size   = a("max_file_size");
     sync_strategy   = a("sync_strategy");
-    none            = a("none");
-    seconds         = a("seconds");
     expiry_secs     = a("expiry_secs");
     tombstone_version = a("tombstone_version");
     key_too_large   = a("key_too_large");
@@ -62,6 +46,14 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     small_file_threshold     = a("small_file_threshold");
     expiry_grace_time        = a("expiry_grace_time");
     max_merge_size           = a("max_merge_size");
+
+    // collection_open 选项
+    analyzer           = a("analyzer");
+    jieba              = a("jieba");
+    ngram              = a("ngram");
+    whitespace         = a("whitespace");
+    dict_path          = a("dict_path");
+    enable_stop_words  = a("enable_stop_words");
 }
 
 Atoms& atoms() noexcept { return g_atoms; }

@@ -22,27 +22,7 @@ struct Atoms {
     ERL_NIF_TERM error;
     ERL_NIF_TERM allocation_error;
 
-    // ---- legacy: 以下 atom 为旧 file_* / keydir_* 细粒度 NIF 保留 ----
-    // M6 正式下线 legacy NIF 时一并清理。
-    ERL_NIF_TERM eof;              // legacy file_* NIF
-    ERL_NIF_TERM lock_not_writable; // legacy lock NIF
-    ERL_NIF_TERM fstat_error;      // legacy file_* NIF
-    ERL_NIF_TERM ftruncate_error;  // legacy file_* NIF
-    ERL_NIF_TERM pread_error;      // legacy file_* NIF
-    ERL_NIF_TERM pwrite_error;     // legacy file_* NIF
-    ERL_NIF_TERM create;           // legacy file_open 选项
-    ERL_NIF_TERM readonly;         // legacy file_open 选项
-    ERL_NIF_TERM cur;              // legacy file_position whence
-    ERL_NIF_TERM bof;              // legacy file_position whence
-    ERL_NIF_TERM eof_whence;       // legacy file_position whence（等同 eof）
-    ERL_NIF_TERM bitcask_entry;    // legacy keydir NIF
-    ERL_NIF_TERM not_ready;        // legacy keydir NIF
-    ERL_NIF_TERM ready;            // legacy keydir NIF
-    ERL_NIF_TERM none;             // legacy sync_strategy 选项
-    ERL_NIF_TERM seconds;          // legacy sync_strategy 选项
-    // ---- legacy end ----
-
-    // 当前 cask_* NIF 使用的 atom
+    // 当前 cask_* / collection_* NIF 使用的 atom
     ERL_NIF_TERM o_sync;
     ERL_NIF_TERM not_found;
     ERL_NIF_TERM already_exists;
@@ -72,6 +52,14 @@ struct Atoms {
     ERL_NIF_TERM small_file_threshold;
     ERL_NIF_TERM expiry_grace_time;
     ERL_NIF_TERM max_merge_size;
+
+    // collection_open 选项
+    ERL_NIF_TERM analyzer;
+    ERL_NIF_TERM jieba;
+    ERL_NIF_TERM ngram;
+    ERL_NIF_TERM whitespace;
+    ERL_NIF_TERM dict_path;
+    ERL_NIF_TERM enable_stop_words;
 
     // 线程安全: 否（写入静态状态）；仅 on_load 调用一次。
     void init(ErlNifEnv* env) noexcept;
