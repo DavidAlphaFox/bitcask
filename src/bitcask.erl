@@ -1,9 +1,12 @@
 %% =========================================================================
 %% bitcask 模块
 %%
-%%   bitcask 数据库的对外门面（facade）。M6 之后只剩一条调用路径：所有公共
-%%   API 都直接派发到 bitcask_cpp_nifs:cask_* 系列 NIF。Erlang 层只做三件事：
+%%   bitcask 数据库的对外门面（facade）。统一架构后所有 API 通过单一引擎
+%%   提供：open 时传入 {analyzer, ...} 选项即可启用全文索引模式，之后
+%%   put 写入的数据自动生成 BM25 索引，search_text/search_phrase 直接
+%%   在同一个 Ref 上调用。
 %%
+%%   Erlang 层只做三件事：
 %%     1. 选项归一化（opt_value/2 处理 Opts > app env > undefined 的优先级）；
 %%     2. 把 bitcask_cpp_nifs:cask_iterator/cask_fold_* 返回的元组重新组装成
 %%        历史外部接口里出现的 #bitcask_entry 记录，保持调用方的兼容性；
@@ -12,6 +15,10 @@
 %%
 %%   open/2 返回的 Ref 本身就是 cask_cpp 资源句柄，BEAM 持有它的强引用；
 %%   GC 时由 cask_resource_dtor 析构。close/1 会立刻释放底层 Cask（不等 GC）。
+%%
+%%   KV 模式（默认）：put(Ref, Key, BinaryValue)，不支持 search_*。
+%%   索引模式：open 时带 {analyzer, ngram|whitespace|jieba}，put 可传
+%%     binary 或 #{text => binary(), meta => binary()}，支持 search_text/phrase。
 %%
 %% Copyright (c) 2010 Basho Technologies, Inc. — Apache License 2.0.
 %% =========================================================================
@@ -34,12 +41,6 @@
          is_frozen/1,
          is_empty_estimate/1,
          status/1,
-         collection_open/1, collection_open/2,
-         collection_close/1,
-         collection_put/3,
-         collection_get/2,
-         collection_delete/2,
-         collection_sync/1,
          search_text/2, search_text/3,
          search_phrase/2, search_phrase/3]).
 
@@ -54,7 +55,8 @@
     frag_merge_trigger, dead_bytes_merge_trigger,
     frag_threshold, dead_bytes_threshold,
     small_file_threshold, expiry_grace_time,
-    max_merge_size
+    max_merge_size,
+    analyzer, dict_path, enable_stop_words
 ]).
 
 %% =========================================================================
@@ -73,9 +75,17 @@ open(Dirname) -> open(Dirname, []).
 %%     {sync_strategy, X}   — none | o_sync | {seconds, N}
 %%     {tombstone_version, V} — 1 或 2，控制墓碑编码（默认 2）
 %%
+%%   索引模式选项（传入即启用全文搜索）：
+%%     {analyzer, Type}     — ngram | whitespace | jieba（必填）
+%%     {dict_path, Path}    — jieba 分词词典路径（jieba 时必填）
+%%     {enable_stop_words, true} — 启用停用词过滤
+%%
+%%   索引模式的 put 可接受 binary 或 #{text => binary(), meta => binary()}。
+%%   索引模式下调 search_text/search_phrase 进行 BM25 检索。
+%%
 %%   返回:
 %%     reference()          — 成功
-%%     {error, Reason}      — 通常是 write_locked / enoent / 权限问题
+%%     {error, Reason}      — 通常是 write_locked / enoent / mode_mismatch
 -spec open(Dirname::string(), Opts::[_]) -> reference() | {error, term()}.
 open(Dirname, Opts) ->
     %% 把 bitcask 应用启动起来——很多默认参数（open_timeout、
@@ -419,38 +429,22 @@ cask_max_put(N) when is_integer(N), N < 0 -> -1;
 cask_max_put(N) when is_integer(N) -> N.
 
 %% =========================================================================
-%% Collection API (BM25 full-text search)
+%% 全文搜索（BM25）
+%%
+%% 必须在索引模式（open 时带 {analyzer, ...} 选项）打开的 Ref 上调用。
+%% KV 模式下调这些接口会返回 {error, no_index}。
 %% =========================================================================
 
-collection_open(Dir) ->
-    collection_open(Dir, []).
-
-collection_open(Dir, Opts) when is_list(Opts) ->
-    bitcask_cpp_nifs:collection_open(Dir, Opts).
-
-collection_close(Ref) ->
-    bitcask_cpp_nifs:collection_close(Ref).
-
-collection_put(Ref, Key, Value) ->
-    bitcask_cpp_nifs:collection_put(Ref, Key, Value).
-
-collection_get(Ref, Key) ->
-    bitcask_cpp_nifs:collection_get(Ref, Key).
-
-collection_delete(Ref, Key) ->
-    bitcask_cpp_nifs:collection_delete(Ref, Key).
-
-collection_sync(Ref) ->
-    bitcask_cpp_nifs:collection_sync(Ref).
-
+%% 词袋模式搜索，默认返回前 10 条。
 search_text(Ref, Query) ->
     search_text(Ref, Query, 10).
 
 search_text(Ref, Query, K) ->
-    bitcask_cpp_nifs:collection_search_text(Ref, Query, K).
+    bitcask_cpp_nifs:cask_search_text(Ref, Query, K).
 
+%% 短语模式搜索，默认返回前 10 条。
 search_phrase(Ref, Query) ->
     search_phrase(Ref, Query, 10).
 
 search_phrase(Ref, Query, K) ->
-    bitcask_cpp_nifs:collection_search_phrase(Ref, Query, K).
+    bitcask_cpp_nifs:cask_search_phrase(Ref, Query, K).
