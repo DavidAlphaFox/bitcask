@@ -14,6 +14,7 @@ using bitcask::Collection;
 using bitcask::CollectionError;
 using bitcask::CollectionOptions;
 using bitcask::DocInput;
+using bitcask::TextHit;
 
 namespace fs = std::filesystem;
 
@@ -162,4 +163,108 @@ TEST(Collection, FileRollAcrossManyDocsSurvivesReopen) {
         EXPECT_EQ(g->text, "value-" + std::to_string(i));
     }
     EXPECT_EQ((*c)->info().live_docs, 50u);
+}
+
+// ===========================================================================
+// search_text 端到端
+// ===========================================================================
+
+TEST(Collection, SearchTextChineseRanking) {
+    TempDir td;
+    auto c = Collection::open(td.str(), {});
+    ASSERT_TRUE(c);
+
+    ASSERT_TRUE((*c)->upsert("d1", text_doc("北京市朝阳区")));
+    ASSERT_TRUE((*c)->upsert("d2", text_doc("上海浦东新区")));
+    ASSERT_TRUE((*c)->upsert("d3", text_doc("北京人在上海")));
+
+    auto result = (*c)->search_text("北京", 10);
+    ASSERT_TRUE(result) << "search_text failed";
+    auto& hits = *result;
+
+    ASSERT_GE(hits.size(), 2u);
+
+    std::vector<std::string> ids;
+    for (auto& h : hits) ids.push_back(h.ext_id);
+    EXPECT_NE(std::find(ids.begin(), ids.end(), "d1"), ids.end());
+    EXPECT_NE(std::find(ids.begin(), ids.end(), "d3"), ids.end());
+    EXPECT_EQ(std::find(ids.begin(), ids.end(), "d2"), ids.end());
+}
+
+TEST(Collection, SearchTextLatinCaseInsensitive) {
+    TempDir td;
+    auto c = Collection::open(td.str(), {});
+    ASSERT_TRUE(c);
+
+    ASSERT_TRUE((*c)->upsert("e1", text_doc("Hello World")));
+    ASSERT_TRUE((*c)->upsert("e2", text_doc("Quick Fox")));
+    ASSERT_TRUE((*c)->upsert("e3", text_doc("Hello Earth")));
+
+    auto result = (*c)->search_text("hello", 10);
+    ASSERT_TRUE(result);
+    auto& hits = *result;
+
+    ASSERT_GE(hits.size(), 2u);
+    std::vector<std::string> ids;
+    for (auto& h : hits) ids.push_back(h.ext_id);
+    EXPECT_NE(std::find(ids.begin(), ids.end(), "e1"), ids.end());
+    EXPECT_NE(std::find(ids.begin(), ids.end(), "e3"), ids.end());
+}
+
+TEST(Collection, SearchTextAfterDelete) {
+    TempDir td;
+    auto c = Collection::open(td.str(), {});
+    ASSERT_TRUE(c);
+
+    ASSERT_TRUE((*c)->upsert("keep", text_doc("北京天安门")));
+    ASSERT_TRUE((*c)->upsert("del",  text_doc("北京故宫")));
+    ASSERT_TRUE((*c)->remove("del"));
+
+    auto result = (*c)->search_text("北京", 10);
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_EQ(result->at(0).ext_id, "keep");
+}
+
+TEST(Collection, SearchTextSurvivesReopen) {
+    TempDir td;
+    {
+        auto c = Collection::open(td.str(), {});
+        ASSERT_TRUE(c);
+        ASSERT_TRUE((*c)->upsert("a", text_doc("北京天安门广场")));
+        ASSERT_TRUE((*c)->upsert("b", text_doc("上海外滩夜景")));
+        ASSERT_TRUE((*c)->sync());
+        (*c)->close();
+    }
+
+    auto c = Collection::open(td.str(), {});
+    ASSERT_TRUE(c);
+
+    auto result = (*c)->search_text("北京", 10);
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_EQ(result->at(0).ext_id, "a");
+}
+
+TEST(Collection, SearchTextNoMatchReturnsEmpty) {
+    TempDir td;
+    auto c = Collection::open(td.str(), {});
+    ASSERT_TRUE(c);
+
+    ASSERT_TRUE((*c)->upsert("x", text_doc("上海浦东")));
+
+    auto result = (*c)->search_text("不存在", 10);
+    ASSERT_TRUE(result);
+    EXPECT_TRUE(result->empty());
+}
+
+TEST(Collection, SearchTextEmptyQueryReturnsEmpty) {
+    TempDir td;
+    auto c = Collection::open(td.str(), {});
+    ASSERT_TRUE(c);
+
+    ASSERT_TRUE((*c)->upsert("x", text_doc("test")));
+    auto result = (*c)->search_text("", 10);
+    ASSERT_TRUE(result);
+    EXPECT_TRUE(result->empty());
 }
