@@ -34,6 +34,7 @@ namespace bitcask::bm25 {
 struct Posting {
     std::uint64_t ord;
     std::uint32_t tf;
+    std::vector<std::uint32_t> positions;
 };
 
 // 一个 term 对应的 posting 列表，按 ord 升序排列。
@@ -51,6 +52,8 @@ struct Bm25Params {
     float k1 = 1.2F;
     float b  = 0.75F;
 };
+
+using TermPositions = std::unordered_map<std::string, std::pair<std::uint32_t, std::vector<std::uint32_t>>>;
 
 // 搜索结果条目。
 struct SearchResult {
@@ -77,7 +80,7 @@ public:
 
     // 添加一篇文档的 posting。term_freqs 来自 analyzer。
     // 线程安全：按 term hash 分片锁。
-    void add_doc(std::uint64_t ord, const std::unordered_map<std::string, std::uint32_t>& term_freqs);
+    void add_doc(std::uint64_t ord, const TermPositions& term_data);
 
     // 删除一篇文档的 posting。V2 实际不删除 posting 行（靠 live 过滤），
     // 但减少 live_doc_count_ / sum_doc_len_ 以保持统计准确。
@@ -94,6 +97,14 @@ public:
         std::size_t k,
         const LiveChecker& live_checker) const -> std::vector<SearchResult>;
 
+    [[nodiscard]] auto search_phrase(
+        const std::vector<std::string>& query_terms,
+        std::size_t k,
+        const LiveChecker& live_checker) const -> std::vector<SearchResult>;
+
+    auto save(std::string_view path) const -> bool;
+    auto load(std::string_view path) -> bool;
+
     // ---- 统计 ----
     [[nodiscard]] auto live_doc_count() const -> std::uint64_t;
     [[nodiscard]] auto sum_doc_len() const -> std::uint64_t;
@@ -101,6 +112,7 @@ public:
 
     // 调试：返回 term 的 df（posting list 长度，含死点）。
     [[nodiscard]] auto df(std::string_view term) const -> std::size_t;
+    [[nodiscard]] auto df_live(std::string_view term, const LiveChecker& live_checker) const -> std::size_t;
 
 private:
     static constexpr std::size_t kShardCount = 16;
