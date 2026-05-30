@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include "bitcask/inverted.hpp"
+
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -45,7 +47,7 @@ struct DocLoc {
 struct DocSlot {
     DocLoc        loc;
     std::uint32_t tstamp  = 0;
-    std::uint32_t doc_len = 0;   // V1 恒 0；V2 切词时填
+    std::uint32_t doc_len = 0;   // BM25 token 数（V2 由 analyzer 填）
 };
 
 struct IndexInfo {
@@ -54,7 +56,7 @@ struct IndexInfo {
     std::uint64_t next_ord   = 0;
 };
 
-class Index {
+class Index : public bm25::LiveChecker {
 public:
     Index() = default;
     Index(const Index&) = delete;
@@ -85,7 +87,11 @@ public:
     [[nodiscard]] std::optional<std::string> ord_to_ext(std::uint64_t ord) const;
 
     // 某 ord 是否存活。越界返回 false。线程安全：shared_lock。
-    [[nodiscard]] bool is_live(std::uint64_t ord) const;
+    // 同时实现 LiveChecker::is_live。
+    [[nodiscard]] bool is_live(std::uint64_t ord) const override;
+
+    // LiveChecker::doc_len — 返回 ord 对应文档的 token 数，越界返回 0。
+    [[nodiscard]] std::uint32_t doc_len(std::uint64_t ord) const override;
 
     // ---- 内省 ----
     [[nodiscard]] IndexInfo info() const;

@@ -86,6 +86,12 @@ bool Index::is_live(std::uint64_t ord) const {
     return ord < live_.size() && live_[ord];
 }
 
+std::uint32_t Index::doc_len(std::uint64_t ord) const {
+    std::shared_lock lk(mutex_);
+    if (ord >= slots_.size()) return 0;
+    return slots_[ord].doc_len;
+}
+
 IndexInfo Index::info() const {
     std::shared_lock lk(mutex_);
     return IndexInfo{
