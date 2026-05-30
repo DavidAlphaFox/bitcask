@@ -194,16 +194,14 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
         }
 
         // sibling 墓碑只活在 keydir 里（file_id 是 sentinel，磁盘上没
-        // 对应 record）。跳过文件读，合成一条 v0 墓碑 value 给 caller。
+        // 对应 record）。跳过文件读，合成一条空 value 墓碑给 caller。
         if (proxy->is_tombstone) {
             Entry e;
             e.key.assign(reinterpret_cast<const std::byte*>(proxy->key.data()),
                           reinterpret_cast<const std::byte*>(proxy->key.data()) +
                           proxy->key.size());
-            const auto& tomb = bitcask::format::kTombstoneV0;
-            e.value.assign(reinterpret_cast<const std::byte*>(tomb.data()),
-                            reinterpret_cast<const std::byte*>(tomb.data()) +
-                            tomb.size());
+            e.value.clear();
+            e.value.shrink_to_fit();
             e.tstamp       = proxy->tstamp;
             e.file_id      = proxy->file_id;
             e.offset       = proxy->offset;
@@ -229,11 +227,9 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
             }
         }
         // 即使 keydir 没把它标成墓碑，磁盘 record 自己也可能是墓碑——
-        // keydir 指向的就是一条带墓碑前缀的 value。这种「磁盘墓碑」要
+        // keydir 指向的就是一条带墓碑类型的 value。这种「磁盘墓碑」要
         // 跟「sibling 墓碑」区分对待（前者有真实磁盘字节，后者纯内存）。
-        const bool value_is_tomb = bitcask::format::is_tombstone_value(
-            std::string_view(reinterpret_cast<const char*>(rec->value.data()),
-                              rec->value.size()));
+        const bool value_is_tomb = rec->type == format::RecordType::kTombstone;
         if (value_is_tomb && !see_tombstones_) continue;
 
         Entry e;
@@ -464,10 +460,7 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
         auto fr = df->fold(
             [&](const codec::DataRecordView& view, std::uint64_t offset,
                 std::uint32_t total_size) {
-                std::string_view value_sv(
-                    reinterpret_cast<const char*>(view.value.data()),
-                    view.value.size());
-                if (format::is_tombstone_value(value_sv)) {
+                if (view.type == format::RecordType::kTombstone) {
                     keydir_->remove(bytes_to_view(view.key), view.tstamp);
                     return;
                 }
@@ -679,10 +672,10 @@ Cask::get(std::span<const std::byte> key) {
                 return std::unexpected(err(CaskError::kIo));
         }
     }
-    // 磁盘墓碑：value 以 "bitcask_tombstone..." 开头。语义上仍然是「最新
-    // 写入」（记录上的 tstamp 比之前的活 entry 大），但表示删除。在 cask
+    // 磁盘墓碑：record type 为 kTombstone。语义上仍然是「最新写入」
+    // （记录上的 tstamp 比之前的活 entry 大），但表示删除。在 cask
     // 层透明过滤掉。
-    if (format::is_tombstone_value(bytes_to_view(rec->value))) {
+    if (rec->type == format::RecordType::kTombstone) {
         return std::unexpected(err(CaskError::kNotFound));
     }
     return GetResult{std::move(rec->value), rec->tstamp};
@@ -716,7 +709,10 @@ Cask::put(std::span<const std::byte> key,
         if (auto r = roll_active(); !r) return std::unexpected(r.error());
     }
 
-    auto w = active_data_->write(tstamp, key, value);
+    // ord = 0: Cask uses keydir-based indexing (no inverted index), so ord
+    // is not needed. Collection's ord is for per-field posting lists.
+    auto w = active_data_->write(format::RecordType::kDoc, tstamp,
+                                  /*ord*/ 0, key, value);
     if (!w) return std::unexpected(io_fault(w.error().errnum,
                                              std::string(active_data_->path())));
     auto h = active_hint_->write(tstamp, w->total_size, w->offset,
@@ -731,7 +727,8 @@ Cask::put(std::span<const std::byte> key,
         // 上面的预 roll 跟 keydir 更新之间又有 merger 抢了一次 file_id——
         // 罕见但必须处理。再 roll 一次重试；二次失败就把错误吐给 caller。
         if (auto r = roll_active(); !r) return std::unexpected(r.error());
-        auto w2 = active_data_->write(tstamp, key, value);
+        auto w2 = active_data_->write(format::RecordType::kDoc, tstamp,
+                                        /*ord*/ 0, key, value);
         if (!w2) return std::unexpected(io_fault(w2.error().errnum));
         auto h2 = active_hint_->write(tstamp, w2->total_size, w2->offset,
                                         /*tomb*/ false, key);
@@ -748,44 +745,41 @@ Cask::put(std::span<const std::byte> key,
 
 // 软删除 = 写一条墓碑 record。
 //
-// 墓碑 value 编码：
-//   v0：纯前缀 "bitcask_tombstone"（17 字节）
-//   v2：前缀 + shadow file_id（22 字节，file_id 大端 4 字节）
-// shadow file_id 来自当前 keydir entry——告诉 merger「我是为这个 file_id
-// 里的某条 entry 而存在的墓碑，那条 entry 还在的话我才有意义」。如果
-// keydir 里 key 已经被删（找不到），shadow=0，回退到 v0 模式。
+// 墓碑 encoding (v2 backward compat):
+//   v0: empty value (RecordType::kTombstone carries the meaning)
+//   v2: 4-byte big-endian shadow file_id (tells merger "I exist because of
+//       an entry in file_id N; if that entry is gone, I'm meaningless").
+//       If key not in keydir or file_id==0, fall back to v0.
 std::expected<void, CaskFault>
 Cask::remove(std::span<const std::byte> key, std::uint32_t tstamp) {
     if (!opts_.read_write) return std::unexpected(err(CaskError::kReadOnly));
     if (tstamp == 0) tstamp = now_sec_default();
 
-    std::string tomb;
+    std::span<const std::byte> tomb_value;
+    std::uint8_t shadow_be[4] = {0};
     if (opts_.tombstone_version == 2) {
-        std::uint32_t shadow = 0;
         if (auto entry = keydir_->get(bytes_to_view(key))) {
-            shadow = entry->file_id;
+            if (entry->file_id != 0) {
+                shadow_be[0] = static_cast<std::uint8_t>((entry->file_id >> 24) & 0xFF);
+                shadow_be[1] = static_cast<std::uint8_t>((entry->file_id >> 16) & 0xFF);
+                shadow_be[2] = static_cast<std::uint8_t>((entry->file_id >>  8) & 0xFF);
+                shadow_be[3] = static_cast<std::uint8_t>( entry->file_id        & 0xFF);
+                tomb_value = std::span<const std::byte>(
+                    reinterpret_cast<const std::byte*>(shadow_be),
+                    sizeof(shadow_be));
+            }
         }
-        if (shadow != 0) {
-            tomb.assign(format::kTombstoneV2);
-            const std::uint8_t be[4] = {
-                static_cast<std::uint8_t>((shadow >> 24) & 0xFF),
-                static_cast<std::uint8_t>((shadow >> 16) & 0xFF),
-                static_cast<std::uint8_t>((shadow >>  8) & 0xFF),
-                static_cast<std::uint8_t>( shadow        & 0xFF),
-            };
-            tomb.append(reinterpret_cast<const char*>(be), 4);
-        } else {
-            tomb.assign(format::kTombstoneV0);
-        }
-    } else {
-        tomb.assign(format::kTombstoneV0);
     }
-    auto tomb_bytes = str_to_bytes(tomb);
+    if (tomb_value.empty()) {
+        tomb_value = std::span<const std::byte>{};
+    }
+
     const std::size_t about =
-        format::kHeaderSize + key.size() + tomb_bytes.size();
+        format::kHeaderSize + key.size() + tomb_value.size();
     if (auto r = roll_active_if_needed(about); !r) return std::unexpected(r.error());
 
-    auto w = active_data_->write(tstamp, key, tomb_bytes);
+    auto w = active_data_->write(format::RecordType::kTombstone, tstamp,
+                                  /*ord*/ 0, key, tomb_value);
     if (!w) return std::unexpected(io_fault(w.error().errnum));
     // hint 文件也要追一条墓碑——下次 open fold(hint) 重建时才能正确删 key。
     auto h = active_hint_->write(tstamp, w->total_size, w->offset,
