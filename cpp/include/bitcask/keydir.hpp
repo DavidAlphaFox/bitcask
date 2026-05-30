@@ -51,12 +51,14 @@ inline constexpr std::uint64_t kMaxOffset  = std::numeric_limits<std::uint64_t>:
 
 // 一个 key 的某次「写入快照」。epoch 是写入时分配的全局递增计数，用于
 // fold 期间区分新 / 旧 revision；wall-clock tstamp 在 ms 级别用于过期判定。
+// ord 是写入时的全局单调递增序号，用于 tie-breaking 和有序遍历。
 struct SingleEntry {
     std::uint32_t file_id  = 0;
     std::uint32_t total_sz = 0;
     std::uint64_t offset   = 0;
     std::uint64_t epoch    = 0;
     std::uint32_t tstamp   = 0;
+    std::uint64_t ord      = 0;  // 全局单调递增写序号
 };
 
 // 「sibling 链」：fold 期间被多次写过的同 key revision 列表。
@@ -77,6 +79,7 @@ struct EntryProxy {
     std::uint64_t offset   = 0;
     std::uint64_t epoch    = 0;
     std::uint32_t tstamp   = 0;
+    std::uint64_t ord      = 0;  // 全局单调递增写序号
     bool is_tombstone      = false;
     std::string_view key;
 };
@@ -202,13 +205,15 @@ public:
     //   newest_put：true 表示「无条件写」（put 流程）；
     //               false 表示「条件写」（用 old_file_id/old_offset 做 CAS，
     //               值不匹配返回 kAlreadyExists——给 merge 用）。
+    //   ord：写入的全局单调递增序号，用于 tie-breaking 和有序遍历。
     // 线程安全: 是。锁: 内部 unique_lock(mutex_)。可重入: 否（递归会死锁）。
     PutResult put(std::string_view key,
                   std::uint32_t file_id, std::uint32_t total_sz,
                   std::uint64_t offset, std::uint32_t tstamp,
                   std::uint32_t now_sec,
                   bool newest_put,
-                  std::uint32_t old_file_id, std::uint64_t old_offset);
+                  std::uint32_t old_file_id, std::uint64_t old_offset,
+                  std::uint64_t ord = 0);
 
     // 无条件删除。返回 true 表示原本有这条 key。
     // 线程安全: 是。锁: 内部 unique_lock(mutex_)。
@@ -236,8 +241,16 @@ public:
     std::optional<EntryProxy> get(std::string_view key,
                                    std::uint64_t epoch = kMaxEpoch) const;
 
-    // 线程安全: 是。锁: 内部 shared_lock(mutex_)。
+    // 线程安全: 是。锁: 内部 shared_lock(mutex_)（多读者并发）。
     [[nodiscard]] std::uint64_t get_epoch() const;
+
+    // 分配一个新的全局 ord 值（单调递增）。
+    // 线程安全: 是。锁: 内部 unique_lock(mutex_)。
+    [[nodiscard]] std::uint64_t alloc_ord();
+
+    // 把 next_ord_ 至少推到 ord + 1（用于 merge 后恢复 ord 状态）。
+    // 线程安全: 是。锁: 内部 unique_lock(mutex_)。
+    void advance_ord(std::uint64_t ord);
 
     // ---- 迭代器工厂 ----
     // 线程安全: 是（仅构造一个 IterHandle 对象，未触碰共享状态）。
@@ -313,6 +326,7 @@ private:
     std::uint64_t key_count_       = 0;
     std::uint64_t key_bytes_       = 0;
     std::uint64_t epoch_           = 0;
+    std::uint64_t next_ord_       = 0;
     std::uint32_t biggest_file_id_ = 0;
     bool is_ready_                 = false;
 

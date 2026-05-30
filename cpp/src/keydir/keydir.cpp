@@ -16,7 +16,7 @@ namespace {
 // 「墓碑 revision」。三个 sentinel 字段同时取 MAX 是 legacy is_sib_tombstone
 // 的判别约定，沿用以保证跨实现互通。
 SingleEntry make_sibling_tombstone(std::uint64_t epoch, std::uint32_t tstamp) noexcept {
-    return SingleEntry{kMaxFileId, kMaxSize, kMaxOffset, epoch, tstamp};
+    return SingleEntry{kMaxFileId, kMaxSize, kMaxOffset, epoch, tstamp, 0};
 }
 [[nodiscard]] bool is_sibling_tombstone(const SingleEntry& s) noexcept {
     return s.file_id == kMaxFileId && s.total_sz == kMaxSize && s.offset == kMaxOffset;
@@ -39,6 +39,7 @@ SingleEntry make_sibling_tombstone(std::uint64_t epoch, std::uint32_t tstamp) no
         .offset       = s.offset,
         .epoch        = s.epoch,
         .tstamp       = s.tstamp,
+        .ord          = s.ord,
         .is_tombstone = tombstone,
         .key          = key,
     };
@@ -215,6 +216,16 @@ std::uint64_t KeyDir::get_epoch() const {
     return epoch_;
 }
 
+std::uint64_t KeyDir::alloc_ord() {
+    std::unique_lock lock(mutex_);
+    return next_ord_++;
+}
+
+void KeyDir::advance_ord(std::uint64_t ord) {
+    std::unique_lock lock(mutex_);
+    next_ord_ = std::max(next_ord_, ord + 1);
+}
+
 // keydir 写入主入口。
 //
 // 大致控制流：
@@ -236,7 +247,8 @@ PutResult KeyDir::put(std::string_view key,
                        std::uint64_t offset, std::uint32_t tstamp,
                        std::uint32_t now_sec,
                        bool newest_put,
-                       std::uint32_t old_file_id, std::uint64_t old_offset) {
+                       std::uint32_t old_file_id, std::uint64_t old_offset,
+                       std::uint64_t ord) {
     std::unique_lock lock(mutex_);
 
     // ---- 阶段 1：探测当前状态 ----
@@ -289,7 +301,7 @@ PutResult KeyDir::put(std::string_view key,
             return PutResult::kAlreadyExists;
         }
 
-        SingleEntry s{file_id, total_sz, offset, this_epoch, tstamp};
+        SingleEntry s{file_id, total_sz, offset, this_epoch, tstamp, ord};
 
         if (pending_entry != nullptr) {
             // 之前在 pending 里是墓碑——直接覆盖成活的 entry。
@@ -338,7 +350,7 @@ PutResult KeyDir::put(std::string_view key,
     const SingleEntry cur = SingleEntry{
         current_proxy.file_id, current_proxy.total_sz,
         current_proxy.offset, current_proxy.epoch,
-        current_proxy.tstamp};
+        current_proxy.tstamp, current_proxy.ord};
 
     // 条件 put 校验：必须正好替换我们期望的 (file_id, offset)，否则失败。
     // newest_put=true 时即使 (old_file_id, old_offset) 不匹配，只要 file_id
@@ -384,7 +396,7 @@ PutResult KeyDir::put(std::string_view key,
     }
     if (keyfolders_ > 0) iter_mutation_ = true;
 
-    SingleEntry next{file_id, total_sz, offset, this_epoch, tstamp};
+    SingleEntry next{file_id, total_sz, offset, this_epoch, tstamp, ord};
 
     if (pending_entry != nullptr) {
         // 已经在 pending 里——直接覆盖（pending 自身就是 fold 不可见的）。
@@ -471,7 +483,7 @@ bool KeyDir::remove(std::string_view key, std::uint32_t remove_time) {
         pending_entry->epoch  = this_epoch;
     } else if (pending_.has_value()) {
         // 已 frozen 但 entry 只在 entries_ 里——分流写一条 pending 墓碑。
-        SingleEntry t{cur.file_id, cur.total_sz, kMaxOffset, this_epoch, remove_time};
+        SingleEntry t{cur.file_id, cur.total_sz, kMaxOffset, this_epoch, remove_time, 0};
         pending_->insert_or_assign(std::string(key), t);
         pending_updated_ += 1;
     } else if (keyfolders_ == 0) {
@@ -766,6 +778,7 @@ std::shared_ptr<KeyDir> KeyDir::deep_copy() const {
     copy->key_count_       = key_count_;
     copy->key_bytes_       = key_bytes_;
     copy->epoch_           = epoch_;
+    copy->next_ord_        = next_ord_;
     copy->biggest_file_id_ = biggest_file_id_;
     copy->is_ready_        = is_ready_;
     copy->iter_generation_ = iter_generation_;
