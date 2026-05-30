@@ -65,6 +65,19 @@ target_include_directories(bitcask_io PUBLIC include)
 target_link_libraries(bitcask_io PRIVATE bitcask_warnings)
 
 # ---------------------------------------------------------------------------
+# bitcask_keydir — in-memory keydir (KeyDir class for bitcask).
+# ---------------------------------------------------------------------------
+add_library(bitcask_keydir STATIC
+    src/keydir/keydir.cpp
+    src/keydir/keydir_registry.cpp
+)
+target_include_directories(bitcask_keydir PUBLIC include)
+target_link_libraries(bitcask_keydir
+    PUBLIC  bitcask_fileops bitcask_io
+    PRIVATE bitcask_warnings
+)
+
+# ---------------------------------------------------------------------------
 # bitcask_index — in-memory Index side tables (vector DB V1, §3.1).
 # Replaces the legacy bitcask_keydir.
 # ---------------------------------------------------------------------------
@@ -87,6 +100,18 @@ target_include_directories(bitcask_bm25 PUBLIC include)
 target_link_libraries(bitcask_bm25 PRIVATE bitcask_warnings)
 
 # ---------------------------------------------------------------------------
+# bitcask_search — SearchLayer (Index + InvertedIndex + Analyzer wrapper).
+# ---------------------------------------------------------------------------
+add_library(bitcask_search STATIC
+    src/search/search_layer.cpp
+)
+target_include_directories(bitcask_search PUBLIC include)
+target_link_libraries(bitcask_search
+    PUBLIC  bitcask_index bitcask_bm25 bitcask_text
+    PRIVATE bitcask_warnings
+)
+
+# ---------------------------------------------------------------------------
 # bitcask_collection — vector DB facade (upsert/get/remove/search_text + recovery).
 # Reuses fileops + index + io + text + bm25.
 # ---------------------------------------------------------------------------
@@ -101,14 +126,28 @@ target_link_libraries(bitcask_collection
 )
 
 # ---------------------------------------------------------------------------
+# bitcask_merge — merge 策略 + 执行。
+# ---------------------------------------------------------------------------
+add_library(bitcask_merge STATIC
+    src/merge/merger.cpp
+    src/merge/merge_policy.cpp
+)
+target_include_directories(bitcask_merge PUBLIC include)
+target_link_libraries(bitcask_merge
+    PUBLIC  bitcask_keydir bitcask_fileops bitcask_io bitcask_format bitcask_search
+    PRIVATE bitcask_warnings
+)
+
+# ---------------------------------------------------------------------------
 # bitcask_cask — legacy Cask KV store (CRUD + merge + iterators).
 # ---------------------------------------------------------------------------
 add_library(bitcask_cask STATIC
     src/cask/cask.cpp
+    src/cask/meta_file.cpp
 )
 target_include_directories(bitcask_cask PUBLIC include)
 target_link_libraries(bitcask_cask
-    PUBLIC  bitcask_fileops bitcask_io bitcask_format
+    PUBLIC  bitcask_keydir bitcask_fileops bitcask_io bitcask_format bitcask_merge bitcask_search
     PRIVATE bitcask_warnings
 )
 
@@ -176,13 +215,12 @@ if(Erlang_INCLUDE_DIR)
         nif/nif_cask_iter.cpp
         nif/nif_cask_admin.cpp
         nif/nif_helpers.cpp
-        nif/nif_collection.cpp
         nif/atoms.cpp
         nif/resources.cpp
     )
     target_include_directories(bitcask_cpp PRIVATE nif ${Erlang_INCLUDE_DIR})
     target_link_libraries(bitcask_cpp
-        PRIVATE bitcask_cask bitcask_collection bitcask_fileops bitcask_index
+        PRIVATE bitcask_cask bitcask_keydir bitcask_fileops bitcask_index
                 bitcask_io bitcask_text bitcask_bm25 bitcask_format
                 bitcask_warnings
     )
