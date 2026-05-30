@@ -88,7 +88,7 @@ target_link_libraries(bitcask_bm25 PRIVATE bitcask_warnings)
 
 # ---------------------------------------------------------------------------
 # bitcask_collection — vector DB facade (upsert/get/remove/search_text + recovery).
-# Replaces the legacy bitcask_cask. Reuses fileops + index + io + text + bm25.
+# Reuses fileops + index + io + text + bm25.
 # ---------------------------------------------------------------------------
 add_library(bitcask_collection STATIC
     src/cask/collection.cpp
@@ -96,6 +96,18 @@ add_library(bitcask_collection STATIC
 target_include_directories(bitcask_collection PUBLIC include)
 target_link_libraries(bitcask_collection
     PUBLIC  bitcask_fileops bitcask_index bitcask_io bitcask_text bitcask_bm25
+    PRIVATE bitcask_warnings
+)
+
+# ---------------------------------------------------------------------------
+# bitcask_cask — legacy Cask KV store (CRUD + merge + iterators).
+# ---------------------------------------------------------------------------
+add_library(bitcask_cask STATIC
+    src/cask/cask.cpp
+)
+target_include_directories(bitcask_cask PUBLIC include)
+target_link_libraries(bitcask_cask
+    PUBLIC  bitcask_fileops bitcask_io bitcask_format
     PRIVATE bitcask_warnings
 )
 
@@ -130,9 +142,39 @@ target_link_libraries(bitcask_text
     PRIVATE bitcask_warnings
 )
 
-# NOTE(V1): legacy targets bitcask_keydir / bitcask_merge / bitcask_cask 及
-# bitcask_cpp NIF 已从构建移除——它们绑定旧的 record 格式与 KeyDir，不在向量库
-# V1 范围内（merge=V4，NIF 消费方将重做）。对应 src 仍在磁盘上，待 M6 正式清理。
+# NOTE(V1): legacy targets bitcask_keydir / bitcask_merge / bitcask_cask 已从构建
+# 移除——它们绑定旧的 record 格式与 KeyDir，不在向量库 V1 范围内
+# （merge=V4，NIF 消费方将重做）。对应 src 仍在磁盘上，待 M6 正式清理。
+# bitcask_cpp NIF 已重新启用，绑定 Collection API（V2.9）。
+
+# ---------------------------------------------------------------------------
+# bitcask_cpp — NIF shared library (priv/bitcask_cpp.so)
+# ---------------------------------------------------------------------------
+if(Erlang_INCLUDE_DIR)
+    add_library(bitcask_cpp SHARED
+        nif/nif_main.cpp
+        nif/nif_collection.cpp
+        nif/nif_collection_helpers.cpp
+        nif/atoms.cpp
+        nif/resources_collection.cpp
+    )
+    target_include_directories(bitcask_cpp PRIVATE nif ${Erlang_INCLUDE_DIR})
+    target_link_libraries(bitcask_cpp
+        PRIVATE bitcask_collection bitcask_fileops bitcask_index
+                bitcask_io bitcask_text bitcask_bm25 bitcask_format
+                bitcask_warnings
+    )
+    set_target_properties(bitcask_cpp PROPERTIES
+        PREFIX ""
+        SUFFIX "${CMAKE_SHARED_MODULE_SUFFIX}"
+        OUTPUT_NAME "bitcask_cpp"
+    )
+    if(DEFINED BITCASK_PRIV_DIR)
+        set_target_properties(bitcask_cpp PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY "${BITCASK_PRIV_DIR}"
+        )
+    endif()
+endif()
 
 # ---------------------------------------------------------------------------
 # Tests (GoogleTest via FetchContent)
