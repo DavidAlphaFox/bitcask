@@ -100,9 +100,10 @@ std::expected<void, CollectionFault> Collection::recover() {
         return std::unexpected(io_fault(entries.error().errnum, "scan_dir"));
     }
 
+    auto snapshot_path = std::string(dirname_) + "/bm25_snapshot.inv";
+    bool has_snapshot = inverted_->load(snapshot_path);
+
     std::uint32_t max_file_id = 0;
-    // scan_dir 已按 tstamp 升序；同一文件内 record 按 offset(=ord) 升序，
-    // 故全局回放顺序与 ord 递增一致，put_doc/remove 的「后写胜」天然成立。
     for (const auto& e : *entries) {
         const auto file_id = static_cast<std::uint32_t>(e.tstamp);
         max_file_id = std::max(max_file_id, file_id);
@@ -117,25 +118,40 @@ std::expected<void, CollectionFault> Collection::recover() {
                 if (v.type == format::RecordType::kTombstone) {
                     index_.remove(ext_id, v.ord);
                 } else {
-                    // 解码 doc value 取 text，用于计算 doc_len + 重建倒排。
                     std::uint32_t doc_len = 0;
-                    text::TermFreqMap term_freqs;
-                    auto dv = codec::decode_doc_value(v.value);
-                    if (dv && dv->has_text) {
-                        auto text_sv = std::string_view(
-                            reinterpret_cast<const char*>(dv->text.data()),
-                            dv->text.size());
-                        term_freqs = analyzer_->analyze(text_sv);
-                        for (auto& [_, tf] : term_freqs) doc_len += tf;
-                    }
 
-                    index_.put_doc(ext_id, v.ord,
-                                   index::DocSlot{
-                                       index::DocLoc{file_id, offset, total},
-                                       v.tstamp, doc_len});
+                    if (!has_snapshot) {
+                        text::TermPositionsMap term_data;
+                        auto dv = codec::decode_doc_value(v.value);
+                        if (dv && dv->has_text) {
+                            auto text_sv = std::string_view(
+                                reinterpret_cast<const char*>(dv->text.data()),
+                                dv->text.size());
+                            term_data = analyzer_->analyze_with_positions(text_sv);
+                            for (auto& [_, data] : term_data) doc_len += data.first;
+                        }
 
-                    if (!term_freqs.empty()) {
-                        inverted_->add_doc(v.ord, term_freqs);
+                        index_.put_doc(ext_id, v.ord,
+                                       index::DocSlot{
+                                           index::DocLoc{file_id, offset, total},
+                                           v.tstamp, doc_len});
+
+                        if (!term_data.empty()) {
+                            inverted_->add_doc(v.ord, term_data);
+                        }
+                    } else {
+                        auto dv = codec::decode_doc_value(v.value);
+                        if (dv && dv->has_text) {
+                            auto text_sv = std::string_view(
+                                reinterpret_cast<const char*>(dv->text.data()),
+                                dv->text.size());
+                            auto tfs = analyzer_->analyze(text_sv);
+                            for (auto& [_, tf] : tfs) doc_len += tf;
+                        }
+                        index_.put_doc(ext_id, v.ord,
+                                       index::DocSlot{
+                                           index::DocLoc{file_id, offset, total},
+                                           v.tstamp, doc_len});
                     }
                 }
             });
@@ -211,10 +227,10 @@ Collection::upsert(std::string_view ext_id, const DocInput& doc,
 
     // 切词 + 计算文档长度。
     std::uint32_t doc_len = 0;
-    text::TermFreqMap term_freqs;
+    text::TermPositionsMap term_data;
     if (doc.text) {
-        term_freqs = analyzer_->analyze(*doc.text);
-        for (auto& [_, tf] : term_freqs) doc_len += tf;
+        term_data = analyzer_->analyze_with_positions(*doc.text);
+        for (auto& [_, data] : term_data) doc_len += data.first;
     }
 
     index_.put_doc(ext_id, ord,
@@ -222,8 +238,8 @@ Collection::upsert(std::string_view ext_id, const DocInput& doc,
                                                 w->total_size},
                                   ts, doc_len});
 
-    if (!term_freqs.empty()) {
-        inverted_->add_doc(ord, term_freqs);
+    if (!term_data.empty()) {
+        inverted_->add_doc(ord, term_data);
     }
     return ord;
 }
@@ -313,10 +329,36 @@ Collection::search_text(std::string_view query, std::size_t k) {
     return hits;
 }
 
+std::expected<std::vector<TextHit>, CollectionFault>
+Collection::search_phrase(std::string_view query, std::size_t k) {
+    auto term_freqs = analyzer_->analyze(query);
+    if (term_freqs.empty()) return std::vector<TextHit>{};
+
+    std::vector<std::string> terms;
+    terms.reserve(term_freqs.size());
+    for (auto& [term, _] : term_freqs) {
+        terms.push_back(term);
+    }
+
+    auto results = inverted_->search_phrase(terms, k, index_);
+
+    std::vector<TextHit> hits;
+    hits.reserve(results.size());
+    for (auto& r : results) {
+        auto ext_id = index_.ord_to_ext(r.ord);
+        if (!ext_id) continue;
+        hits.push_back(TextHit{std::move(*ext_id), r.score});
+    }
+    return hits;
+}
+
 std::expected<void, CollectionFault> Collection::sync() {
     if (!active_) return {};
     auto s = active_->sync();
     if (!s) return std::unexpected(df_fault(s.error()));
+
+    auto snapshot_path = std::string(dirname_) + "/bm25_snapshot.inv";
+    inverted_->save(snapshot_path);
     return {};
 }
 

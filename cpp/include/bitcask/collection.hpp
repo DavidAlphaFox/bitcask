@@ -110,6 +110,9 @@ public:
     [[nodiscard]] std::expected<std::vector<TextHit>, CollectionFault>
     search_text(std::string_view query, std::size_t k = 10);
 
+    [[nodiscard]] std::expected<std::vector<TextHit>, CollectionFault>
+    search_phrase(std::string_view query, std::size_t k = 10);
+
     // fsync active 文件。线程安全：否。
     [[nodiscard]] std::expected<void, CollectionFault> sync();
 
