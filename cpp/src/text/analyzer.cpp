@@ -30,7 +30,9 @@ auto AnalyzerFactory::create(const AnalyzerConfig& config)
             if (config.min_n < 1 || config.max_n < config.min_n) {
                 return nullptr;
             }
-            return std::make_unique<NgramAnalyzer>(config.min_n, config.max_n);
+            return std::make_unique<NgramAnalyzer>(
+                config.min_n, config.max_n,
+                config.enable_stop_words, config.stop_words);
         case AnalyzerType::Whitespace:
             return std::make_unique<WhitespaceAnalyzer>();
     }
@@ -130,28 +132,62 @@ struct CpInfo {
 
 }  // namespace detail
 
+namespace {
+
+const std::vector<std::string>& default_stop_words() {
+    static const std::vector<std::string> words = {
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "could",
+        "should", "may", "might", "shall", "can", "need", "dare", "ought",
+        "used", "to", "of", "in", "for", "on", "with", "at", "by", "from",
+        "as", "into", "through", "during", "before", "after", "above", "below",
+        "between", "out", "off", "over", "under", "again", "further", "then",
+        "once", "and", "but", "or", "nor", "not", "so", "yet", "both",
+        "either", "neither", "each", "every", "all", "any", "few", "more",
+        "most", "other", "some", "such", "no", "only", "own", "same", "than",
+        "too", "very", "just", "because", "if", "when", "while", "where",
+        "how", "what", "which", "who", "whom", "this", "that", "these",
+        "those", "it", "its", "he", "she", "they", "them", "his", "her",
+        "their", "my", "your", "our", "me", "him", "us", "i",
+        "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都",
+        "一", "一个", "上", "也", "很", "到", "说", "要", "去", "你",
+        "会", "着", "没有", "看", "好", "自己", "这",
+    };
+    return words;
+}
+
+}  // namespace
+
 // ===========================================================================
 // NgramAnalyzer
 // ===========================================================================
 
-NgramAnalyzer::NgramAnalyzer(std::uint32_t min_n, std::uint32_t max_n)
-    : min_n_(min_n), max_n_(max_n) {}
+NgramAnalyzer::NgramAnalyzer(std::uint32_t min_n, std::uint32_t max_n,
+                             bool enable_stop_words,
+                             std::vector<std::string> custom_stop_words)
+    : min_n_(min_n), max_n_(max_n), enable_stop_words_(enable_stop_words) {
+    if (enable_stop_words_) {
+        const auto& defaults = default_stop_words();
+        const auto& src = custom_stop_words.empty()
+                              ? defaults
+                              : custom_stop_words;
+        stop_words_.insert(src.begin(), src.end());
+    }
+}
 
-auto NgramAnalyzer::analyze(std::string_view text) const -> TermFreqMap {
+auto NgramAnalyzer::analyze_with_positions(std::string_view text) const -> TermPositionsMap {
     if (text.empty()) return {};
 
-    // Step 1: NFKC 归一化 + case fold
     auto normalized = detail::nfkc_fold(text);
     if (normalized.empty()) return {};
 
-    // Step 2: 解码为 codepoint 序列
     auto cps = detail::to_codepoints(normalized);
     if (cps.empty()) return {};
 
-    TermFreqMap tfs;
+    TermPositionsMap tpm;
     std::size_t i = 0;
+    std::uint32_t pos = 0;
 
-    // 辅助 lambda：对一段连续 CJK 字符（无标点）生成 n-gram
     auto emit_ngrams = [&](std::size_t start, std::size_t end) {
         auto n = end - start;
         for (std::size_t gram = min_n_; gram <= max_n_; ++gram) {
@@ -159,17 +195,33 @@ auto NgramAnalyzer::analyze(std::string_view text) const -> TermFreqMap {
             for (std::size_t j = start; j + gram <= end; ++j) {
                 auto& first_cp = cps[j];
                 auto& last_cp = cps[j + gram - 1];
-                auto term = std::string_view(
+                auto term = std::string(
                     normalized.data() + first_cp.byte_off,
                     (last_cp.byte_off + last_cp.byte_len) - first_cp.byte_off);
-                ++tfs[std::string(term)];
+                auto& [tf, positions] = tpm[std::move(term)];
+                ++tf;
+                positions.push_back(pos);
             }
         }
+        ++pos;
+    };
+
+    auto emit_word = [&](std::size_t start, std::size_t end) {
+        auto& first = cps[start];
+        auto& last = cps[end - 1];
+        auto term = std::string(
+            normalized.data() + first.byte_off,
+            (last.byte_off + last.byte_len) - first.byte_off);
+        if (!term.empty()) {
+            auto& [tf, positions] = tpm[std::move(term)];
+            ++tf;
+            positions.push_back(pos);
+        }
+        ++pos;
     };
 
     while (i < cps.size()) {
         if (detail::is_cjk(cps[i].cp) && !detail::is_cjk_punct(cps[i].cp)) {
-            // 收集连续 CJK 非标点字符，遇到标点/非 CJK 时断开
             std::size_t run_start = i;
             while (i < cps.size() &&
                    detail::is_cjk(cps[i].cp) &&
@@ -177,7 +229,6 @@ auto NgramAnalyzer::analyze(std::string_view text) const -> TermFreqMap {
                 ++i;
             }
             emit_ngrams(run_start, i);
-            // 如果当前位置是 CJK 标点，跳过它（外层 while 会重新进入 CJK 分支或退出）
             if (i < cps.size() && detail::is_cjk_punct(cps[i].cp)) {
                 ++i;
             }
@@ -194,17 +245,30 @@ auto NgramAnalyzer::analyze(std::string_view text) const -> TermFreqMap {
                    !detail::is_ascii_punct(cps[i].cp)) {
                 ++i;
             }
-            auto& first = cps[word_start];
-            auto& last = cps[i - 1];
-            auto term = std::string_view(
-                normalized.data() + first.byte_off,
-                (last.byte_off + last.byte_len) - first.byte_off);
-            if (!term.empty()) {
-                ++tfs[std::string(term)];
+            emit_word(word_start, i);
+        }
+    }
+
+    if (enable_stop_words_ && !stop_words_.empty()) {
+        for (auto it = tpm.begin(); it != tpm.end();) {
+            if (stop_words_.count(it->first)) {
+                it = tpm.erase(it);
+            } else {
+                ++it;
             }
         }
     }
 
+    return tpm;
+}
+
+auto NgramAnalyzer::analyze(std::string_view text) const -> TermFreqMap {
+    auto tpm = analyze_with_positions(text);
+    TermFreqMap tfs;
+    tfs.reserve(tpm.size());
+    for (auto& [term, data] : tpm) {
+        tfs.emplace(term, data.first);
+    }
     return tfs;
 }
 
@@ -212,7 +276,7 @@ auto NgramAnalyzer::analyze(std::string_view text) const -> TermFreqMap {
 // WhitespaceAnalyzer
 // ===========================================================================
 
-auto WhitespaceAnalyzer::analyze(std::string_view text) const -> TermFreqMap {
+auto WhitespaceAnalyzer::analyze_with_positions(std::string_view text) const -> TermPositionsMap {
     if (text.empty()) return {};
 
     auto normalized = detail::nfkc_fold(text);
@@ -221,29 +285,42 @@ auto WhitespaceAnalyzer::analyze(std::string_view text) const -> TermFreqMap {
     auto cps = detail::to_codepoints(normalized);
     if (cps.empty()) return {};
 
-    TermFreqMap tfs;
+    TermPositionsMap tpm;
     std::size_t i = 0;
+    std::uint32_t pos = 0;
 
     while (i < cps.size()) {
         if (detail::is_unicode_space(cps[i].cp)) {
             ++i;
             continue;
         }
-        // 收集连续非空白字符
         std::size_t word_start = i;
         while (i < cps.size() && !detail::is_unicode_space(cps[i].cp)) {
             ++i;
         }
         auto& first = cps[word_start];
         auto& last = cps[i - 1];
-        auto term = std::string_view(
+        auto term = std::string(
             normalized.data() + first.byte_off,
             (last.byte_off + last.byte_len) - first.byte_off);
         if (!term.empty()) {
-            ++tfs[std::string(term)];
+            auto& [tf, positions] = tpm[std::move(term)];
+            ++tf;
+            positions.push_back(pos);
         }
+        ++pos;
     }
 
+    return tpm;
+}
+
+auto WhitespaceAnalyzer::analyze(std::string_view text) const -> TermFreqMap {
+    auto tpm = analyze_with_positions(text);
+    TermFreqMap tfs;
+    tfs.reserve(tpm.size());
+    for (auto& [term, data] : tpm) {
+        tfs.emplace(term, data.first);
+    }
     return tfs;
 }
 

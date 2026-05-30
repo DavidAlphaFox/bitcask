@@ -201,7 +201,68 @@ TEST(WhitespaceAnalyzer, CjkNotSegmented) {
     WhitespaceAnalyzer a;
     auto tfs = a.analyze("北京市");
 
-    // 空白切分器不识别 CJK，整个字符串作为一个 term
     EXPECT_EQ(tfs.size(), 1u);
     EXPECT_EQ(tfs.at("北京市"), 1u);
+}
+
+// ===========================================================================
+// Stop Words
+// ===========================================================================
+
+TEST(NgramAnalyzer, StopWordsDisabledByDefault) {
+    NgramAnalyzer a(2, 3, false, {});
+    auto tfs = a.analyze("this is a test");
+    EXPECT_NE(tfs.find("this"), tfs.end());
+    EXPECT_NE(tfs.find("is"), tfs.end());
+}
+
+TEST(NgramAnalyzer, StopWordsEnabledFiltersEnglish) {
+    NgramAnalyzer a(2, 3, true, {});
+    auto tfs = a.analyze("this is a test of the system");
+
+    EXPECT_EQ(tfs.find("this"), tfs.end());
+    EXPECT_EQ(tfs.find("is"), tfs.end());
+    EXPECT_EQ(tfs.find("a"), tfs.end());
+    EXPECT_EQ(tfs.find("of"), tfs.end());
+    EXPECT_EQ(tfs.find("the"), tfs.end());
+
+    EXPECT_NE(tfs.find("test"), tfs.end());
+    EXPECT_NE(tfs.find("system"), tfs.end());
+}
+
+TEST(NgramAnalyzer, StopWordsFiltersChinese) {
+    NgramAnalyzer a(2, 3, true, {});
+    auto tfs = a.analyze("我是一个北京人");
+
+    EXPECT_EQ(tfs.find("我"), tfs.end());
+    EXPECT_EQ(tfs.find("是"), tfs.end());
+
+    EXPECT_NE(tfs.find("北京"), tfs.end());
+}
+
+TEST(NgramAnalyzer, StopWordsCustomList) {
+    NgramAnalyzer a(2, 3, true, {"bad", "term"});
+    auto tfs = a.analyze("this bad term is good");
+
+    EXPECT_EQ(tfs.find("bad"), tfs.end());
+    EXPECT_EQ(tfs.find("term"), tfs.end());
+    EXPECT_NE(tfs.find("this"), tfs.end());
+    EXPECT_NE(tfs.find("good"), tfs.end());
+}
+
+TEST(AnalyzerFactory, StopWordsThroughConfig) {
+    auto a = AnalyzerFactory::create(AnalyzerConfig{
+        .type = AnalyzerType::Ngram,
+        .min_n = 2,
+        .max_n = 3,
+        .enable_stop_words = true,
+    });
+    ASSERT_TRUE(a);
+
+    auto tfs = a->analyze("the cat is on the mat");
+    EXPECT_EQ(tfs.find("the"), tfs.end());
+    EXPECT_EQ(tfs.find("is"), tfs.end());
+    EXPECT_EQ(tfs.find("on"), tfs.end());
+    EXPECT_NE(tfs.find("cat"), tfs.end());
+    EXPECT_NE(tfs.find("mat"), tfs.end());
 }

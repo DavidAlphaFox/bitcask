@@ -12,18 +12,24 @@
 
 #include <cstdint>
 
+#include <string>
+#include <unordered_set>
+
 #include "bitcask/analyzer.hpp"
 
 namespace bitcask::text {
 
 class NgramAnalyzer final : public Analyzer {
 public:
-    // min_n / max_n: n-gram 的字符数范围。
-    // 前置条件：1 <= min_n <= max_n。
-    explicit NgramAnalyzer(std::uint32_t min_n = 2, std::uint32_t max_n = 3);
+    explicit NgramAnalyzer(std::uint32_t min_n = 2, std::uint32_t max_n = 3,
+                           bool enable_stop_words = false,
+                           std::vector<std::string> custom_stop_words = {});
 
     [[nodiscard]] auto analyze(std::string_view text) const
         -> TermFreqMap override;
+
+    [[nodiscard]] auto analyze_with_positions(std::string_view text) const
+        -> TermPositionsMap override;
 
     [[nodiscard]] auto type() const noexcept -> AnalyzerType override {
         return AnalyzerType::Ngram;
@@ -35,6 +41,8 @@ public:
 private:
     std::uint32_t min_n_;
     std::uint32_t max_n_;
+    bool enable_stop_words_;
+    std::unordered_set<std::string> stop_words_;
 };
 
 }  // namespace bitcask::text

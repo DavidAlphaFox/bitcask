@@ -23,11 +23,13 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace bitcask::text {
 
 // 分词结果类型：term → 词频。
 using TermFreqMap = std::unordered_map<std::string, std::uint32_t>;
+using TermPositionsMap = std::unordered_map<std::string, std::pair<std::uint32_t, std::vector<std::uint32_t>>>;
 
 // --------------------------------------------------------------------------
 // 分词器类型枚举。
@@ -45,11 +47,10 @@ enum class AnalyzerType {
 // --------------------------------------------------------------------------
 struct AnalyzerConfig {
     AnalyzerType  type  = AnalyzerType::Ngram;
-    std::uint32_t min_n = 2;   // n-gram 最小字符数（仅 Ngram 类型使用）
-    std::uint32_t max_n = 3;   // n-gram 最大字符数（仅 Ngram 类型使用）
-    // 后续可扩展：
-    // std::string dict_path;   // 词典路径（jieba / IK 等）
-    // std::vector<std::string> stop_words;  // 停用词表
+    std::uint32_t min_n = 2;
+    std::uint32_t max_n = 3;
+    bool enable_stop_words = false;                  // 启用停用词过滤
+    std::vector<std::string> stop_words;             // 自定义停用词表（空则用内置默认）
 };
 
 // --------------------------------------------------------------------------
@@ -70,6 +71,9 @@ public:
     // 线程安全：是（实现保证无可变共享状态）。
     [[nodiscard]] virtual auto analyze(std::string_view text) const
         -> TermFreqMap = 0;
+
+    [[nodiscard]] virtual auto analyze_with_positions(std::string_view text) const
+        -> TermPositionsMap = 0;
 
     // 返回分词器类型标识（用于调试/序列化）。
     [[nodiscard]] virtual auto type() const noexcept -> AnalyzerType = 0;
