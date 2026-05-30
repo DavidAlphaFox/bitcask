@@ -16,11 +16,13 @@
 #include <erl_nif.h>
 
 #include "bitcask/cask.hpp"
+#include "bitcask/collection.hpp"
 
 namespace bitcask::nif {
 
 struct CaskHandle;
 struct CaskIterHandle;
+struct CollectionHandle;
 
 // 跨 .cpp 共享的内部辅助函数。
 namespace detail {
@@ -34,6 +36,8 @@ CaskHandle* checked_cask_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept;
 // 从 NIF term 取出 CaskIterHandle 指针；类型不对返回 nullptr。
 CaskIterHandle* cask_iter_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept;
 
+CollectionHandle* collection_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept;
+
 // 解析 [{Key, Value} | atom, ...] 形态的选项 proplist 到 CaskOptions。
 // 不识别的键静默跳过，与 legacy 语义一致。
 CaskOptions parse_options(ErlNifEnv* env, ERL_NIF_TERM list);
@@ -41,6 +45,8 @@ CaskOptions parse_options(ErlNifEnv* env, ERL_NIF_TERM list);
 // CaskFault → Erlang 错误 term。
 // kNotFound / kAlreadyExists 返回裸 atom（legacy 契约），其余返回 {error, Tag}。
 ERL_NIF_TERM fault_to_term(ErlNifEnv* env, const CaskFault& f) noexcept;
+
+ERL_NIF_TERM collection_fault_to_term(ErlNifEnv* env, const CollectionFault& f) noexcept;
 
 // fold_start / fold_start4 共用实现。
 // 创建迭代器、启动快照、包装成 NIF 资源 term。

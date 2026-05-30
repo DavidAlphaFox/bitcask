@@ -34,6 +34,12 @@ CaskIterHandle* cask_iter_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept {
     return static_cast<CaskIterHandle*>(obj);
 }
 
+CollectionHandle* collection_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept {
+    void* obj = nullptr;
+    if (!enif_get_resource(env, term, g_collection_resource_type, &obj)) return nullptr;
+    return static_cast<CollectionHandle*>(obj);
+}
+
 // ---------------------------------------------------------------------------
 // 选项解析
 // ---------------------------------------------------------------------------
@@ -143,6 +149,21 @@ ERL_NIF_TERM fault_to_term(ErlNifEnv* env, const CaskFault& f) noexcept {
         case CaskError::kWriteLocked:    tag = atoms().write_locked; break;
         case CaskError::kInvalidOption:
         default:                          tag = atoms().error; break;
+    }
+    return enif_make_tuple2(env, atoms().error, tag);
+}
+
+ERL_NIF_TERM collection_fault_to_term(ErlNifEnv* env, const CollectionFault& f) noexcept {
+    ERL_NIF_TERM tag;
+    switch (f.kind) {
+        case CollectionError::kIo:             tag = errno_atom(env, f.errnum); break;
+        case CollectionError::kBadCrc:         tag = atoms().bad_crc; break;
+        case CollectionError::kNotFound:       return atoms().not_found;
+        case CollectionError::kCorrupt:        tag = atoms().error; break;
+        case CollectionError::kWriteLocked:    tag = atoms().write_locked; break;
+        case CollectionError::kKeyTooLarge:    tag = atoms().key_too_large; break;
+        case CollectionError::kValueTooLarge:  tag = atoms().value_too_large; break;
+        default:                               tag = atoms().error; break;
     }
     return enif_make_tuple2(env, atoms().error, tag);
 }
