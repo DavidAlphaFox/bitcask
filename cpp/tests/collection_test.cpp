@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include "bitcask/analyzer.hpp"
 #include "bitcask/collection.hpp"
 
 using bitcask::Collection;
@@ -15,6 +16,8 @@ using bitcask::CollectionError;
 using bitcask::CollectionOptions;
 using bitcask::DocInput;
 using bitcask::TextHit;
+using bitcask::text::AnalyzerConfig;
+using bitcask::text::AnalyzerType;
 
 namespace fs = std::filesystem;
 
@@ -267,4 +270,107 @@ TEST(Collection, SearchTextEmptyQueryReturnsEmpty) {
     auto result = (*c)->search_text("", 10);
     ASSERT_TRUE(result);
     EXPECT_TRUE(result->empty());
+}
+
+// ===========================================================================
+// Jieba 分词器 Collection 集成测试
+// ===========================================================================
+
+namespace {
+const char* kJiebaDictDir = "/tmp/bitcask-jieba-build3/_deps/cppjieba-src/dict";
+}
+
+TEST(CollectionJieba, SearchTextChineseRanking) {
+    TempDir td;
+    auto c = Collection::open(td.str(), CollectionOptions{
+        .analyzer_config = AnalyzerConfig{
+            .type = AnalyzerType::Jieba,
+            .dict_path = kJiebaDictDir,
+        },
+    });
+    ASSERT_TRUE(c);
+
+    ASSERT_TRUE((*c)->upsert("d1", text_doc("北京市朝阳区")));
+    ASSERT_TRUE((*c)->upsert("d2", text_doc("上海浦东新区")));
+    ASSERT_TRUE((*c)->upsert("d3", text_doc("北京人在上海")));
+
+    auto result = (*c)->search_text("北京", 10);
+    ASSERT_TRUE(result);
+    auto& hits = *result;
+    ASSERT_GE(hits.size(), 2u);
+
+    std::vector<std::string> ids;
+    for (auto& h : hits) ids.push_back(h.ext_id);
+    EXPECT_NE(std::find(ids.begin(), ids.end(), "d1"), ids.end());
+    EXPECT_NE(std::find(ids.begin(), ids.end(), "d3"), ids.end());
+}
+
+TEST(CollectionJieba, SearchTextAfterDelete) {
+    TempDir td;
+    auto c = Collection::open(td.str(), CollectionOptions{
+        .analyzer_config = AnalyzerConfig{
+            .type = AnalyzerType::Jieba,
+            .dict_path = kJiebaDictDir,
+        },
+    });
+    ASSERT_TRUE(c);
+
+    ASSERT_TRUE((*c)->upsert("keep", text_doc("北京天安门")));
+    ASSERT_TRUE((*c)->upsert("del", text_doc("北京故宫")));
+    ASSERT_TRUE((*c)->remove("del"));
+
+    auto result = (*c)->search_text("北京", 10);
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_EQ(result->at(0).ext_id, "keep");
+}
+
+TEST(CollectionJieba, SearchPhraseWithJieba) {
+    TempDir td;
+    auto c = Collection::open(td.str(), CollectionOptions{
+        .analyzer_config = AnalyzerConfig{
+            .type = AnalyzerType::Jieba,
+            .dict_path = kJiebaDictDir,
+        },
+    });
+    ASSERT_TRUE(c);
+
+    ASSERT_TRUE((*c)->upsert("p1", text_doc("北京是中国的首都")));
+    ASSERT_TRUE((*c)->upsert("p2", text_doc("首都机场在北京")));
+
+    // jieba 将 "中国" "的" "首都" 切为连续词；过滤停用词 "的" 后 "中国" "首都" 相邻。
+    auto result = (*c)->search_text("中国 首都", 10);
+    ASSERT_TRUE(result);
+    ASSERT_GE(result->size(), 1u);
+    EXPECT_EQ(result->at(0).ext_id, "p1");
+}
+
+TEST(CollectionJieba, SurvivesReopen) {
+    TempDir td;
+    {
+        auto c = Collection::open(td.str(), CollectionOptions{
+            .analyzer_config = AnalyzerConfig{
+                .type = AnalyzerType::Jieba,
+                .dict_path = kJiebaDictDir,
+            },
+        });
+        ASSERT_TRUE(c);
+        ASSERT_TRUE((*c)->upsert("a", text_doc("南京长江大桥")));
+        ASSERT_TRUE((*c)->upsert("b", text_doc("上海外滩夜景")));
+        ASSERT_TRUE((*c)->sync());
+        (*c)->close();
+    }
+
+    auto c = Collection::open(td.str(), CollectionOptions{
+        .analyzer_config = AnalyzerConfig{
+            .type = AnalyzerType::Jieba,
+            .dict_path = kJiebaDictDir,
+        },
+    });
+    ASSERT_TRUE(c);
+
+    auto result = (*c)->search_text("南京", 10);
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_EQ(result->at(0).ext_id, "a");
 }
