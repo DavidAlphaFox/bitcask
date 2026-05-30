@@ -31,6 +31,29 @@
 
 namespace bitcask::nif {
 
+// --- cask_* NIF 声明（纯 KV 存储，无全文索引）---------------------------
+ERL_NIF_TERM nif_cask_open              (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_close             (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_get               (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_put               (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_delete            (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_sync              (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_close_write_file  (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_fold_start        (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_fold_start4       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_fold_next         (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_fold_next_full    (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_fold_release      (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_iterator          (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_iterator_next     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_iterator_release  (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_is_empty          (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_is_frozen         (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_status            (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_needs_merge       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_merge             (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+
+// --- collection_* NIF 声明（文档存储 + BM25 全文索引）--------------------
 ERL_NIF_TERM nif_collection_open        (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_collection_close       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_collection_put         (ErlNifEnv*, int, const ERL_NIF_TERM[]);
@@ -42,7 +65,36 @@ ERL_NIF_TERM nif_collection_search_phrase(ErlNifEnv*, int, const ERL_NIF_TERM[])
 
 namespace {
 
+// 函数注册表：Erlang 函数名 → C++ 实现。
+// flag=0 表示主调度线程执行（必须 <1ms）；
+// flag=ERL_NIF_DIRTY_JOB_IO_BOUND 表示 dirty IO 调度器（允许长耗时）。
 ErlNifFunc kNifFuncs[] = {
+    // --- cask_*：纯 KV 存储（keydir + append-only data file）---
+    {"cask_open",              2, nif_cask_open,             ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"cask_close",             1, nif_cask_close,            0},
+    {"cask_get",               2, nif_cask_get,              0},
+    {"cask_put",               3, nif_cask_put,              0},
+    {"cask_delete",            2, nif_cask_delete,           0},
+    {"cask_sync",              1, nif_cask_sync,             ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"cask_close_write_file",  1, nif_cask_close_write_file, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    // 迭代：fold 系列（独立 IterRef，可多个并发）
+    {"cask_fold_start",        3, nif_cask_fold_start,       0},
+    {"cask_fold_start",        4, nif_cask_fold_start4,      0},
+    {"cask_fold_next",         1, nif_cask_fold_next,        0},
+    {"cask_fold_next_full",    1, nif_cask_fold_next_full,   0},
+    {"cask_fold_release",      1, nif_cask_fold_release,     0},
+    // 迭代：iterator 系列（挂在 CaskHandle 上，同 cask 同时只允许一个）
+    {"cask_iterator",          3, nif_cask_iterator,         0},
+    {"cask_iterator_next",     1, nif_cask_iterator_next,    0},
+    {"cask_iterator_release",  1, nif_cask_iterator_release, 0},
+    // 管理
+    {"cask_is_empty",          1, nif_cask_is_empty,         0},
+    {"cask_is_frozen",         1, nif_cask_is_frozen,        0},
+    {"cask_status",            1, nif_cask_status,           0},
+    {"cask_needs_merge",       1, nif_cask_needs_merge,      0},
+    {"cask_merge",             2, nif_cask_merge,            ERL_NIF_DIRTY_JOB_IO_BOUND},
+
+    // --- collection_*：文档存储 + BM25 全文索引 ---
     {"collection_open",         1, nif_collection_open,        ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"collection_open",         2, nif_collection_open,        ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"collection_close",        1, nif_collection_close,       0},
