@@ -20,19 +20,19 @@ upsert/get/remove/update + 崩溃恢复 + 文件滚动；文本与向量存取�
 
 ---
 
-## ▶ V2 — BM25 原生倒排 + `search_text`（进行中）
+## ✅ V2 — BM25 原生倒排 + `search_text`（已完成，ctest 109/109）
 
 目标：文本可按 BM25 检索。设计依据 §3.2 / §3.4 / §6。
 
 | # | 目标 | 新建/改动 | 关键内容 | 测试 | 状态 |
 |---|---|---|---|---|---|
 | **V2.1** | analyzer | `analyzer.hpp`（抽象基类+工厂）、`ngram_analyzer.hpp`、`whitespace_analyzer.hpp`、`cjk_detect.hpp`、`src/text/analyzer.cpp`、utf8proc(FetchContent) | NFKC+casefold → CJK bi/tri-gram + 拉丁空白切分 → term→tf。抽象工厂模式：`AnalyzerFactory::create(config)` → `NgramAnalyzer`/`WhitespaceAnalyzer` | 22/22 测试通过（CJK/拉丁/混合/标点/工厂） | ✅ |
-| **V2.2** | 倒排结构 | `inverted.hpp/.cpp`（新，`bitcask::bm25`） | `term → PostingList[(ord,tf)]`(按 ord 升序)；`add_doc(ord, terms)`/`remove_doc(ord)`；全局 `N`/`sum_doc_len`；按 term hash 分片锁(§4) | add/remove、posting 有序 | |
-| **V2.3** | doc_len 回填 | `index.hpp/.cpp` | `put_doc` 增 `doc_len` 入参（或单独 setter），填 `slots[ord].doc_len`（V1 恒 0） | doc_len 持久于侧表 | |
-| **V2.4** | BM25 评分 + 查询 | `inverted.cpp` | DAAT：query 切词 → 取 posting → 累加 `IDF·tf·(k1+1)/(tf+k1·(1−b+b·dl/avgdl))`，**跳过 `live=0`** → top-k 堆。`k1/b` 可配 | 已知语料打分/排序 | |
-| **V2.5** | 接入 Collection | `collection.hpp/.cpp` | upsert：切词 → `inverted.add_doc` + 写 doc_len；remove：`inverted.remove_doc`（或靠 live 过滤）；新增 `search_text(query,k) → [{ext_id,score}]`（经 `ord→ext_id` 翻译） | 端到端 search_text | |
-| **V2.6** | 恢复重建倒排 | `collection.cpp` `recover()` | 侧表重建后，遍历 live 文档读 value→切词→`add_doc`（V2 先全量重切词；**倒排段持久化留作后续**） | 重开后 search_text 一致 | |
-| **V2.7** | 接线 | `CMakeLists.txt`、`tests/` | 新 target `bitcask_text`/`bitcask_bm25`；新增测试目标；全量 ctest 绿 | — | ✅ (bitcask_text) |
+| **V2.2** | 倒排结构 | `inverted.hpp/.cpp`（新，`bitcask::bm25`） | `term → PostingList[(ord,tf)]`(按 ord 升序)；`add_doc/remove_doc`；全局 `N/sum_doc_len`；16 shard 分片锁(§4)；BM25 DAAT 评分 + top-k 堆 | 8/8 测试通过（add/search/remove/stats/df） | ✅ |
+| **V2.3** | doc_len 回填 | `index.hpp/.cpp` | `DocSlot.doc_len` 由 V1 恒 0 改为 upsert 时 analyzer 填；Index 实现 `LiveChecker` 接口（`is_live` + `doc_len`） | 现有 Index 测试兼容 | ✅ |
+| **V2.4** | BM25 评分 + 查询 | `inverted.cpp` | DAAT：query 切词 → 取 posting → `IDF·tf·(k1+1)/(tf+k1·(1-b+b·dl/avgdl))`，跳过 `live=0` → top-k 堆。`k1/b` 可配 | 包含在 V2.2 测试中 | ✅ |
+| **V2.5** | 接入 Collection | `collection.hpp/.cpp` | upsert：切词 → `inverted.add_doc` + 写 doc_len；remove：`inverted.remove_doc`；新增 `search_text(query,k) → [{ext_id,score}]`；`CollectionOptions` 增加 `analyzer_config` + `bm25_params` | 现有 Collection 测试兼容 | ✅ |
+| **V2.6** | 恢复重建倒排 | `collection.cpp` `recover()` | 侧表重建时同时解码 text → 切词 → `add_doc`（全量重切词） | ReopenRecoversState 测试兼容 | ✅ |
+| **V2.7** | 接线 | `CMakeLists.txt`、`tests/` | `bitcask_text` + `bitcask_bm25` target；`bitcask_index` → link bitcask_text；`bitcask_collection` → link text+bm25 | — | ✅ |
 
 **不在 V2**：HNSW/向量检索、merge 时重算 df、Block-Max WAND、倒排段持久化
 （恢复先全量重切词）。df 漂移：V2 查询过滤死点 + 接受漂移（merge 重算在 V4）。

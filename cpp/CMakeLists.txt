@@ -72,18 +72,30 @@ add_library(bitcask_index STATIC
     src/keydir/index.cpp
 )
 target_include_directories(bitcask_index PUBLIC include)
-target_link_libraries(bitcask_index PRIVATE bitcask_warnings)
+target_link_libraries(bitcask_index
+    PUBLIC  bitcask_text
+    PRIVATE bitcask_warnings
+)
 
 # ---------------------------------------------------------------------------
-# bitcask_collection — vector DB facade (upsert/get/remove + recovery, §5/§8).
-# Replaces the legacy bitcask_cask. Reuses fileops + index + io.
+# bitcask_bm25 — BM25 倒排索引（InvertedIndex + DAAT 评分）。
+# ---------------------------------------------------------------------------
+add_library(bitcask_bm25 STATIC
+    src/bm25/inverted.cpp
+)
+target_include_directories(bitcask_bm25 PUBLIC include)
+target_link_libraries(bitcask_bm25 PRIVATE bitcask_warnings)
+
+# ---------------------------------------------------------------------------
+# bitcask_collection — vector DB facade (upsert/get/remove/search_text + recovery).
+# Replaces the legacy bitcask_cask. Reuses fileops + index + io + text + bm25.
 # ---------------------------------------------------------------------------
 add_library(bitcask_collection STATIC
     src/cask/collection.cpp
 )
 target_include_directories(bitcask_collection PUBLIC include)
 target_link_libraries(bitcask_collection
-    PUBLIC  bitcask_fileops bitcask_index bitcask_io
+    PUBLIC  bitcask_fileops bitcask_index bitcask_io bitcask_text bitcask_bm25
     PRIVATE bitcask_warnings
 )
 

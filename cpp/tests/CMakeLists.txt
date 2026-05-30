@@ -82,6 +82,15 @@ target_link_libraries(bitcask_analyzer_test PRIVATE
     bitcask_sanitizers
 )
 
+add_executable(bitcask_inverted_test inverted_test.cpp)
+target_link_libraries(bitcask_inverted_test PRIVATE
+    GTest::gtest_main
+    bitcask_bm25
+    bitcask_text
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 include(GoogleTest)
 gtest_discover_tests(bitcask_smoke_test)
 gtest_discover_tests(bitcask_codec_test)
@@ -92,3 +101,4 @@ gtest_discover_tests(bitcask_collection_test)
 gtest_discover_tests(bitcask_data_file_test)
 gtest_discover_tests(bitcask_scanner_test)
 gtest_discover_tests(bitcask_analyzer_test)
+gtest_discover_tests(bitcask_inverted_test)
