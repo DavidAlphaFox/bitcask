@@ -1,13 +1,18 @@
 include(FetchContent)
 
-FetchContent_Declare(
-    googletest
-    GIT_REPOSITORY https://github.com/google/googletest.git
-    GIT_TAG        v1.15.2
-    GIT_SHALLOW    TRUE
-)
-set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(googletest)
+if(EXISTS "${CMAKE_BINARY_DIR}/_deps/googletest-src/CMakeLists.txt")
+    add_subdirectory("${CMAKE_BINARY_DIR}/_deps/googletest-src"
+                     "${CMAKE_BINARY_DIR}/_deps/googletest-build")
+else()
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG        v1.15.2
+        GIT_SHALLOW    TRUE
+    )
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+endif()
 
 add_executable(bitcask_smoke_test smoke_test.cpp)
 target_link_libraries(bitcask_smoke_test PRIVATE
@@ -91,6 +96,14 @@ target_link_libraries(bitcask_inverted_test PRIVATE
     bitcask_sanitizers
 )
 
+add_executable(bitcask_jieba_analyzer_test jieba_analyzer_test.cpp)
+target_link_libraries(bitcask_jieba_analyzer_test PRIVATE
+    GTest::gtest_main
+    bitcask_text
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 include(GoogleTest)
 gtest_discover_tests(bitcask_smoke_test)
 gtest_discover_tests(bitcask_codec_test)
@@ -102,3 +115,4 @@ gtest_discover_tests(bitcask_data_file_test)
 gtest_discover_tests(bitcask_scanner_test)
 gtest_discover_tests(bitcask_analyzer_test)
 gtest_discover_tests(bitcask_inverted_test)
+gtest_discover_tests(bitcask_jieba_analyzer_test)

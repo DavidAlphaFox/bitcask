@@ -112,16 +112,33 @@ target_link_libraries(bitcask_cask
 )
 
 # ---------------------------------------------------------------------------
-# utf8proc — Unicode NFKC 归一化 + case fold（via FetchContent）。
+# utf8proc — Unicode NFKC 归一化 + case fold。
+# 优先使用 FetchContent；若 _deps 下已有手动 clone 则直接 add_subdirectory。
 # ---------------------------------------------------------------------------
 include(FetchContent)
-FetchContent_Declare(
-    utf8proc
-    GIT_REPOSITORY https://github.com/JuliaStrings/utf8proc.git
-    GIT_TAG        v2.10.0
-    GIT_SHALLOW    TRUE
-)
-FetchContent_MakeAvailable(utf8proc)
+if(EXISTS "${CMAKE_BINARY_DIR}/_deps/utf8proc-src/CMakeLists.txt")
+    add_subdirectory("${CMAKE_BINARY_DIR}/_deps/utf8proc-src"
+                     "${CMAKE_BINARY_DIR}/_deps/utf8proc-build")
+else()
+    FetchContent_Declare(
+        utf8proc
+        GIT_REPOSITORY https://github.com/JulieStrings/utf8proc.git
+        GIT_TAG        v2.10.0
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_MakeAvailable(utf8proc)
+endif()
+
+# ---------------------------------------------------------------------------
+# cppjieba — jieba 中文分词（header-only，依赖 limonp）。
+# ---------------------------------------------------------------------------
+if(NOT TARGET cppjieba)
+    add_library(cppjieba INTERFACE)
+    target_include_directories(cppjieba INTERFACE
+        "${CMAKE_BINARY_DIR}/_deps/cppjieba-src/include"
+        "${CMAKE_BINARY_DIR}/_deps/limonp-src/include"
+    )
+endif()
 
 # ---------------------------------------------------------------------------
 # bitcask_text — 文本分词器（Analyzer 抽象基类 + NgramAnalyzer + 工厂）。
@@ -129,6 +146,7 @@ FetchContent_MakeAvailable(utf8proc)
 # ---------------------------------------------------------------------------
 add_library(bitcask_text STATIC
     src/text/analyzer.cpp
+    src/text/jieba_analyzer.cpp
 )
 target_include_directories(bitcask_text PUBLIC include)
 # utf8proc FetchContent 导出的 target 名与上游 CMakeLists 一致。
@@ -139,7 +157,7 @@ else()
 endif()
 target_link_libraries(bitcask_text
     PUBLIC  ${UTF8PROC_TARGET}
-    PRIVATE bitcask_warnings
+    PRIVATE bitcask_warnings cppjieba
 )
 
 # NOTE(V1): legacy targets bitcask_keydir / bitcask_merge / bitcask_cask 已从构建
