@@ -22,15 +22,19 @@
 #include <unordered_map>
 #include <vector>
 
+#include "bitcask/analyzer.hpp"
 #include "bitcask/data_file.hpp"
 #include "bitcask/file_lock.hpp"
 #include "bitcask/index.hpp"
+#include "bitcask/inverted.hpp"
 
 namespace bitcask {
 
 struct CollectionOptions {
     std::uint64_t max_file_size = 2ULL * 1024ULL * 1024ULL * 1024ULL;  // 2 GiB
     bool          o_sync        = false;
+    text::AnalyzerConfig analyzer_config;   // 分词器配置（默认 Ngram bi/tri-gram）
+    bm25::Bm25Params    bm25_params;        // BM25 参数（默认 k1=1.2, b=0.75）
 };
 
 enum class CollectionError {
@@ -67,6 +71,12 @@ struct Doc {
     std::uint32_t          tstamp     = 0;
 };
 
+// search_text 输出：匹配文档 + BM25 分数。
+struct TextHit {
+    std::string ext_id;
+    float       score;
+};
+
 class Collection {
 public:
     Collection() = default;
@@ -95,6 +105,11 @@ public:
     [[nodiscard]] std::expected<bool, CollectionFault>
     remove(std::string_view ext_id, std::uint32_t tstamp = 0);
 
+    // BM25 全文检索：query 切词 → 倒排查询 → top-k。
+    // 线程安全：是（读路径）。
+    [[nodiscard]] std::expected<std::vector<TextHit>, CollectionFault>
+    search_text(std::string_view query, std::size_t k = 10);
+
     // fsync active 文件。线程安全：否。
     [[nodiscard]] std::expected<void, CollectionFault> sync();
 
@@ -111,6 +126,8 @@ private:
     std::string                dirname_;
     CollectionOptions          opts_;
     index::Index               index_;
+    std::unique_ptr<bm25::InvertedIndex> inverted_;
+    std::unique_ptr<text::Analyzer> analyzer_;
     std::optional<lock::FileLock> write_lock_;
 
     std::unique_ptr<fileops::DataFile> active_;

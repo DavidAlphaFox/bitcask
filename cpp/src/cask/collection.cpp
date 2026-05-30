@@ -8,6 +8,7 @@
 
 #include "bitcask/codec.hpp"
 #include "bitcask/format.hpp"
+#include "bitcask/ngram_analyzer.hpp"
 #include "bitcask/scanner.hpp"
 
 namespace bitcask {
@@ -56,6 +57,11 @@ Collection::open(std::string_view dirname, const CollectionOptions& opts) {
     auto self = std::make_unique<Collection>();
     self->dirname_ = std::string(dirname);
     self->opts_    = opts;
+    self->analyzer_ = text::AnalyzerFactory::create(opts.analyzer_config);
+    if (!self->analyzer_) {
+        return std::unexpected(err(CollectionError::kCorrupt, "invalid analyzer config"));
+    }
+    self->inverted_ = std::make_unique<bm25::InvertedIndex>(opts.bm25_params);
 
     std::error_code ec;
     fs::create_directories(dirname, ec);
@@ -111,10 +117,26 @@ std::expected<void, CollectionFault> Collection::recover() {
                 if (v.type == format::RecordType::kTombstone) {
                     index_.remove(ext_id, v.ord);
                 } else {
+                    // 解码 doc value 取 text，用于计算 doc_len + 重建倒排。
+                    std::uint32_t doc_len = 0;
+                    text::TermFreqMap term_freqs;
+                    auto dv = codec::decode_doc_value(v.value);
+                    if (dv && dv->has_text) {
+                        auto text_sv = std::string_view(
+                            reinterpret_cast<const char*>(dv->text.data()),
+                            dv->text.size());
+                        term_freqs = analyzer_->analyze(text_sv);
+                        for (auto& [_, tf] : term_freqs) doc_len += tf;
+                    }
+
                     index_.put_doc(ext_id, v.ord,
                                    index::DocSlot{
                                        index::DocLoc{file_id, offset, total},
-                                       v.tstamp, /*doc_len*/ 0});
+                                       v.tstamp, doc_len});
+
+                    if (!term_freqs.empty()) {
+                        inverted_->add_doc(v.ord, term_freqs);
+                    }
                 }
             });
         // 尾部 torn write 容忍：fold 在最后一条合法 record 处停止，其后的
@@ -187,10 +209,22 @@ Collection::upsert(std::string_view ext_id, const DocInput& doc,
                             str_to_bytes(ext_id), val);
     if (!w) return std::unexpected(df_fault(w.error()));
 
+    // 切词 + 计算文档长度。
+    std::uint32_t doc_len = 0;
+    text::TermFreqMap term_freqs;
+    if (doc.text) {
+        term_freqs = analyzer_->analyze(*doc.text);
+        for (auto& [_, tf] : term_freqs) doc_len += tf;
+    }
+
     index_.put_doc(ext_id, ord,
                    index::DocSlot{index::DocLoc{active_file_id_, w->offset,
                                                 w->total_size},
-                                  ts, /*doc_len*/ 0});
+                                  ts, doc_len});
+
+    if (!term_freqs.empty()) {
+        inverted_->add_doc(ord, term_freqs);
+    }
     return ord;
 }
 
@@ -245,7 +279,38 @@ Collection::remove(std::string_view ext_id, std::uint32_t tstamp) {
     auto w = active_->write(format::RecordType::kTombstone, ts, ord,
                             str_to_bytes(ext_id), {});
     if (!w) return std::unexpected(df_fault(w.error()));
+    // V2: 更新倒排全局统计（posting 行不删除，靠 live 过滤）。
+    auto slot = index_.get(ext_id);
+    if (slot && slot->doc_len > 0) {
+        // 需要重新分析文本来获取 term_freqs 以更新统计... 但 remove 时不再读磁盘。
+        // 简化：只更新 live_doc_count / sum_doc_len（通过 doc_len）。
+        text::TermFreqMap empty;
+        inverted_->remove_doc(slot->doc_len, empty);
+    }
     return index_.remove(ext_id, ord);
+}
+
+std::expected<std::vector<TextHit>, CollectionFault>
+Collection::search_text(std::string_view query, std::size_t k) {
+    auto term_freqs = analyzer_->analyze(query);
+    if (term_freqs.empty()) return std::vector<TextHit>{};
+
+    std::vector<std::string> terms;
+    terms.reserve(term_freqs.size());
+    for (auto& [term, _] : term_freqs) {
+        terms.push_back(term);
+    }
+
+    auto results = inverted_->search(terms, k, index_);
+
+    std::vector<TextHit> hits;
+    hits.reserve(results.size());
+    for (auto& r : results) {
+        auto ext_id = index_.ord_to_ext(r.ord);
+        if (!ext_id) continue;
+        hits.push_back(TextHit{std::move(*ext_id), r.score});
+    }
+    return hits;
 }
 
 std::expected<void, CollectionFault> Collection::sync() {
