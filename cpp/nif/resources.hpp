@@ -23,13 +23,11 @@
 #include <erl_nif.h>
 
 #include "bitcask/cask.hpp"
-#include "bitcask/collection.hpp"
 
 namespace bitcask::nif {
 
 extern ErlNifResourceType* g_cask_resource_type;
 extern ErlNifResourceType* g_cask_iter_resource_type;
-extern ErlNifResourceType* g_collection_resource_type;
 
 // 包住 C++ Cask 对象的 NIF 资源。Cask 自己持有 KeyDir 和 active write/hint
 // file，析构会顺序释放它们。
@@ -45,10 +43,6 @@ struct CaskHandle {
 // 对象自行收尾，不持有对父 cask 的引用（父 cask 的生命周期由 BEAM 管）。
 struct CaskIterHandle {
     std::unique_ptr<CaskIter> iter;
-};
-
-struct CollectionHandle {
-    std::unique_ptr<Collection> collection;
 };
 
 // 注册全部资源类型；任一注册失败返回 false。
@@ -75,6 +69,5 @@ ERL_NIF_TERM make_resource(ErlNifEnv* env, ErlNifResourceType* rt, Args&&... arg
 // 调用线程不可预测，禁止内部反向调任何 BEAM 锁或拿任何阻塞资源。
 void cask_resource_dtor(ErlNifEnv* env, void* obj) noexcept;
 void cask_iter_resource_dtor(ErlNifEnv* env, void* obj) noexcept;
-void collection_resource_dtor(ErlNifEnv* env, void* obj) noexcept;
 
 }  // namespace bitcask::nif

@@ -44,6 +44,8 @@ struct Atoms {
     ERL_NIF_TERM read_only;
     ERL_NIF_TERM write_locked;
     ERL_NIF_TERM bad_crc;
+    ERL_NIF_TERM no_index;
+    ERL_NIF_TERM mode_mismatch;
     // merge 策略阈值
     ERL_NIF_TERM frag_merge_trigger;
     ERL_NIF_TERM dead_bytes_merge_trigger;

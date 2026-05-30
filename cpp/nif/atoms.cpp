@@ -38,6 +38,8 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     read_only       = a("read_only");
     write_locked    = a("write_locked");
     bad_crc         = a("bad_crc");
+    no_index        = a("no_index");
+    mode_mismatch   = a("mode_mismatch");
 
     frag_merge_trigger       = a("frag_merge_trigger");
     dead_bytes_merge_trigger = a("dead_bytes_merge_trigger");

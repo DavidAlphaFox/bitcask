@@ -16,13 +16,11 @@
 #include <erl_nif.h>
 
 #include "bitcask/cask.hpp"
-#include "bitcask/collection.hpp"
 
 namespace bitcask::nif {
 
 struct CaskHandle;
 struct CaskIterHandle;
-struct CollectionHandle;
 
 // 跨 .cpp 共享的内部辅助函数。
 namespace detail {
@@ -42,11 +40,6 @@ CaskHandle* checked_cask_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept;
 // 从 NIF term 取出 CaskIterHandle 指针；类型不对返回 nullptr。
 CaskIterHandle* cask_iter_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept;
 
-CollectionHandle* collection_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept;
-
-// 同 checked_cask_handle：额外验证 h->collection 非空（collection 未关闭）。
-CollectionHandle* checked_collection_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept;
-
 // 解析 [{Key, Value} | atom, ...] 形态的选项 proplist 到 CaskOptions。
 // 不识别的键静默跳过，与 legacy 语义一致。
 CaskOptions parse_options(ErlNifEnv* env, ERL_NIF_TERM list);
@@ -59,8 +52,6 @@ CollectionOptions parse_collection_options(ErlNifEnv* env, ERL_NIF_TERM list);
 // kNotFound / kAlreadyExists 返回裸 atom（legacy 契约），其余返回 {error, Tag}。
 ERL_NIF_TERM fault_to_term(ErlNifEnv* env, const CaskFault& f) noexcept;
 
-ERL_NIF_TERM collection_fault_to_term(ErlNifEnv* env, const CollectionFault& f) noexcept;
-
 // fold_start / fold_start4 共用实现。
 // 创建迭代器、启动快照、包装成 NIF 资源 term。
 ERL_NIF_TERM fold_start_impl(ErlNifEnv* env, CaskHandle* h,
@@ -71,9 +62,9 @@ ERL_NIF_TERM fold_start_impl(ErlNifEnv* env, CaskHandle* h,
 ERL_NIF_TERM make_string_list(ErlNifEnv* env,
                                const std::vector<std::string>& v);
 
-// 把搜索结果（vector<TextHit>）转换为 Erlang 的 [{ExtId, Score}, ...] 列表。
+// 把搜索结果（vector<SearchHit>）转换为 Erlang 的 [{Key, Ord, Score}, ...] 列表。
 // 倒着遍历保持结果原始顺序（BM25 分数从高到低）。
-ERL_NIF_TERM make_search_hits(ErlNifEnv* env, const std::vector<TextHit>& hits);
+ERL_NIF_TERM make_search_hits(ErlNifEnv* env, const std::vector<bitcask::search::SearchHit>& hits);
 
 }  // namespace detail
 }  // namespace bitcask::nif

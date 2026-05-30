@@ -11,14 +11,12 @@
 
 #pragma once
 
-#include "bitcask/collection_registry.hpp"
 #include "bitcask/keydir_registry.hpp"
 
 namespace bitcask::nif {
 
 struct PrivData {
     keydir::KeyDirRegistry cask_registry;
-    CollectionRegistry     collection_registry;
 };
 
 inline PrivData* priv(ErlNifEnv* env) noexcept {
