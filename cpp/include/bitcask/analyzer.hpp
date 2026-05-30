@@ -38,6 +38,7 @@ using TermPositionsMap = std::unordered_map<std::string, std::pair<std::uint32_t
 enum class AnalyzerType {
     Ngram,        // CJK 字符级 n-gram + 拉丁空白切分（默认，V2.1）
     Whitespace,   // 纯空白切分（调试 / 纯拉丁场景）
+    Jieba,        // jieba 词典分词 + CutForSearch + CJK 回退 n-gram（V2.10）
 };
 
 // --------------------------------------------------------------------------
@@ -51,6 +52,7 @@ struct AnalyzerConfig {
     std::uint32_t max_n = 3;
     bool enable_stop_words = false;                  // 启用停用词过滤
     std::vector<std::string> stop_words;             // 自定义停用词表（空则用内置默认）
+    std::string dict_path;                           // jieba 词典目录（空=内嵌 priv/dict/）
 };
 
 // --------------------------------------------------------------------------
