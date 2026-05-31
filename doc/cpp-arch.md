@@ -1,35 +1,59 @@
 # C++ Architecture
 
 This document maps the C++ codebase under `cpp/` and explains how the
-layers fit together. Pair this with `doc/format.md` (on-disk spec) and
-`doc/migration.md` (how to move from the legacy NIF).
+layers fit together. Pair this with `doc/format.md` (on-disk spec).
 
 ## Module layout
 
 ```
 cpp/
 ├── include/bitcask/         # public headers (the API surface)
-│   ├── format.hpp           # constants, sentinels, tombstones
-│   ├── codec.hpp            # data/hint record encode/decode
+│   ├── format.hpp           # on-disk format constants (typed records: kDoc/kTombstone + ord)
+│   ├── codec.hpp            # data/hint record encode/decode (23B data header, 18B hint)
 │   ├── io.hpp               # PosixFile + IoError
-│   ├── data_file.hpp        # DataFile: append/read/fold a single file
+│   ├── data_file.hpp        # DataFile: append/read/fold typed records
 │   ├── hint_file.hpp        # HintFile: write/validate hint records
 │   ├── scanner.hpp          # scan_dir: list .bitcask.data files
-│   ├── keydir.hpp           # in-memory key directory + iterator
-│   ├── keydir_registry.hpp  # named-keydir cache (legacy parity)
+│   ├── keydir.hpp           # KeyDir: in-memory key directory + iterator (MVCC sibling chain)
+│   ├── keydir_registry.hpp  # KeyDirRegistry: named-keydir cache (refcount sharing)
 │   ├── merge_policy.hpp     # decide() rule + per-file thresholds
-│   ├── merger.hpp           # run_merge: produces new files + GCs old
-│   └── cask.hpp             # Cask: end-user facade tying it all together
-├── src/                     # impls; one .cpp per header where appropriate
+│   ├── merger.hpp           # Merger: merge execution (rewrites live records)
+│   ├── cask.hpp             # Cask: end-user KV+search facade (open/get/put/delete/search/merge)
+│   ├── meta_file.hpp        # bitcask.meta: mode persistence (KV vs Index)
+│   ├── collection.hpp       # Collection: standalone document + BM25 search facade
+│   ├── collection_registry.hpp # CollectionRegistry: named-collection cache
+│   ├── index.hpp            # Index: in-memory document side tables (ext2ord/slots/ord2ext/live)
+│   ├── inverted.hpp         # InvertedIndex: BM25 inverted index (sharded locks)
+│   ├── search_layer.hpp     # SearchLayer: Index + InvertedIndex + Analyzer wrapper
+│   ├── analyzer.hpp         # text::Analyzer abstract base + factory + AnalyzerConfig
+│   ├── ngram_analyzer.hpp   # NgramAnalyzer: CJK bi/tri-gram + Latin whitespace
+│   ├── jieba_analyzer.hpp   # JiebaAnalyzer: Chinese segmentation (cppjieba)
+│   ├── whitespace_analyzer.hpp # WhitespaceAnalyzer: pure whitespace tokenization
+│   ├── cjk_detect.hpp       # CJK character detection utilities
+│   ├── text_utils.hpp      # NFKC normalization + text utilities
+│   └── file_lock.hpp       # FileLock: advisory lock (O_CREAT|O_EXCL)
+├── src/
+│   ├── fileops/             # codec.cpp, data_file.cpp, hint_file.cpp, scanner.cpp
+│   ├── io/                  # posix_file.cpp
+│   ├── keydir/              # keydir.cpp, keydir_registry.cpp, index.cpp
+│   ├── lock/                # file_lock.cpp
+│   ├── merge/               # merger.cpp, merge_policy.cpp
+│   ├── cask/                # cask.cpp, meta_file.cpp, collection.cpp, collection_registry.cpp
+│   ├── search/              # search_layer.cpp
+│   ├── bm25/                # inverted.cpp
+│   └── text/                # analyzer.cpp, jieba_analyzer.cpp
 ├── nif/                     # erl_nif glue → bitcask_cpp.so
-│   ├── nif_main.cpp         # ErlNifFunc table + on_load
-│   ├── nif_io.cpp           # legacy file_*_int / lock_*_int subset
-│   ├── nif_keydir.cpp       # legacy keydir_*_int subset
-│   ├── nif_cask.cpp         # coarse-grained cask_* (the cask_cpp dispatch)
-│   ├── atoms.{hpp,cpp}      # cached ERL_NIF_TERM atoms
-│   └── resources.{hpp,cpp}  # ErlNifResourceType registration
-├── tests/                   # GoogleTest unit + stress tests
-└── bench/                   # Google Benchmark micro-benchmarks (opt-in)
+│   ├── nif_main.cpp         # ErlNifFunc table + on_load (21 NIF functions)
+│   ├── nif_cask.cpp         # cask_* functions (open/close/get/put/delete/sync/search/merge)
+│   ├── nif_cask_iter.cpp    # cask_fold_* + cask_iterator_* (fold/iterator NIFs)
+│   ├── nif_cask_admin.cpp   # cask_status / cask_needs_merge / cask_is_empty / cask_is_frozen
+│   ├── nif_helpers.cpp/hpp  # option parsing, binary conversion utilities
+│   ├── atoms.cpp/hpp        # cached ERL_NIF_TERM atoms
+│   ├── resources.cpp/hpp    # ErlNifResourceType registration
+│   ├── term_conv.hpp        # Erlang term ↔ C++ conversion helpers
+│   └── priv_data.hpp        # per-NIF-instance state (registry + resource types)
+├── tests/                   # GoogleTest unit + integration (15 test files, ~167 tests)
+└── bench/                   # Google Benchmark (cask_bench, keydir_bench)
 ```
 
 ## Layering
@@ -37,25 +61,30 @@ cpp/
 ```
 ┌────────────────────────────────────────────────────────────┐
 │  Erlang facade (src/bitcask.erl)                           │
-│  is_cask() dispatch → bitcask_cpp_nifs:* OR bitcask_legacy │
+│  bitcask:put/get/delete/search_text/merge/... → NIF call  │
 └────────────────────────────┬───────────────────────────────┘
-                             │ NIF
+                             │ NIF (bitcask_cpp_nifs)
 ┌────────────────────────────▼───────────────────────────────┐
 │  cpp/nif/  (thin glue, owns Erlang lifetime + atoms)       │
 └────────────────────────────┬───────────────────────────────┘
                              │
 ┌────────────────────────────▼───────────────────────────────┐
-│  cask::Cask  (open/get/put/delete/sync/fold/merge/status)  │
-│  ↓ holds                                                   │
-│  ┌───────────────┬──────────────┬──────────────────────┐   │
-│  │ keydir::KeyDir│ DataFile cache│ HintFile (active)   │   │
-│  │ (in-memory)   │ (open fds)    │                      │   │
-│  └───────────────┴──────────────┴──────────────────────┘   │
+│  Cask (KV + search facade)                                  │
+│  ├─ KeyDir (in-memory hash index + MVCC iterator)           │
+│  ├─ DataFile cache (open fds for pread)                     │
+│  ├─ HintFile (active writer)                               │
+│  ├─ SearchLayer (optional, index mode only)                 │
+│  │   ├─ Index (ext2ord/slots/ord2ext/live side tables)     │
+│  │   ├─ InvertedIndex (BM25 posting lists)                  │
+│  │   └─ Analyzer (ngram/jieba/whitespace)                  │
+│  └─ MetaConfig (bitcask.meta mode persistence)             │
 └────────────────────────────┬───────────────────────────────┘
                              │
 ┌────────────────────────────▼───────────────────────────────┐
-│  fileops (codec, scanner, data_file, hint_file)            │
+│  fileops (codec, data_file, hint_file, scanner)             │
 │  io (PosixFile, FileLock)                                  │
+│  merge (Merger, PolicyOptions)                             │
+│  text (Analyzer, NgramAnalyzer, JiebaAnalyzer)             │
 └────────────────────────────────────────────────────────────┘
 ```
 
@@ -89,6 +118,11 @@ concurrent readers. Per-bucket sharding to push beyond that requires
 breaking up `pending_` / `epoch_` / `fstats_` (all global by design) and
 is deferred to M6.
 
+**SearchLayer** is NOT thread-safe — single-writer model, same as Cask writes.
+
+**InvertedIndex** uses sharded locks (16 shards by term hash) — different from
+KeyDir's single `shared_mutex`.
+
 ## Iterator semantics (sibling chain + pending hash)
 
 When at least one `IterHandle` is iterating (`keyfolders_ > 0`):
@@ -112,20 +146,23 @@ When the last folder releases:
 This is the bitcask-equivalent of MVCC for in-memory state — readers see a
 consistent snapshot without copying the whole map at iter start.
 
-## NIF dispatch modes
+## NIF dispatch
 
-The Erlang facade picks one of three modes at `bitcask:open` time:
+The Erlang facade (`src/bitcask.erl`) dispatches ALL operations to the C++ NIF
+(`bitcask_cpp_nifs`). There is no legacy mode — `bitcask_legacy.erl` has been
+deleted.
 
-| `{nifs, _}`     | Erlang module       | C++ surface used         |
-|-----------------|---------------------|--------------------------|
-| `legacy` (default in TEST) | `bitcask_legacy` + `bitcask_nifs` (legacy C) | none |
-| `cpp`           | `bitcask_legacy` + `bitcask_cpp_nifs` (fine-grained C++) | keydir + file_* |
-| `cask_cpp` (default in prod) | `bitcask_cpp_nifs` only         | full Cask facade |
+21 NIF functions are registered:
 
-`legacy` is the original implementation. `cpp` swaps the C NIF for the C++
-NIF but keeps all Erlang business logic. `cask_cpp` pushes everything to
-C++ and Erlang becomes a thin facade. Production = `cask_cpp`; existing
-white-box eunit tests run under `legacy`.
+| Group | Functions |
+|-------|-----------|
+| Core KV | `cask_open/2`, `cask_close/1`, `cask_get/2`, `cask_put/3`, `cask_delete/2`, `cask_sync/1` |
+| Search | `cask_search_text/3`, `cask_search_phrase/3` |
+| Fold/Iter | `cask_fold_start/3,4`, `cask_fold_next/1`, `cask_fold_next_full/1`, `cask_fold_release/1` |
+| Legacy iter compat | `cask_iterator/3`, `cask_iterator_next/1`, `cask_iterator_release/1` |
+| Admin | `cask_is_empty/1`, `cask_is_frozen/1`, `cask_status/1`, `cask_needs_merge/1` |
+| Merge | `cask_merge/2` |
+| Other | `cask_close_write_file/1` |
 
 ## Build entry points
 
