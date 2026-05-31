@@ -27,6 +27,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -39,6 +40,7 @@
 #include "bitcask/merger.hpp"
 #include "bitcask/meta_file.hpp"
 #include "bitcask/search_layer.hpp"
+#include "bitcask/thread_pool.hpp"
 
 namespace bitcask {
 
@@ -258,6 +260,10 @@ public:
     [[nodiscard]] bool has_search() const { return search_ != nullptr; }
     [[nodiscard]] search::SearchLayer* search() { return search_.get(); }
 
+    void flush_index() {
+        if (index_pool_) index_pool_->flush();
+    }
+
     // fsync active data file。o_sync 模式下退化为 no-op。
     // 线程安全: 否（操作 active_data_，与 put/remove 互斥）；caller 串行化。
     [[nodiscard]] std::expected<void, CaskFault> sync();
@@ -343,6 +349,17 @@ private:
 
     // SearchLayer 实例（enable_search 时创建）
     std::unique_ptr<search::SearchLayer> search_;
+
+    // T2.4: Index Pool（搜索模式开启时创建，用于 T3 异步索引）
+    std::unique_ptr<IndexPool> index_pool_;
+
+    // T3: 提交索引任务到 IndexPool，带背压控制。
+    // 队列超过 80% 水位（8192/10240）时自旋等待。
+    void submit_index_task(IndexTask task);
+
+public:
+    // 访问 IndexPool（用于 T3 阶段启动 worker）
+    [[nodiscard]] IndexPool* index_pool() { return index_pool_.get(); }
 
     // 内部辅助
     [[nodiscard]] std::expected<void, CaskFault> load_keydir_from_disk(search::SearchLayer* search_layer);

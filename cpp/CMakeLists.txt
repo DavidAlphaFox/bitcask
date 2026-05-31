@@ -19,6 +19,7 @@ target_compile_options(bitcask_warnings INTERFACE
 )
 
 find_package(ZLIB REQUIRED)
+find_package(TBB REQUIRED)
 
 # 当从 cpp/ 子目录独立构建时（不经过顶层 CMake），提供 bitcask_sanitizers
 # 的空壳 target，使测试 target 能正常链接。
@@ -97,7 +98,7 @@ add_library(bitcask_bm25 STATIC
     src/bm25/inverted.cpp
 )
 target_include_directories(bitcask_bm25 PUBLIC include)
-target_link_libraries(bitcask_bm25 PRIVATE bitcask_warnings)
+target_link_libraries(bitcask_bm25 PRIVATE bitcask_warnings TBB::tbb)
 
 # ---------------------------------------------------------------------------
 # bitcask_search — SearchLayer (Index + InvertedIndex + Analyzer wrapper).
@@ -148,7 +149,7 @@ add_library(bitcask_cask STATIC
 target_include_directories(bitcask_cask PUBLIC include)
 target_link_libraries(bitcask_cask
     PUBLIC  bitcask_keydir bitcask_fileops bitcask_io bitcask_format bitcask_merge bitcask_search
-    PRIVATE bitcask_warnings
+    PRIVATE bitcask_warnings TBB::tbb
 )
 
 # ---------------------------------------------------------------------------
