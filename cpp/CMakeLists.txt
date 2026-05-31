@@ -56,7 +56,7 @@ target_link_libraries(bitcask_fileops
 
 # ---------------------------------------------------------------------------
 # bitcask_io — POSIX file + advisory lock primitives.
-# Pure C++. Used by Collection and by C++ unit tests directly.
+# Pure C++. Used by C++ unit tests directly.
 # ---------------------------------------------------------------------------
 add_library(bitcask_io STATIC
     src/io/posix_file.cpp
@@ -112,20 +112,6 @@ add_library(bitcask_search STATIC
 target_include_directories(bitcask_search PUBLIC include)
 target_link_libraries(bitcask_search
     PUBLIC  bitcask_index bitcask_bm25 bitcask_text
-    PRIVATE bitcask_warnings
-)
-
-# ---------------------------------------------------------------------------
-# bitcask_collection — vector DB facade (upsert/get/remove/search_text + recovery).
-# Reuses fileops + index + io + text + bm25.
-# ---------------------------------------------------------------------------
-add_library(bitcask_collection STATIC
-    src/cask/collection.cpp
-    src/cask/collection_registry.cpp
-)
-target_include_directories(bitcask_collection PUBLIC include)
-target_link_libraries(bitcask_collection
-    PUBLIC  bitcask_fileops bitcask_index bitcask_io bitcask_text bitcask_bm25
     PRIVATE bitcask_warnings
 )
 

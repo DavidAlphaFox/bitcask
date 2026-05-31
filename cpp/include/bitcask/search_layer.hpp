@@ -1,6 +1,6 @@
 // SearchLayer — Index + InvertedIndex + Analyzer 封装层。
 //
-// 将 Collection 的 BM25 集成逻辑抽取为可复用组件，供 Phase 4 集成使用。
+// 将 BM25 集成逻辑抽取为可复用组件，供 Phase 4 集成使用。
 // SearchLayer 是独立模块，不依赖 Collection/Cask/KeyDir 等上层组件。
 //
 // === 数据流 ===
@@ -9,7 +9,7 @@
 //   查询：search_text(query, k) → analyzer_->analyze → inverted_->search → ord_to_ext → SearchHit
 //
 // === 约束 ===
-//   - 非线程安全：caller 负责并发控制（V1 由 Collection 单写者保证）
+//   - 非线程安全：caller 负责并发控制
 //   - ord 唯一且单调分配，不复用
 //   - analyzer_ 在构造时创建，失败则整个 SearchLayer 创建失败
 
@@ -98,7 +98,7 @@ public:
                           const HighlightOptions& opts = {}) const;
 
     // ---- 恢复：从磁盘 record 重放活文档 ----
-    // 与 Collection::recover 逻辑相同（全量 analyze + add_doc）。
+    // 恢复文档到索引（全量 analyze + add_doc）。
     void recover_doc(std::string_view key, std::uint64_t ord,
                      std::string_view text,
                      std::uint32_t file_id, std::uint64_t offset,

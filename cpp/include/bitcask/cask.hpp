@@ -108,6 +108,7 @@ struct CaskFault {
 
 struct GetResult {
     std::vector<std::byte> value;  // DocValue 解码后的 text 段（纯 binary）
+    std::vector<std::byte> meta;   // DocValue 解码后的 meta 段（可为空）
     std::uint32_t tstamp = 0;
     std::uint64_t ord = 0;
 };

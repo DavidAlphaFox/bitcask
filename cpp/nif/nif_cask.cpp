@@ -48,6 +48,21 @@ ERL_NIF_TERM nif_cask_get(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[
     }
     auto r = h->cask->get(as_bytes(key));
     if (!r) return fault_to_term(env, r.error());
+    if (h->cask->has_search()) {
+        // 索引模式：返回 #{text => Binary, meta => Binary | undefined}
+        ERL_NIF_TERM map = enif_make_new_map(env);
+        ERL_NIF_TERM text_key = enif_make_atom(env, "text");
+        ERL_NIF_TERM text_val = make_binary_checked(env, r->value);
+        if (!text_val) return make_error(env, atoms().allocation_error);
+        enif_make_map_put(env, map, text_key, text_val, &map);
+        ERL_NIF_TERM meta_key = enif_make_atom(env, "meta");
+        ERL_NIF_TERM meta_val = r->meta.empty() ? atoms().undefined
+                                               : make_binary_checked(env, r->meta);
+        if (!meta_val) return make_error(env, atoms().allocation_error);
+        enif_make_map_put(env, map, meta_key, meta_val, &map);
+        return make_ok(env, map);
+    }
+    // KV模式：返回纯 binary（行为不变）
     ERL_NIF_TERM val_bin = make_binary_checked(env, r->value);
     if (!val_bin) return make_error(env, atoms().allocation_error);
     return make_ok(env, val_bin);

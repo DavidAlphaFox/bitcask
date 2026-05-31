@@ -801,6 +801,7 @@ Cask::get(std::span<const std::byte> key) {
     }
     return GetResult{
         std::vector<std::byte>(dv->text.begin(), dv->text.end()),
+        std::vector<std::byte>(dv->meta.begin(), dv->meta.end()),
         rec->tstamp,
         rec->ord
     };

@@ -53,14 +53,6 @@ target_link_libraries(bitcask_index_test PRIVATE
     bitcask_sanitizers
 )
 
-add_executable(bitcask_collection_test collection_test.cpp)
-target_link_libraries(bitcask_collection_test PRIVATE
-    GTest::gtest_main
-    bitcask_collection
-    bitcask_warnings
-    bitcask_sanitizers
-)
-
 add_executable(bitcask_data_file_test data_file_test.cpp)
 target_link_libraries(bitcask_data_file_test PRIVATE
     GTest::gtest_main
@@ -142,7 +134,6 @@ gtest_discover_tests(bitcask_codec_test)
 gtest_discover_tests(bitcask_posix_file_test)
 gtest_discover_tests(bitcask_file_lock_test)
 gtest_discover_tests(bitcask_index_test)
-gtest_discover_tests(bitcask_collection_test)
 gtest_discover_tests(bitcask_data_file_test)
 gtest_discover_tests(bitcask_scanner_test)
 gtest_discover_tests(bitcask_analyzer_test)

@@ -72,8 +72,7 @@ struct AnalyzerConfig {
 // 职责：将一段 UTF-8 文本拆成 {term → tf} 映射，供 BM25 倒排索引消费。
 // 写入（upsert）和查询（search_text）走同一条 analyze 管线。
 //
-// 生命周期：Analyzer 实例由 AnalyzerFactory 创建，归 Collection 持有，
-// 进程级单例（一个 collection 一个 analyzer）。
+// 生命周期：Analyzer 实例由 AnalyzerFactory 创建，进程级单例。
 // --------------------------------------------------------------------------
 class Analyzer {
 public:

@@ -26,7 +26,7 @@ struct CaskIterHandle;
 namespace detail {
 
 // 模板化的资源句柄提取：从 NIF term 中取出指定类型的资源指针。
-// T 是句柄类型（CaskHandle / CaskIterHandle / CollectionHandle），
+// T 是句柄类型（CaskHandle / CaskIterHandle），
 // rt 是对应的 ErlNifResourceType* 全局变量。
 template <typename T>
 T* get_resource_handle(ErlNifEnv* env, ERL_NIF_TERM term, ErlNifResourceType* rt) noexcept;

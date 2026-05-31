@@ -9,8 +9,8 @@
 //
 // === 线程模型 ===
 // 所有 public 方法线程安全：读取 shared_lock、写入 unique_lock。caller 不应
-// 在外部预先持锁。组合操作（如 get 后 put）非原子——V1 由 Collection「单写者」
-// 保证。*_locked 后缀的私有方法要求 caller 已持 unique_lock。
+// 在外部预先持锁。组合操作（如 get 后 put）非原子。*_locked 后缀的
+// 私有方法要求 caller 已持 unique_lock。
 
 #pragma once
 
