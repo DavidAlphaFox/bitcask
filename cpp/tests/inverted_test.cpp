@@ -537,3 +537,112 @@ TEST(InvertedIndex, SaveLoadWithFinalizedPostings) {
 
     cleanup();
 }
+
+TEST(PostingList, BlockMetadata) {
+    InvertedIndex idx;
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        std::uint32_t tf = static_cast<std::uint32_t>((i % 10) + 1);
+        idx.add_doc(i, {{"term", tp(tf, {0})}});
+    }
+
+    idx.finalize_all_postings();
+
+    auto& shard = idx.shard_for("term");
+    tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+    ASSERT_TRUE(shard.inverted.find(acc, "term"));
+    auto& pl = acc->second;
+
+    EXPECT_GE(pl.blocks.size(), 2u);
+    std::size_t expected_blocks = (300 + PostingList::kBlockSize - 1) / PostingList::kBlockSize;
+    EXPECT_EQ(pl.blocks.size(), expected_blocks);
+
+    for (std::size_t b = 0; b < pl.blocks.size(); ++b) {
+        auto& blk = pl.blocks[b];
+        EXPECT_LE(blk.count, PostingList::kBlockSize);
+        EXPECT_EQ(blk.base_ord, blk.start_idx);
+        EXPECT_TRUE(blk.max_tf > 0);
+    }
+}
+
+TEST(InvertedIndex, BlockMaxWandBasic) {
+    InvertedIndex idx;
+    for (std::uint64_t i = 0; i < 500; ++i) {
+        std::uint32_t tf = static_cast<std::uint32_t>((i % 20) + 1);
+        idx.add_doc(i, {{"common", tp(tf, {0})}, {"term", tp(1, {1})}});
+    }
+
+    FakeLiveChecker checker;
+    for (std::uint64_t i = 0; i < 500; ++i) {
+        checker.doc_lens[i] = 10;
+    }
+
+    auto results_wand = idx.search({"common", "term"}, 10, checker);
+    ASSERT_FALSE(results_wand.empty());
+
+    InvertedIndex idx2;
+    for (std::uint64_t i = 0; i < 500; ++i) {
+        std::uint32_t tf = static_cast<std::uint32_t>((i % 20) + 1);
+        idx2.add_doc(i, {{"common", tp(tf, {0})}, {"term", tp(1, {1})}});
+    }
+    auto results_daat = idx2.search({"common", "term"}, 10, checker);
+    ASSERT_EQ(results_wand.size(), results_daat.size());
+    for (std::size_t i = 0; i < results_wand.size(); ++i) {
+        EXPECT_EQ(results_wand[i].ord, results_daat[i].ord);
+    }
+}
+
+TEST(InvertedIndex, BlockMaxWandLargeDataset) {
+    InvertedIndex idx;
+    for (std::uint64_t i = 0; i < 3000; ++i) {
+        std::uint32_t tf = static_cast<std::uint32_t>((i % 50) + 1);
+        idx.add_doc(i, {{"common", tp(tf, {0})}, {"rare", tp(1, {1})}});
+    }
+
+    FakeLiveChecker checker;
+    for (std::uint64_t i = 0; i < 3000; ++i) {
+        checker.doc_lens[i] = static_cast<std::uint32_t>((i % 100) + 10);
+    }
+
+    auto results_wand = idx.search({"common", "rare"}, 5, checker);
+
+    InvertedIndex idx2;
+    for (std::uint64_t i = 0; i < 3000; ++i) {
+        std::uint32_t tf = static_cast<std::uint32_t>((i % 50) + 1);
+        idx2.add_doc(i, {{"common", tp(tf, {0})}, {"rare", tp(1, {1})}});
+    }
+    auto results_daat = idx2.search({"common", "rare"}, 5, checker);
+
+    ASSERT_EQ(results_wand.size(), results_daat.size());
+    for (std::size_t i = 0; i < results_wand.size(); ++i) {
+        EXPECT_EQ(results_wand[i].ord, results_daat[i].ord);
+        EXPECT_FLOAT_EQ(results_wand[i].score, results_daat[i].score);
+    }
+}
+
+TEST(InvertedIndex, BlockMaxWandSingleTerm) {
+    InvertedIndex idx;
+    for (std::uint64_t i = 0; i < 2000; ++i) {
+        std::uint32_t tf = static_cast<std::uint32_t>((i % 30) + 1);
+        idx.add_doc(i, {{"term", tp(tf, {0})}});
+    }
+
+    FakeLiveChecker checker;
+    for (std::uint64_t i = 0; i < 2000; ++i) {
+        checker.doc_lens[i] = 5;
+    }
+
+    auto results_wand = idx.search({"term"}, 10, checker);
+
+    InvertedIndex idx2;
+    for (std::uint64_t i = 0; i < 2000; ++i) {
+        std::uint32_t tf = static_cast<std::uint32_t>((i % 30) + 1);
+        idx2.add_doc(i, {{"term", tp(tf, {0})}});
+    }
+    auto results_daat = idx2.search({"term"}, 10, checker);
+
+    ASSERT_EQ(results_wand.size(), results_daat.size());
+    for (std::size_t i = 0; i < results_wand.size(); ++i) {
+        EXPECT_EQ(results_wand[i].ord, results_daat[i].ord);
+        EXPECT_FLOAT_EQ(results_wand[i].score, results_daat[i].score);
+    }
+}

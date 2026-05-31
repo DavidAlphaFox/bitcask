@@ -25,6 +25,7 @@
 #include "bitcask/analyzer.hpp"
 #include "bitcask/index.hpp"
 #include "bitcask/inverted.hpp"
+#include "bitcask/search_cache.hpp"
 
 namespace bitcask::search {
 
@@ -32,6 +33,7 @@ namespace bitcask::search {
 struct SearchLayerConfig {
     text::AnalyzerConfig analyzer_config;
     bm25::Bm25Params     bm25_params;
+    std::size_t          cache_max_entries = 256;  // 缓存最大条目数，0 禁用
 };
 
 // 搜索结果条目。
@@ -112,6 +114,7 @@ private:
     index::Index      index_;
     std::unique_ptr<bm25::InvertedIndex> inverted_;
     std::unique_ptr<text::Analyzer>      analyzer_;
+    mutable SearchCache cache_;
 };
 
 }  // namespace bitcask::search

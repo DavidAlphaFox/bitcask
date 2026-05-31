@@ -226,3 +226,100 @@ TEST(SearchLayer, RebuildIndexCleansDeadPostings) {
     ASSERT_EQ(result_foo->size(), 1u);
     EXPECT_EQ(result_foo->at(0).key, "doc3");
 }
+
+TEST(SearchLayer, CacheHitTest) {
+    auto config = default_config();
+    SearchLayer layer(config);
+
+    layer.on_write("doc1", 0, "hello world", 1, 100, 50, 1000);
+
+    auto result1 = layer.search_text("hello", 10);
+    ASSERT_TRUE(result1.has_value());
+    ASSERT_EQ(result1->size(), 1u);
+
+    auto result2 = layer.search_text("hello", 10);
+    ASSERT_TRUE(result2.has_value());
+    ASSERT_EQ(result2->size(), 1u);
+
+    EXPECT_EQ(result1->at(0).key, result2->at(0).key);
+    EXPECT_EQ(result1->at(0).ord, result2->at(0).ord);
+    EXPECT_EQ(result1->at(0).score, result2->at(0).score);
+}
+
+TEST(SearchLayer, CacheInvalidationTest) {
+    auto config = default_config();
+    SearchLayer layer(config);
+
+    layer.on_write("doc1", 0, "hello world foo bar", 1, 100, 50, 1000);
+
+    auto result1 = layer.search_text("foo", 10);
+    ASSERT_TRUE(result1.has_value());
+    ASSERT_EQ(result1->size(), 1u);
+    EXPECT_EQ(result1->at(0).key, "doc1");
+
+    auto result1_2 = layer.search_text("foo", 10);
+    ASSERT_TRUE(result1_2.has_value());
+    ASSERT_EQ(result1_2->size(), 1u);
+
+    layer.on_write("doc2", 1, "hello world baz qux", 1, 200, 50, 1001);
+
+    auto result2 = layer.search_text("foo", 10);
+    ASSERT_TRUE(result2.has_value());
+    ASSERT_EQ(result2->size(), 1u);
+    EXPECT_EQ(result2->at(0).key, "doc1");
+}
+
+TEST(SearchLayer, CacheEvictionTest) {
+    auto config = default_config();
+    config.cache_max_entries = 2;
+    SearchLayer layer(config);
+
+    layer.on_write("doc1", 0, "hello world", 1, 100, 50, 1000);
+    layer.on_write("doc2", 1, "foo bar", 1, 200, 50, 1001);
+    layer.on_write("doc3", 2, "baz qux", 1, 300, 50, 1002);
+
+    auto result1 = layer.search_text("hello", 10);
+    ASSERT_TRUE(result1.has_value());
+    auto result2 = layer.search_text("foo", 10);
+    ASSERT_TRUE(result2.has_value());
+    auto result3 = layer.search_text("baz", 10);
+    ASSERT_TRUE(result3.has_value());
+
+    EXPECT_EQ(result1->size(), 1u);
+    EXPECT_EQ(result2->size(), 1u);
+    EXPECT_EQ(result3->size(), 1u);
+}
+
+TEST(SearchLayer, CachePhraseTest) {
+    auto config = default_config();
+    SearchLayer layer(config);
+
+    layer.on_write("doc1", 0, "hello world foo bar", 1, 100, 50, 1000);
+    layer.on_write("doc2", 1, "world hello", 1, 200, 40, 1001);
+
+    auto result_text = layer.search_text("hello world", 10);
+    ASSERT_TRUE(result_text.has_value());
+
+    auto result_phrase = layer.search_phrase("hello world", 10);
+    ASSERT_TRUE(result_phrase.has_value());
+    EXPECT_EQ(result_phrase->size(), 1u);
+    EXPECT_EQ(result_phrase->at(0).key, "doc1");
+}
+
+TEST(SearchLayer, CacheDisabledTest) {
+    auto config = default_config();
+    config.cache_max_entries = 0;
+    SearchLayer layer(config);
+
+    layer.on_write("doc1", 0, "hello world", 1, 100, 50, 1000);
+
+    auto result1 = layer.search_text("hello", 10);
+    ASSERT_TRUE(result1.has_value());
+    ASSERT_EQ(result1->size(), 1u);
+
+    auto result2 = layer.search_text("hello", 10);
+    ASSERT_TRUE(result2.has_value());
+    ASSERT_EQ(result2->size(), 1u);
+
+    EXPECT_EQ(result1->at(0).key, result2->at(0).key);
+}

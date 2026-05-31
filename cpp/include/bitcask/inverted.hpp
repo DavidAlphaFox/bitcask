@@ -36,6 +36,21 @@
 
 namespace bitcask::bm25 {
 
+// BM25 可调参数。
+struct Bm25Params {
+    float k1 = 1.2F;
+    float b  = 0.75F;
+};
+
+// Posting 分块元数据（Block-Max WAND 跳跃索引）。
+struct PostingBlock {
+    std::uint64_t base_ord;
+    std::uint64_t end_ord;
+    std::uint32_t max_tf;
+    std::size_t   start_idx;
+    std::size_t   count;
+};
+
 // 一条 posting 记录：文档 ord + 该 term 在文档中的词频。
 struct Posting {
     std::uint64_t ord;
@@ -46,13 +61,18 @@ struct Posting {
 // 一个 term 对应的 posting 列表，按 ord 升序排列。
 // 同一个 ord 不会出现两次（add_doc 保证）。
 struct PostingList {
+    static constexpr std::size_t kBlockSize = 128;
+
     std::vector<Posting> items;
 
     // VByte 压缩 ord 存储（finalize 后使用）。
     std::vector<std::uint8_t> compressed_ords;
     bool finalized = false;
 
-    // 压缩所有 ord 为 VByte gap 编码。
+    // Block-Max WAND 跳跃索引（finalize 后计算）。
+    std::vector<PostingBlock> blocks;
+
+    // 压缩所有 ord 为 VByte gap 编码，并计算块元数据。
     void finalize() {
         if (items.empty() || finalized) return;
         std::vector<std::uint64_t> ords;
@@ -60,6 +80,24 @@ struct PostingList {
         for (auto& p : items) ords.push_back(p.ord);
         compressed_ords = codec::gap_encode(ords);
         finalized = true;
+
+        // 计算 Block-Max WAND 元数据。
+        if (items.size() >= kBlockSize) {
+            std::size_t n = items.size();
+            std::size_t block_count = (n + kBlockSize - 1) / kBlockSize;
+            blocks.reserve(block_count);
+            for (std::size_t b = 0; b < block_count; ++b) {
+                std::size_t start = b * kBlockSize;
+                std::size_t end = std::min(start + kBlockSize, n);
+                std::uint64_t base = items[start].ord;
+                std::uint64_t last = items[end - 1].ord;
+                std::uint32_t max_tf = 0;
+                for (std::size_t i = start; i < end; ++i) {
+                    if (items[i].tf > max_tf) max_tf = items[i].tf;
+                }
+                blocks.push_back({base, last, max_tf, start, end - start});
+            }
+        }
     }
 
     // 解压返回 ord 数组。
@@ -76,12 +114,12 @@ struct PostingList {
     // 按 ord 查找（二分，用于 add_doc 去重 / remove_doc 定位）。
     [[nodiscard]] auto find(std::uint64_t ord) const -> std::size_t;
     [[nodiscard]] bool has(std::uint64_t ord) const;
-};
 
-// BM25 可调参数。
-struct Bm25Params {
-    float k1 = 1.2F;
-    float b  = 0.75F;
+    // 返回包含指定 ord 的块（binary search）。
+    [[nodiscard]] auto block_for_ord(std::uint64_t ord) const -> const PostingBlock*;
+
+    // 计算该 posting list 的全局上界分数（用于 WAND剪枝）。
+    [[nodiscard]] auto block_upper_bound(float idf, const Bm25Params& params, double avgdl) const -> float;
 };
 
 using TermPositions = std::unordered_map<std::string, std::pair<std::uint32_t, std::vector<std::uint32_t>>>;
@@ -153,12 +191,18 @@ public:
     // 压缩所有 posting list 的 ord 为 VByte gap 编码。
     void finalize_all_postings();
 
-private:
-    static constexpr std::size_t kShardCount = 64;
-
+    // 内部分片结构（公开用于测试）。
     struct Shard {
         tbb::concurrent_hash_map<std::string, PostingList> inverted;
     };
+
+    // 获取内部 shard（用于测试）。
+    [[nodiscard]] auto shard_for(std::string_view term) -> Shard&;
+    [[nodiscard]] auto shard_for(std::string_view term) const -> const Shard&;
+
+private:
+    static constexpr std::size_t kShardCount = 64;
+    static constexpr std::size_t kWandThreshold = 1024;
 
     std::array<Shard, kShardCount> shards_;
     Bm25Params params_;
@@ -168,8 +212,11 @@ private:
     std::uint64_t live_doc_count_ = 0;
     std::uint64_t sum_doc_len_   = 0;
 
-    [[nodiscard]] Shard& shard_for(std::string_view term);
-    [[nodiscard]] const Shard& shard_for(std::string_view term) const;
+    // Block-Max WAND 算法。
+    auto search_wand(
+        const std::vector<std::string>& query_terms,
+        std::size_t k,
+        const LiveChecker& live_checker) const -> std::vector<SearchResult>;
 };
 
 }  // namespace bitcask::bm25

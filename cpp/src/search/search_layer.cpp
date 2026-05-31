@@ -9,6 +9,7 @@ SearchLayer::SearchLayer(const SearchLayerConfig& config)
     , index_()
     , inverted_(std::make_unique<bm25::InvertedIndex>(config.bm25_params))
     , analyzer_(text::AnalyzerFactory::create(config.analyzer_config))
+    , cache_(config.cache_max_entries)
 {
 }
 
@@ -32,6 +33,7 @@ void SearchLayer::on_write(std::string_view key, std::uint64_t ord,
     if (!term_data.empty()) {
         inverted_->add_doc(ord, term_data);
     }
+    cache_.invalidate();
 }
 
 std::optional<std::uint64_t> SearchLayer::on_delete(std::string_view key, std::uint64_t tomb_ord) {
@@ -40,6 +42,7 @@ std::optional<std::uint64_t> SearchLayer::on_delete(std::string_view key, std::u
 
     inverted_->remove_doc(slot->doc_len, {});
     index_.remove(key, tomb_ord);
+    cache_.invalidate();
     return tomb_ord;
 }
 
@@ -61,13 +64,22 @@ SearchLayer::search_text(std::string_view query, std::size_t k) const {
     auto term_freqs = analyzer_->analyze(query);
     if (term_freqs.empty()) return std::vector<SearchHit>{};
 
-    std::vector<std::string> terms;
-    terms.reserve(term_freqs.size());
-    for (auto& [term, _] : term_freqs) {
-        terms.push_back(term);
-    }
+    auto cache_key = CacheKey::make("text", query, k);
+    auto* cached = cache_.get(cache_key);
 
-    auto results = inverted_->search(terms, k, index_);
+    std::vector<bm25::SearchResult> results;
+    if (cached) {
+        results = *cached;
+    } else {
+        std::vector<std::string> terms;
+        terms.reserve(term_freqs.size());
+        for (auto& [term, _] : term_freqs) {
+            terms.push_back(term);
+        }
+
+        results = inverted_->search(terms, k, index_);
+        cache_.put(cache_key, results);
+    }
 
     std::vector<SearchHit> hits;
     hits.reserve(results.size());
@@ -84,13 +96,22 @@ SearchLayer::search_phrase(std::string_view query, std::size_t k) const {
     auto term_freqs = analyzer_->analyze(query);
     if (term_freqs.empty()) return std::vector<SearchHit>{};
 
-    std::vector<std::string> terms;
-    terms.reserve(term_freqs.size());
-    for (auto& [term, _] : term_freqs) {
-        terms.push_back(term);
-    }
+    auto cache_key = CacheKey::make("phrase", query, k);
+    auto* cached = cache_.get(cache_key);
 
-    auto results = inverted_->search_phrase(terms, k, index_);
+    std::vector<bm25::SearchResult> results;
+    if (cached) {
+        results = *cached;
+    } else {
+        std::vector<std::string> terms;
+        terms.reserve(term_freqs.size());
+        for (auto& [term, _] : term_freqs) {
+            terms.push_back(term);
+        }
+
+        results = inverted_->search_phrase(terms, k, index_);
+        cache_.put(cache_key, results);
+    }
 
     std::vector<SearchHit> hits;
     hits.reserve(results.size());
@@ -109,8 +130,18 @@ SearchLayer::bool_search(std::string_view query, std::size_t k) const {
         return std::vector<SearchHit>{};
     }
 
-    auto results = inverted_->bool_search(query_node, k, index_);
-    if (results.empty()) return std::vector<SearchHit>{};
+    auto cache_key = CacheKey::make("bool", query, k);
+    auto* cached = cache_.get(cache_key);
+
+    std::vector<bm25::SearchResult> results;
+    if (cached) {
+        results = *cached;
+    } else {
+        results = inverted_->bool_search(query_node, k, index_);
+        if (!results.empty()) {
+            cache_.put(cache_key, results);
+        }
+    }
 
     std::vector<SearchHit> hits;
     hits.reserve(results.size());
@@ -142,6 +173,7 @@ void SearchLayer::recover_doc(std::string_view key, std::uint64_t ord,
     if (!term_data.empty()) {
         inverted_->add_doc(ord, term_data);
     }
+    cache_.invalidate();
 }
 
 void SearchLayer::recover_tomb(std::string_view key, std::uint64_t ord) {
@@ -179,6 +211,7 @@ void SearchLayer::rebuild_index(DocReader doc_reader) {
 
     new_inv->finalize_all_postings();
     inverted_ = std::move(new_inv);
+    cache_.invalidate();
 }
 
 }  // namespace bitcask::search
