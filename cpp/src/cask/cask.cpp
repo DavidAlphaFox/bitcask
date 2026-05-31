@@ -410,9 +410,19 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
         cask->meta_config_ = mc;
     }
 
-    // 创建 SearchLayer（如果配置了 search_config）
+    // 创建 SearchLayer + IndexPool（如果配置了 search_config）
     if (opts.search_config) {
         cask->search_ = std::make_unique<search::SearchLayer>(*opts.search_config);
+        cask->index_pool_ = std::make_unique<IndexPool>(1, 10240);
+        cask->index_pool_->start([&search = *cask->search_](const IndexTask& task) {
+            if (task.op == IndexOp::Delete) {
+                search.on_delete(task.key, task.ord);
+            } else {
+                search.on_write(task.key, task.ord, task.text,
+                                task.file_id, task.offset, task.total_sz, task.tstamp);
+            }
+            return true;
+        });
     }
 
     // 拿 / 建 keydir。
@@ -478,11 +488,22 @@ void Cask::close() noexcept {
         keydir_name_.clear();
     }
     keydir_.reset();
+    if (index_pool_) {
+        index_pool_->stop();
+        index_pool_.reset();
+    }
     search_.reset();
     if (write_lock_) {
         write_lock_->release_quiet();
         write_lock_.reset();
     }
+}
+
+// T3: 提交索引任务到 IndexPool，带背压控制。
+// 队列超过 80% 水位（8192/10240）时自旋等待，让 put 路径减速以避免内存溢出。
+void Cask::submit_index_task(IndexTask task) {
+    if (!index_pool_) return;
+    index_pool_->submit(std::move(task));
 }
 
 // ---- open 时重建 keydir ----------------------------------------------------
@@ -791,7 +812,7 @@ Cask::get(std::span<const std::byte> key) {
 //   3. 写 data + hint
 //   4. 更新 keydir
 //   5. keydir 拒绝（merge race）→ 再 roll 一次重试一次；二次失败上报
-std::expected<void, CaskFault>
+    std::expected<void, CaskFault>
 Cask::put(std::span<const std::byte> key,
           std::span<const std::byte> value,
           std::uint32_t tstamp) {
@@ -855,19 +876,21 @@ auto pr = keydir_->put(bytes_to_view(key), active_file_id_,
         if (pr2 == keydir::PutResult::kAlreadyExists) {
             return std::unexpected(err(CaskError::kAlreadyExists));
         }
-        if (search_) {
-            std::string_view text_sv(
-                reinterpret_cast<const char*>(value.data()), value.size());
-            search_->on_write(bytes_to_view(key), ord2, text_sv,
-                              active_file_id_, w2->offset, w2->total_size, tstamp);
-        }
+        submit_index_task(IndexTask{
+            IndexOp::Add,
+            std::string(bytes_to_view(key)),
+            ord2,
+            std::string(reinterpret_cast<const char*>(value.data()), value.size()),
+            active_file_id_, w2->offset, w2->total_size, tstamp, 0
+        });
     } else {
-        if (search_) {
-            std::string_view text_sv(
-                reinterpret_cast<const char*>(value.data()), value.size());
-            search_->on_write(bytes_to_view(key), ord, text_sv,
-                              active_file_id_, w->offset, w->total_size, tstamp);
-        }
+        submit_index_task(IndexTask{
+            IndexOp::Add,
+            std::string(bytes_to_view(key)),
+            ord,
+            std::string(reinterpret_cast<const char*>(value.data()), value.size()),
+            active_file_id_, w->offset, w->total_size, tstamp, 0
+        });
     }
     return {};
 }
@@ -916,7 +939,13 @@ Cask::remove(std::span<const std::byte> key, std::uint32_t tstamp) {
                                   /*tomb*/ true, key);
     if (!h) return std::unexpected(io_fault(h.error().errnum));
     keydir_->remove(bytes_to_view(key), tstamp);
-    if (search_) {
+    if (index_pool_) {
+        submit_index_task(IndexTask{
+            IndexOp::Delete,
+            std::string(bytes_to_view(key)),
+            ord, {}, 0, 0, 0, tstamp, 0
+        });
+    } else if (search_) {
         search_->on_delete(bytes_to_view(key), ord);
     }
     return {};
@@ -995,21 +1024,21 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
         if (pr2 == keydir::PutResult::kAlreadyExists) {
             return std::unexpected(err(CaskError::kAlreadyExists));
         }
-        if (search_) {
-            std::string_view text_sv(
-                reinterpret_cast<const char*>(doc.text.data()),
-                doc.text.size());
-            search_->on_write(bytes_to_view(key), ord2, text_sv,
-                              active_file_id_, w2->offset, w2->total_size, tstamp);
-        }
+        submit_index_task(IndexTask{
+            IndexOp::Add,
+            std::string(bytes_to_view(key)),
+            ord2,
+            std::string(reinterpret_cast<const char*>(doc.text.data()), doc.text.size()),
+            active_file_id_, w2->offset, w2->total_size, tstamp, 0
+        });
     } else {
-        if (search_) {
-            std::string_view text_sv(
-                reinterpret_cast<const char*>(doc.text.data()),
-                doc.text.size());
-            search_->on_write(bytes_to_view(key), ord, text_sv,
-                              active_file_id_, w->offset, w->total_size, tstamp);
-        }
+        submit_index_task(IndexTask{
+            IndexOp::Add,
+            std::string(bytes_to_view(key)),
+            ord,
+            std::string(reinterpret_cast<const char*>(doc.text.data()), doc.text.size()),
+            active_file_id_, w->offset, w->total_size, tstamp, 0
+        });
     }
     return {};
 }
@@ -1018,6 +1047,7 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
 std::expected<TextSearchResult, CaskFault>
 Cask::search_text(std::string_view query, std::size_t k) {
     if (!search_) return std::unexpected(err(CaskError::kNoIndex));
+    flush_index();
     auto hits = search_->search_text(query, k);
     if (!hits) return std::unexpected(err(CaskError::kIo, hits.error()));
     return TextSearchResult{std::move(*hits)};
@@ -1027,6 +1057,7 @@ Cask::search_text(std::string_view query, std::size_t k) {
 std::expected<TextSearchResult, CaskFault>
 Cask::search_phrase(std::string_view query, std::size_t k) {
     if (!search_) return std::unexpected(err(CaskError::kNoIndex));
+    flush_index();
     auto hits = search_->search_phrase(query, k);
     if (!hits) return std::unexpected(err(CaskError::kIo, hits.error()));
     return TextSearchResult{std::move(*hits)};
