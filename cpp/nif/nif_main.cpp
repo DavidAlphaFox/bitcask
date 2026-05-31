@@ -67,8 +67,8 @@ ErlNifFunc kNifFuncs[] = {
     {"cask_sync",              1, nif_cask_sync,             ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"cask_close_write_file",  1, nif_cask_close_write_file, ERL_NIF_DIRTY_JOB_IO_BOUND},
     // 搜索
-    {"cask_search_text",       3, nif_cask_search_text,     0},
-    {"cask_search_phrase",    3, nif_cask_search_phrase,   0},
+    {"cask_search_text",       3, nif_cask_search_text,     ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"cask_search_phrase",    3, nif_cask_search_phrase,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     // 迭代：fold 系列（独立 IterRef，可多个并发）
     {"cask_fold_start",        3, nif_cask_fold_start,       0},
     {"cask_fold_start",        4, nif_cask_fold_start4,      0},

@@ -1,5 +1,8 @@
 #include "bitcask/inverted.hpp"
 
+#include <oneapi/tbb/blocked_range.h>
+#include <oneapi/tbb/parallel_reduce.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -7,7 +10,6 @@
 #include <queue>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 namespace bitcask::bm25 {
@@ -57,9 +59,9 @@ void InvertedIndex::add_doc(
     for (auto& [term, data] : term_data) {
         auto& [tf, positions] = data;
         auto& shard = shard_for(term);
-        std::unique_lock lock(shard.mutex);
-        auto& pl = shard.inverted[term];
-        pl.items.push_back({ord, tf, positions});
+        tbb::concurrent_hash_map<std::string, PostingList>::accessor acc;
+        shard.inverted.insert(acc, term);
+        acc->second.items.push_back({ord, tf, positions});
         doc_len += tf;
     }
 
@@ -86,20 +88,18 @@ auto InvertedIndex::search(
     const std::vector<std::string>& query_terms,
     std::size_t k,
     const LiveChecker& live_checker) const -> std::vector<SearchResult> {
-    // 收集每个 query term 的 posting list（shared_lock 各分片）。
     struct TermPostings {
         std::string term;
-        const PostingList* pl;
+        PostingList pl_copy;
     };
     std::vector<TermPostings> tps;
     tps.reserve(query_terms.size());
 
     for (auto& term : query_terms) {
         auto& shard = shard_for(term);
-        std::shared_lock lock(shard.mutex);
-        auto it = shard.inverted.find(term);
-        if (it != shard.inverted.end()) {
-            tps.push_back({term, &it->second});
+        tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+        if (shard.inverted.find(acc, term)) {
+            tps.push_back({term, acc->second});
         }
     }
 
@@ -110,28 +110,47 @@ auto InvertedIndex::search(
     auto sum_dl = sum_doc_len_;
     auto avgdl = N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
 
-    // DAAT: 逐 posting 累加 BM25 分数，按 ord 聚合。
-    std::unordered_map<std::uint64_t, float> scores;
-    for (auto& [term, pl] : tps) {
-        std::size_t live_df = 0;
-        for (auto& posting : pl->items) {
-            if (live_checker.is_live(posting.ord)) ++live_df;
-        }
-        if (live_df == 0) continue;
-        auto idf = std::log(static_cast<double>(N + 1) / static_cast<double>(live_df + 1));
+    // 并行 BM25 评分：parallel_reduce 按查询词分片，线程本地 map 无锁累加。
+    using ScoreMap = std::unordered_map<std::uint64_t, float>;
 
-        for (auto& posting : pl->items) {
-            if (!live_checker.is_live(posting.ord)) continue;
+    ScoreMap scores = tbb::parallel_reduce(
+        tbb::blocked_range<std::size_t>(0, tps.size()),
+        ScoreMap{},
+        [&](const tbb::blocked_range<std::size_t>& range, ScoreMap local) {
+            for (std::size_t ti = range.begin(); ti < range.end(); ++ti) {
+                auto& pl_copy = tps[ti].pl_copy;
 
-            auto dl = live_checker.doc_len(posting.ord);
-            auto tf_norm = static_cast<float>(posting.tf) *
-                           (params_.k1 + 1.0F) /
-                           (static_cast<float>(posting.tf) + params_.k1 *
-                            (1.0F - params_.b + params_.b *
-                             static_cast<float>(dl) / static_cast<float>(avgdl)));
-            scores[posting.ord] += static_cast<float>(idf) * tf_norm;
+                // 计算该词的 live df。
+                std::size_t live_df = 0;
+                for (auto& posting : pl_copy.items) {
+                    if (live_checker.is_live(posting.ord)) ++live_df;
+                }
+                if (live_df == 0) continue;
+
+                auto idf = std::log(static_cast<double>(N + 1) / static_cast<double>(live_df + 1));
+
+                // 逐 posting 累加 BM25 分数到线程本地 map。
+                for (auto& posting : pl_copy.items) {
+                    if (!live_checker.is_live(posting.ord)) continue;
+
+                    auto dl = live_checker.doc_len(posting.ord);
+                    auto tf_norm = static_cast<float>(posting.tf) *
+                                   (params_.k1 + 1.0F) /
+                                   (static_cast<float>(posting.tf) + params_.k1 *
+                                    (1.0F - params_.b + params_.b *
+                                     static_cast<float>(dl) / static_cast<float>(avgdl)));
+                    local[posting.ord] += static_cast<float>(idf) * tf_norm;
+                }
+            }
+            return local;
+        },
+        [](ScoreMap a, const ScoreMap& b) {
+            for (auto& [doc, score] : b) {
+                a[doc] += score;
+            }
+            return a;
         }
-    }
+    );
 
     // top-k 堆。
     using Entry = std::pair<float, std::uint64_t>;  // (score, ord)，按 score 小顶
@@ -166,17 +185,16 @@ auto InvertedIndex::search_phrase(
 
     struct TermPostings {
         std::string term;
-        const PostingList* pl;
+        PostingList pl_copy;
     };
     std::vector<TermPostings> tps;
     tps.reserve(query_terms.size());
 
     for (auto& term : query_terms) {
         auto& shard = shard_for(term);
-        std::shared_lock lock(shard.mutex);
-        auto it = shard.inverted.find(term);
-        if (it == shard.inverted.end()) return {};
-        tps.push_back({term, &it->second});
+        tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+        if (!shard.inverted.find(acc, term)) return {};
+        tps.push_back({term, acc->second});
     }
 
     auto N = live_doc_count_;
@@ -185,8 +203,8 @@ auto InvertedIndex::search_phrase(
 
     std::unordered_map<std::uint64_t, float> scores;
 
-    auto& first_pl = tps[0].pl;
-    for (auto& posting : first_pl->items) {
+    auto& first_pl = tps[0].pl_copy;
+    for (auto& posting : first_pl.items) {
         if (!live_checker.is_live(posting.ord)) continue;
 
         std::uint32_t phrase_tf = 0;
@@ -194,7 +212,7 @@ auto InvertedIndex::search_phrase(
             bool match = true;
             for (std::size_t t = 1; t < tps.size(); ++t) {
                 auto needed = static_cast<std::uint32_t>(start_pos + t);
-                auto& other_pl = *tps[t].pl;
+                auto& other_pl = tps[t].pl_copy;
                 auto idx = other_pl.find(posting.ord);
                 if (idx >= other_pl.items.size()) { match = false; break; }
                 auto& pos_list = other_pl.items[idx].positions;
@@ -208,7 +226,7 @@ auto InvertedIndex::search_phrase(
 
         if (phrase_tf > 0) {
             std::size_t live_df = 0;
-            for (auto& p : first_pl->items) {
+            for (auto& p : first_pl.items) {
                 if (live_checker.is_live(p.ord)) ++live_df;
             }
             auto idf = std::log(static_cast<double>(N + 1) / static_cast<double>(live_df + 1));
@@ -264,19 +282,17 @@ auto InvertedIndex::avg_doc_len() const -> double {
 
 auto InvertedIndex::df(std::string_view term) const -> std::size_t {
     auto& shard = shard_for(term);
-    std::shared_lock lock(shard.mutex);
-    auto it = shard.inverted.find(std::string(term));
-    if (it == shard.inverted.end()) return 0;
-    return it->second.items.size();
+    tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+    if (!shard.inverted.find(acc, std::string(term))) return 0;
+    return acc->second.items.size();
 }
 
 auto InvertedIndex::df_live(std::string_view term, const LiveChecker& live_checker) const -> std::size_t {
     auto& shard = shard_for(term);
-    std::shared_lock lock(shard.mutex);
-    auto it = shard.inverted.find(std::string(term));
-    if (it == shard.inverted.end()) return 0;
+    tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+    if (!shard.inverted.find(acc, std::string(term))) return 0;
     std::size_t count = 0;
-    for (auto& posting : it->second.items) {
+    for (auto& posting : acc->second.items) {
         if (live_checker.is_live(posting.ord)) ++count;
     }
     return count;
@@ -303,7 +319,6 @@ auto InvertedIndex::save(std::string_view path) const -> bool {
     if (!ok) { std::fclose(f); return false; }
 
     for (auto& shard : shards_) {
-        std::shared_lock lock(shard.mutex);
         std::uint32_t term_count = static_cast<std::uint32_t>(shard.inverted.size());
         ok = write_u32(term_count);
         if (!ok) { std::fclose(f); return false; }
@@ -365,7 +380,6 @@ auto InvertedIndex::load(std::string_view path) -> bool {
     auto sdl = read_u64();
 
     for (auto& shard : shards_) {
-        std::unique_lock lock(shard.mutex);
         auto term_count = read_u32();
         if (term_count == 0xFFFFFFFF) { std::fclose(f); return false; }
 

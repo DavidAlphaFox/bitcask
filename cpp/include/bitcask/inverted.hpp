@@ -8,14 +8,17 @@
 //   删除：remove_doc(ord, term_freqs) → posting 标记删除（V2 靠 live 过滤）
 //   查询：search(terms, k, live_checker) → DAAT 累加 BM25 → top-k 堆
 //
-// === 锁模型（§4）===
-//   写入按 term hash 分片上 shared_mutex：写入只锁命中分片，不阻塞其他 term。
-//   查询（search）持所有分片的 shared_lock（读）——并发写入不阻塞查询。
+// === 锁模型（§4） ===
+//   写入按 term hash 分片，tbb::concurrent_hash_map 提供桶级锁。
+//   查询（search）无锁读——concurrent_hash_map 支持并发迭代。
+//   全局统计（live_doc_count_ / sum_doc_len_）仍用 stats_mutex_ 保护。
 //
 // === df 漂移 ===
 //   V2 查询时过滤 live=0 的 ord，接受 df 轻微偏大。merge 时重算 df。
 
 #pragma once
+
+#include <oneapi/tbb/concurrent_hash_map.h>
 
 #include <algorithm>
 #include <cmath>
@@ -115,11 +118,10 @@ public:
     [[nodiscard]] auto df_live(std::string_view term, const LiveChecker& live_checker) const -> std::size_t;
 
 private:
-    static constexpr std::size_t kShardCount = 16;
+    static constexpr std::size_t kShardCount = 64;
 
     struct Shard {
-        mutable std::shared_mutex mutex;
-        std::unordered_map<std::string, PostingList> inverted;
+        tbb::concurrent_hash_map<std::string, PostingList> inverted;
     };
 
     std::array<Shard, kShardCount> shards_;
