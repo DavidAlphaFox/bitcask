@@ -184,3 +184,45 @@ TEST(SearchLayer, IndexAccess) {
     EXPECT_EQ(slot->loc.file_id, 1u);
     EXPECT_EQ(slot->loc.offset, 100u);
 }
+
+TEST(SearchLayer, RebuildIndexCleansDeadPostings) {
+    auto config = default_config();
+    SearchLayer layer(config);
+
+    layer.on_write("doc1", 0, "hello world foo bar", 1, 100, 50, 1000);
+    layer.on_write("doc2", 1, "hello world baz qux", 1, 200, 50, 1001);
+    layer.on_write("doc3", 2, "foo bar baz qux", 1, 300, 50, 1002);
+
+    auto result_before = layer.search_text("hello", 10);
+    ASSERT_TRUE(result_before.has_value());
+    ASSERT_EQ(result_before->size(), 2u);
+
+    layer.on_delete("doc1", 3);
+
+    auto result_after_delete = layer.search_text("hello", 10);
+    ASSERT_TRUE(result_after_delete.has_value());
+    ASSERT_EQ(result_after_delete->size(), 1u);
+    EXPECT_EQ(result_after_delete->at(0).key, "doc2");
+
+    auto mock_reader = [](std::uint32_t fid, std::uint64_t off, std::uint32_t)
+        -> std::optional<std::string> {
+        if (fid == 1 && off == 200) {
+            return std::string("hello world baz qux");
+        }
+        if (fid == 1 && off == 300) {
+            return std::string("foo bar baz qux");
+        }
+        return std::nullopt;
+    };
+    layer.rebuild_index(mock_reader);
+
+    auto result_after_rebuild = layer.search_text("hello", 10);
+    ASSERT_TRUE(result_after_rebuild.has_value());
+    ASSERT_EQ(result_after_rebuild->size(), 1u);
+    EXPECT_EQ(result_after_rebuild->at(0).key, "doc2");
+
+    auto result_foo = layer.search_text("foo", 10);
+    ASSERT_TRUE(result_foo.has_value());
+    ASSERT_EQ(result_foo->size(), 1u);
+    EXPECT_EQ(result_foo->at(0).key, "doc3");
+}

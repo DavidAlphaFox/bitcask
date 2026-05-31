@@ -102,6 +102,26 @@ SearchLayer::search_phrase(std::string_view query, std::size_t k) const {
     return hits;
 }
 
+std::expected<std::vector<SearchHit>, std::string>
+SearchLayer::bool_search(std::string_view query, std::size_t k) const {
+    auto query_node = bitcask::bm25::parse_query(query);
+    if (query_node.term.empty() && query_node.children.empty()) {
+        return std::vector<SearchHit>{};
+    }
+
+    auto results = inverted_->bool_search(query_node, k, index_);
+    if (results.empty()) return std::vector<SearchHit>{};
+
+    std::vector<SearchHit> hits;
+    hits.reserve(results.size());
+    for (auto& r : results) {
+        auto ext_id = index_.ord_to_ext(r.ord);
+        if (!ext_id) continue;
+        hits.push_back(SearchHit{std::move(*ext_id), r.ord, r.score});
+    }
+    return hits;
+}
+
 void SearchLayer::recover_doc(std::string_view key, std::uint64_t ord,
                               std::string_view text,
                               std::uint32_t file_id, std::uint64_t offset,
@@ -140,6 +160,25 @@ std::expected<bool, std::string> SearchLayer::load_snapshot(std::string_view pat
         return std::unexpected(std::string("failed to load snapshot from ") + std::string(path));
     }
     return true;
+}
+
+void SearchLayer::rebuild_index(DocReader doc_reader) {
+    auto new_inv = std::make_unique<bm25::InvertedIndex>(config_.bm25_params);
+
+    index_.for_each_live([&](std::uint64_t ord,
+                              const std::string& /*ext_id*/,
+                              const index::DocSlot& slot) {
+        auto text = doc_reader(slot.loc.file_id, slot.loc.offset, slot.loc.total_sz);
+        if (!text) return;
+
+        auto term_data = analyzer_->analyze_with_positions(*text);
+        if (term_data.empty()) return;
+
+        new_inv->add_doc(ord, term_data);
+    });
+
+    new_inv->finalize_all_postings();
+    inverted_ = std::move(new_inv);
 }
 
 }  // namespace bitcask::search

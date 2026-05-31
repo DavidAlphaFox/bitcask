@@ -119,27 +119,30 @@ auto InvertedIndex::search(
         [&](const tbb::blocked_range<std::size_t>& range, ScoreMap local) {
             for (std::size_t ti = range.begin(); ti < range.end(); ++ti) {
                 auto& pl_copy = tps[ti].pl_copy;
+                auto ords = pl_copy.decompress_ords();
 
                 // 计算该词的 live df。
                 std::size_t live_df = 0;
-                for (auto& posting : pl_copy.items) {
-                    if (live_checker.is_live(posting.ord)) ++live_df;
+                for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
+                    if (live_checker.is_live(ords[i])) ++live_df;
                 }
                 if (live_df == 0) continue;
 
-                auto idf = std::log(static_cast<double>(N + 1) / static_cast<double>(live_df + 1));
+                auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
 
                 // 逐 posting 累加 BM25 分数到线程本地 map。
-                for (auto& posting : pl_copy.items) {
-                    if (!live_checker.is_live(posting.ord)) continue;
+                for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
+                    auto& posting = pl_copy.items[i];
+                    auto ord = ords[i];
+                    if (!live_checker.is_live(ord)) continue;
 
-                    auto dl = live_checker.doc_len(posting.ord);
+                    auto dl = live_checker.doc_len(ord);
                     auto tf_norm = static_cast<float>(posting.tf) *
                                    (params_.k1 + 1.0F) /
                                    (static_cast<float>(posting.tf) + params_.k1 *
                                     (1.0F - params_.b + params_.b *
                                      static_cast<float>(dl) / static_cast<float>(avgdl)));
-                    local[posting.ord] += static_cast<float>(idf) * tf_norm;
+                    local[ord] += static_cast<float>(idf) * tf_norm;
                 }
             }
             return local;
@@ -204,8 +207,11 @@ auto InvertedIndex::search_phrase(
     std::unordered_map<std::uint64_t, float> scores;
 
     auto& first_pl = tps[0].pl_copy;
-    for (auto& posting : first_pl.items) {
-        if (!live_checker.is_live(posting.ord)) continue;
+    auto first_ords = first_pl.decompress_ords();
+    for (std::size_t i = 0; i < first_pl.items.size(); ++i) {
+        auto& posting = first_pl.items[i];
+        auto posting_ord = first_ords[i];
+        if (!live_checker.is_live(posting_ord)) continue;
 
         std::uint32_t phrase_tf = 0;
         for (auto start_pos : posting.positions) {
@@ -213,7 +219,7 @@ auto InvertedIndex::search_phrase(
             for (std::size_t t = 1; t < tps.size(); ++t) {
                 auto needed = static_cast<std::uint32_t>(start_pos + t);
                 auto& other_pl = tps[t].pl_copy;
-                auto idx = other_pl.find(posting.ord);
+                auto idx = other_pl.find(posting_ord);
                 if (idx >= other_pl.items.size()) { match = false; break; }
                 auto& pos_list = other_pl.items[idx].positions;
                 if (!std::binary_search(pos_list.begin(), pos_list.end(), needed)) {
@@ -226,23 +232,243 @@ auto InvertedIndex::search_phrase(
 
         if (phrase_tf > 0) {
             std::size_t live_df = 0;
-            for (auto& p : first_pl.items) {
-                if (live_checker.is_live(p.ord)) ++live_df;
+            for (std::size_t j = 0; j < first_pl.items.size(); ++j) {
+                if (live_checker.is_live(first_ords[j])) ++live_df;
             }
-            auto idf = std::log(static_cast<double>(N + 1) / static_cast<double>(live_df + 1));
-            auto dl = live_checker.doc_len(posting.ord);
+            auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
+            auto dl = live_checker.doc_len(posting_ord);
             auto tf_norm = static_cast<float>(phrase_tf) *
                            (params_.k1 + 1.0F) /
                            (static_cast<float>(phrase_tf) + params_.k1 *
                             (1.0F - params_.b + params_.b *
                              static_cast<float>(dl) / static_cast<float>(avgdl)));
-            scores[posting.ord] += static_cast<float>(idf) * tf_norm;
+            scores[posting_ord] += static_cast<float>(idf) * tf_norm;
         }
     }
 
     using Entry = std::pair<float, std::uint64_t>;
     std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
     for (auto& [ord, score] : scores) {
+        if (heap.size() < k) {
+            heap.push({score, ord});
+        } else if (score > heap.top().first) {
+            heap.pop();
+            heap.push({score, ord});
+        }
+    }
+
+    std::vector<SearchResult> results;
+    results.reserve(heap.size());
+    while (!heap.empty()) {
+        auto& [score, ord] = heap.top();
+        results.push_back({ord, score});
+        heap.pop();
+    }
+    std::reverse(results.begin(), results.end());
+    return results;
+}
+
+auto InvertedIndex::bool_search(
+    const QueryNode& query,
+    std::size_t k,
+    const LiveChecker& live_checker) const -> std::vector<SearchResult> {
+    std::vector<std::string> must_terms;
+    std::vector<std::string> should_terms;
+    std::vector<std::string> must_not_terms;
+    collect_terms(query, must_terms, should_terms, must_not_terms);
+
+    struct TermPostings {
+        std::string term;
+        PostingList pl_copy;
+        bool is_must;
+    };
+    std::vector<TermPostings> must_tps;
+    must_tps.reserve(must_terms.size());
+    for (auto& term : must_terms) {
+        auto& shard = shard_for(term);
+        tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+        if (shard.inverted.find(acc, term)) {
+            must_tps.push_back({term, acc->second, true});
+        }
+    }
+
+    std::vector<TermPostings> should_tps;
+    should_tps.reserve(should_terms.size());
+    for (auto& term : should_terms) {
+        auto& shard = shard_for(term);
+        tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+        if (shard.inverted.find(acc, term)) {
+            should_tps.push_back({term, acc->second, false});
+        }
+    }
+
+    std::vector<TermPostings> must_not_tps;
+    must_not_tps.reserve(must_not_terms.size());
+    for (auto& term : must_not_terms) {
+        auto& shard = shard_for(term);
+        tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+        if (shard.inverted.find(acc, term)) {
+            must_not_tps.push_back({term, acc->second, false});
+        }
+    }
+
+    std::vector<std::uint64_t> must_not_ords;
+    for (auto& tp : must_not_tps) {
+        auto ords = tp.pl_copy.decompress_ords();
+        for (std::size_t i = 0; i < tp.pl_copy.items.size(); ++i) {
+            if (live_checker.is_live(ords[i])) {
+                must_not_ords.push_back(ords[i]);
+            }
+        }
+    }
+    std::sort(must_not_ords.begin(), must_not_ords.end());
+    must_not_ords.erase(std::unique(must_not_ords.begin(), must_not_ords.end()), must_not_ords.end());
+
+    if (must_tps.empty() && should_tps.empty()) return {};
+
+    std::vector<std::uint64_t> candidates;
+
+    if (!must_tps.empty()) {
+        bool all_terms_found = true;
+        for (auto& term : must_terms) {
+            auto& shard = shard_for(term);
+            tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+            if (!shard.inverted.find(acc, term)) {
+                all_terms_found = false;
+                break;
+            }
+        }
+
+        if (!all_terms_found) {
+            return {};
+        }
+
+        std::vector<std::uint64_t> intersection;
+        bool first_must = true;
+        for (auto& tp : must_tps) {
+            std::vector<std::uint64_t> ords;
+            auto decompressed = tp.pl_copy.decompress_ords();
+            for (std::size_t i = 0; i < tp.pl_copy.items.size(); ++i) {
+                if (live_checker.is_live(decompressed[i])) {
+                    ords.push_back(decompressed[i]);
+                }
+            }
+            std::sort(ords.begin(), ords.end());
+            ords.erase(std::unique(ords.begin(), ords.end()), ords.end());
+
+            if (first_must) {
+                intersection = std::move(ords);
+                first_must = false;
+            } else {
+                std::vector<std::uint64_t> tmp;
+                tmp.reserve(std::min(intersection.size(), ords.size()));
+                std::set_intersection(intersection.begin(), intersection.end(),
+                                      ords.begin(), ords.end(),
+                                      std::back_inserter(tmp));
+                intersection = std::move(tmp);
+            }
+        }
+        candidates = std::move(intersection);
+    } else if (!should_tps.empty()) {
+        for (auto& tp : should_tps) {
+            auto decompressed = tp.pl_copy.decompress_ords();
+            for (std::size_t i = 0; i < tp.pl_copy.items.size(); ++i) {
+                if (live_checker.is_live(decompressed[i])) {
+                    candidates.push_back(decompressed[i]);
+                }
+            }
+        }
+        std::sort(candidates.begin(), candidates.end());
+        candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+    } else {
+        return {};
+    }
+
+    for (auto& tp : should_tps) {
+        auto decompressed = tp.pl_copy.decompress_ords();
+        for (std::size_t i = 0; i < tp.pl_copy.items.size(); ++i) {
+            if (live_checker.is_live(decompressed[i])) {
+                candidates.push_back(decompressed[i]);
+            }
+        }
+    }
+    std::sort(candidates.begin(), candidates.end());
+    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+
+    std::vector<std::uint64_t> filtered;
+    filtered.reserve(candidates.size());
+    for (auto ord : candidates) {
+        if (!std::binary_search(must_not_ords.begin(), must_not_ords.end(), ord)) {
+            filtered.push_back(ord);
+        }
+    }
+    candidates = std::move(filtered);
+
+    if (candidates.empty()) return {};
+
+    auto N = live_doc_count_;
+    auto sum_dl = sum_doc_len_;
+    auto avgdl = N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
+
+    std::vector<TermPostings> all_tps;
+    all_tps.insert(all_tps.end(), must_tps.begin(), must_tps.end());
+    all_tps.insert(all_tps.end(), should_tps.begin(), should_tps.end());
+
+    std::sort(all_tps.begin(), all_tps.end(), [](const auto& a, const auto& b) {
+        return a.term < b.term;
+    });
+    all_tps.erase(std::unique(all_tps.begin(), all_tps.end(), [](const auto& a, const auto& b) {
+        return a.term == b.term;
+    }), all_tps.end());
+
+    std::unordered_map<std::string, float> term_idf;
+    for (auto& tp : all_tps) {
+        std::size_t live_df = 0;
+        auto decompressed = tp.pl_copy.decompress_ords();
+        for (std::size_t i = 0; i < tp.pl_copy.items.size(); ++i) {
+            if (live_checker.is_live(decompressed[i])) ++live_df;
+        }
+        if (live_df == 0) continue;
+        auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) /
+                          (static_cast<double>(live_df) + 0.5));
+        term_idf[tp.term] = static_cast<float>(idf);
+    }
+
+    struct ScoreAcc {
+        std::unordered_map<std::uint64_t, float> scores;
+    };
+
+    ScoreAcc acc;
+    for (auto ord : candidates) {
+        acc.scores[ord] = 0.0f;
+    }
+
+    for (auto& tp : all_tps) {
+        auto idf_it = term_idf.find(tp.term);
+        if (idf_it == term_idf.end()) continue;
+        auto idf = idf_it->second;
+        auto decompressed = tp.pl_copy.decompress_ords();
+
+        for (std::size_t i = 0; i < tp.pl_copy.items.size(); ++i) {
+            auto posting_ord = decompressed[i];
+            if (!live_checker.is_live(posting_ord)) continue;
+            auto it = acc.scores.find(posting_ord);
+            if (it == acc.scores.end()) continue;
+
+            auto dl = live_checker.doc_len(posting_ord);
+            auto tf_norm = static_cast<float>(tp.pl_copy.items[i].tf) *
+                           (params_.k1 + 1.0F) /
+                           (static_cast<float>(tp.pl_copy.items[i].tf) + params_.k1 *
+                            (1.0F - params_.b + params_.b *
+                             static_cast<float>(dl) / static_cast<float>(avgdl)));
+            it->second += idf * tf_norm;
+        }
+    }
+
+    using Entry = std::pair<float, std::uint64_t>;
+    std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
+
+    for (auto& [ord, score] : acc.scores) {
         if (heap.size() < k) {
             heap.push({score, ord});
         } else if (score > heap.top().first) {
@@ -298,10 +524,18 @@ auto InvertedIndex::df_live(std::string_view term, const LiveChecker& live_check
     return count;
 }
 
+void InvertedIndex::finalize_all_postings() {
+    for (auto& shard : shards_) {
+        for (auto it = shard.inverted.begin(); it != shard.inverted.end(); ++it) {
+            it->second.finalize();
+        }
+    }
+}
+
 // ---- 持久化 ----
 
 static constexpr std::uint32_t kInvMagic   = 0x494E5632;
-static constexpr std::uint32_t kInvVersion = 1;
+static constexpr std::uint32_t kInvVersion = 2;
 
 auto InvertedIndex::save(std::string_view path) const -> bool {
     auto* f = std::fopen(std::string(path).c_str(), "wb");
@@ -335,16 +569,45 @@ auto InvertedIndex::save(std::string_view path) const -> bool {
             ok = write_u32(pc);
             if (!ok) { std::fclose(f); return false; }
 
-            for (auto& posting : pl.items) {
-                ok = write_u64(posting.ord) && write_u32(posting.tf);
+            if (pl.finalized && !pl.compressed_ords.empty()) {
+                // VByte gap 编码格式（version=2）
+                std::uint8_t comp = 1;
+                ok = write_u32(comp);
                 if (!ok) { std::fclose(f); return false; }
+                auto csize = static_cast<std::uint32_t>(pl.compressed_ords.size());
+                ok = write_u32(csize);
+                if (!ok) { std::fclose(f); return false; }
+                if (std::fwrite(pl.compressed_ords.data(), 1, csize, f) != csize) {
+                    std::fclose(f); return false;
+                }
+                for (auto& posting : pl.items) {
+                    ok = write_u32(posting.tf);
+                    if (!ok) { std::fclose(f); return false; }
+                    auto posc = static_cast<std::uint32_t>(posting.positions.size());
+                    ok = write_u32(posc);
+                    if (!ok) { std::fclose(f); return false; }
+                    if (posc > 0) {
+                        if (std::fwrite(posting.positions.data(), 4, posc, f) != posc) {
+                            std::fclose(f); return false;
+                        }
+                    }
+                }
+            } else {
+                // 原始格式（version=1 或未压缩）
+                std::uint8_t comp = 0;
+                ok = write_u32(comp);
+                if (!ok) { std::fclose(f); return false; }
+                for (auto& posting : pl.items) {
+                    ok = write_u64(posting.ord) && write_u32(posting.tf);
+                    if (!ok) { std::fclose(f); return false; }
 
-                auto posc = static_cast<std::uint32_t>(posting.positions.size());
-                ok = write_u32(posc);
-                if (!ok) { std::fclose(f); return false; }
-                if (posc > 0) {
-                    if (std::fwrite(posting.positions.data(), 4, posc, f) != posc) {
-                        std::fclose(f); return false;
+                    auto posc = static_cast<std::uint32_t>(posting.positions.size());
+                    ok = write_u32(posc);
+                    if (!ok) { std::fclose(f); return false; }
+                    if (posc > 0) {
+                        if (std::fwrite(posting.positions.data(), 4, posc, f) != posc) {
+                            std::fclose(f); return false;
+                        }
                     }
                 }
             }
@@ -372,7 +635,10 @@ auto InvertedIndex::load(std::string_view path) -> bool {
 
     auto magic = read_u32();
     auto ver = read_u32();
-    if (magic != kInvMagic || ver != kInvVersion) {
+    if (magic != kInvMagic) {
+        std::fclose(f); return false;
+    }
+    if (ver != kInvVersion && ver != 1) {
         std::fclose(f); return false;
     }
 
@@ -397,15 +663,56 @@ auto InvertedIndex::load(std::string_view path) -> bool {
 
             PostingList pl;
             pl.items.resize(pc);
-            for (std::uint32_t p = 0; p < pc; ++p) {
-                pl.items[p].ord = read_u64();
-                pl.items[p].tf = read_u32();
-                auto posc = read_u32();
-                if (posc == 0xFFFFFFFF) { std::fclose(f); return false; }
-                pl.items[p].positions.resize(posc);
-                if (posc > 0) {
-                    if (std::fread(pl.items[p].positions.data(), 4, posc, f) != posc) {
-                        std::fclose(f); return false;
+
+            if (ver == 2) {
+                auto comp = read_u32();
+                if (comp == 0xFFFFFFFF) { std::fclose(f); return false; }
+                if (comp == 1) {
+                    pl.finalized = true;
+                    auto csize = read_u32();
+                    if (csize == 0xFFFFFFFF) { std::fclose(f); return false; }
+                    pl.compressed_ords.resize(csize);
+                    if (csize > 0) {
+                        if (std::fread(pl.compressed_ords.data(), 1, csize, f) != csize) {
+                            std::fclose(f); return false;
+                        }
+                    }
+                    for (std::uint32_t p = 0; p < pc; ++p) {
+                        pl.items[p].tf = read_u32();
+                        auto posc = read_u32();
+                        if (posc == 0xFFFFFFFF) { std::fclose(f); return false; }
+                        pl.items[p].positions.resize(posc);
+                        if (posc > 0) {
+                            if (std::fread(pl.items[p].positions.data(), 4, posc, f) != posc) {
+                                std::fclose(f); return false;
+                            }
+                        }
+                    }
+                } else {
+                    for (std::uint32_t p = 0; p < pc; ++p) {
+                        pl.items[p].ord = read_u64();
+                        pl.items[p].tf = read_u32();
+                        auto posc = read_u32();
+                        if (posc == 0xFFFFFFFF) { std::fclose(f); return false; }
+                        pl.items[p].positions.resize(posc);
+                        if (posc > 0) {
+                            if (std::fread(pl.items[p].positions.data(), 4, posc, f) != posc) {
+                                std::fclose(f); return false;
+                            }
+                        }
+                    }
+                }
+            } else {
+                for (std::uint32_t p = 0; p < pc; ++p) {
+                    pl.items[p].ord = read_u64();
+                    pl.items[p].tf = read_u32();
+                    auto posc = read_u32();
+                    if (posc == 0xFFFFFFFF) { std::fclose(f); return false; }
+                    pl.items[p].positions.resize(posc);
+                    if (posc > 0) {
+                        if (std::fread(pl.items[p].positions.data(), 4, posc, f) != posc) {
+                            std::fclose(f); return false;
+                        }
                     }
                 }
             }

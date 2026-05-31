@@ -77,6 +77,9 @@ public:
     [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
     search_phrase(std::string_view query, std::size_t k) const;
 
+    [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
+    bool_search(std::string_view query, std::size_t k) const;
+
     // ---- 恢复：从磁盘 record 重放活文档 ----
     // 与 Collection::recover 逻辑相同（全量 analyze + add_doc）。
     void recover_doc(std::string_view key, std::uint64_t ord,
@@ -92,6 +95,13 @@ public:
 
     // ---- 快照加载 ----
     [[nodiscard]] std::expected<bool, std::string> load_snapshot(std::string_view path);
+
+    // 从磁盘重建倒排索引：遍历 Index 中所有 live 文档，通过 doc_reader 回调读取文本，
+    // 重新分词并构建全新的 InvertedIndex，原子替换旧的。
+    // doc_reader(file_id, offset, total_sz) → 返回文档文本，失败返回 std::nullopt。
+    using DocReader = std::function<std::optional<std::string>(
+        std::uint32_t, std::uint64_t, std::uint32_t)>;
+    void rebuild_index(DocReader doc_reader);
 
     // ---- 访问内部组件（Phase 4 集成用）----
     [[nodiscard]] index::Index&       index()       { return index_; }

@@ -1063,6 +1063,16 @@ Cask::search_phrase(std::string_view query, std::size_t k) {
     return TextSearchResult{std::move(*hits)};
 }
 
+// bool_search：BM25 布尔搜索（AND/OR/NOT）。
+std::expected<TextSearchResult, CaskFault>
+Cask::bool_search(std::string_view query, std::size_t k) {
+    if (!search_) return std::unexpected(err(CaskError::kNoIndex));
+    flush_index();
+    auto hits = search_->bool_search(query, k);
+    if (!hits) return std::unexpected(err(CaskError::kIo, hits.error()));
+    return TextSearchResult{std::move(*hits)};
+}
+
 std::expected<void, CaskFault> Cask::sync() {
     if (active_data_) {
         if (auto r = active_data_->sync(); !r) {
@@ -1148,6 +1158,26 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
     auto r = merge::run_merge(files, dirname_, *keydir_, opts_.o_sync, search_.get());
     if (!r) {
         return std::unexpected(err(CaskError::kIo, r.error().detail));
+    }
+
+    if (search_) {
+        if (index_pool_) index_pool_->flush();
+
+        search_->rebuild_index(
+            [this](std::uint32_t fid, std::uint64_t off, std::uint32_t sz)
+                -> std::optional<std::string> {
+                auto* df = read_file(fid);
+                if (!df) return std::nullopt;
+                auto rec = df->read(off, sz);
+                if (!rec) return std::nullopt;
+                auto dv = codec::decode_doc_value(
+                    std::span<const std::byte>(rec->value.data(), rec->value.size()));
+                if (!dv || !dv->has_text) return std::nullopt;
+                return std::string(reinterpret_cast<const char*>(dv->text.data()), dv->text.size());
+            });
+
+        auto snap = dirname_ + "/bm25_snapshot.inv";
+        search_->save_snapshot(snap);
     }
 
     // 关键顺序：先关 fd 再 unlink。

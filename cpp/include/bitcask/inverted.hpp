@@ -31,6 +31,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include "bitcask/query.hpp"
+#include "bitcask/vbyte.hpp"
+
 namespace bitcask::bm25 {
 
 // 一条 posting 记录：文档 ord + 该 term 在文档中的词频。
@@ -44,6 +47,31 @@ struct Posting {
 // 同一个 ord 不会出现两次（add_doc 保证）。
 struct PostingList {
     std::vector<Posting> items;
+
+    // VByte 压缩 ord 存储（finalize 后使用）。
+    std::vector<std::uint8_t> compressed_ords;
+    bool finalized = false;
+
+    // 压缩所有 ord 为 VByte gap 编码。
+    void finalize() {
+        if (items.empty() || finalized) return;
+        std::vector<std::uint64_t> ords;
+        ords.reserve(items.size());
+        for (auto& p : items) ords.push_back(p.ord);
+        compressed_ords = codec::gap_encode(ords);
+        finalized = true;
+    }
+
+    // 解压返回 ord 数组。
+    [[nodiscard]] std::vector<std::uint64_t> decompress_ords() const {
+        if (!finalized || compressed_ords.empty()) {
+            std::vector<std::uint64_t> ords;
+            ords.reserve(items.size());
+            for (auto& p : items) ords.push_back(p.ord);
+            return ords;
+        }
+        return codec::gap_decode(compressed_ords);
+    }
 
     // 按 ord 查找（二分，用于 add_doc 去重 / remove_doc 定位）。
     [[nodiscard]] auto find(std::uint64_t ord) const -> std::size_t;
@@ -105,6 +133,11 @@ public:
         std::size_t k,
         const LiveChecker& live_checker) const -> std::vector<SearchResult>;
 
+    [[nodiscard]] auto bool_search(
+        const QueryNode& query,
+        std::size_t k,
+        const LiveChecker& live_checker) const -> std::vector<SearchResult>;
+
     auto save(std::string_view path) const -> bool;
     auto load(std::string_view path) -> bool;
 
@@ -116,6 +149,9 @@ public:
     // 调试：返回 term 的 df（posting list 长度，含死点）。
     [[nodiscard]] auto df(std::string_view term) const -> std::size_t;
     [[nodiscard]] auto df_live(std::string_view term, const LiveChecker& live_checker) const -> std::size_t;
+
+    // 压缩所有 posting list 的 ord 为 VByte gap 编码。
+    void finalize_all_postings();
 
 private:
     static constexpr std::size_t kShardCount = 64;

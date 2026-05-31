@@ -96,6 +96,18 @@ public:
     // ---- 内省 ----
     [[nodiscard]] IndexInfo info() const;
 
+    // 遍历所有 live 文档，对每个调用 fn(ord, ext_id, slot)。
+    // 线程安全：持 shared_lock。
+    template <typename Fn>
+    void for_each_live(Fn&& fn) const {
+        std::shared_lock lk(mutex_);
+        for (std::uint64_t ord = 0; ord < slots_.size(); ++ord) {
+            if (live_[ord]) {
+                fn(ord, ord2ext_[ord], slots_[ord]);
+            }
+        }
+    }
+
 private:
     mutable std::shared_mutex mutex_;
 

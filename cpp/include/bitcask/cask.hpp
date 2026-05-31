@@ -256,6 +256,9 @@ public:
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
     search_phrase(std::string_view query, std::size_t k = 10);
 
+    [[nodiscard]] std::expected<TextSearchResult, CaskFault>
+    bool_search(std::string_view query, std::size_t k = 10);
+
     // 访问内部 SearchLayer（用于 NIF 层）。
     [[nodiscard]] bool has_search() const { return search_ != nullptr; }
     [[nodiscard]] search::SearchLayer* search() { return search_.get(); }

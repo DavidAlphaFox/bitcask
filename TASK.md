@@ -215,6 +215,128 @@
 
 ---
 
+## BM25 搜索引擎完善（S1-S8）
+
+> 基于 Lucene/Elasticsearch/Tantivy 行业基准审计，补齐 BM25 实现的关键缺失。
+
+### S1 — P0：修正 IDF 公式为 Lucene 标准
+
+**目标**：当前 IDF 使用简化公式 `log((N+1)/(df+1))`，偏离 Robertson-Sparck Jones 标准，对高频/低频词区分度不足。修正为 Lucene 标准公式。
+
+| # | 目标 | 改动范围 | 关键内容 | 状态 |
+|---|------|---------|---------|------|
+| **S1.1** | search() IDF 修正 | `inverted.cpp` | `log((N+1)/(df+1))` → `log(1 + (N - df + 0.5) / (df + 0.5))`（Lucene 标准，避免负 IDF） | ⬜ |
+| **S1.2** | search_phrase() IDF 修正 | `inverted.cpp` | 同 S1.1，phrase 搜索的 IDF 也要统一 | ⬜ |
+| **S1.3** | df 参数语义确认 | `inverted.cpp` | 确认传入 IDF 的 df 使用 `live_df`（非 `items.size()`），当前已正确 | ⬜ |
+| **S1.4** | 回归测试 | 全量 | 相关性排序结果可能变化，需验证测试通过 | ⬜ |
+
+---
+
+### S2 — P1：Merge 时重建倒排索引（清理死 posting）
+
+**目标**：当前删除文档的 posting 永不物理删除，内存无限增长。Merge 只调用 `on_relocate()` 更新存储位置，不清理死 posting。需在 merge 时重建紧凑倒排索引。
+
+| # | 目标 | 改动范围 | 关键内容 | 状态 |
+|---|------|---------|---------|------|
+| **S2.1** | SearchLayer::rebuild_index | `search_layer.hpp/.cpp` | 新增方法：遍历 Index 中所有 live DocSlot → 清空 InvertedIndex → 逐文档重新 add_doc | ⬜ |
+| **S2.2** | Merge 后触发 rebuild | `cask.cpp` / `merger.cpp` | merge 完成后调用 `search_->rebuild_index()` 重建紧凑索引 | ⬜ |
+| **S2.3** | rebuild 期间搜索可用性 | `search_layer.cpp` | rebuild 期间旧索引仍可查询（写新索引到新 InvertedIndex，原子 swap） | ⬜ |
+| **S2.4** | rebuild 后持久化 | `cask.cpp` | rebuild 完成后 save snapshot 覆盖旧文件 | ⬜ |
+| **S2.5** | 测试 | `search_layer_test.cpp` / `cask_docvalue_test.cpp` | put→delete→merge→search 验证死 posting 清理 | ⬜ |
+
+---
+
+### S3 — P2：布尔查询支持（AND/OR/NOT）
+
+**目标**：当前只有 bag-of-words（所有查询词 OR 关系）。支持布尔组合查询。
+
+| # | 目标 | 改动范围 | 关键内容 | 状态 |
+|---|------|---------|---------|------|
+| **S3.1** | QueryAST 数据结构 | 新建 `query.hpp` | `enum Op { MUST, SHOULD, MUST_NOT }`；`struct QueryNode { Op op; string term; vector<QueryNode> children; }` | ⬜ |
+| **S3.2** | 查询解析器 | 新建 `query_parser.hpp/.cpp` | 解析简单查询语法：`+hello +world`（MUST）、`hello world`（SHOULD）、`-test`（MUST_NOT） | ⬜ |
+| **S3.3** | bool_search 实现 | `inverted.cpp` | MUST：所有 term posting 取交集；SHOULD：并集评分；MUST_NOT：排除 | ⬜ |
+| **S3.4** | Cask/SearchLayer 接口扩展 | `cask.hpp` / `search_layer.hpp` | `search_text(query, k, filter)` 或 `search_bool(query_ast, k)` | ⬜ |
+| **S3.5** | NIF 接口扩展 | `nif_cask.cpp` | Erlang 侧传入查询语法字符串或 AST map | ⬜ |
+| **S3.6** | 测试 | `inverted_test.cpp` | AND/OR/NOT 各场景 + 组合查询 | ⬜ |
+
+---
+
+### S4 — P3：Posting 压缩（VByte gap encoding）
+
+**目标**：当前 posting 是 `vector<Posting>` 无压缩，内存占用高。对 ord 做差值编码 + VByte 压缩。
+
+| # | 目标 | 改动范围 | 关键内容 | 状态 |
+|---|------|---------|---------|------|
+| **S4.1** | VByte 编解码器 | 新建 `vbyte.hpp` | `vbyte_encode/gap_encode` 和 `vbyte_decode/gap_decode` 内联函数 | ⬜ |
+| **S4.2** | PostingList 存储改造 | `inverted.hpp` | PostingList 使用压缩存储：`vector<uint8_t> compressed_ords` + `vector<uint8_t> compressed_tfs` + 解压缓存 | ⬜ |
+| **S4.3** | add_doc 写入压缩 | `inverted.cpp` | 新 posting 追加时做 gap + VByte 编码 | ⬜ |
+| **S4.4** | search 解压迭代 | `inverted.cpp` | 搜索时流式解压 posting list（不全文解压到内存） | ⬜ |
+| **S4.5** | save/load 兼容 | `inverted.cpp` | 持久化格式写入压缩后的字节，加载时直接读入 | ⬜ |
+| **S4.6** | 压缩率 + 性能基准测试 | `inverted_test.cpp` | 对比压缩前后内存占用和搜索延迟 | ⬜ |
+
+---
+
+### S5 — P4：Block-Max WAND 早终止
+
+**目标**：当前 DAAT 遍历所有匹配 posting。对 top-k 查询，实现 Block-Max WAND 跳过不可能进入 top-k 的文档块。
+
+| # | 目标 | 改动范围 | 关键内容 | 状态 |
+|---|------|---------|---------|------|
+| **S5.1** | Posting 分块 | `inverted.hpp` | PostingList 按 128 个 posting 分 block，每 block 存储 `max_tf` 和 `max_ord` | ⬜ |
+| **S5.2** | Block-Max 元数据维护 | `inverted.cpp` | add_doc 时更新 block max；分块阈值触发新 block | ⬜ |
+| **S5.3** | WAND 框架 | 新建 `wand.hpp/.cpp` | WAND 迭代器：维护 term cursor + upper_bound → pivot 选择 → skip | ⬜ |
+| **S5.4** | search 集成 WAND | `inverted.cpp` | `search()` 检测 posting list 长度 > 阈值时走 WAND 路径，否则走 DAAT fallback | ⬜ |
+| **S5.5** | 正确性验证 | `inverted_test.cpp` | WAND 结果与 DAAT 完全一致（精确 top-k） | ⬜ |
+| **S5.6** | 性能基准 | benchmark | 对比 WAND vs DAAT 在不同 posting list 长度下的延迟 | ⬜ |
+
+---
+
+### S6 — P5：查询结果缓存
+
+**目标**：热门查询重复执行全量评分。引入 LRU 缓存，相同查询+参数直接返回缓存结果。
+
+| # | 目标 | 改动范围 | 关键内容 | 状态 |
+|---|------|---------|---------|------|
+| **S6.1** | 缓存数据结构 | `search_layer.hpp` | `unordered_map<QueryHash, CachedResult>` + LRU 淘汰链；QueryHash = hash(query_terms + k) | ⬜ |
+| **S6.2** | 缓存失效策略 | `search_layer.cpp` | on_write/on_delete 时标记缓存 stale（或版本号检查） | ⬜ |
+| **S6.3** | search_text 缓存集成 | `search_layer.cpp` | 先查缓存 → miss 时正常搜索 → 写入缓存 | ⬜ |
+| **S6.4** | 缓存大小限制 | `search_layer.hpp` | 可配置最大条目数（默认 1024），超限淘汰 LRU | ⬜ |
+| **S6.5** | 测试 | `search_layer_test.cpp` | 缓存命中/失效/淘汰场景 | ⬜ |
+
+---
+
+### S7 — P6：高亮/摘要生成
+
+**目标**：搜索结果返回匹配片段（snippet），支持前后标签高亮。
+
+| # | 目标 | 改动范围 | 关键内容 | 状态 |
+|---|------|---------|---------|------|
+| **S7.1** | 位置偏移存储 | `inverted.hpp` / `analyzer.hpp` | Analyzer 返回 token 的 start/end byte offset（当前只存 position index） | ⬜ |
+| **S7.2** | 片段切分 | 新建 `highlighter.hpp/.cpp` | 按句子/固定窗口切分原文，BM25 评分选 top-N 片段 | ⬜ |
+| **S7.3** | 高亮标签插入 | `highlighter.cpp` | 在匹配 token 的 byte offset 处插入 `<em>...</em>`（可配置 tag） | ⬜ |
+| **S7.4** | API 扩展 | `search_layer.hpp` / `cask.hpp` | `search_text_ex(query, k, opts)` 返回 `SearchHitEx { ord, score, highlights }` | ⬜ |
+| **S7.5** | NIF 扩展 | `nif_cask.cpp` | 返回带 highlight 字段的 map | ⬜ |
+| **S7.6** | 测试 | `highlighter_test.cpp` | 中文/英文高亮 + 边界情况 | ⬜ |
+
+---
+
+### S8 — 锦上添花（非关键，按需实现）
+
+| # | 目标 | 改动范围 | 关键内容 | 优先级 |
+|---|------|---------|---------|--------|
+| **S8.1** | 词干提取（Stemming） | `analyzer.hpp/.cpp` | Porter/Snowball 英文词干；"running" → "run" | 低 |
+| **S8.2** | 同义词扩展 | `analyzer.hpp/.cpp` | 同义词词典 + 查询时展开；"NYC" → {"NYC", "New York"} | 低 |
+| **S8.3** | 模糊搜索（Fuzzy） | `inverted.cpp` | Levenshtein edit distance 匹配；"helo" → "hello" | 低 |
+| **S8.4** | 通配符搜索 | `inverted.cpp` | 前缀通配 `te*`、后缀 `*st`；需 term 字典 + 前缀树 | 低 |
+| **S8.5** | 查询时 k1/b 调节 | `inverted.hpp` / `cask.hpp` | `search(query, k, params)` 可选 Bm25Params 覆盖 | 低 |
+| **S8.6** | 多字段索引 + 权重 | `search_layer.hpp` | DocValue 多字段（title/body）独立索引 + field boost `title^3` | 低 |
+| **S8.7** | 近邻搜索（带距离） | `inverted.cpp` | `search_phrase` 支持 `NEAR/N` 窗口而非严格连续 | 低 |
+| **S8.8** | 评分解释 API | `inverted.hpp` / `cask.hpp` | `explain(query, ord)` 返回各 term 的 IDF/TF/BM25 分项得分 | 低 |
+| **S8.9** | 增量索引持久化 | `inverted.cpp` | append-only WAL 而非全量 snapshot；减少 sync 开销 | 低 |
+| **S8.10** | BM25+ / BM25L 变体 | `inverted.cpp` | 可选 δ 参数的 BM25 变体，针对长文档优化 | 低 |
+
+---
+
 ## 未来任务
 
 ### V3 — HNSW 单图 + search_vector（暂缓）
