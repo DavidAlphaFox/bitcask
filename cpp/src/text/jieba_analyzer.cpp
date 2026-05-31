@@ -246,4 +246,18 @@ auto JiebaAnalyzer::analyze(std::string_view text) const -> TermFreqMap {
     return tfs;
 }
 
+auto JiebaAnalyzer::analyze_with_offsets(std::string_view text) const -> TermTokenMap {
+    auto tpm = analyze_with_positions(text);
+    TermTokenMap ttm;
+    ttm.reserve(tpm.size());
+    for (auto& [term, data] : tpm) {
+        auto& infos = ttm[term];
+        infos.reserve(data.second.size());
+        for (auto p : data.second) {
+            infos.push_back(TokenInfo{p, 0, 0});
+        }
+    }
+    return ttm;
+}
+
 }  // namespace bitcask::text

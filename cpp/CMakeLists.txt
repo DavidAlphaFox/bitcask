@@ -107,6 +107,7 @@ target_link_libraries(bitcask_bm25 PRIVATE bitcask_warnings TBB::tbb)
 add_library(bitcask_search STATIC
     src/search/search_cache.cpp
     src/search/search_layer.cpp
+    src/search/highlighter.cpp
 )
 target_include_directories(bitcask_search PUBLIC include)
 target_link_libraries(bitcask_search

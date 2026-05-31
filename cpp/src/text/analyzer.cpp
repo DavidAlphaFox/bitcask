@@ -46,6 +46,24 @@ auto AnalyzerFactory::create(const AnalyzerConfig& config)
 }
 
 // ===========================================================================
+// Analyzer 默认实现
+// ===========================================================================
+
+auto Analyzer::analyze_with_offsets(std::string_view text) const -> TermTokenMap {
+    auto tpm = analyze_with_positions(text);
+    TermTokenMap ttm;
+    ttm.reserve(tpm.size());
+    for (auto& [term, data] : tpm) {
+        auto& infos = ttm[term];
+        infos.reserve(data.second.size());
+        for (auto p : data.second) {
+            infos.push_back(TokenInfo{p, 0, 0});
+        }
+    }
+    return ttm;
+}
+
+// ===========================================================================
 // 内部辅助（detail 命名空间中仅 analyzer.cpp 使用的函数）
 // ===========================================================================
 
@@ -260,6 +278,63 @@ auto WhitespaceAnalyzer::analyze(std::string_view text) const -> TermFreqMap {
         tfs.emplace(term, data.first);
     }
     return tfs;
+}
+
+auto WhitespaceAnalyzer::analyze_with_offsets(std::string_view text) const -> TermTokenMap {
+    if (text.empty()) return {};
+
+    auto normalized = detail::nfkc_fold(text);
+    if (normalized.empty()) return {};
+
+    auto cps = detail::to_codepoints(normalized);
+    if (cps.empty()) return {};
+
+    TermTokenMap ttm;
+    std::size_t i = 0;
+    std::uint32_t pos = 0;
+
+    while (i < cps.size()) {
+        if (detail::is_unicode_space(cps[i].cp)) {
+            ++i;
+            continue;
+        }
+        std::size_t word_start = i;
+        while (i < cps.size() && !detail::is_unicode_space(cps[i].cp)) {
+            ++i;
+        }
+        auto& first = cps[word_start];
+        auto& last = cps[i - 1];
+        auto term = std::string(
+            normalized.data() + first.byte_off,
+            (last.byte_off + last.byte_len) - first.byte_off);
+        if (!term.empty()) {
+            auto& infos = ttm[std::move(term)];
+            infos.push_back(TokenInfo{pos,
+                                      static_cast<std::uint32_t>(first.byte_off),
+                                      static_cast<std::uint32_t>(last.byte_off + last.byte_len)});
+        }
+        ++pos;
+    }
+
+    return ttm;
+}
+
+// ===========================================================================
+// NgramAnalyzer
+// ===========================================================================
+
+auto NgramAnalyzer::analyze_with_offsets(std::string_view text) const -> TermTokenMap {
+    auto tpm = analyze_with_positions(text);
+    TermTokenMap ttm;
+    ttm.reserve(tpm.size());
+    for (auto& [term, data] : tpm) {
+        auto& infos = ttm[term];
+        infos.reserve(data.second.size());
+        for (auto p : data.second) {
+            infos.push_back(TokenInfo{p, 0, 0});
+        }
+    }
+    return ttm;
 }
 
 }  // namespace bitcask::text

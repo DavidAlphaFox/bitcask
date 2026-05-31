@@ -20,9 +20,11 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <expected>
 #include <vector>
 #include "bitcask/analyzer.hpp"
+#include "bitcask/highlighter.hpp"
 #include "bitcask/index.hpp"
 #include "bitcask/inverted.hpp"
 #include "bitcask/search_cache.hpp"
@@ -41,6 +43,14 @@ struct SearchHit {
     std::string   key;   // 外部 key（由 caller 通过 index_.ord_to_ext 翻译）
     std::uint64_t ord;   // 文档 ord
     double        score; // BM25 分数
+};
+
+// 带高亮的搜索结果。
+struct SearchHitEx {
+    std::string              key;
+    std::uint64_t            ord;
+    double                   score;
+    std::vector<Snippet>     highlights;
 };
 
 class SearchLayer {
@@ -82,6 +92,11 @@ public:
     [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
     bool_search(std::string_view query, std::size_t k) const;
 
+    // ---- 搜索（带高亮）----
+    [[nodiscard]] std::expected<std::vector<SearchHitEx>, std::string>
+    search_text_highlight(std::string_view query, std::size_t k,
+                          const HighlightOptions& opts = {}) const;
+
     // ---- 恢复：从磁盘 record 重放活文档 ----
     // 与 Collection::recover 逻辑相同（全量 analyze + add_doc）。
     void recover_doc(std::string_view key, std::uint64_t ord,
@@ -115,6 +130,7 @@ private:
     std::unique_ptr<bm25::InvertedIndex> inverted_;
     std::unique_ptr<text::Analyzer>      analyzer_;
     mutable SearchCache cache_;
+    std::unordered_map<std::uint64_t, std::string> doc_texts_;
 };
 
 }  // namespace bitcask::search

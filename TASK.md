@@ -311,12 +311,12 @@
 
 | # | 目标 | 改动范围 | 关键内容 | 状态 |
 |---|------|---------|---------|------|
-| **S7.1** | 位置偏移存储 | `inverted.hpp` / `analyzer.hpp` | Analyzer 返回 token 的 start/end byte offset（当前只存 position index） | ⬜ |
-| **S7.2** | 片段切分 | 新建 `highlighter.hpp/.cpp` | 按句子/固定窗口切分原文，BM25 评分选 top-N 片段 | ⬜ |
-| **S7.3** | 高亮标签插入 | `highlighter.cpp` | 在匹配 token 的 byte offset 处插入 `<em>...</em>`（可配置 tag） | ⬜ |
-| **S7.4** | API 扩展 | `search_layer.hpp` / `cask.hpp` | `search_text_ex(query, k, opts)` 返回 `SearchHitEx { ord, score, highlights }` | ⬜ |
-| **S7.5** | NIF 扩展 | `nif_cask.cpp` | 返回带 highlight 字段的 map | ⬜ |
-| **S7.6** | 测试 | `highlighter_test.cpp` | 中文/英文高亮 + 边界情况 | ⬜ |
+| **S7.1** | 位置偏移存储 | `analyzer.hpp` | 新增 `TokenInfo{position, start_byte, end_byte}` + `analyze_with_offsets()` 虚方法，WhitespaceAnalyzer 实现真实偏移 | ✅ |
+| **S7.2** | 片段切分 | 新建 `highlighter.hpp/.cpp` | 固定窗口滑动 + 覆盖 query term 数评分 + top-N 非重叠片段选取 | ✅ |
+| **S7.3** | 高亮标签插入 | `highlighter.cpp` | 在匹配 token 的 byte offset 处插入可配置 pre/post tag（默认 `<em>`/`</em>`） | ✅ |
+| **S7.4** | API 扩展 | `search_layer.hpp` | `SearchHitEx{key, ord, score, highlights}` + `search_text_highlight(query, k, opts)` | ✅ |
+| **S7.5** | 文本存储 | `search_layer.cpp` | `doc_texts_` map（ord → 原始文本），on_write/recover_doc 写入，on_delete/rebuild_index 清理 | ✅ |
+| **S7.6** | 测试 | `highlighter_test.cpp` | 6 测试：英文高亮/多词/无匹配/片段大小/多片段/集成测试 | ✅ |
 
 ---
 

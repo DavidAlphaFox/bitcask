@@ -128,6 +128,14 @@ target_link_libraries(bitcask_search_layer_test PRIVATE
     bitcask_sanitizers
 )
 
+add_executable(bitcask_highlighter_test highlighter_test.cpp)
+target_link_libraries(bitcask_highlighter_test PRIVATE
+    GTest::gtest_main
+    bitcask_search
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 include(GoogleTest)
 gtest_discover_tests(bitcask_smoke_test)
 gtest_discover_tests(bitcask_codec_test)
@@ -143,6 +151,7 @@ gtest_discover_tests(bitcask_jieba_analyzer_test)
 gtest_discover_tests(bitcask_keydir_test)
 gtest_discover_tests(bitcask_cask_docvalue_test)
 gtest_discover_tests(bitcask_search_layer_test)
+gtest_discover_tests(bitcask_highlighter_test)
 
 add_executable(bitcask_thread_pool_test thread_pool_test.cpp)
 target_link_libraries(bitcask_thread_pool_test PRIVATE

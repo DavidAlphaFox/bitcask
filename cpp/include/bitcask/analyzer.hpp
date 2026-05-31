@@ -31,6 +31,17 @@ namespace bitcask::text {
 using TermFreqMap = std::unordered_map<std::string, std::uint32_t>;
 using TermPositionsMap = std::unordered_map<std::string, std::pair<std::uint32_t, std::vector<std::uint32_t>>>;
 
+// 分词结果：包含位置和字节偏移。
+struct TokenInfo {
+    std::uint32_t position;    // 词在文本中的位置序号（从 0 开始）
+    std::uint32_t start_byte;   // token 在原文中的起始字节偏移
+    std::uint32_t end_byte;    // token 在原文中的结束字节偏移（不含）
+};
+
+// analyze_with_offsets 返回每个 token 的详细信息。
+// 返回值：unordered_map<term, vector<TokenInfo>>
+using TermTokenMap = std::unordered_map<std::string, std::vector<TokenInfo>>;
+
 // --------------------------------------------------------------------------
 // 分词器类型枚举。
 // 新增分词方案时在此添加枚举值 + 工厂分支 + 对应 Analyzer 子类。
@@ -68,16 +79,15 @@ class Analyzer {
 public:
     virtual ~Analyzer() = default;
 
-    // 对文本进行分词，返回 term → 词频映射。
-    // 输入必须是合法 UTF-8；非法字节作为孤立字节处理（不崩溃）。
-    // 线程安全：是（实现保证无可变共享状态）。
     [[nodiscard]] virtual auto analyze(std::string_view text) const
         -> TermFreqMap = 0;
 
     [[nodiscard]] virtual auto analyze_with_positions(std::string_view text) const
         -> TermPositionsMap = 0;
 
-    // 返回分词器类型标识（用于调试/序列化）。
+    [[nodiscard]] virtual auto analyze_with_offsets(std::string_view text) const
+        -> TermTokenMap;
+
     [[nodiscard]] virtual auto type() const noexcept -> AnalyzerType = 0;
 };
 

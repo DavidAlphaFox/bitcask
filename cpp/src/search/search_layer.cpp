@@ -33,6 +33,7 @@ void SearchLayer::on_write(std::string_view key, std::uint64_t ord,
     if (!term_data.empty()) {
         inverted_->add_doc(ord, term_data);
     }
+    doc_texts_[ord] = std::string(text);
     cache_.invalidate();
 }
 
@@ -42,6 +43,7 @@ std::optional<std::uint64_t> SearchLayer::on_delete(std::string_view key, std::u
 
     inverted_->remove_doc(slot->doc_len, {});
     index_.remove(key, tomb_ord);
+    doc_texts_.erase(slot->doc_len);
     cache_.invalidate();
     return tomb_ord;
 }
@@ -173,6 +175,7 @@ void SearchLayer::recover_doc(std::string_view key, std::uint64_t ord,
     if (!term_data.empty()) {
         inverted_->add_doc(ord, term_data);
     }
+    doc_texts_[ord] = std::string(text);
     cache_.invalidate();
 }
 
@@ -196,6 +199,7 @@ std::expected<bool, std::string> SearchLayer::load_snapshot(std::string_view pat
 
 void SearchLayer::rebuild_index(DocReader doc_reader) {
     auto new_inv = std::make_unique<bm25::InvertedIndex>(config_.bm25_params);
+    doc_texts_.clear();
 
     index_.for_each_live([&](std::uint64_t ord,
                               const std::string& /*ext_id*/,
@@ -207,11 +211,65 @@ void SearchLayer::rebuild_index(DocReader doc_reader) {
         if (term_data.empty()) return;
 
         new_inv->add_doc(ord, term_data);
+        doc_texts_[ord] = *text;
     });
 
     new_inv->finalize_all_postings();
     inverted_ = std::move(new_inv);
     cache_.invalidate();
+}
+
+std::expected<std::vector<SearchHitEx>, std::string>
+SearchLayer::search_text_highlight(std::string_view query, std::size_t k,
+                                   const HighlightOptions& opts) const {
+    auto term_freqs = analyzer_->analyze(query);
+    if (term_freqs.empty()) return std::vector<SearchHitEx>{};
+
+    auto cache_key = CacheKey::make("highlight", query, k);
+    auto* cached = cache_.get(cache_key);
+
+    std::vector<bm25::SearchResult> results;
+    if (cached) {
+        results = *cached;
+    } else {
+        std::vector<std::string> terms;
+        terms.reserve(term_freqs.size());
+        for (auto& [term, _] : term_freqs) {
+            terms.push_back(term);
+        }
+
+        results = inverted_->search(terms, k, index_);
+        cache_.put(cache_key, results);
+    }
+
+    std::vector<SearchHitEx> hits;
+    hits.reserve(results.size());
+    for (auto& r : results) {
+        auto ext_id = index_.ord_to_ext(r.ord);
+        if (!ext_id) continue;
+
+        auto it = doc_texts_.find(r.ord);
+        if (it == doc_texts_.end()) continue;
+
+        auto token_offsets = analyzer_->analyze_with_offsets(it->second);
+        std::unordered_map<std::string, std::vector<text::TokenInfo>> query_token_offsets;
+        for (auto& [term, _] : term_freqs) {
+            auto it_token = token_offsets.find(term);
+            if (it_token != token_offsets.end()) {
+                query_token_offsets[term] = it_token->second;
+            }
+        }
+
+        auto hl_result = highlight(it->second, query_token_offsets, opts);
+
+        hits.push_back(SearchHitEx{
+            std::move(*ext_id),
+            r.ord,
+            r.score,
+            std::move(hl_result.snippets)
+        });
+    }
+    return hits;
 }
 
 }  // namespace bitcask::search
