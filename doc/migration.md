@@ -1,157 +1,170 @@
-# Migration Guide: legacy → cask_cpp
+# Feature Status and API Reference
 
-This is the practical guide for moving an existing bitcask deployment off
-the legacy C NIF onto the C++ rewrite. Read `doc/cpp-arch.md` for the
-implementation map and `doc/format.md` for the on-disk spec — neither
-changes byte-level, so existing data is readable as-is.
+This document describes the current bitcask feature set, the complete API
+surface, and operational characteristics. All operations go through the C++
+NIF — there is no legacy mode.
 
-## TL;DR
+## Overview
 
-```erlang
-%% Before (or with -DTEST):
-R = bitcask:open(Dir, [read_write]).
+The C++23 NIF (`cask_cpp`) is the only available mode. `bitcask_legacy.erl`
+has been deleted. All API calls route through `bitcask_cpp_nifs` →
+`priv/bitcask_cpp.so`.
 
-%% After:
-R = bitcask:open(Dir, [read_write, {nifs, cask_cpp}]).
-```
+- **KV mode** (default): `open(Dir, [read_write])` — plain key/value storage
+- **Index mode**: `open(Dir, [read_write, {analyzer, ...}])` — adds BM25
+  full-text search; creates `bitcask.meta` with `mode=kIndex`
 
-Or set the default once:
+Both modes share the same on-disk format (typed records `kDoc`/`kTombstone`).
 
-```erlang
-application:set_env(bitcask, default_nif_mode, cask_cpp).
-```
+## API Reference
 
-The compiled-in default is `cask_cpp` in production builds and `legacy`
-under `-DTEST`. The latter exists so the 80+ legacy white-box eunit
-tests keep running unchanged; new tests opt into cask via
-`{nifs, cask_cpp}` explicitly.
+| Erlang API                    | C++ NIF            | Notes                                              |
+|-------------------------------|--------------------|----------------------------------------------------|
+| `bitcask:open/1,2`            | `cask_open/2`      | Returns resource ref                               |
+| `bitcask:close/1`             | `cask_close/1`     | Releases write/merge lock                         |
+| `bitcask:get/2`               | `cask_get/2`       |                                                    |
+| `bitcask:put/3`               | `cask_put/3`       | `put(_, _, tombstone)`等价于`delete`               |
+| `bitcask:delete/2`            | `cask_delete/2`    | Soft-delete (tombstone)                            |
+| `bitcask:sync/1`              | `cask_sync/1`      | fsync active data file                             |
+| `bitcask:search_text/2,3`     | `cask_search_text/3`| BM25 bag-of-words; index mode only               |
+| `bitcask:search_phrase/2,3`   | `cask_search_phrase/3`| BM25 phrase; index mode only                     |
+| `bitcask:fold/3,6`            | `cask_fold_start/3,4` + iterators | 3-step iterator (start/next/release)     |
+| `bitcask:fold_keys/3,6`       | `cask_fold_start/3,4` + iterators | Returns `#bitcask_entry` records          |
+| `bitcask:list_keys/1`         | via `cask_fold_*`   | Collects keys into a list                         |
+| `bitcask:stream/1`            | via `cask_fold_*`  | Producer/consumer streaming iterator              |
+| `bitcask:next/1`              | via `cask_fold_*`  | Pull next entry                                   |
+| `bitcask:stop/1`              | via `cask_fold_*`  | Stop and release stream                           |
+| `bitcask:with_stream/2`       | via `cask_fold_*`  | RAII wrapper                                      |
+| `bitcask:merge/1,2,3`         | `cask_merge/2`     | Opens `merge_only` cask, merges, closes           |
+| `bitcask:needs_merge/1,2`     | `cask_needs_merge/1`| Returns `{true, {Files, Expired}}` or `false`    |
+| `bitcask:status/1`            | `cask_status/1`    | Returns `{KeyCount, Files}`                       |
+| `bitcask:is_empty_estimate/1` | `cask_is_empty/1`  | O(1) estimate                                      |
+| `bitcask:is_frozen/1`         | `cask_is_frozen/1` | Keydir frozen state                               |
+| `bitcask:close_write_file/1`  | `cask_close_write_file/1` | Release write lock, keep handle usable        |
 
-## What changes for the caller
+## Options
 
-| API                              | Behaviour under `cask_cpp`                              |
-|----------------------------------|---------------------------------------------------------|
-| `open/1,2`                       | Returns the cask resource handle as `Ref`               |
-| `close/1`                        | Closes the cask, releases write/merge lock              |
-| `get/2`, `put/3`, `delete/2`     | Round-trip through the C++ NIF                          |
-| `sync/1`                         | `fsync(2)` on the active data file                       |
-| `list_keys/1`                    | Walks `cask_fold_*` internally                          |
-| `fold/3`, `fold_keys/3`          | Walks `cask_fold_*` internally; `fold_keys` callbacks see real `#bitcask_entry` fields |
-| `merge/1,2,3`                    | Opens a `merge_only` cask, runs the merge, closes        |
-| `needs_merge/1,2`                | Routes to `cask_needs_merge`                             |
-| `status/1`                       | Returns `{KeyCount, Files}` (matches legacy 2-tuple)     |
-| `is_empty_estimate/1`            | Routes to `cask_is_empty`                                |
-| `is_frozen/1`                    | Surfaces the keydir's iter-frozen state (M5.2 task 5)    |
+Options flow through `?CASK_PASSTHROUGH_OPTS` in `src/bitcask.erl`. Unrecognised
+options are silently dropped.
 
-## What's not (yet) implemented in cask_cpp
+### General
 
-These three legacy APIs **fall through to `bitcask_legacy:`** even when
-`{nifs, cask_cpp}` is selected:
+| Option                      | Default | Description                              |
+|-----------------------------|---------|------------------------------------------|
+| `read_write`                | `false` | Open with write permission               |
+| `{expiry_secs, N}`          | `0`     | Records older than N seconds are filtered on get/fold; also triggers merge |
+| `{max_file_size, B}`        | `2 GiB` | Active file rolls over at B bytes        |
+| `{sync_strategy, none}`     | (default) | No auto-sync                           |
+| `{sync_strategy, o_sync}`   | —       | O_SYNC every write                       |
+| `{sync_strategy, {seconds, N}}` | —    | Caller-driven sync                       |
+| `{tombstone_version, V}`    | `0`     | `0` = `bitcask_tombstone` (17 B); `2` = `bitcask_tombstone2` (22 B, supports concurrent control) |
 
-- `iterator/3, iterator_next/1, iterator_release/1`
-- `fold/6, fold_keys/6` (the variants taking `MaxAge`, `MaxPut`,
-  `SeeTombstones`)
-- `close_write_file/1` (legacy test helper; cask manages active writer
-  internally so it's a no-op)
+### Merge Policy
 
-Plus four utility helpers that delegate:
+| Option                      | Default | Description                              |
+|-----------------------------|---------|------------------------------------------|
+| `frag_merge_trigger`        | `60`    | Percent fragmentation to trigger merge   |
+| `dead_bytes_merge_trigger`  | `512 MB`| Dead bytes to trigger merge              |
+| `frag_threshold`            | `40`    | Per-file fragmentation threshold          |
+| `dead_bytes_threshold`      | `128 MB`| Per-file dead bytes threshold            |
+| `small_file_threshold`      | `10 MB` | Total size below which file is included   |
+| `expiry_grace_time`         | —       | Grace period after expiry_secs            |
+| `max_merge_size`           | —       | Maximum total size to merge in one pass  |
 
-- `get_opt/2`, `is_tombstone/1`, `has_pending_delete_bit/1`,
-  `get_filestate/2`
+### Index Mode (Full-Text Search)
 
-These exist mostly because `bitcask_fileops` and `bitcask_merge_delete`
-are still legacy modules. M6 will collapse them.
+| Option                      | Default | Description                              |
+|-----------------------------|---------|------------------------------------------|
+| `{analyzer, ngram\|jieba\|whitespace}` | `ngram` | Analyzer type; must be set to enable search |
+| `{dict_path, binary()}`     | —       | Path to jieba dictionary (required for `jieba`) |
+| `{enable_stop_words, boolean()}` | `false` | Enable stop word filtering               |
 
-## Options that flow through to the cask
+## Operational Notes
 
-The Erlang option list passes through `?CASK_PASSTHROUGH_OPTS` in
-`src/bitcask.erl`. Recognised opts:
+### Two-Lock Model
 
-```erlang
-{expiry_secs, N}          % records older than N seconds are filtered
-{max_file_size, B}        % active file rolls over at B bytes (default 2 GB)
-{sync_strategy, none}     % no auto-sync (default)
-{sync_strategy, o_sync}   % O_SYNC every write
-{sync_strategy, {seconds, N}}  % accepted; caller-driven (matches legacy)
-{tombstone_version, 2}    % write v2 tombstones (default v0)
-%% merge policy ----------------------------------------------------
-{frag_merge_trigger, Pct}        % default 60
-{dead_bytes_merge_trigger, B}    % default 512 MiB
-{frag_threshold, Pct}            % default 40
-{dead_bytes_threshold, B}        % default 128 MiB
-{small_file_threshold, B}        % default 10 MiB
-{expiry_grace_time, S}
-{max_merge_size, B}
-```
+`bitcask:merge/1,2,3` acquires `bitcask.merge.lock` — **not**
+`bitcask.write.lock`. A live writer keeps running concurrently. The merger
+reads the writer's lock file to learn which file id is active and excludes it
+from merge candidates. Two mergers on the same dir still serialize on
+`merge.lock`.
 
-Anything else is silently dropped (legacy did the same).
-
-## Operational changes
-
-### Two-lock model
-
-`bitcask_merge_worker` (cask path) acquires `bitcask.merge.lock`, **not**
-`bitcask.write.lock`. A live writer keeps running. The merger reads the
-writer's lock file to learn which file id is active and excludes it from
-merge candidates. Two mergers on the same dir still serialize on
-`merge.lock` (good).
-
-### Stale lock reclamation
+### Stale Lock Reclamation
 
 If a previous writer process died without releasing `bitcask.write.lock`,
-opening the dir again now succeeds: `Cask::open` reads the lock contents,
-checks `kill(pid, 0)`, and unlinks the file if `ESRCH`. Empty/malformed
-lock files are also treated as stale.
+opening the dir again succeeds: `Cask::open` reads the lock contents, checks
+`kill(pid, 0)`, and unlinks the file if `ESRCH`. Empty/malformed lock files
+are also treated as stale.
 
-### Torn-write tail recovery
+### Torn-Write Tail Recovery
 
-Opening a dir as a writer after a mid-record crash will trim the tail of
-the last data file back to the last successfully-decoded record. Read-only
-opens leave the file alone. No more "skip-CRC-errors-forever-and-eat-disk"
-behaviour.
+Opening a dir as a writer after a mid-record crash will trim the tail of the
+last data file back to the last successfully-decoded record. Read-only opens
+leave the file alone. No more "skip-CRC-errors-forever-and-eat-disk" behaviour.
 
-### Merge actually deletes old files
+### Merge Deletes Old Files Inline
 
-Cask's merge unlinks both the `.data` and `.hint` of files it merged away
-and calls `keydir_->trim_fstats()` so the file-stats slate is clean. The
-legacy implementation deferred this to a separate `bitcask_merge_delete`
-gen_server; cask does it inline.
+Cask's merge unlinks both the `.data` and `.hint` of merged-away files and
+calls `keydir_->trim_fstats()` so the file-stats slate is clean. There is no
+separate deferred delete process.
 
-## Cross-mode compatibility
+## What's Not Yet Implemented
 
-A directory written by `legacy` can be reopened under `cask_cpp` and vice
-versa. The on-disk format is byte-identical — the only thing that changes
-is which code path interprets the bytes. Verified via the
-`cross_mode_*` tests in `test/bitcask_cpp_cask_gap_tests.erl`.
+See `TASK.md` for the full roadmap (U0–U6).
 
-## Rolling out
+- **Unified Cask + Collection architecture**: planned; currently `Cask` and
+  `Collection` are separate classes. U0–U6 will merge them.
+- **HNSW vector search**: designed but not yet implemented.
+- **`put_doc` / `upgrade`**: available in C++ (`Cask::put_doc`, `Cask::upgrade`);
+  NIF exposure is partial.
 
-1. Build with cask_cpp as default (`default_nif_mode_compiled() =
-   cask_cpp` is the production build). Run your existing eunit suite —
-   it still uses `legacy` because of `-DTEST`.
-2. Add a per-feature opt-in in your application code: pass
-   `{nifs, cask_cpp}` for the bitcasks you want to migrate first.
+## Rolling Out
+
+1. Build with `rebar3 compile` — the C++ NIF is the only option.
+2. Run your existing tests — the on-disk format is unchanged; existing data
+   is readable as-is.
 3. Watch `bitcask:status/1`, `bitcask:needs_merge/1`, and the
-   `bitcask.write.lock` content evolve — the lock now contains
-   `<pid> <active_data_path>\n` instead of just `<pid>`.
-4. After a soak period, flip the runtime default:
-   `application:set_env(bitcask, default_nif_mode, cask_cpp)`.
-5. Once you're confident, drop the option entirely and rely on the
-   compiled-in default.
+   `bitcask.write.lock` content.
+4. To enable full-text search, open with `{analyzer, ngram}` (or `jieba` for
+   Chinese with `{dict_path, Path}`).
 
-## Rollback
+## Common Errors
 
-Just pass `{nifs, legacy}` (or set the app env to `legacy`) and reopen.
-The data files are unchanged, so the legacy code reads them without
-issue. Hint files written by cask validate under legacy too.
+| Return                       | Cause                                   | Fix                                     |
+|------------------------------|-----------------------------------------|----------------------------------------|
+| `{error, write_locked}`      | Live writer holds the lock              | Close the prior cask, or pick another dir |
+| `not_found`                  | Key never existed / deleted / expired   | Normal                                 |
+| `{error, bad_crc}`           | Disk corruption on read                 | Restore from backup; merge skips these |
+| `{error, key_too_large}`     | Key > 65 535 bytes                      | Format limit; not configurable          |
+| `{error, value_too_large}`    | Value > 4 GiB                           | Format limit                            |
+| `{error, no_index}`          | Search called on KV-mode Cask           | Reopen with `{analyzer, ...}`          |
+| `{error, merge_locked}`      | Another merger already running          | Wait for it to finish                   |
 
-## When NOT to migrate yet
+## Expiry
 
-- You depend on `iterator/3` or the `fold/6` variants — they fall through
-  to legacy today but you'd be running mixed paths.
-- You need `key_transform` — wontfix in cask_cpp; rare in production.
-- You depend on `tombstone_version=1` — cask reads v1 but doesn't write
-  it (only v0 default and v2 opt-in).
-- You rely on `bitcask_merge_delete`'s deferred unlink behaviour for some
-  external coordination.
+Records older than `expiry_secs` seconds are invisible to `get`/`list_keys`/`fold`.
+They are also candidates for expiry-triggered merge once past
+`now - (expiry_secs + expiry_grace_time)`.
 
-For all other cases, `cask_cpp` is the recommended default.
+```erlang
+1> R = bitcask:open(Dir, [read_write, {expiry_secs, 60}]).
+2> bitcask:put(R, <<"k">>, <<"v">>).
+3> timer:sleep(61000).
+4> bitcask:get(R, <<"k">>).           not_found
+```
+
+## Crash Recovery
+
+If a writer process crashes leaving `bitcask.write.lock`, the next
+`open(Dir, [read_write])` checks whether the recorded PID is still alive.
+If not (or the lock file is empty/malformed), the stale lock is unlinked and
+the open succeeds.
+
+```erlang
+%% Process A writes, then crashes:
+1> R = bitcask:open("/tmp/db", [read_write]).
+
+%% Process B reopens — stale lock is reclaimed:
+2> R2 = bitcask:open("/tmp/db", [read_write]).
+#Ref<...>   % succeeds
+```

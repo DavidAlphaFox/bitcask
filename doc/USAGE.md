@@ -1,33 +1,32 @@
 # bitcask Usage Guide
 
-This guide assumes the C++23 NIF refactor is in place (M2–M4). Production
-default is the coarse-grained `cask_cpp` NIF; legacy paths remain available
-behind explicit opts.
+This guide covers the C++23 NIF (`cask_cpp`) — the only mode available.
+All operations go through `bitcask_cpp_nifs` → `priv/bitcask_cpp.so`.
 
 ## Build & Shell
 
 ```bash
 cd /path/to/bitcask
-rebar3 compile        # produces priv/bitcask.so + priv/bitcask_cpp.so
-rebar3 shell          # production-mode shell (default = cask_cpp)
+rebar3 compile        # produces priv/bitcask_cpp.so
+rebar3 shell          # start a production-mode shell
 ```
 
 ## NIF Modes
 
-| Mode       | When | Selector |
-|------------|------|----------|
-| `cask_cpp` | production default; coarse-grained C++ NIF | `bitcask:open(D)` (no opt) |
-| `cpp`      | C++ NIF, fine-grained (keydir/file 散件) | `{nifs, cpp}` |
-| `legacy`   | original C NIF | `{nifs, legacy}` |
-
-Override the global default:
+There is **one mode only**: `cask_cpp` (coarse-grained C++ NIF).
 
 ```erlang
-application:set_env(bitcask, default_nif_mode, legacy).  % rollback
+%% Production default — no option needed
+R = bitcask:open("/tmp/db", [read_write]).
+
+%% To force KV mode explicitly (default when no analyzer is set):
+R = bitcask:open("/tmp/db", [read_write]).
+
+%% To enable full-text search, add an analyzer:
+R = bitcask:open("/tmp/db", [read_write, {analyzer, ngram}]).
 ```
 
-Test profile (`-DTEST` / `rebar3 eunit`) is pinned to `legacy` for
-backwards compatibility with existing white-box tests.
+No legacy fallback exists — `bitcask_legacy.erl` has been deleted.
 
 ## Basic Operations
 
@@ -40,6 +39,81 @@ backwards compatibility with existing white-box tests.
 6> bitcask:delete(R, <<"k">>).                    ok
 7> bitcask:close(R).                              ok
 ```
+
+### Full-Text Search (Index Mode)
+
+Open with an analyzer to enable BM25 search:
+
+```erlang
+%% Open with BM25 index — creates bitcask.meta with mode=kIndex
+1> R = bitcask:open("/tmp/db", [read_write, {analyzer, ngram}]).
+
+%% Put documents — accepts binary or #{text => binary(), meta => binary()}
+2> bitcask:put(R, <<"doc1">>, <<"Beijing Chaoyang district">>).
+3> bitcask:put(R, <<"doc2">>, <<"Shanghai Pudong area">>).
+4> bitcask:put(R, <<"doc3">>, <<"Beijing Chaoyang is a district">>).
+
+%% BM25 bag-of-words search
+5> bitcask:search_text(R, <<"Beijing">>, 10).
+{ok,[{<<"doc1">>,0.288},{<<"doc3">>,0.288}]}
+
+%% BM25 phrase search (tokens must be adjacent)
+6> bitcask:search_phrase(R, <<"Beijing Chaoyang">>, 10).
+{ok,[{<<"doc1">>,0.287}]}
+
+7> bitcask:close(R).
+```
+
+**Analyzer options:**
+
+| Analyzer    | Description                                     |
+|-------------|-------------------------------------------------|
+| `ngram`     | Default; n-gram tokenization                     |
+| `jieba`     | Chinese word segmentation (requires `{dict_path, Path}`) |
+| `whitespace`| Simple space-separated tokenization             |
+
+**Return format:** `[{Key :: binary(), Score :: float()}]`
+
+**Mode constraint:** `search_text`/`search_phrase` require the Cask to be opened in index mode (bitcask.meta has `mode=kIndex`). KV mode returns `{error, no_index}`.
+
+### Streaming Fold
+
+Streaming iteration via a producer/consumer model:
+
+```erlang
+1> R = bitcask:open("/tmp/db", [read_write]).
+2> [bitcask:put(R, K, <<"v">>) || K <- [<<"a">>,<<"b">>,<<"c">>]].
+
+%% Open a stream
+3> S = bitcask:stream(R).
+
+%% Pull entries one at a time
+4> bitcask:next(S).
+{ok,<<"a">>,<<"v">>}
+5> bitcask:next(S).
+{ok,<<"b">>,<<"v">>}
+6> bitcask:next(S).
+{ok,<<"c">>,<<"v">>}
+7> bitcask:next(S).
+done
+
+%% Stop the stream (also auto-cleaned on consumer crash)
+8> bitcask:stop(S).
+
+%% RAII wrapper — automatically stops stream on exit
+9> bitcask:with_stream(R, fun(S) ->
+    loop(S, []).
+end).
+
+loop(S, Acc) ->
+    case bitcask:next(S) of
+        done         -> Acc;
+        {ok, K, V}  -> loop(S, [{K,V}|Acc]);
+        {error, E}  -> {error, E}
+    end.
+```
+
+Multiple streams can be open simultaneously on the same `Ref` — each holds an independent iterator.
 
 ## Crash Recovery
 
@@ -79,7 +153,7 @@ A merge runs only if at least one non-active file crosses **any** of these:
 | Option                       | Default | Meaning |
 |------------------------------|---------|---------|
 | `frag_merge_trigger`         | `60`    | Percent fragmentation |
-| `dead_bytes_merge_trigger`   | `512 MB` | Bytes of dead data |
+| `dead_bytes_merge_trigger`   | `512 MB`| Bytes of dead data |
 | `expiry_secs` + `expiry_grace_time` | unset | All records older than `now - (expiry_secs + grace)` |
 
 ### Per-file Inclusion Thresholds (any-of)
@@ -89,9 +163,9 @@ Once the trigger fires, each file is checked against:
 | Option                  | Default | Meaning |
 |-------------------------|---------|---------|
 | `frag_threshold`        | `40`    | Fragmentation percent |
-| `dead_bytes_threshold`  | `128 MB` | Dead bytes |
+| `dead_bytes_threshold`  | `128 MB`| Dead bytes |
 | `small_file_threshold`  | `10 MB` | Total size below which file is included |
-| (`expiry_secs`)         | unset  | Whole file expired |
+| (`expiry_secs`)         | unset   | Whole file expired |
 
 ### Configuring Thresholds
 
@@ -153,18 +227,8 @@ bitcask:open(D, [read_write, {max_file_size, 1024}]).
 6> bitcask:needs_merge(R).
 %% {true, {[file_paths_to_merge], [expired_paths]}}
 
-%% Step 5: trigger the merge. In cask_cpp mode this goes through the
-%% coarse-grained NIF directly (the legacy bitcask:merge/N facade does
-%% NOT yet dispatch to cask — known M4.2 gap).
-7> {true, {Files, _Expired}} = bitcask:needs_merge(R).
-8> bitcask_cpp_nifs:cask_merge(R, Files).
-%% {ok, {Seen, Kept, Stale, Tombs}}
-
-%% Step 6: verify the live data is intact.
-9> bitcask:get(R, <<"k">>).
-%% {ok, <<"100">>}
-
-10> bitcask:close(R).
+%% Step 5: trigger merge via the convenience wrapper
+7> do_merge(R).
 ```
 
 ### Reading the `cask_merge` Result
@@ -199,21 +263,22 @@ To force the trigger:
 ```erlang
 do_merge(R) ->
     case bitcask:needs_merge(R) of
-        false                       -> nothing_to_merge;
-        {true, {Files, _Expired}}   -> bitcask_cpp_nifs:cask_merge(R, Files)
+        false                     -> nothing_to_merge;
+        {true, {Files, _Expired}} -> bitcask_cpp_nifs:cask_merge(R, Files)
     end.
 ```
+
+After a successful `cask_merge`, the input `.data` + `.hint` files are
+unlinked and their `fstats` entries trimmed from the keydir, so disk
+usage drops immediately and `bitcask:status/1` reflects the new state.
 
 ### Known Limitations
 
 | Limitation | Workaround |
 |------------|------------|
-| `bitcask:merge/1,2,3` always dispatches to legacy | Use `bitcask_cpp_nifs:cask_merge/2` directly in cask_cpp mode |
+| `search_text`/`search_phrase` only available in index mode (bitcask.meta with `mode=kIndex`) | Open with `{analyzer, ...}` to enable |
+| Collection class is separate from Cask | Unification planned (see TASK.md U0-U6) |
 | No tombstone-v2 reverse marker on source files | Single-process workloads only; multi-process readers not supported |
-
-After a successful `cask_merge`, the input `.data` + `.hint` files are
-unlinked and their `fstats` entries trimmed from the keydir, so disk
-usage drops immediately and `bitcask:status/1` reflects the new state.
 
 ## Expiry
 
@@ -231,7 +296,7 @@ for merge so storage can be reclaimed.
 
 ## Direct cask_* NIF (Bypass facade)
 
-The bitcask facade is the supported user API. If you need the raw NIF for
+The `bitcask` facade is the supported user API. If you need the raw NIF for
 microbenchmarks or testing:
 
 ```erlang
@@ -244,8 +309,35 @@ ok      = bitcask_cpp_nifs:cask_put(R, K, V).
 {ok, K, V}      = bitcask_cpp_nifs:cask_fold_next(IR).        % or `done`
 ok              = bitcask_cpp_nifs:cask_fold_release(IR).
 
+%% Search (index mode only)
+{ok, [{K,S}]}   = bitcask_cpp_nifs:cask_search_text(R, <<"query">>, 10).
+{ok, [{K,S}]}   = bitcask_cpp_nifs:cask_search_phrase(R, <<"query">>, 10).
+
 ok = bitcask_cpp_nifs:cask_close(R).
 ```
+
+### Available cask_* NIFs
+
+| NIF | Description |
+|-----|-------------|
+| `cask_open/2` | Open a cask |
+| `cask_close/1` | Close and release resources |
+| `cask_get/2` | Read a key |
+| `cask_put/3` | Write a key/value |
+| `cask_delete/2` | Soft-delete a key |
+| `cask_sync/1` | fsync active data file |
+| `cask_close_write_file/1` | Release write lock, keep handle usable |
+| `cask_search_text/3` | BM25 bag-of-words search (index mode only) |
+| `cask_search_phrase/3` | BM25 phrase search (index mode only) |
+| `cask_fold_start/3,4` | Begin iteration |
+| `cask_fold_next/1` | Next entry (K, V) |
+| `cask_fold_next_full/1` | Next entry (K, V, FileId, Offset, Sz, Tstamp, IsTomb) |
+| `cask_fold_release/1` | Release iterator |
+| `cask_is_empty/1` | O(1) empty estimate |
+| `cask_is_frozen/1` | Keydir frozen state |
+| `cask_status/1` | `{KeyCount, Files}` |
+| `cask_needs_merge/1` | `{true, {Files, Expired}}` or `false` |
+| `cask_merge/2` | Run merge on specified files |
 
 ## Common Errors
 
@@ -253,7 +345,7 @@ ok = bitcask_cpp_nifs:cask_close(R).
 |--------|-------|-----|
 | `{error, write_locked}` | Live writer holds the lock | Close the prior cask, or pick another dir |
 | `not_found`             | Key never existed / deleted / expired | Normal |
-| `{error, eexist}`       | (legacy mode) write.lock exists | Stale lock auto-cleared in cask_cpp mode |
 | `{error, bad_crc}`      | Disk corruption on read | Restore from backup; merge will skip these |
 | `{error, key_too_large}` | Key > 65 535 bytes | Format limit; not configurable |
 | `{error, value_too_large}` | Value > 4 GiB | Format limit |
+| `{error, no_index}`     | Search called on KV-mode Cask | Reopen with `{analyzer, ...}` |
