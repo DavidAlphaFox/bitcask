@@ -147,6 +147,74 @@
 
 ---
 
+## 并发架构（T1-T6）
+
+### T1 — ✅ Phase 0：消除 Index::mutex_ 搜索瓶颈
+
+| # | 目标 | 状态 |
+|---|------|------|
+| T1.1 | Posting 嵌入 doc_len | ✅ |
+| T1.2 | 原子 bitmap 替换 live_ | ✅ |
+| T1.3 | 评分循环消除锁 | ✅ |
+| T1.4 | mutex_ → structure_mutex_ | ✅ |
+| T1.5 | live_df 优化（skipped） | ✅ |
+| T1.7 | 回归测试 168/182 | ✅ |
+
+### T2 — ✅ Phase 1：引入 TBB + 线程池基础设施
+
+| # | 目标 | 状态 |
+|---|------|------|
+| T2.1 | CMake 引入 TBB | ✅ |
+| T2.2 | 线程池封装 (std::thread + concurrent_bounded_queue) | ✅ |
+| T2.3 | 索引任务队列 + IndexTask | ✅ |
+| T2.4 | Cask 持有线程池 | ✅ |
+| T2.5 | NIF 生命周期 (TbbLifetime) | ✅ |
+| T2.6 | 热升级安全 (RT_TAKEOVER) | ✅ |
+| T2.7 | 单元测试 8/8 | ✅ |
+| T2.8 | 回归测试 176/190 | ✅ |
+
+### T3 — ✅ Phase 2：异步索引队列
+
+| # | 目标 | 状态 |
+|---|------|------|
+| T3.1 | IndexTask 定义 | ✅ |
+| T3.2 | put/put_doc/remove 路径异步化 | ✅ |
+| T3.3 | Index Pool worker (std::thread) | ✅ |
+| T3.4 | 背压 (bounded queue capacity) | ✅ |
+| T3.5 | 有序性保证 (单消费者 FIFO) | ✅ |
+| T3.6 | 一致性语义 (get 强一致, search flush) | ✅ |
+| T3.8 | 回归测试 176/190 | ✅ |
+
+### T4 — ✅ Phase 3：搜索 NIF 接口变更
+
+| # | 目标 | 状态 |
+|---|------|------|
+| T4.1 | search NIF flag → ERL_NIF_DIRTY_JOB_CPU_BOUND | ✅ |
+| T4.8 | 回归测试 176/190 | ✅ |
+
+### T5 — ✅ Phase 4：InvertedIndex 扩 shard + TBB concurrent_hash_map
+
+| # | 目标 | 状态 |
+|---|------|------|
+| T5.1 | kShardCount 16→64 | ✅ |
+| T5.2 | std::unordered_map → tbb::concurrent_hash_map | ✅ |
+| T5.3 | add_doc/search/search_phrase 适配 accessor | ✅ |
+| T5.4 | save/load 移除 shared_mutex | ✅ |
+| T5.5 | CMakeLists: bitcask_bm25 链接 TBB::tbb | ✅ |
+| T5.7 | 回归测试 176/190 | ✅ |
+
+### T6 — ✅ Phase 5：并行搜索 per-shard BM25 评分
+
+| # | 目标 | 状态 |
+|---|------|------|
+| T6.1 | search() 改用 tbb::parallel_reduce | ✅ |
+| T6.2 | 线程本地 ScoreMap 无锁累加 | ✅ |
+| T6.3 | join 合并 + 单线程 top-k | ✅ |
+| T6.4 | search_phrase 保持串行（位置依赖） | ✅ |
+| T6.7 | 回归测试 176/190 | ✅ |
+
+---
+
 ## 未来任务
 
 ### V3 — HNSW 单图 + search_vector（暂缓）
