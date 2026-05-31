@@ -74,7 +74,7 @@ ERL_NIF_TERM nif_cask_merge(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM arg
 
     auto r = h->cask->merge(std::move(files));
     if (!r) return fault_to_term(env, r.error());
-    return enif_make_tuple2(env, atoms().ok,
+    return make_ok(env,
         enif_make_tuple4(env,
             enif_make_uint64(env, r->records_seen),
             enif_make_uint64(env, r->records_kept),

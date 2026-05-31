@@ -59,6 +59,9 @@ using SearchFn = std::expected<TextSearchResult, CaskFault> (Cask::*)(std::strin
 ERL_NIF_TERM search_impl(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[],
                           SearchFn search_fn);
 
+// bool_search NIF 共用实现：提取 handle + query + k，调用 bool_search，构造结果。
+ERL_NIF_TERM bool_search_impl(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+
 // fold_start / fold_start4 共用实现。
 // 创建迭代器、启动快照、包装成 NIF 资源 term。
 ERL_NIF_TERM fold_start_impl(ErlNifEnv* env, CaskHandle* h,

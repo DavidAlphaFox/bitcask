@@ -46,7 +46,15 @@ CaskIterHandle* cask_iter_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept {
 // 选项解析
 // ---------------------------------------------------------------------------
 
+// ===========================================================================
+// 选项解析（open/2 的 proplist 参数）
+//
+// 格式：[atom, {Key, Value}, ...]
+// 不识别的键静默跳过，与 legacy 语义一致。
+// ===========================================================================
+
 static void parse_atom_option(ERL_NIF_TERM head, CaskOptions& o) {
+    // 解析裸 atom 选项（read_write / merge_only）。
     if (head == atoms().read_write) {
         o.read_write = true;
     } else if (head == atoms().merge_only) {
@@ -57,6 +65,7 @@ static void parse_atom_option(ERL_NIF_TERM head, CaskOptions& o) {
 
 static void parse_merge_option(ErlNifEnv* env, const ERL_NIF_TERM* tup,
                                 merge::PolicyOptions& p) {
+    // 解析合并策略相关选项 {frag_merge_trigger, Int} 等。
     if (tup[0] == atoms().frag_merge_trigger) {
         int v = 0;
         if (enif_get_int(env, tup[1], &v)) p.frag_merge_trigger = v;
@@ -85,6 +94,7 @@ static void parse_merge_option(ErlNifEnv* env, const ERL_NIF_TERM* tup,
 
 static void parse_analyzer_option(ErlNifEnv* env, const ERL_NIF_TERM* tup,
                                   CaskOptions& o) {
+    // 解析搜索/分词器选项 {analyzer, jieba|ngram|whitespace} 等。
     if (tup[0] == atoms().analyzer) {
         if (tup[1] == atoms().jieba) {
             o.search_config->analyzer_config.type = text::AnalyzerType::Jieba;
@@ -106,8 +116,9 @@ static void parse_analyzer_option(ErlNifEnv* env, const ERL_NIF_TERM* tup,
     }
 }
 
-static void parse_tuple_option(ErlNifEnv* env, const ERL_NIF_TERM* tup,
+static void parse_2tuple_option(ErlNifEnv* env, const ERL_NIF_TERM* tup,
                                 CaskOptions& o) {
+    // 解析二元组选项，分发到 merge/analyzer/general 处理器。
     if (tup[0] == atoms().read_write) {
         o.read_write = (tup[1] == atoms().atom_true);
     } else if (tup[0] == atoms().max_file_size) {
@@ -147,7 +158,7 @@ CaskOptions parse_options(ErlNifEnv* env, ERL_NIF_TERM list) {
         int arity = 0;
         const ERL_NIF_TERM* tup = nullptr;
         if (!enif_get_tuple(env, head, &arity, &tup) || arity != 2) continue;
-        parse_tuple_option(env, tup, o);
+        parse_2tuple_option(env, tup, o);
     }
     if (o.expiry_secs > 0) o.policy.expiry_secs = o.expiry_secs;
     if (o.search_config) o.enable_search = true;
@@ -216,7 +227,7 @@ ERL_NIF_TERM search_impl(ErlNifEnv* env, int, const ERL_NIF_TERM argv[],
     if (k <= 0) k = 10;
 
     if (!h->cask->has_search()) {
-        return enif_make_tuple2(env, atoms().error, atoms().no_index);
+        return make_error(env, atoms().no_index);
     }
 
     std::string_view query(
@@ -224,7 +235,29 @@ ERL_NIF_TERM search_impl(ErlNifEnv* env, int, const ERL_NIF_TERM argv[],
     auto r = (h->cask->*search_fn)(query, static_cast<std::size_t>(k));
     if (!r) return fault_to_term(env, r.error());
 
-    return enif_make_tuple2(env, atoms().ok, make_search_hits(env, r->hits));
+    return make_ok(env, make_search_hits(env, r->hits));
+}
+
+ERL_NIF_TERM bool_search_impl(ErlNifEnv* env, int, const ERL_NIF_TERM argv[]) {
+    auto* h = checked_cask_handle(env, argv[0]);
+    ErlNifBinary query_bin{};
+    if (!h || !enif_inspect_binary(env, argv[1], &query_bin)) {
+        return enif_make_badarg(env);
+    }
+
+    int k = get_int_with_default(env, argv[2], 10);
+    if (k <= 0) k = 10;
+
+    if (!h->cask->has_search()) {
+        return make_error(env, atoms().no_index);
+    }
+
+    std::string_view query(
+        reinterpret_cast<const char*>(query_bin.data), query_bin.size);
+    auto r = h->cask->bool_search(query, static_cast<std::size_t>(k));
+    if (!r) return fault_to_term(env, r.error());
+
+    return make_ok(env, make_search_hits(env, r->hits));
 }
 
 // ---------------------------------------------------------------------------
@@ -240,8 +273,8 @@ ERL_NIF_TERM fold_start_impl(ErlNifEnv* env, CaskHandle* h,
     if (*r == keydir::StartIterResult::kOutOfDate) return atoms().out_of_date;
     auto term = make_resource<CaskIterHandle>(env, g_cask_iter_resource_type,
                                                std::move(it));
-    if (!term) return enif_make_tuple2(env, atoms().error, atoms().allocation_error);
-    return enif_make_tuple2(env, atoms().ok, term);
+    if (!term) return make_error(env, atoms().allocation_error);
+    return make_ok(env, term);
 }
 
 // ---------------------------------------------------------------------------

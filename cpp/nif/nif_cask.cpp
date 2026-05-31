@@ -26,8 +26,8 @@ ERL_NIF_TERM nif_cask_open(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv
 
     auto term = make_resource<CaskHandle>(env, g_cask_resource_type,
                                            std::move(*c), nullptr);
-    if (!term) return enif_make_tuple2(env, atoms().error, atoms().allocation_error);
-    return enif_make_tuple2(env, atoms().ok, term);
+    if (!term) return make_error(env, atoms().allocation_error);
+    return make_ok(env, term);
 }
 
 ERL_NIF_TERM nif_cask_close(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
@@ -43,14 +43,14 @@ ERL_NIF_TERM nif_cask_close(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM arg
 ERL_NIF_TERM nif_cask_get(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
     auto* h = cask_handle(env, argv[0]);
     ErlNifBinary key{};
-    if (!h || !h->cask || !enif_inspect_binary(env, argv[1], &key)) {
+    if (!h || !h->cask || !ensure_binary(env, argv[1], key)) {
         return enif_make_badarg(env);
     }
     auto r = h->cask->get(as_bytes(key));
     if (!r) return fault_to_term(env, r.error());
-    ERL_NIF_TERM val_bin = make_binary_from_bytes(env, r->value, 0);
-    if (!val_bin) return enif_make_tuple2(env, atoms().error, atoms().allocation_error);
-    return enif_make_tuple2(env, atoms().ok, val_bin);
+    ERL_NIF_TERM val_bin = make_binary_checked(env, r->value);
+    if (!val_bin) return make_error(env, atoms().allocation_error);
+    return make_ok(env, val_bin);
 }
 
 ERL_NIF_TERM nif_cask_put(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
@@ -58,11 +58,11 @@ ERL_NIF_TERM nif_cask_put(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[
     if (!h || !h->cask) return enif_make_badarg(env);
 
     ErlNifBinary key{};
-    if (!enif_inspect_binary(env, argv[1], &key)) return enif_make_badarg(env);
+    if (!ensure_binary(env, argv[1], key)) return enif_make_badarg(env);
 
     if (enif_is_binary(env, argv[2])) {
         ErlNifBinary value{};
-        if (!enif_inspect_binary(env, argv[2], &value)) return enif_make_badarg(env);
+        if (!ensure_binary(env, argv[2], value)) return enif_make_badarg(env);
         auto r = h->cask->put(as_bytes(key), as_bytes(value));
         if (!r) return fault_to_term(env, r.error());
         return atoms().ok;
@@ -82,7 +82,7 @@ ERL_NIF_TERM nif_cask_put(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[
 ERL_NIF_TERM nif_cask_delete(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
     auto* h = cask_handle(env, argv[0]);
     ErlNifBinary key{};
-    if (!h || !h->cask || !enif_inspect_binary(env, argv[1], &key)) {
+    if (!h || !h->cask || !ensure_binary(env, argv[1], key)) {
         return enif_make_badarg(env);
     }
     auto r = h->cask->remove(as_bytes(key));
@@ -119,6 +119,11 @@ ERL_NIF_TERM nif_cask_search_text(ErlNifEnv* env, int argc,
 ERL_NIF_TERM nif_cask_search_phrase(ErlNifEnv* env, int argc,
                                      const ERL_NIF_TERM argv[]) {
     return search_impl(env, argc, argv, &Cask::search_phrase);
+}
+
+ERL_NIF_TERM nif_cask_bool_search(ErlNifEnv* env, int argc,
+                                   const ERL_NIF_TERM argv[]) {
+    return bool_search_impl(env, argc, argv);
 }
 
 }  // namespace bitcask::nif

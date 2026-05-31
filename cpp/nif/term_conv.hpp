@@ -102,4 +102,29 @@ inline ERL_NIF_TERM make_uint64_bin(ErlNifEnv* env, std::uint64_t value) {
     return enif_make_binary(env, &bin);
 }
 
+// 从 NIF term 中提取二进制数据。成功返回 true 并填充 bin；失败返回 false。
+// 用于替代重复的 enif_inspect_binary + badarg 模式。
+inline bool ensure_binary(ErlNifEnv* env, ERL_NIF_TERM term, ErlNifBinary& bin) noexcept {
+    return enif_inspect_binary(env, term, &bin) != 0;
+}
+
+// 构造 {ok, Value} term。
+inline ERL_NIF_TERM make_ok(ErlNifEnv* env, ERL_NIF_TERM value) noexcept {
+    return enif_make_tuple2(env, enif_make_atom(env, "ok"), value);
+}
+
+// 构造 {error, Reason} term。
+inline ERL_NIF_TERM make_error(ErlNifEnv* env, ERL_NIF_TERM reason) noexcept {
+    return enif_make_tuple2(env, enif_make_atom(env, "error"), reason);
+}
+
+// 分配二进制并拷贝数据，失败时返回 0（无效 term）。
+// 比 make_binary_from_bytes 更简洁：调用方只需检查返回值是否为 0。
+inline ERL_NIF_TERM make_binary_checked(ErlNifEnv* env, std::span<const std::byte> src) noexcept {
+    ErlNifBinary bin;
+    if (!enif_alloc_binary(src.size(), &bin)) return 0;
+    if (!src.empty()) std::memcpy(bin.data, src.data(), src.size());
+    return enif_make_binary(env, &bin);
+}
+
 }  // namespace bitcask::nif

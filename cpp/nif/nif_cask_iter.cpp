@@ -15,6 +15,49 @@
 namespace bitcask::nif {
 using namespace detail;
 
+namespace {
+
+// 释放迭代器资源（通用逻辑）。idempotent。
+static void release_iter(std::unique_ptr<CaskIter>& iter) {
+    if (iter) {
+        iter->release();
+        iter.reset();
+    }
+}
+
+// 迭代器 next 的公共逻辑：调用 iter->next()，处理错误和 EOI，
+// 成功时构造 key/value 二进制 term。
+// 返回 nullptr 表示错误或 EOI（调用方应直接返回 out_term）；
+// 返回 entry 指针表示成功（key_bin/val_bin 已填充）。
+static const CaskIterEntry* iter_next_common(
+    ErlNifEnv* env,
+    CaskIter* iter,
+    ERL_NIF_TERM eoi_term,    // EOI 时返回的 term（done 或 not_found）
+    ERL_NIF_TERM& out_term,   // 错误/EOI 时的输出 term
+    ERL_NIF_TERM& key_bin,
+    ERL_NIF_TERM& val_bin)
+{
+    auto r = iter->next();
+    if (!r) {
+        out_term = fault_to_term(env, r.error());
+        return nullptr;
+    }
+    if (!r->has_value()) {
+        out_term = eoi_term;
+        return nullptr;
+    }
+    const auto& e = **r;
+    key_bin = make_binary_checked(env, e.key);
+    val_bin = make_binary_checked(env, e.value);
+    if (!key_bin || !val_bin) {
+        out_term = make_error(env, atoms().allocation_error);
+        return nullptr;
+    }
+    return &e;
+}
+
+}  // namespace
+
 // =============================================================================
 // fold 系列
 // =============================================================================
@@ -47,13 +90,9 @@ ERL_NIF_TERM nif_cask_fold_start4(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TE
 ERL_NIF_TERM nif_cask_fold_next(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
     auto* ih = cask_iter_handle(env, argv[0]);
     if (!ih || !ih->iter) return enif_make_badarg(env);
-    auto r = ih->iter->next();
-    if (!r) return fault_to_term(env, r.error());
-    if (!r->has_value()) return atoms().done;
-    ERL_NIF_TERM key_bin = make_binary_from_bytes(env, (*r)->key, 0);
-    ERL_NIF_TERM val_bin = make_binary_from_bytes(env, (*r)->value, 0);
-    if (!key_bin || !val_bin)
-        return enif_make_tuple2(env, atoms().error, atoms().allocation_error);
+    ERL_NIF_TERM out, key_bin, val_bin;
+    auto* e = iter_next_common(env, ih->iter.get(), atoms().done, out, key_bin, val_bin);
+    if (!e) return out;
     return enif_make_tuple3(env, atoms().ok, key_bin, val_bin);
 }
 
@@ -62,23 +101,18 @@ ERL_NIF_TERM nif_cask_fold_next(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM
 ERL_NIF_TERM nif_cask_fold_next_full(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
     auto* ih = cask_iter_handle(env, argv[0]);
     if (!ih || !ih->iter) return enif_make_badarg(env);
-    auto r = ih->iter->next();
-    if (!r) return fault_to_term(env, r.error());
-    if (!r->has_value()) return atoms().done;
-    const auto& e = **r;
-    ERL_NIF_TERM key_bin = make_binary_from_bytes(env, e.key, 0);
-    ERL_NIF_TERM val_bin = make_binary_from_bytes(env, e.value, 0);
-    if (!key_bin || !val_bin)
-        return enif_make_tuple2(env, atoms().error, atoms().allocation_error);
+    ERL_NIF_TERM out, key_bin, val_bin;
+    auto* e = iter_next_common(env, ih->iter.get(), atoms().done, out, key_bin, val_bin);
+    if (!e) return out;
     ERL_NIF_TERM tup[8] = {
         atoms().ok,
         key_bin,
         val_bin,
-        enif_make_uint(env, e.file_id),
-        enif_make_uint64(env, e.offset),
-        enif_make_uint(env, e.total_sz),
-        enif_make_uint(env, e.tstamp),
-        e.is_tombstone ? atoms().atom_true : atoms().atom_false,
+        enif_make_uint(env, e->file_id),
+        enif_make_uint64(env, e->offset),
+        enif_make_uint(env, e->total_sz),
+        enif_make_uint(env, e->tstamp),
+        e->is_tombstone ? atoms().atom_true : atoms().atom_false,
     };
     return enif_make_tuple_from_array(env, tup, 8);
 }
@@ -87,10 +121,7 @@ ERL_NIF_TERM nif_cask_fold_next_full(ErlNifEnv* env, int /*argc*/, const ERL_NIF
 ERL_NIF_TERM nif_cask_fold_release(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
     auto* ih = cask_iter_handle(env, argv[0]);
     if (!ih) return enif_make_badarg(env);
-    if (ih->iter) {
-        ih->iter->release();
-        ih->iter.reset();
-    }
+    release_iter(ih->iter);
     return atoms().ok;
 }
 
@@ -127,25 +158,19 @@ ERL_NIF_TERM nif_cask_iterator_next(ErlNifEnv* env, int /*argc*/, const ERL_NIF_
     auto* h = cask_handle(env, argv[0]);
     if (!h || !h->cask) return enif_make_badarg(env);
     if (!h->iter || !h->iter->is_iterating()) {
-        return enif_make_tuple2(env, atoms().error, atoms().iteration_not_started);
+        return make_error(env, atoms().iteration_not_started);
     }
-    auto r = h->iter->next();
-    if (!r) return fault_to_term(env, r.error());
-    // EOI 用 not_found——legacy iterator_next 也是这个 atom（不是 done）。
-    if (!r->has_value()) return atoms().not_found;
-    const auto& e = **r;
-    ERL_NIF_TERM key_bin = make_binary_from_bytes(env, e.key, 0);
-    ERL_NIF_TERM val_bin = make_binary_from_bytes(env, e.value, 0);
-    if (!key_bin || !val_bin)
-        return enif_make_tuple2(env, atoms().error, atoms().allocation_error);
+    ERL_NIF_TERM out, key_bin, val_bin;
+    auto* e = iter_next_common(env, h->iter.get(), atoms().not_found, out, key_bin, val_bin);
+    if (!e) return out;
     ERL_NIF_TERM tup[7] = {
         atoms().ok,
         key_bin,
         val_bin,
-        enif_make_uint(env, e.file_id),
-        enif_make_uint64(env, e.offset),
-        enif_make_uint(env, e.total_sz),
-        enif_make_uint(env, e.tstamp),
+        enif_make_uint(env, e->file_id),
+        enif_make_uint64(env, e->offset),
+        enif_make_uint(env, e->total_sz),
+        enif_make_uint(env, e->tstamp),
     };
     return enif_make_tuple_from_array(env, tup, 7);
 }
@@ -153,10 +178,7 @@ ERL_NIF_TERM nif_cask_iterator_next(ErlNifEnv* env, int /*argc*/, const ERL_NIF_
 ERL_NIF_TERM nif_cask_iterator_release(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
     auto* h = cask_handle(env, argv[0]);
     if (!h) return enif_make_badarg(env);
-    if (h->iter) {
-        h->iter->release();
-        h->iter.reset();
-    }
+    release_iter(h->iter);
     return atoms().ok;
 }
 
