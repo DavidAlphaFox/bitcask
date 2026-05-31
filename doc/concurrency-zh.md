@@ -207,7 +207,39 @@ merger 用 `merge_only` 选项 open（内部由 `bitcask:merge/N` 触发，不�
 
 ---
 
-## 6. 总结表
+## 6. 索引模式（SearchLayer）的并发
+
+索引模式（`open(Dir, [read_write, {analyzer, ...}])`）在 Cask 内部创建
+一个 `SearchLayer` 实例，用于 BM25 全文搜索。
+
+### SearchLayer 线程模型
+
+`SearchLayer` **不是线程安全的**：内部 `InvertedIndex` 使用 16 个分片
+锁（按 term hash 分桶），但 `SearchLayer` 自身要求单写者模型。
+
+这与 KV 层的并发模型**不冲突**：
+
+| 组件            | 线程安全？ | 并发要求                                      |
+|---|---|---|
+| KeyDir          | ✅ 是      | `unique_lock` 串行写，shared_lock 并发读      |
+| SearchLayer    | ❌ 否      | 单写者（由 `Cask::put` 在同一写线程里调用）     |
+| InvertedIndex  | ✅ 是      | 内部 16 分片锁，搜索可并发                     |
+
+### InvertedIndex 分片锁
+
+`InvertedIndex` 内部按 term hash 分 16 个 shard（`std::mutex` 数组），
+搜索时对命中的 shard 加 `shared_lock` 并发查。这让多个 `search_text`
+调用可以并行——每个调用只锁自己命中的分片，不锁整个索引。
+
+### 与 KV 层的关系
+
+索引模式的 SearchLayer 不改变 KeyDir 的共享语义——同一个目录的多个
+`bitcask:open` 仍共享 KeyDir；SearchLayer 作为 `Cask` 的成员只在
+`put/delete` 路径上被调用，不影响 reader 的并发读。
+
+---
+
+## 7. 总结表
 
 ### 跨 OS 进程
 
@@ -227,7 +259,7 @@ merger 用 `merge_only` 选项 open（内部由 `bitcask:merge/N` 触发，不�
 
 ---
 
-## 7. 部署模型推荐
+## 8. 部署模型推荐
 
 **典型 Riak 风格部署**：一个 OS 节点一个 BEAM，BEAM 内一个 bitcask
 实例服务无数 Erlang 进程的并发读写。配置上：

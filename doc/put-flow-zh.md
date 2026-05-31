@@ -15,7 +15,8 @@ put(Ref, Key, tombstone) -> bitcask_cpp_nifs:cask_delete(Ref, Key);
 put(Ref, Key, Value)     -> bitcask_cpp_nifs:cask_put(Ref, Key, Value).
 ```
 
-`tombstone` atom 是历史接口糖——直接走 delete 路径。否则下沉 NIF。
+`bitcask:put/3` 直接下沉 NIF，不做 tombstone dispatch（tombstone 走
+`bitcask:delete/2`）。
 
 ---
 
@@ -48,20 +49,27 @@ put(Ref, Key, Value)     -> bitcask_cpp_nifs:cask_put(Ref, Key, Value).
    - value.size() > 4 GiB     → kValueTooLarge
 3. tstamp 默认值
    - tstamp == 0 时取当前 Unix 秒
-4. 估算本次 record 字节数
-   - about = 14 + key.size() + value.size()
-5. roll_active_if_needed(about)
+4. ★ DocValue 编码
+   - 用 codec::encode_doc_value 把 value 打包成 DocValue（text 段 = 原始 value）
+   - encoded = [Ver:1][Flags:1][Len:4][text bytes]
+5. ★ 分配 ord
+   - ord = keydir_->alloc_ord()（全局单调递增序号）
+6. 估算本次 record 字节数
+   - about = 23 + key.size() + encoded.size()     ← 23B header（新格式）
+7. roll_active_if_needed(about)
    - 没 active writer → ensure_active_writer()
    - 写入会撑爆 max_file_size → roll_active()
-6. ★ 关键 race 检查：active_file_id_ < keydir.biggest_file_id() → roll_active()
+8. ★ 关键 race 检查：active_file_id_ < keydir.biggest_file_id() → roll_active()
    - 并发 merger 抢先把 biggest_file_id 推过去了
-   - 不主动 roll 的话第 9 步 keydir.put 会被 staleness 检查拒掉，put 静默丢失
-7. active_data_->write(tstamp, key, value)        → 落 data record
-8. active_hint_->write(tstamp, total_sz, offset, false, key)  → 落 hint record
-9. keydir_->put(key, active_file_id_, total_sz, offset, tstamp,
-                0, /*newest_put=*/true, 0, 0)
-10. 如果 keydir 返回 kAlreadyExists（极少见的二段 race）→ roll + 重试一次
+   - 不主动 roll 的话第 11 步 keydir.put 会被 staleness 检查拒掉，put 静默丢失
+9. active_data_->write(kDoc, tstamp, ord, key, encoded)  → 落 data record
+10. active_hint_->write(tstamp, total_sz, offset, false, key)  → 落 hint record
+11. keydir_->put(key, active_file_id_, total_sz, offset, tstamp,
+                 0, /*newest_put=*/true, 0, 0, ord)
+12. 如果 keydir 返回 kAlreadyExists（极少见的二段 race）→ roll + 重试一次
     二次仍失败 → 上报 kAlreadyExists
+13. 如果开启了索引模式（search_ != nullptr）→ 调 search_->on_write(...)
+    在 SearchLayer 里建立 text 索引
 ```
 
 ---
@@ -92,18 +100,23 @@ put(Ref, Key, Value)     -> bitcask_cpp_nifs:cask_put(Ref, Key, Value).
 
 ### `DataFile::write` (`cpp/src/fileops/data_file.cpp`)
 
-`codec::encode_data_record` 在内存 buffer 里组装：
+`codec::encode_data_record` 在内存 buffer 里组装（23 B 固定 header）：
 
 ```
 偏移   字段      值
-─────────────────────────────────────
-0      CRC32     算 Tstamp..Value 的 zlib CRC，写到这里
-4      Tstamp    大端 u32
-8      KeySz     大端 u16
-10     ValueSz   大端 u32
-14     Key       原样字节
-14+KS  Value     原样字节
+───────────────────────────────────────
+0      CRC32     算 Type..Value 的 zlib CRC，写到这里（4 B）
+4      Type      u8：0=kDoc，1=kTombstone
+5      Tstamp    大端 u32（4 B）
+9      Ord       大端 u64（8 B）—— 单调递增的写入序号
+17     KeySz     大端 u16（2 B）
+19     ValueSz   大端 u32（4 B）
+23     Key       原样字节
+23+KS  Value     DocValue 打包字节（kDoc 时）：[Ver:1][Flags:1][可选段...]
 ```
+
+CRC 覆盖 `Type..Value`（即偏移 4 起的所有内容），不包含 CRC 字段本身。
+这与 legacy 从 `Tstamp` 开始计算不同。
 
 然后 **`file_.pwrite(current_offset_, buf)`**——注意是 pwrite 不是
 write，文件虽然带 O_APPEND 打开，但这里显式追踪偏移，方便 torn-write
@@ -111,16 +124,33 @@ write，文件虽然带 O_APPEND 打开，但这里显式追踪偏移，方便 t
 
 写完 `current_offset_ += total`，返回 `{offset, total_size}` 给上层。
 
+### DocValue 打包格式（kDoc value）
+
+`codec::encode_doc_value` 将 value 编码为：
+
+```
+偏移   字段              字节数  说明
+───────────────────────────────────────────
+0      Ver               1       1
+1      Flags             1       位掩码：bit0=has_vector, bit1=has_text, bit2=has_meta
+2      Text段（has_text 时）
+         Len             4       字节长度（大端）
+         字节数组         Len    UTF-8 文本
+[后续为可选的 vector/meta 段]
+```
+
+普通 `put(K,V)` 写入时只有 text 段（原始 value 作为 UTF-8 文本）。
+
 ### `HintFile::write` (`cpp/src/fileops/hint_file.cpp`)
 
-`codec::encode_hint_record` 组装：
+`codec::encode_hint_record` 组装（18 B 固定 header）：
 
 ```
 偏移   字段          值
 ─────────────────────────────────────
 0      Tstamp        大端 u32
 4      KeySz         大端 u16
-6      TotalSz       data record 整条字节数（含 14 B header）
+6      TotalSz       data record 整条字节数（含 23 B header）
 10     Tomb|Offset   大端 u64：(0 << 63) | offset      ← 普通 put，tomb=0
 18     Key           原样字节
 ```
@@ -142,7 +172,7 @@ trailer 用。
 4. 三大分支：
    (A) key 不存在 / 是墓碑：
        - merge race 检查：file_id < biggest_file_id_ → kAlreadyExists
-       - 没 fold → entries_[key] = SingleEntry{...}    ← 最常见路径
+       - 没 fold → entries_[key] = SingleEntry{..., ord}  ← 最常见路径
        - 在 fold → 走 pending 表
    (B)/(C) key 存在：
        - staleness 检查（newest_put=true 模式：file_id >= biggest_file_id_）
@@ -154,26 +184,36 @@ trailer 用。
 6. biggest_file_id_ = max(biggest_file_id_, file_id)
 ```
 
+`ord` 参数在第 4 步写入 SingleEntry/MultiEntry，用于 tie-breaking
+和 SearchLayer 的文档跟踪。
+
 ---
 
 ## 完整时序示意
 
 ```
 Erlang 进程              NIF/C++                       磁盘
-─────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────
 bitcask:put(R,K,V)
   └─→ cask_put NIF
         └─→ Cask::put
-              ├─[校验 + roll 检查]
+              ├─[校验 + DocValue 编码 + alloc_ord]
               ├─→ DataFile::write
-              │     └─ pwrite(off, [CRC|Ts|KS|VS|K|V])  ━━━━ <id>.bitcask.data
+              │     └─ pwrite(off, [CRC|Type|Tstamp|Ord|KS|VS|K|DocValue])
+              │                                         ━━━━ <id>.bitcask.data
               ├─→ HintFile::write
-              │     └─ write([Ts|KS|TSz|Off|K])         ━━━━ <id>.bitcask.hint
-              └─→ KeyDir::put
-                    └─ entries_[K] = {fid, off, tsz, ep++, ts}
+              │     └─ write([Tstamp|KS|TSz|Off|K])     ━━━━ <id>.bitcask.hint
+              ├─→ KeyDir::put
+              │     └─ entries_[K] = {fid,off,tsz,ep,ts,ord}
+              └─[可选]→ SearchLayer::on_write
+                        └─ InvertedIndex::add_doc
         └─ return ok
   ←─ ok
 ```
+
+DocValue 编码将原始 value 打包为 `[Ver:1][Flags:1][Len:4][text bytes]`——
+普通 put 只含 text 段。写入 record 的 type = kDoc，ord = alloc_ord()
+返回的单调递增序号。
 
 落盘顺序固定：**data → hint → keydir**。这是有意为之：
 
@@ -218,6 +258,10 @@ put 返回后任何后续 `get(K)` 立刻能看到新值（即使 OS 还没刷�
 - **file_id 单调递增**：`KeyDir::increment_file_id()` 是唯一分配器，
   active_file_id_ 永远不小于历史任何已分配 id。配合 keydir 的 staleness
   检查防止「老 file_id 写入覆盖新值」。
+- **ord 单调递增**：每次 `put` 调用 `keydir_->alloc_ord()` 获取全局单调
+  递增序号，永不复用。用于 tie-breaking、有序遍历和 SearchLayer 文档跟踪。
+- **DocValue 编码格式**：`type = kDoc` 的 value 必须是 `encode_doc_value`
+  输出的打包格式（Ver + Flags + 可选段），否则 CRC 校验会失败。
 - **data 在 hint 之前**：data 是权威，hint 只是加速重建的索引；
   hint 损坏可以从 data 重建，反之不行。
 - **keydir 在最后更新**：keydir 是 put 成功的唯一可见性边界；任何在
@@ -232,6 +276,8 @@ put 返回后任何后续 `get(K)` 立刻能看到新值（即使 OS 还没刷�
 - `cpp/src/cask/cask.cpp::ensure_active_writer` — 锁 + 文件准备
 - `cpp/src/fileops/data_file.cpp::DataFile::write` — 落 data record
 - `cpp/src/fileops/hint_file.cpp::HintFile::write` — 落 hint record
+- `cpp/src/fileops/codec.cpp::encode_data_record` / `encode_doc_value` /
+  `encode_hint_record` — 字节编码
 - `cpp/src/keydir/keydir.cpp::KeyDir::put` — 内存索引更新
-- `cpp/src/fileops/codec.cpp::encode_data_record` / `encode_hint_record` —
-  字节编码
+- `cpp/src/keydir/keydir.cpp::KeyDir::alloc_ord` — ord 分配
+- `cpp/src/search/search_layer.cpp::SearchLayer::on_write` — 索引更新（索引模式）
