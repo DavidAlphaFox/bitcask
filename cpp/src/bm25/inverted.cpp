@@ -1,4 +1,6 @@
 #include "bitcask/inverted.hpp"
+#include "bitcask/inverted_wal.hpp"
+#include "bitcask/wildcard_matcher.hpp"
 
 #include <oneapi/tbb/blocked_range.h>
 #include <oneapi/tbb/parallel_reduce.h>
@@ -68,6 +70,8 @@ auto PostingList::block_upper_bound(float idf, const Bm25Params& params, double 
 // InvertedIndex
 // ===========================================================================
 
+InvertedIndex::~InvertedIndex() = default;
+
 InvertedIndex::InvertedIndex(Bm25Params params)
     : params_(params) {}
 
@@ -101,16 +105,19 @@ void InvertedIndex::add_doc(
         ++live_doc_count_;
         sum_doc_len_ += doc_len;
     }
+
+    if (wal_) wal_->append_add_doc(ord, WalTermPositions(term_data.begin(), term_data.end()));
 }
 
 void InvertedIndex::remove_doc(
     std::uint32_t doc_len,
-    const std::unordered_map<std::string, std::uint32_t>& /*term_freqs*/) {
-    // V2: 不物理删除 posting 行，靠 search 时 live 过滤。
-    // 只更新全局统计。
+    const std::unordered_map<std::string, std::uint32_t>& term_freqs) {
     std::unique_lock lock(stats_mutex_);
     if (live_doc_count_ > 0) --live_doc_count_;
     if (sum_doc_len_ >= doc_len) sum_doc_len_ -= doc_len;
+    lock.unlock();
+
+    if (wal_) wal_->append_remove_doc(doc_len, term_freqs);
 }
 
 // ---- 查询 ----
@@ -579,6 +586,98 @@ auto InvertedIndex::search_near(
     return search_phrase_impl(query_terms, k, slop, live_checker, params_override);
 }
 
+auto InvertedIndex::search_wildcard(
+    const std::string& pattern,
+    std::size_t k,
+    const LiveChecker& live_checker,
+    const Bm25Params* params_override) const -> std::vector<SearchResult> {
+    const Bm25Params& params = params_override ? *params_override : params_;
+
+    struct TermPostings {
+        std::string term;
+        PostingList pl_copy;
+    };
+    std::vector<TermPostings> tps;
+
+    for (auto& shard : shards_) {
+        for (auto& [term, plist] : shard.inverted) {
+            if (wildcard_match(pattern, term)) {
+                tps.push_back({term, plist});
+            }
+        }
+    }
+
+    if (tps.empty()) return {};
+
+    auto N = live_doc_count_;
+    auto sum_dl = sum_doc_len_;
+    auto avgdl = N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
+
+    using ScoreMap = std::unordered_map<std::uint64_t, float>;
+
+    ScoreMap scores = tbb::parallel_reduce(
+        tbb::blocked_range<std::size_t>(0, tps.size()),
+        ScoreMap{},
+        [&](const tbb::blocked_range<std::size_t>& range, ScoreMap local) {
+            for (std::size_t ti = range.begin(); ti < range.end(); ++ti) {
+                auto& pl_copy = tps[ti].pl_copy;
+                auto ords = pl_copy.decompress_ords();
+
+                std::size_t live_df = 0;
+                for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
+                    if (live_checker.is_live(ords[i])) ++live_df;
+                }
+                if (live_df == 0) continue;
+
+                auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
+
+                for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
+                    auto& posting = pl_copy.items[i];
+                    auto ord = ords[i];
+                    if (!live_checker.is_live(ord)) continue;
+
+                    auto dl = live_checker.doc_len(ord);
+                    auto tf_norm = static_cast<float>(posting.tf) *
+                                   (params.k1 + 1.0F) /
+                                   (static_cast<float>(posting.tf) + params.k1 *
+                                    (1.0F - params.b + params.b *
+                                     static_cast<float>(dl) / static_cast<float>(avgdl)));
+                    local[ord] += static_cast<float>(idf) * (tf_norm + params.delta);
+                }
+            }
+            return local;
+        },
+        [](ScoreMap a, const ScoreMap& b) {
+            for (auto& [doc, score] : b) {
+                a[doc] += score;
+            }
+            return a;
+        }
+    );
+
+    using Entry = std::pair<float, std::uint64_t>;
+    std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
+
+    for (auto& [ord, score] : scores) {
+        if (heap.size() < k) {
+            heap.push({score, ord});
+        } else if (score > heap.top().first) {
+            heap.pop();
+            heap.push({score, ord});
+        }
+    }
+
+    std::vector<SearchResult> results;
+    results.reserve(heap.size());
+    while (!heap.empty()) {
+        auto& [score, ord] = heap.top();
+        results.push_back({ord, score});
+        heap.pop();
+    }
+    std::reverse(results.begin(), results.end());
+    return results;
+}
+
 auto InvertedIndex::bool_search(
     const QueryNode& query,
     std::size_t k,
@@ -768,6 +867,102 @@ auto InvertedIndex::bool_search(
     std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
 
     for (auto& [ord, score] : acc.scores) {
+        if (heap.size() < k) {
+            heap.push({score, ord});
+        } else if (score > heap.top().first) {
+            heap.pop();
+            heap.push({score, ord});
+        }
+    }
+
+    std::vector<SearchResult> results;
+    results.reserve(heap.size());
+    while (!heap.empty()) {
+        auto& [score, ord] = heap.top();
+        results.push_back({ord, score});
+        heap.pop();
+    }
+    std::reverse(results.begin(), results.end());
+    return results;
+}
+
+auto InvertedIndex::search_fuzzy(
+    const std::vector<std::string>& query_terms,
+    std::size_t k,
+    std::uint32_t max_edit_distance,
+    const LiveChecker& live_checker,
+    const Bm25Params* params_override) const -> std::vector<SearchResult> {
+    if (query_terms.empty()) return {};
+    const Bm25Params& params = params_override ? *params_override : params_;
+
+    struct TermPostings {
+        std::string term;
+        PostingList pl_copy;
+    };
+    std::vector<TermPostings> tps;
+
+    for (auto& query_term : query_terms) {
+        for (auto& shard : shards_) {
+            for (auto& [term, plist] : shard.inverted) {
+                if (levenshtein_distance(query_term, term) <= max_edit_distance) {
+                    tps.push_back({term, plist});
+                }
+            }
+        }
+    }
+
+    if (tps.empty()) return {};
+
+    auto N = live_doc_count_;
+    auto sum_dl = sum_doc_len_;
+    auto avgdl = N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
+
+    using ScoreMap = std::unordered_map<std::uint64_t, float>;
+
+    ScoreMap scores = tbb::parallel_reduce(
+        tbb::blocked_range<std::size_t>(0, tps.size()),
+        ScoreMap{},
+        [&](const tbb::blocked_range<std::size_t>& range, ScoreMap local) {
+            for (std::size_t ti = range.begin(); ti < range.end(); ++ti) {
+                auto& pl_copy = tps[ti].pl_copy;
+                auto ords = pl_copy.decompress_ords();
+
+                std::size_t live_df = 0;
+                for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
+                    if (live_checker.is_live(ords[i])) ++live_df;
+                }
+                if (live_df == 0) continue;
+
+                auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
+
+                for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
+                    auto& posting = pl_copy.items[i];
+                    auto ord = ords[i];
+                    if (!live_checker.is_live(ord)) continue;
+
+                    auto dl = live_checker.doc_len(ord);
+                    auto tf_norm = static_cast<float>(posting.tf) *
+                                   (params.k1 + 1.0F) /
+                                   (static_cast<float>(posting.tf) + params.k1 *
+                                    (1.0F - params.b + params.b *
+                                     static_cast<float>(dl) / static_cast<float>(avgdl)));
+                    local[ord] += static_cast<float>(idf) * (tf_norm + params.delta);
+                }
+            }
+            return local;
+        },
+        [](ScoreMap a, const ScoreMap& b) {
+            for (auto& [doc, score] : b) {
+                a[doc] += score;
+            }
+            return a;
+        }
+    );
+
+    using Entry = std::pair<float, std::uint64_t>;
+    std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
+
+    for (auto& [ord, score] : scores) {
         if (heap.size() < k) {
             heap.push({score, ord});
         } else if (score > heap.top().first) {
@@ -1063,6 +1258,33 @@ auto InvertedIndex::load(std::string_view path) -> bool {
 
     std::fclose(f);
     return true;
+}
+
+void InvertedIndex::enable_wal(std::string_view path) {
+    wal_path_ = path;
+    wal_ = std::make_unique<InvertedWal>(path);
+}
+
+void InvertedIndex::disable_wal() {
+    if (wal_) {
+        wal_->truncate();
+        wal_.reset();
+    }
+}
+
+void InvertedIndex::truncate_wal() {
+    if (wal_) wal_->truncate();
+}
+
+int InvertedIndex::replay_wal() {
+    if (!wal_) return 0;
+    // 重放时临时移交 WAL 所有权，避免 add_doc → wal_->append 的递归写入死循环。
+    auto saved = std::move(wal_);
+    int count = saved->replay(*this);
+    wal_ = std::move(saved);
+    // 重放完成后截断 WAL（条目已进入内存索引，不再需要）。
+    if (count >= 0) wal_->truncate();
+    return count;
 }
 
 }  // namespace bitcask::bm25

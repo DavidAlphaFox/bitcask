@@ -1,5 +1,6 @@
 #include "bitcask/search_layer.hpp"
 #include "bitcask/text_utils.hpp"
+#include "bitcask/highlighter.hpp"
 
 #include <algorithm>
 #include <fstream>
@@ -170,7 +171,6 @@ SearchLayer::search_text(std::string_view query, std::size_t k,
     auto term_freqs = analyzer_->analyze(query);
     if (term_freqs.empty()) return std::vector<SearchHit>{};
 
-    // S8.5：自定义 k1/b 的查询绕过缓存——避免与默认参数结果互相污染。
     auto cache_key = CacheKey::make("text", query, k);
     auto* cached = params_override ? nullptr : cache_.get(cache_key);
 
@@ -182,6 +182,9 @@ SearchLayer::search_text(std::string_view query, std::size_t k,
         terms.reserve(term_freqs.size());
         for (auto& [term, _] : term_freqs) {
             terms.push_back(term);
+        }
+        if (synonym_map_) {
+            terms = synonym_map_->expand_terms(terms);
         }
 
         const auto* inv = field_index(kDefaultField);
@@ -270,6 +273,32 @@ SearchLayer::search_near(std::string_view query, std::uint32_t slop, std::size_t
 }
 
 std::expected<std::vector<SearchHit>, std::string>
+SearchLayer::search_fuzzy(std::string_view query, std::size_t k, std::uint32_t max_edit_distance,
+                          const bm25::Bm25Params* params_override) const {
+    auto term_freqs = analyzer_->analyze(query);
+    if (term_freqs.empty()) return std::vector<SearchHit>{};
+
+    std::vector<std::string> terms;
+    terms.reserve(term_freqs.size());
+    for (auto& [term, _] : term_freqs) {
+        terms.push_back(term);
+    }
+
+    std::vector<bm25::SearchResult> results;
+    const auto* inv = field_index(kDefaultField);
+    if (inv) results = inv->search_fuzzy(terms, k, max_edit_distance, index_, params_override);
+
+    std::vector<SearchHit> hits;
+    hits.reserve(results.size());
+    for (auto& r : results) {
+        auto ext_id = index_.ord_to_ext(r.ord);
+        if (!ext_id) continue;
+        hits.push_back(SearchHit{std::move(*ext_id), r.ord, r.score});
+    }
+    return hits;
+}
+
+std::expected<std::vector<SearchHit>, std::string>
 SearchLayer::bool_search(std::string_view query, std::size_t k,
                          const bm25::Bm25Params* params_override) const {
     auto query_node = bitcask::bm25::parse_query(query);
@@ -324,11 +353,27 @@ SearchLayer::explain(std::string_view query, std::string_view key,
 }
 
 std::expected<std::vector<SearchHit>, std::string>
+SearchLayer::search_wildcard(std::string_view pattern, std::size_t k,
+                             const bm25::Bm25Params* params_override) const {
+    std::vector<bm25::SearchResult> results;
+    const auto* inv = field_index(kDefaultField);
+    if (inv) results = inv->search_wildcard(std::string(pattern), k, index_, params_override);
+
+    std::vector<SearchHit> hits;
+    hits.reserve(results.size());
+    for (auto& r : results) {
+        auto ext_id = index_.ord_to_ext(r.ord);
+        if (!ext_id) continue;
+        hits.push_back(SearchHit{std::move(*ext_id), r.ord, r.score});
+    }
+    return hits;
+}
+
+std::expected<std::vector<SearchHit>, std::string>
 SearchLayer::search_fields(std::string_view query, std::size_t k,
                            const bm25::Bm25Params* params_override) const {
     auto qnode = bitcask::bm25::parse_query(query);
 
-    // 收集叶子节点（含 field/boost）。复用 children 展平。
     std::vector<const bm25::QueryNode*> leaves;
     std::function<void(const bm25::QueryNode&)> walk = [&](const bm25::QueryNode& n) {
         if (!n.term.empty()) { leaves.push_back(&n); return; }
@@ -337,8 +382,6 @@ SearchLayer::search_fields(std::string_view query, std::size_t k,
     walk(qnode);
     if (leaves.empty()) return std::vector<SearchHit>{};
 
-    // 按字段分组：field → 该字段下 (归一化 term, boost) 列表。
-    // 字段空 → kDefaultField。term 经 analyzer 归一化（与索引一致）。
     struct FieldQuery { std::vector<std::string> terms; float boost; };
     std::unordered_map<std::string, std::vector<std::pair<std::string,float>>> by_field;
     for (auto* leaf : leaves) {
@@ -349,7 +392,6 @@ SearchLayer::search_fields(std::string_view query, std::size_t k,
         }
     }
 
-    // 各字段索引查询，boost 加权，同 ord 跨字段累加。
     std::unordered_map<std::uint64_t, double> acc;
     for (auto& [field, term_boosts] : by_field) {
         const auto* inv = field_index(field);
@@ -357,15 +399,18 @@ SearchLayer::search_fields(std::string_view query, std::size_t k,
         std::vector<std::string> terms;
         terms.reserve(term_boosts.size());
         for (auto& [t, _] : term_boosts) terms.push_back(t);
-        // 该字段所有词用同一 boost？不同词可能不同 boost——按词分别查再加权。
-        // 简化：逐词查（term 少），各自乘自身 boost。
+        if (synonym_map_) {
+            terms = synonym_map_->expand_terms(terms);
+        }
         for (auto& [t, boost] : term_boosts) {
-            auto res = inv->search({t}, k, index_, params_override);
-            for (auto& r : res) acc[r.ord] += static_cast<double>(r.score) * boost;
+            auto expanded = synonym_map_ ? synonym_map_->expand(t) : std::vector<std::string>{t};
+            for (auto& et : expanded) {
+                auto res = inv->search({et}, k, index_, params_override);
+                for (auto& r : res) acc[r.ord] += static_cast<double>(r.score) * boost;
+            }
         }
     }
 
-    // top-k。
     std::vector<std::pair<std::uint64_t,double>> ranked(acc.begin(), acc.end());
     std::partial_sort(ranked.begin(),
                       ranked.begin() + std::min(k, ranked.size()),
@@ -407,6 +452,11 @@ void SearchLayer::recover_doc(std::string_view key, std::uint64_t ord,
     cache_.invalidate();
 }
 
+void SearchLayer::set_synonym_map(std::unique_ptr<text::SynonymMap> map) {
+    synonym_map_ = std::move(map);
+    cache_.invalidate();
+}
+
 void SearchLayer::recover_tomb(std::string_view key, std::uint64_t ord) {
     index_.remove(key, ord);
 }
@@ -415,6 +465,7 @@ void SearchLayer::recover_tomb(std::string_view key, std::uint64_t ord) {
 // manifest 文本行：第一行字段数，之后每行一个字段名。字段名→序号即行号。
 std::expected<void, std::string> SearchLayer::save_snapshot(std::string_view path) const {
     const std::string base(path);
+    snapshot_path_ = base;
     std::ofstream mf(base + ".manifest", std::ios::binary);
     if (!mf) return std::unexpected("failed to open manifest for " + base);
     mf << fields_.size() << '\n';
@@ -424,6 +475,7 @@ std::expected<void, std::string> SearchLayer::save_snapshot(std::string_view pat
         if (!inv->save(base + ".f" + std::to_string(idx) + ".inv")) {
             return std::unexpected("failed to save field snapshot " + field);
         }
+        inv->truncate_wal();
         ++idx;
     }
     if (!mf.good()) return std::unexpected("failed to write manifest for " + base);
@@ -432,6 +484,7 @@ std::expected<void, std::string> SearchLayer::save_snapshot(std::string_view pat
 
 std::expected<bool, std::string> SearchLayer::load_snapshot(std::string_view path) {
     const std::string base(path);
+    snapshot_path_ = base;
     std::ifstream mf(base + ".manifest", std::ios::binary);
     if (mf) {
         std::size_t count = 0;
@@ -447,17 +500,23 @@ std::expected<bool, std::string> SearchLayer::load_snapshot(std::string_view pat
             if (!inv->load(base + ".f" + std::to_string(i) + ".inv")) {
                 return std::unexpected("failed to load field snapshot " + field);
             }
+            // S8.9：加载快照后如 WAL 文件存在，启用并重放。
+            auto wal_path = base + ".f" + std::to_string(i) + ".inv.wal";
+            if (std::ifstream(wal_path).good()) {
+                inv->enable_wal(wal_path);
+                inv->replay_wal();
+            }
             fields_.emplace(std::move(field), std::move(inv));
         }
         return true;
     }
     // 回退：无 manifest 时尝试旧单文件格式 → 映射到默认字段（向后兼容）。
-    auto inv = std::make_unique<bm25::InvertedIndex>(config_.bm25_params);
-    if (!inv->load(base)) {
+    auto inv_fallback = std::make_unique<bm25::InvertedIndex>(config_.bm25_params);
+    if (!inv_fallback->load(base)) {
         return std::unexpected(std::string("failed to load snapshot from ") + base);
     }
     fields_.clear();
-    fields_.emplace(std::string(kDefaultField), std::move(inv));
+    fields_.emplace(std::string(kDefaultField), std::move(inv_fallback));
     return true;
 }
 
@@ -480,8 +539,18 @@ void SearchLayer::rebuild_index(DocReader doc_reader) {
     });
 
     new_inv->finalize_all_postings();
+
+    const std::string default_field(kDefaultField);
+    auto it = fields_.find(default_field);
+    bool had_wal = (it != fields_.end()) && it->second->has_wal();
+
     fields_.clear();
-    fields_.emplace(std::string(kDefaultField), std::move(new_inv));
+    fields_.emplace(default_field, std::move(new_inv));
+
+    if (had_wal && !snapshot_path_.empty()) {
+        fields_[default_field]->enable_wal(snapshot_path_ + ".f0.inv.wal");
+    }
+
     cache_.invalidate();
 }
 

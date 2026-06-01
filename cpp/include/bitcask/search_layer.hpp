@@ -30,6 +30,7 @@
 #include "bitcask/index.hpp"
 #include "bitcask/inverted.hpp"
 #include "bitcask/search_cache.hpp"
+#include "bitcask/synonym_map.hpp"
 
 namespace bitcask::search {
 
@@ -118,6 +119,10 @@ public:
     bool_search(std::string_view query, std::size_t k,
                 const bm25::Bm25Params* params_override = nullptr) const;
 
+    [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
+    search_fuzzy(std::string_view query, std::size_t k, std::uint32_t max_edit_distance,
+                 const bm25::Bm25Params* params_override = nullptr) const;
+
     // ---- 多字段搜索（S8.6）----
     // 解析 `field:term^boost` 语法：有字段限定的词查对应字段索引，无限定的词
     // 查默认字段；各词得分 × boost，同一文档跨字段累加；返回 top-k。
@@ -125,6 +130,10 @@ public:
     [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
     search_fields(std::string_view query, std::size_t k,
                   const bm25::Bm25Params* params_override = nullptr) const;
+
+    [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
+    search_wildcard(std::string_view pattern, std::size_t k,
+                    const bm25::Bm25Params* params_override = nullptr) const;
 
     // ---- 评分解释（S8.8，调试/调优）----
     // 解释 query 对外部 key 文档的 BM25 评分分项。key 不存在返回 nullopt。
@@ -136,6 +145,8 @@ public:
     [[nodiscard]] std::expected<std::vector<SearchHitEx>, std::string>
     search_text_highlight(std::string_view query, std::size_t k,
                           const HighlightOptions& opts = {}) const;
+
+    void set_synonym_map(std::unique_ptr<text::SynonymMap> map);
 
     // ---- 恢复：从磁盘 record 重放活文档 ----
     // 恢复文档到索引（全量 analyze + add_doc）。
@@ -230,7 +241,9 @@ private:
                        std::vector<std::pair<std::string, std::uint32_t>>> ord_field_lens_;
     std::unique_ptr<text::Analyzer>      analyzer_;
     mutable SearchCache cache_;
-    mutable DocTextLru  doc_texts_;   // mutable：const 查询路径里 get() 会提升 LRU 顺序
+    mutable DocTextLru  doc_texts_;
+    mutable std::string snapshot_path_;
+    std::unique_ptr<text::SynonymMap> synonym_map_;
 };
 
 }  // namespace bitcask::search

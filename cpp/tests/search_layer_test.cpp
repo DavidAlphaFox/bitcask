@@ -551,3 +551,55 @@ TEST(SearchLayer, QueryTimeBm25ParamsOverride) {
     EXPECT_NE(def_top_score, ovr_top_score)
         << "override b=0 should change score vs default b=0.75";
 }
+
+TEST(SearchLayer, WalIntegration) {
+    auto config = default_config();
+    SearchLayer layer1(config);
+
+    layer1.on_write("doc1", 0, "hello world", 1, 100, 50, 1000);
+    layer1.on_write("doc2", 1, "foo bar", 1, 200, 40, 1001);
+
+    auto snapshot_path = std::filesystem::temp_directory_path() / "wal_integration_test.inv";
+    // 清理上次测试残留
+    std::filesystem::remove(snapshot_path);
+    std::filesystem::remove(snapshot_path.string() + ".manifest");
+    for (int i = 0; i < 10; ++i) {
+        std::filesystem::remove(snapshot_path.string() + ".f" + std::to_string(i) + ".inv");
+        std::filesystem::remove(snapshot_path.string() + ".f" + std::to_string(i) + ".inv.wal");
+    }
+
+    auto save_result = layer1.save_snapshot(snapshot_path.string());
+    ASSERT_TRUE(save_result.has_value());
+
+    layer1.on_write("doc3", 2, "baz qux", 1, 300, 50, 1002);
+
+    auto search_before_load = layer1.search_text("hello", 10);
+    ASSERT_TRUE(search_before_load.has_value());
+    EXPECT_EQ(search_before_load->size(), 1u);
+
+    SearchLayer layer2(config);
+    // load_snapshot 只恢复 InvertedIndex（倒排索引），不恢复 Index（ord→key 映射）。
+    // 要搜索生效，需先用 recover_doc 恢复 Index。
+    layer2.recover_doc("doc1", 0, "hello world", 1, 100, 50, 1000);
+    layer2.recover_doc("doc2", 1, "foo bar", 1, 200, 40, 1001);
+
+    auto load_result = layer2.load_snapshot(snapshot_path.string());
+    ASSERT_TRUE(load_result.has_value());
+
+    auto search_hello = layer2.search_text("hello", 10);
+    ASSERT_TRUE(search_hello.has_value());
+    ASSERT_EQ(search_hello->size(), 1u);
+    EXPECT_EQ(search_hello->at(0).key, "doc1");
+
+    auto search_foo = layer2.search_text("foo", 10);
+    ASSERT_TRUE(search_foo.has_value());
+    ASSERT_EQ(search_foo->size(), 1u);
+    EXPECT_EQ(search_foo->at(0).key, "doc2");
+
+    std::filesystem::remove(snapshot_path);
+    std::filesystem::remove(snapshot_path.string() + ".manifest");
+    for (int i = 0; i < 10; ++i) {
+        std::filesystem::remove(snapshot_path.string() + ".f" + std::to_string(i) + ".inv");
+        std::filesystem::remove(snapshot_path.string() + ".f" + std::to_string(i) + ".inv.wal");
+    }
+}

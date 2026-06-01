@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -31,8 +32,10 @@
 #include <unordered_map>
 #include <vector>
 
+#include "bitcask/fuzzy_matcher.hpp"
 #include "bitcask/query.hpp"
 #include "bitcask/vbyte.hpp"
+#include "bitcask/inverted_wal.hpp"
 
 namespace bitcask::bm25 {
 
@@ -163,6 +166,7 @@ public:
 class InvertedIndex {
 public:
     InvertedIndex() = default;
+    ~InvertedIndex();
     explicit InvertedIndex(Bm25Params params);
 
     // ---- 写 ----
@@ -210,6 +214,19 @@ public:
         const LiveChecker& live_checker,
         const Bm25Params* params_override = nullptr) const -> std::vector<SearchResult>;
 
+    [[nodiscard]] auto search_fuzzy(
+        const std::vector<std::string>& query_terms,
+        std::size_t k,
+        std::uint32_t max_edit_distance,
+        const LiveChecker& live_checker,
+        const Bm25Params* params_override = nullptr) const -> std::vector<SearchResult>;
+
+    [[nodiscard]] auto search_wildcard(
+        const std::string& pattern,
+        std::size_t k,
+        const LiveChecker& live_checker,
+        const Bm25Params* params_override = nullptr) const -> std::vector<SearchResult>;
+
     // 解释 query_terms 对文档 ord 的 BM25 评分（S8.8，调试/调优用）。
     // 用与 search() 完全相同的 idf/tf_norm 公式，逐 term 给出分项。
     // 与 search 一致：参数可被 params_override 覆盖。
@@ -234,6 +251,13 @@ public:
     // 压缩所有 posting list 的 ord 为 VByte gap 编码。
     void finalize_all_postings();
 
+    // WAL 支持（S8.9）：启用后 add_doc/remove_doc 自动追加到 WAL 文件。
+    void enable_wal(std::string_view path);
+    void disable_wal();
+    void truncate_wal();
+    bool has_wal() const { return wal_ != nullptr; }
+    int replay_wal();
+
     // 内部分片结构（公开用于测试）。
     struct Shard {
         tbb::concurrent_hash_map<std::string, PostingList> inverted;
@@ -254,6 +278,10 @@ private:
     mutable std::shared_mutex stats_mutex_;
     std::uint64_t live_doc_count_ = 0;
     std::uint64_t sum_doc_len_   = 0;
+
+    // WAL（S8.9）。
+    std::unique_ptr<InvertedWal> wal_;
+    std::string wal_path_;
 
     // Block-Max WAND 算法。
     auto search_wand(
