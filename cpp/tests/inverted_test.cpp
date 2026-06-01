@@ -418,6 +418,32 @@ TEST(InvertedIndex, BoolSearchNoMatch) {
     EXPECT_TRUE(results.empty());
 }
 
+// MUST + SHOULD 混合：MUST 决定候选集，SHOULD 只参与打分、不扩大候选。
+// 回归 S9.6 修复——此前 "只含 should、不含 must" 的文档会被错误纳入结果。
+TEST(InvertedIndex, BoolSearchMustWithShouldBoost) {
+    InvertedIndex idx;
+    idx.add_doc(0, {{"hello", tp(1, {0})}, {"world", tp(1, {1})}});  // must + should
+    idx.add_doc(1, {{"hello", tp(1, {0})}});                          // must only
+    idx.add_doc(2, {{"world", tp(1, {0})}});                          // should only（无 must）
+
+    FakeLiveChecker checker;
+    checker.doc_lens[0] = 2;
+    checker.doc_lens[1] = 1;
+    checker.doc_lens[2] = 1;
+
+    auto node = parse_query("+hello world");
+    auto results = idx.bool_search(node, 10, checker);
+
+    // doc2 不含 must 词 hello，必须被排除。
+    ASSERT_EQ(results.size(), 2u);
+    for (auto& r : results) EXPECT_NE(r.ord, 2u);
+
+    // 结果按分数降序：doc0（含 should 词 world 加分）应排在 doc1 之前。
+    EXPECT_EQ(results[0].ord, 0u);
+    EXPECT_EQ(results[1].ord, 1u);
+    EXPECT_GT(results[0].score, results[1].score);
+}
+
 TEST(InvertedIndex, BoolSearchTopK) {
     InvertedIndex idx;
     idx.add_doc(0, {{"common", tp(1, {0})}});

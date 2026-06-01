@@ -491,43 +491,40 @@ auto InvertedIndex::bool_search(
         std::string term;
         PostingList pl_copy;
         bool is_must;
+        std::vector<std::uint64_t> ords;  // decompress_ords 缓存（S9.6：一次解压复用）
     };
-    std::vector<TermPostings> must_tps;
-    must_tps.reserve(must_terms.size());
-    for (auto& term : must_terms) {
+    // 收集一个 term 的 posting 到 dst，顺带解压 ords 一次缓存起来。
+    auto collect = [&](const std::string& term, bool is_must,
+                       std::vector<TermPostings>& dst) {
         auto& shard = shard_for(term);
         tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
         if (shard.inverted.find(acc, term)) {
-            must_tps.push_back({term, acc->second, true});
+            TermPostings tp;
+            tp.term = term;
+            tp.pl_copy = acc->second;
+            tp.is_must = is_must;
+            tp.ords = tp.pl_copy.decompress_ords();
+            dst.push_back(std::move(tp));
         }
-    }
+    };
+
+    std::vector<TermPostings> must_tps;
+    must_tps.reserve(must_terms.size());
+    for (auto& term : must_terms) collect(term, true, must_tps);
 
     std::vector<TermPostings> should_tps;
     should_tps.reserve(should_terms.size());
-    for (auto& term : should_terms) {
-        auto& shard = shard_for(term);
-        tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
-        if (shard.inverted.find(acc, term)) {
-            should_tps.push_back({term, acc->second, false});
-        }
-    }
+    for (auto& term : should_terms) collect(term, false, should_tps);
 
     std::vector<TermPostings> must_not_tps;
     must_not_tps.reserve(must_not_terms.size());
-    for (auto& term : must_not_terms) {
-        auto& shard = shard_for(term);
-        tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
-        if (shard.inverted.find(acc, term)) {
-            must_not_tps.push_back({term, acc->second, false});
-        }
-    }
+    for (auto& term : must_not_terms) collect(term, false, must_not_tps);
 
     std::vector<std::uint64_t> must_not_ords;
     for (auto& tp : must_not_tps) {
-        auto ords = tp.pl_copy.decompress_ords();
         for (std::size_t i = 0; i < tp.pl_copy.items.size(); ++i) {
-            if (live_checker.is_live(ords[i])) {
-                must_not_ords.push_back(ords[i]);
+            if (live_checker.is_live(tp.ords[i])) {
+                must_not_ords.push_back(tp.ords[i]);
             }
         }
     }
@@ -557,10 +554,9 @@ auto InvertedIndex::bool_search(
         bool first_must = true;
         for (auto& tp : must_tps) {
             std::vector<std::uint64_t> ords;
-            auto decompressed = tp.pl_copy.decompress_ords();
             for (std::size_t i = 0; i < tp.pl_copy.items.size(); ++i) {
-                if (live_checker.is_live(decompressed[i])) {
-                    ords.push_back(decompressed[i]);
+                if (live_checker.is_live(tp.ords[i])) {
+                    ords.push_back(tp.ords[i]);
                 }
             }
             std::sort(ords.begin(), ords.end());
@@ -581,10 +577,9 @@ auto InvertedIndex::bool_search(
         candidates = std::move(intersection);
     } else if (!should_tps.empty()) {
         for (auto& tp : should_tps) {
-            auto decompressed = tp.pl_copy.decompress_ords();
             for (std::size_t i = 0; i < tp.pl_copy.items.size(); ++i) {
-                if (live_checker.is_live(decompressed[i])) {
-                    candidates.push_back(decompressed[i]);
+                if (live_checker.is_live(tp.ords[i])) {
+                    candidates.push_back(tp.ords[i]);
                 }
             }
         }
@@ -594,16 +589,9 @@ auto InvertedIndex::bool_search(
         return {};
     }
 
-    for (auto& tp : should_tps) {
-        auto decompressed = tp.pl_copy.decompress_ords();
-        for (std::size_t i = 0; i < tp.pl_copy.items.size(); ++i) {
-            if (live_checker.is_live(decompressed[i])) {
-                candidates.push_back(decompressed[i]);
-            }
-        }
-    }
-    std::sort(candidates.begin(), candidates.end());
-    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+    // 注意：SHOULD 词在 MUST 非空时只参与打分（见下方评分循环），不扩大候选集。
+    // 候选集已由上面确定（MUST → 交集；纯 SHOULD → 并集），此处不再追加 SHOULD ords，
+    // 否则「只含 should、不含 must」的文档会错误进入结果（违反 MUST 语义）。
 
     std::vector<std::uint64_t> filtered;
     filtered.reserve(candidates.size());
@@ -634,9 +622,8 @@ auto InvertedIndex::bool_search(
     std::unordered_map<std::string, float> term_idf;
     for (auto& tp : all_tps) {
         std::size_t live_df = 0;
-        auto decompressed = tp.pl_copy.decompress_ords();
         for (std::size_t i = 0; i < tp.pl_copy.items.size(); ++i) {
-            if (live_checker.is_live(decompressed[i])) ++live_df;
+            if (live_checker.is_live(tp.ords[i])) ++live_df;
         }
         if (live_df == 0) continue;
         auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) /
@@ -657,10 +644,9 @@ auto InvertedIndex::bool_search(
         auto idf_it = term_idf.find(tp.term);
         if (idf_it == term_idf.end()) continue;
         auto idf = idf_it->second;
-        auto decompressed = tp.pl_copy.decompress_ords();
 
         for (std::size_t i = 0; i < tp.pl_copy.items.size(); ++i) {
-            auto posting_ord = decompressed[i];
+            auto posting_ord = tp.ords[i];
             if (!live_checker.is_live(posting_ord)) continue;
             auto it = acc.scores.find(posting_ord);
             if (it == acc.scores.end()) continue;
@@ -745,7 +731,9 @@ void InvertedIndex::finalize_all_postings() {
 // ---- 持久化 ----
 
 static constexpr std::uint32_t kInvMagic   = 0x494E5632;
-static constexpr std::uint32_t kInvVersion = 3;
+// v4：positions 落盘改用 gap+VByte 压缩（内存仍是 vector<uint32_t>，短语查询不变）。
+//     v1/2/3 旧快照按原始 uint32 数组读，向后兼容。
+static constexpr std::uint32_t kInvVersion = 4;
 
 auto InvertedIndex::save(std::string_view path) const -> bool {
     auto* f = std::fopen(std::string(path).c_str(), "wb");
@@ -757,6 +745,19 @@ auto InvertedIndex::save(std::string_view path) const -> bool {
 
     auto write_u32 = [&](std::uint32_t v) { return std::fwrite(&v, 4, 1, f) == 1; };
     auto write_u64 = [&](std::uint64_t v) { return std::fwrite(&v, 8, 1, f) == 1; };
+
+    // v4：positions 以 gap+VByte 压缩落盘。格式 = u32 原始个数 + u32 压缩字节数
+    // + 压缩字节流。个数用于 load 时 reserve；压缩字节流由 gap_decode 还原。
+    auto write_positions = [&](const std::vector<std::uint32_t>& positions) -> bool {
+        if (!write_u32(static_cast<std::uint32_t>(positions.size()))) return false;
+        std::vector<std::uint64_t> tmp(positions.begin(), positions.end());
+        auto comp = codec::gap_encode(tmp);
+        if (!write_u32(static_cast<std::uint32_t>(comp.size()))) return false;
+        if (!comp.empty() && std::fwrite(comp.data(), 1, comp.size(), f) != comp.size()) {
+            return false;
+        }
+        return true;
+    };
 
     bool ok = write_u32(kInvMagic) && write_u32(kInvVersion)
               && write_u32(N) && write_u64(sdl);
@@ -793,13 +794,8 @@ auto InvertedIndex::save(std::string_view path) const -> bool {
                 for (auto& posting : pl.items) {
                     ok = write_u32(posting.tf);
                     if (!ok) { std::fclose(f); return false; }
-                    auto posc = static_cast<std::uint32_t>(posting.positions.size());
-                    ok = write_u32(posc);
-                    if (!ok) { std::fclose(f); return false; }
-                    if (posc > 0) {
-                        if (std::fwrite(posting.positions.data(), 4, posc, f) != posc) {
-                            std::fclose(f); return false;
-                        }
+                    if (!write_positions(posting.positions)) {
+                        std::fclose(f); return false;
                     }
                 }
                 // Block-Max WAND 元数据（version=3）
@@ -820,14 +816,8 @@ auto InvertedIndex::save(std::string_view path) const -> bool {
                 for (auto& posting : pl.items) {
                     ok = write_u64(posting.ord) && write_u32(posting.tf);
                     if (!ok) { std::fclose(f); return false; }
-
-                    auto posc = static_cast<std::uint32_t>(posting.positions.size());
-                    ok = write_u32(posc);
-                    if (!ok) { std::fclose(f); return false; }
-                    if (posc > 0) {
-                        if (std::fwrite(posting.positions.data(), 4, posc, f) != posc) {
-                            std::fclose(f); return false;
-                        }
+                    if (!write_positions(posting.positions)) {
+                        std::fclose(f); return false;
                     }
                 }
             }
@@ -855,6 +845,29 @@ auto InvertedIndex::load(std::string_view path) -> bool {
 
     auto magic = read_u32();
     auto ver = read_u32();
+
+    // positions 读取：v4 走 gap+VByte 压缩格式（count + comp_size + 字节流），
+    // v1/2/3 走原始 uint32 数组。失败返回 false。
+    auto read_positions = [&](std::vector<std::uint32_t>& out) -> bool {
+        auto posc = read_u32();
+        if (posc == 0xFFFFFFFF) return false;
+        if (ver >= 4) {
+            auto csize = read_u32();
+            if (csize == 0xFFFFFFFF) return false;
+            std::vector<std::uint8_t> comp(csize);
+            if (csize > 0 && std::fread(comp.data(), 1, csize, f) != csize) return false;
+            auto vals = codec::gap_decode(comp);
+            if (vals.size() != posc) return false;  // 个数自洽校验
+            out.resize(posc);
+            for (std::uint32_t i = 0; i < posc; ++i) {
+                out[i] = static_cast<std::uint32_t>(vals[i]);
+            }
+        } else {
+            out.resize(posc);
+            if (posc > 0 && std::fread(out.data(), 4, posc, f) != posc) return false;
+        }
+        return true;
+    };
     if (magic != kInvMagic) {
         std::fclose(f); return false;
     }
@@ -884,7 +897,7 @@ auto InvertedIndex::load(std::string_view path) -> bool {
             PostingList pl;
             pl.items.resize(pc);
 
-            if (ver == 2 || ver == 3) {
+            if (ver >= 2) {
                 auto comp = read_u32();
                 if (comp == 0xFFFFFFFF) { std::fclose(f); return false; }
                 if (comp == 1) {
@@ -899,16 +912,11 @@ auto InvertedIndex::load(std::string_view path) -> bool {
                     }
                     for (std::uint32_t p = 0; p < pc; ++p) {
                         pl.items[p].tf = read_u32();
-                        auto posc = read_u32();
-                        if (posc == 0xFFFFFFFF) { std::fclose(f); return false; }
-                        pl.items[p].positions.resize(posc);
-                        if (posc > 0) {
-                            if (std::fread(pl.items[p].positions.data(), 4, posc, f) != posc) {
-                                std::fclose(f); return false;
-                            }
+                        if (!read_positions(pl.items[p].positions)) {
+                            std::fclose(f); return false;
                         }
                     }
-                    if (ver == 3) {
+                    if (ver >= 3) {
                         auto block_count = read_u32();
                         if (block_count == 0xFFFFFFFF) { std::fclose(f); return false; }
                         pl.blocks.resize(block_count);
@@ -924,13 +932,8 @@ auto InvertedIndex::load(std::string_view path) -> bool {
                     for (std::uint32_t p = 0; p < pc; ++p) {
                         pl.items[p].ord = read_u64();
                         pl.items[p].tf = read_u32();
-                        auto posc = read_u32();
-                        if (posc == 0xFFFFFFFF) { std::fclose(f); return false; }
-                        pl.items[p].positions.resize(posc);
-                        if (posc > 0) {
-                            if (std::fread(pl.items[p].positions.data(), 4, posc, f) != posc) {
-                                std::fclose(f); return false;
-                            }
+                        if (!read_positions(pl.items[p].positions)) {
+                            std::fclose(f); return false;
                         }
                     }
                 }
@@ -938,13 +941,8 @@ auto InvertedIndex::load(std::string_view path) -> bool {
                 for (std::uint32_t p = 0; p < pc; ++p) {
                     pl.items[p].ord = read_u64();
                     pl.items[p].tf = read_u32();
-                    auto posc = read_u32();
-                    if (posc == 0xFFFFFFFF) { std::fclose(f); return false; }
-                    pl.items[p].positions.resize(posc);
-                    if (posc > 0) {
-                        if (std::fread(pl.items[p].positions.data(), 4, posc, f) != posc) {
-                            std::fclose(f); return false;
-                        }
+                    if (!read_positions(pl.items[p].positions)) {
+                        std::fclose(f); return false;
                     }
                 }
             }
