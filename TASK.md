@@ -337,6 +337,54 @@
 
 ---
 
+### S9 — 分词 / BM25 优化（代码审查产出，2026-06-01）
+
+**背景**：对 analyzer + BM25 + 倒排索引子系统做了一次代码审查。下表均经实代码核实；
+已排除两个误报——IDF 公式已是 Lucene 标准（`inverted.cpp:168` 等，无需改），
+缓存 avgdl 收益可忽略（非热点）。
+
+#### 已确认问题（按性价比排序）
+
+| # | 目标 | 改动范围 | 关键内容 | 优先级 | 状态 |
+|---|------|---------|---------|--------|------|
+| **S9.1** | 修复高亮缓存删错 key | `search_layer.cpp:46` `index.hpp/.cpp` | `doc_texts_` 以 ord 为 key 存（:36），删除却用 `slot->doc_len`（:46）→ 内存泄漏 + 误删无关文档正文。修法：`DocSlot` 加 `ord` 字段、`Index::get()` 填充，`on_delete` 改用 `slot->ord`。✅ 已全量构建并跑 index(8) 测试通过（含 sanitizers） | 🔴 高 | ✅ |
+| **S9.2** | 查询缓存选择性失效 | `search_cache.hpp/.cpp` `search_layer.cpp` | 改为按 term 选择性失效：缓存条目记录 query terms，`invalidate_terms(changed)` 只删与变更文档词集有交集者；on_delete 原文 miss 时降级整失效。属 near-real-time（score 绝对值可能轻微陈旧）。✅ 已全量构建并跑 search_layer(18) 测试通过（含 sanitizers） | 🟡 中 | ✅ |
+| **S9.3** | 高亮正文不再全量常驻 | `search_layer.hpp/.cpp` | `doc_texts_` 改为带上限 LRU（`DocTextLru`，默认 1024 篇，配置 `doc_text_cache_max`）；高亮路径冷文档 miss 时降级为无片段 hit（不再整条丢弃，修了连带的结果缩水 bug）。✅ 已全量构建并跑 search_layer(18)+highlighter(6) 测试通过 | 🟡 中 | ✅ |
+
+#### 顺带修的构建缺陷（本次联网构建时发现）
+
+| # | 目标 | 改动范围 | 关键内容 | 优先级 | 状态 |
+|---|------|---------|---------|--------|------|
+| **S9.10** | utf8proc 仓库 URL 拼写修正 | `cpp/CMakeLists.txt:155` | `JulieStrings`（不存在，clone 报 could-not-read-Username）→ `JuliaStrings`（官方仓库） | 🔴 高 | ✅ |
+| **S9.11** | cppjieba/limonp FetchContent 获取 | `cpp/CMakeLists.txt:165` | 原仅无条件指向空 `_deps/*-src`，CMake 不会获取；补 FetchContent_Declare（cppjieba v5.6.7 / limonp v1.0.2），保留 _deps-then-fetch 兼容 | 🔴 高 | ✅ |
+| **S9.12** | thread_pool.hpp TBB 头路径过时 | `thread_pool.hpp:30-31` | `<tbb/concurrent_bounded_queue.h>` 在系统 oneTBB 已移除独立头（类已并入 `concurrent_queue.h`）；改用 `<oneapi/tbb/concurrent_queue.h>` + `<oneapi/tbb/global_control.h>`，与 inverted 一致 | 🟡 中 | ✅ |
+| **S9.13** | NIF 引用了不存在的类型名 | `nif_cask_iter.cpp:32` | `CaskIterEntry` → `CaskIter::Entry`（嵌套类型，疑似重命名遗留）；NIF 层此前从未在本环境编译过故未暴露 | 🔴 高 | ✅ |
+| **S9.14** | NIF 对 unique_ptr 用成员指针 | `nif_helpers.cpp:235` | `h->cask->*search_fn` 在 `unique_ptr<Cask>` 上用 `->*` 不合法；改 `((*h->cask).*search_fn)(...)` | 🔴 高 | ✅ |
+
+| **S9.15** | Jieba 测试词典路径硬编码 | `jieba_analyzer_test.cpp:11` `cpp/CMakeLists.txt` `tests/CMakeLists.txt` | fixture 把词典目录写死成 `/tmp/bitcask-jieba-build3/...`（某次旧构建的绝对路径），换机器/构建目录必失败——这才是「10 Jieba pre-existing」的真因（词典其实在 cppjieba 源里）。修法：CMake 设 `BITCASK_JIEBA_DICT_DIR` 指向 `_deps/cppjieba-src/dict`，`target_compile_definitions` 注入测试，fixture 用宏（带相对路径回退） | 🔴 高 | ✅ |
+
+| **S9.16** | jieba 词典进 priv + 运行时默认路径 | `cpp/CMakeLists.txt` `src/bitcask.erl` `.gitignore` | 此前注释称「dict_path 空=内嵌 priv/dict/」但①priv 无 dict ②代码无回退（空路径拼成 `/jieba.dict.utf8` 必失败）③契约实为「jieba 必填」。修法：CMake POST_BUILD 把 cppjieba 词典 copy 到 `priv/dict/`（仅 BITCASK_PRIV_DIR 定义时）；`bitcask.erl` 新增 `maybe_default_dict_path`：analyzer=jieba 且未传 dict_path 时用 `code:priv_dir(bitcask)/dict`（list_to_binary，匹配 NIF 的 enif_inspect_binary）；priv/dict 加入 .gitignore（构建产物）。已验证 priv/dict 5 文件齐全 + bitcask.erl 编译通过 | 🔴 高 | ✅ |
+
+**全量构建结果**：`build_exit=0`，含 NIF 共享库 `priv/bitcask_cpp.so`（`cask_close` dirty-scheduler 改动也随之编译验证）。
+ctest **206/206 全部通过**（含此前一贯失败的 10 个 Jieba 测试，经 S9.15 修复后全绿）。
+
+| **S9.17** | 修复迭代器悬空指针 UB | `nif_cask_iter.cpp` | `iter_next_common` 原返回 `&e`（指向局部 `r` 内部，函数返回后析构 → 悬空），调用方读 `e->file_id` 等是 UB。改为返回 `std::optional<CaskIter::Entry>`（值拷贝，生命周期独立）；三个调用方 `auto* e` → `auto e`。✅ 全量构建 + ctest 206/206（含 sanitizers）通过 | 🔴 高 | ✅ |
+| **S9.18** | C++ 注释与新行为对齐 | `analyzer.hpp:66` `jieba_analyzer.hpp:21` | 原注释称「dict_path 空=内嵌 priv/dict/」，实则无回退、空路径必失败。改为「必须有效，由 Erlang facade 默认填 priv/dict（S9.16）」，并说明空串会拼成 `/jieba.dict.utf8` 加载失败 | 🟡 中 | ✅ |
+| **S9.4** | position 列 gap+VByte 压缩（仅磁盘） | `inverted.cpp` save/load | 核实后修正子分析：内存压缩会拖慢短语匹配（`binary_search` 需随机访问，VByte 变长不支持），故只压**磁盘 save/load**，内存仍 `vector<uint32_t>`、短语查询零影响。新增 `kInvVersion=4`：positions 落盘走 `gap_encode`/`gap_decode`（count+comp_size+字节流），v1/2/3 旧快照按原始 u32 读（load 分派 `ver==2\|\|3`→`ver>=2`、`ver==3`→`ver>=3`）。实测 positions 40000B→~10KB（约 75% 压缩），往返一致。✅ ctest 206/206。⚠️ 旧版本快照读取仅逻辑保留兼容分支、未实跑 v3 文件验证 | 🟡 中 | ✅ |
+| **S9.5** | ~~搜索避免整体拷贝 PostingList~~ | `inverted.cpp` | **核实后判定不做**：`pl_copy` 是**有意设计**——`const_accessor` 持桶级读锁，拷贝后立即出作用域放锁，让查询不长期占桶锁、不阻塞并发 `add_doc`。改 `const&` 须让 accessor 活到查询结束 → 整个查询期间持多个桶读锁 → 牺牲读写并发度。子分析「纯收益」误判。另查 search/wand 路径无冗余 `decompress_ords`，无可省的二次拷贝。保留现状 | 🟡 中 | ❌不做 |
+
+#### 待核实（子分析产出，未亲验，优先级低）
+
+| # | 目标 | 改动范围 | 关键内容 | 优先级 | 状态 |
+|---|------|---------|---------|--------|------|
+| **S9.6** | bool_search 缓存 decompress_ords | `inverted.cpp` | 核实后修正子分析：`set_intersection` 对已排序序列本就是 O(n+m) 双指针、**不慢**（子分析误判「逐两比较」）。真正低效是同一 PostingList 在一次 bool_search 里被 `decompress_ords()` 解压 6 次（must_not/must/should×2/idf/评分各一次）。修法：给 `TermPostings` 加 `ords` 缓存，收集时解压一次，6 处复用。纯收益、不碰锁语义、不改算法/结果。✅ ctest 206/206（含 5 个 bool_search 用例）<br>**关联修复见 S9.6b** | 低 | ✅ |
+| **S9.6b** | 修复 MUST+SHOULD 候选集语义 bug | `inverted.cpp` `inverted_test.cpp` | 实测确认 bug：`+hello world`（MUST hello + SHOULD world）会返回只含 world、不含 hello 的 doc2（违反 MUST 语义）。根因：must 非空时仍无条件把 should ords 追加进 candidates（原 592-600）。修法：删除该段——MUST 定候选集、SHOULD 只参与打分（评分循环遍历 all_tps 对候选内 ord 累加，加分不受影响）。顺带消除了 S9.6 记的「should 分支重复收集」。实测：修后 `+hello world`→{0,1}，且 doc0（含 world 加分 0.78）> doc1（0.52），打分仍正确。新增回归测试 `BoolSearchMustWithShouldBoost`。✅ ctest 207/207 | 🔴 高 | ✅ |
+| **S9.7** | 短语位置匹配加 skip | `inverted.cpp:427` 附近 | `O(短语长×posting×log(pos))`；position 加 skip index，3~5 词短语提升 30~50% | 低 | ☐ |
+| **S9.8** | 分词 `min_token_length` | `analyzer.hpp/.cpp` | 过滤 1~2 字符无意义拉丁 token，削减英文索引体积 | 低 | ☐ |
+| **S9.9** | jieba 二次归一化对齐 | `jieba_analyzer.cpp` | `jieba_cut`（内部 normalize）与 `nfkc_fold` 归一化差异致字节 offset 错位，可能搞乱高亮/回退判定（正确性） | 低 | ☐ |
+
+---
+
 ## 未来任务
 
 ### V3 — HNSW 单图 + search_vector（暂缓）
