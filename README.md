@@ -94,7 +94,8 @@ ok
 | `doc/concurrency-zh.md` | 并发与共享语义 |
 | `doc/put-flow-zh.md` | put(K,V) 完整调用链 |
 | `doc/collection-fulltext-zh.md` | Collection 全文索引使用与内部机制 |
-| `doc/vector-db-design-zh.md` | 向量库设计方案 |
+| `doc/vector-db-design-zh.md` | 向量库设计方案（V1–V6 蓝图） |
+| `doc/vector-search-extension-zh.md` | 向量搜索扩展：HNSW + RRF 混合检索（动手切片） |
 | `doc/vector-graph-db-zh.md` | 向量库/图库可行性分析 |
 | `doc/unified-architecture-plan-zh.md` | 统一架构计划 |
 | `TASK.md` | Project roadmap (V1–V2.10 done, U0–U6 planned) |
