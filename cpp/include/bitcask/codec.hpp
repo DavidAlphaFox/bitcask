@@ -83,12 +83,19 @@ decode_data_record(std::span<const std::byte> buf);
 // kDoc value 打包/解包（§2.4）。仅用于 type==kDoc 的 record 的 VALUE 段。
 // ---------------------------------------------------------------------------
 
+// 命名字段（S8.6 多字段）：name/value 都是 zero-copy span。
+struct DocField {
+    std::span<const std::byte> name;
+    std::span<const std::byte> value;
+};
+
 // encode 输入：三段皆可选（nullopt = 该段缺省，不写 flag）。vector 是 f32
-// 向量（V1 不量化）。
+// 向量（V1 不量化）。fields 非空时写 fields 段并升版本为 v2（S8.6）。
 struct DocValueParts {
     std::optional<std::span<const float>>      vector;
     std::optional<std::span<const std::byte>>  text;
     std::optional<std::span<const std::byte>>  meta;
+    std::vector<DocField>                      fields;  // 空 = 不写 fields 段、Ver=1
 };
 
 // 解码后的 kDoc value 视图。各段是 zero-copy span，生命周期跟着输入 buf。
@@ -99,11 +106,13 @@ struct DocValueView {
     bool has_vector = false;
     bool has_text   = false;
     bool has_meta   = false;
+    bool has_fields = false;                // S8.6
     bool vec_quantized = false;
     std::uint32_t dim = 0;                  // 仅 has_vector 有效
     std::span<const std::byte> vector_raw;
     std::span<const std::byte> text;
     std::span<const std::byte> meta;
+    std::vector<DocField>      fields;      // S8.6：解出的命名字段（zero-copy span）
 };
 
 // 把 {vector,text,meta} 打包成 kDoc value，append 到 out。返回写入字节数。

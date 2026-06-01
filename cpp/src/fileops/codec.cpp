@@ -156,12 +156,17 @@ static_assert(std::endian::native == std::endian::little,
 std::size_t encode_doc_value(std::vector<std::byte>& out, const DocValueParts& parts) {
     const std::size_t base = out.size();
 
+    const bool has_fields = !parts.fields.empty();
+
     std::uint8_t flags = 0;
     if (parts.vector) flags |= format::kFlagHasVector;
     if (parts.text)   flags |= format::kFlagHasText;
     if (parts.meta)   flags |= format::kFlagHasMeta;
+    if (has_fields)   flags |= format::kFlagHasFields;
 
-    out.push_back(static_cast<std::byte>(format::kDocValueVersion));
+    // 仅当存在 fields 段时升版本为 v2；否则写 v1，字节与旧实现完全一致（S8.6）。
+    out.push_back(static_cast<std::byte>(
+        has_fields ? format::kDocValueVersionFields : format::kDocValueVersion));
     out.push_back(static_cast<std::byte>(flags));
 
     // 追加一个「带 u32 大端长度前缀」的字节段。
@@ -194,6 +199,27 @@ std::size_t encode_doc_value(std::vector<std::byte>& out, const DocValueParts& p
         out.resize(at + m.size());
         if (!m.empty()) std::memcpy(out.data() + at, m.data(), m.size());
     }
+    // fields 段（S8.6）：[FieldCount:u16 BE] × { [NameLen:u16][name][ValLen:u32][value] }
+    if (has_fields) {
+        assert(parts.fields.size() <= 0xFFFFu);
+        const std::size_t fc_at = out.size();
+        out.resize(fc_at + format::kFieldCountSize);
+        be_store_u16(out.data() + fc_at,
+                     static_cast<std::uint16_t>(parts.fields.size()));
+        for (const auto& f : parts.fields) {
+            assert(f.name.size() <= 0xFFFFu);
+            const std::size_t n_at = out.size();
+            out.resize(n_at + format::kFieldNameLenSize);
+            be_store_u16(out.data() + n_at, static_cast<std::uint16_t>(f.name.size()));
+            const std::size_t nb_at = out.size();
+            out.resize(nb_at + f.name.size());
+            if (!f.name.empty()) std::memcpy(out.data() + nb_at, f.name.data(), f.name.size());
+            append_len(static_cast<std::uint32_t>(f.value.size()));
+            const std::size_t vb_at = out.size();
+            out.resize(vb_at + f.value.size());
+            if (!f.value.empty()) std::memcpy(out.data() + vb_at, f.value.data(), f.value.size());
+        }
+    }
     return out.size() - base;
 }
 
@@ -204,7 +230,8 @@ decode_doc_value(std::span<const std::byte> buf) {
     }
     const std::uint8_t ver   = static_cast<std::uint8_t>(buf[0]);
     const std::uint8_t flags = static_cast<std::uint8_t>(buf[1]);
-    if (ver != format::kDocValueVersion) {
+    // 范围式版本兼容（S8.6）：v1（无 fields）与 v2（含 fields 段）都接受。
+    if (ver != format::kDocValueVersion && ver != format::kDocValueVersionFields) {
         return std::unexpected(DecodeError::kUnsupportedVersion);
     }
 
@@ -213,6 +240,7 @@ decode_doc_value(std::span<const std::byte> buf) {
     v.has_vector    = (flags & format::kFlagHasVector) != 0;
     v.has_text      = (flags & format::kFlagHasText) != 0;
     v.has_meta      = (flags & format::kFlagHasMeta) != 0;
+    v.has_fields    = (flags & format::kFlagHasFields) != 0;
     v.vec_quantized = (flags & format::kFlagVecQuantized) != 0;
 
     std::size_t pos = format::kDocValueHeaderSize;
@@ -253,6 +281,30 @@ decode_doc_value(std::span<const std::byte> buf) {
     }
     if (v.has_meta && !read_bytes_section(v.meta)) {
         return std::unexpected(DecodeError::kBufferTooShort);
+    }
+    // fields 段（S8.6）：[FieldCount:u16] × { [NameLen:u16][name][ValLen:u32][value] }
+    if (v.has_fields) {
+        if (buf.size() < pos + format::kFieldCountSize) {
+            return std::unexpected(DecodeError::kBufferTooShort);
+        }
+        const std::uint16_t fc = be_load_u16(buf.data() + pos);
+        pos += format::kFieldCountSize;
+        v.fields.reserve(fc);
+        for (std::uint16_t i = 0; i < fc; ++i) {
+            if (buf.size() < pos + format::kFieldNameLenSize) {
+                return std::unexpected(DecodeError::kBufferTooShort);
+            }
+            const std::uint16_t nlen = be_load_u16(buf.data() + pos);
+            pos += format::kFieldNameLenSize;
+            if (buf.size() < pos + nlen) return std::unexpected(DecodeError::kBufferTooShort);
+            DocField f;
+            f.name = buf.subspan(pos, nlen);
+            pos += nlen;
+            if (!read_bytes_section(f.value)) {
+                return std::unexpected(DecodeError::kBufferTooShort);
+            }
+            v.fields.push_back(f);
+        }
     }
     return v;
 }

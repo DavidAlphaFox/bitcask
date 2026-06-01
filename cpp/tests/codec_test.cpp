@@ -281,6 +281,75 @@ TEST(DocValue, DetectsTruncation) {
     EXPECT_EQ(v.error(), codec::DecodeError::kBufferTooShort);
 }
 
+// --- S8.6: DocValue v2 多字段段 ---
+
+// 空 fields 仍写 v1（向后兼容核心）。
+TEST(DocValue, EmptyFieldsStaysV1) {
+    codec::DocValueParts parts;
+    parts.text = as_bytes("hello");
+    // fields 默认空
+    std::vector<std::byte> out;
+    codec::encode_doc_value(out, parts);
+    EXPECT_EQ(static_cast<std::uint8_t>(out[0]), kDocValueVersion);  // Ver=1
+    auto v = codec::decode_doc_value(out);
+    ASSERT_TRUE(v.has_value());
+    EXPECT_FALSE(v->has_fields);
+}
+
+// text + 多字段 round-trip：升 v2，字段名/值正确、顺序保持。
+TEST(DocValue, MultiFieldRoundTrip) {
+    const std::string text = "default text";
+    const std::string n1 = "title", v1s = "BM25 ranking";
+    const std::string n2 = "body",  v2s = "正文内容";
+    codec::DocValueParts parts;
+    parts.text = as_bytes(text);
+    parts.fields.push_back({as_bytes(n1), as_bytes(v1s)});
+    parts.fields.push_back({as_bytes(n2), as_bytes(v2s)});
+
+    std::vector<std::byte> out;
+    codec::encode_doc_value(out, parts);
+
+    auto v = codec::decode_doc_value(out);
+    ASSERT_TRUE(v.has_value());
+    EXPECT_EQ(v->ver, kDocValueVersionFields);  // Ver=2
+    ASSERT_TRUE(v->has_text);
+    ASSERT_TRUE(v->has_fields);
+    ASSERT_EQ(v->fields.size(), 2u);
+    auto span_eq = [](std::span<const std::byte> s, const std::string& str) {
+        return s.size() == str.size() && std::memcmp(s.data(), str.data(), str.size()) == 0;
+    };
+    EXPECT_TRUE(span_eq(v->fields[0].name, n1));
+    EXPECT_TRUE(span_eq(v->fields[0].value, v1s));
+    EXPECT_TRUE(span_eq(v->fields[1].name, n2));
+    EXPECT_TRUE(span_eq(v->fields[1].value, v2s));
+}
+
+// 仅 fields、无 text。
+TEST(DocValue, FieldsOnly) {
+    const std::string n = "title", val = "hi";
+    codec::DocValueParts parts;
+    parts.fields.push_back({as_bytes(n), as_bytes(val)});
+    std::vector<std::byte> out;
+    codec::encode_doc_value(out, parts);
+    auto v = codec::decode_doc_value(out);
+    ASSERT_TRUE(v.has_value());
+    EXPECT_FALSE(v->has_text);
+    ASSERT_EQ(v->fields.size(), 1u);
+}
+
+// fields 段被截断 → kBufferTooShort，不崩。
+TEST(DocValue, DetectsFieldsTruncation) {
+    const std::string n = "title", val = "some value here";
+    codec::DocValueParts parts;
+    parts.fields.push_back({as_bytes(n), as_bytes(val)});
+    std::vector<std::byte> out;
+    codec::encode_doc_value(out, parts);
+    out.resize(out.size() - 3);  // 砍进字段 value
+    auto v = codec::decode_doc_value(out);
+    ASSERT_FALSE(v.has_value());
+    EXPECT_EQ(v.error(), codec::DecodeError::kBufferTooShort);
+}
+
 // ---------------------------------------------------------------------------
 // Hint record golden (format unchanged in V1).
 // ---------------------------------------------------------------------------

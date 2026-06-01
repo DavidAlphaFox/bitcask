@@ -70,20 +70,29 @@ inline constexpr std::uint64_t kTombMaskV2 = 0x8000'0000'0000'0000ull;
 //   [可选] vector 段：  [Dim:u32 大端][ f32×Dim 小端  或  量化码字 ]
 //   [可选] text   段：  [Len:u32 大端][ utf8 字节 ]
 //   [可选] meta   段：  [Len:u32 大端][ 序列化字节(msgpack/CBOR) ]
-// 三段按 vector→text→meta 定序出现，由 Flags 决定是否存在（向量段放最前，
-// 便于 HNSW 重建按 Dim O(1) 切片）。
+//   [可选] fields 段（v2，S8.6）：[FieldCount:u16 大端] ×
+//          { [NameLen:u16 大端][name utf8][ValLen:u32 大端][value utf8] }
+// 各段按 vector→text→meta→fields 定序出现，由 Flags 决定是否存在（向量段放
+// 最前，便于 HNSW 重建按 Dim O(1) 切片）。
 //
 // 字节序：长度类整数(Dim/Len)大端，沿用本文件契约；向量 f32 数组固定小端
 // （x86/ARM64 原生零转换，见 §2.4）。
+//
+// 版本兼容（S8.6）：encode 仅当存在 fields 段时写 Ver=2，否则写 Ver=1，字节
+// 与旧实现完全一致；decode 接受 Ver∈{1,2}（范围式兼容，参考 inverted 的 S9.27）。
 // ---------------------------------------------------------------------------
-inline constexpr std::uint8_t kDocValueVersion   = 1;
+inline constexpr std::uint8_t kDocValueVersion       = 1;  // 默认（无 fields 段）
+inline constexpr std::uint8_t kDocValueVersionFields = 2;  // 含 fields 段（S8.6）
 inline constexpr std::size_t  kDocValueHeaderSize = 2;  // Ver + Flags
 inline constexpr std::size_t  kSectionLenSize     = 4;  // 各段 Dim/Len 字段宽度
+inline constexpr std::size_t  kFieldCountSize     = 2;  // fields 段 FieldCount 宽度
+inline constexpr std::size_t  kFieldNameLenSize   = 2;  // 字段名长度宽度
 
 inline constexpr std::uint8_t kFlagHasVector    = 0x01;
 inline constexpr std::uint8_t kFlagHasText      = 0x02;
 inline constexpr std::uint8_t kFlagHasMeta      = 0x04;
 inline constexpr std::uint8_t kFlagVecQuantized = 0x08;
+inline constexpr std::uint8_t kFlagHasFields    = 0x10;  // fields 段存在（S8.6）
 
 // ---------------------------------------------------------------------------
 // hint 文件的 CRC chunk 大小（解析时做合理性边界检查）。
