@@ -64,10 +64,9 @@ namespace bitcask::text::detail {
     // Hangul Jamo Extended-B (D7B0–D7FF)
     if (cp >= 0xD7B0 && cp <= 0xD7FF) return true;
 
-    // Fullwidth ASCII variants (FF01–FF5E)
-    if (cp >= 0xFF01 && cp <= 0xFF5E) return true;
-    // Fullwidth Latin Letters (not CJK but fullwidth → treat as CJK context)
-    // Skip — these are Latin fullwidth, handled by Latin path.
+    // 全角 ASCII 变体（FF01–FF5E）不在此判 CJK：全角字母/数字语义上是 Latin，
+    // 全角标点由 is_cjk_punct 处理。实际上输入到 is_cjk 前已经过 NFKC，全角已
+    // 折成半角，此处拿不到 FF 段；保留说明以防未来有未归一化路径直接调 is_cjk。
 
     // CJK Symbols and Punctuation (3000–303F)
     if (cp >= 0x3000 && cp <= 0x303F) return true;
