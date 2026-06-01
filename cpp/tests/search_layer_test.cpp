@@ -142,6 +142,31 @@ TEST(SearchLayer, PhraseSearch) {
     EXPECT_EQ(result_phrase->at(0).key, "doc1");
 }
 
+// S9.28：短语词序敏感——逆序文档不应匹配正序短语。
+// 用 whitespace analyzer + 3 词短语（更易暴露 map 无序导致的词序丢失）。
+TEST(SearchLayer, PhraseOrderSensitive) {
+    SearchLayerConfig config{
+        .analyzer_config = bitcask::text::AnalyzerConfig{
+            .type = bitcask::text::AnalyzerType::Whitespace},
+        .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F}
+    };
+    SearchLayer layer(config);
+    layer.on_write("doc1", 0, "alpha beta gamma", 1, 100, 50, 1000);   // 正序
+    layer.on_write("doc2", 1, "gamma beta alpha", 1, 200, 50, 1001);   // 逆序
+
+    // 查正序短语 "alpha beta gamma" → 只命中 doc1。
+    auto r = layer.search_phrase("alpha beta gamma", 10);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->size(), 1u);
+    EXPECT_EQ(r->at(0).key, "doc1");
+
+    // 查逆序短语 "gamma beta alpha" → 只命中 doc2。
+    auto r2 = layer.search_phrase("gamma beta alpha", 10);
+    ASSERT_TRUE(r2.has_value());
+    ASSERT_EQ(r2->size(), 1u);
+    EXPECT_EQ(r2->at(0).key, "doc2");
+}
+
 TEST(SearchLayer, PhraseSearchNoMatch) {
     auto config = default_config();
     SearchLayer layer(config);

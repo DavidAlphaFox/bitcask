@@ -178,8 +178,10 @@ SearchLayer::search_text(std::string_view query, std::size_t k,
 std::expected<std::vector<SearchHit>, std::string>
 SearchLayer::search_phrase(std::string_view query, std::size_t k,
                            const bm25::Bm25Params* params_override) const {
-    auto term_freqs = analyzer_->analyze(query);
-    if (term_freqs.empty()) return std::vector<SearchHit>{};
+    // S9.28：短语匹配依赖查询词序。analyze() 返回的 map 无序，不能直接取 terms；
+    // 用 analyze_with_positions 按 position 还原 query 词序（与 search_near 一致）。
+    auto tpm = analyzer_->analyze_with_positions(query);
+    if (tpm.empty()) return std::vector<SearchHit>{};
 
     auto cache_key = CacheKey::make("phrase", query, k);
     auto* cached = params_override ? nullptr : cache_.get(cache_key);
@@ -188,11 +190,14 @@ SearchLayer::search_phrase(std::string_view query, std::size_t k,
     if (cached) {
         results = *cached;
     } else {
-        std::vector<std::string> terms;
-        terms.reserve(term_freqs.size());
-        for (auto& [term, _] : term_freqs) {
-            terms.push_back(term);
+        std::vector<std::pair<std::uint32_t, std::string>> ordered;  // (position, term)
+        for (auto& [term, data] : tpm) {
+            for (auto pos : data.second) ordered.push_back({pos, term});
         }
+        std::sort(ordered.begin(), ordered.end());
+        std::vector<std::string> terms;
+        terms.reserve(ordered.size());
+        for (auto& [_, term] : ordered) terms.push_back(term);
 
         const auto* inv = field_index(kDefaultField);
         if (inv) results = inv->search_phrase(terms, k, index_, params_override);
