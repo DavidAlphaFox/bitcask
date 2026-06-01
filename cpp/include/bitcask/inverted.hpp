@@ -40,6 +40,10 @@ namespace bitcask::bm25 {
 struct Bm25Params {
     float k1 = 1.2F;
     float b  = 0.75F;
+    // BM25+ 的下界常数 δ（S8.10）：每个在文档中出现的 term 的 tf 归一化项加 δ，
+    // 缓解标准 BM25 对长文档的过度惩罚（Lv & Zhai 2011）。
+    // 默认 0 = 标准 BM25（向后兼容）。典型值 1.0。
+    float delta = 0.0F;
 };
 
 // Posting 分块元数据（Block-Max WAND 跳跃索引）。
@@ -130,6 +134,22 @@ struct SearchResult {
     float         score;
 };
 
+// BM25 评分解释的单 term 分项（S8.8）。
+struct TermScore {
+    std::string   term;
+    std::size_t   df        = 0;   // live document frequency
+    double        idf       = 0.0; // log(1 + (N - df + 0.5)/(df + 0.5))
+    std::uint32_t tf        = 0;   // 该 term 在目标文档中的词频（不在文档则 0）
+    float         tf_norm   = 0.0F;// tf 长度归一化项
+    float         contribution = 0.0F; // idf * tf_norm，该 term 对总分的贡献
+};
+
+// explain() 的返回：各 term 分项 + 总分。
+struct ScoreExplanation {
+    std::vector<TermScore> terms;
+    float                  total = 0.0F;
+};
+
 // live 文档检查器接口（由 Index 侧表提供）。
 // search() 调用它跳过已删除的 ord。
 class LiveChecker {
@@ -161,20 +181,34 @@ public:
     // BM25 搜索：对 query terms 做 DAAT 累加，返回 top-k 结果。
     // live_checker 用于跳过已删文档并获取 doc_len。
     // 线程安全：持所有分片 shared_lock。
+    // params_override 非空时覆盖默认 Bm25Params（查询期 k1/b 调参，S8.5）；
+    // 为空则用构造时的 params_。WAND 上界估算也用同一组参数，保证剪枝正确。
     [[nodiscard]] auto search(
         const std::vector<std::string>& query_terms,
         std::size_t k,
-        const LiveChecker& live_checker) const -> std::vector<SearchResult>;
+        const LiveChecker& live_checker,
+        const Bm25Params* params_override = nullptr) const -> std::vector<SearchResult>;
 
     [[nodiscard]] auto search_phrase(
         const std::vector<std::string>& query_terms,
         std::size_t k,
-        const LiveChecker& live_checker) const -> std::vector<SearchResult>;
+        const LiveChecker& live_checker,
+        const Bm25Params* params_override = nullptr) const -> std::vector<SearchResult>;
 
     [[nodiscard]] auto bool_search(
         const QueryNode& query,
         std::size_t k,
-        const LiveChecker& live_checker) const -> std::vector<SearchResult>;
+        const LiveChecker& live_checker,
+        const Bm25Params* params_override = nullptr) const -> std::vector<SearchResult>;
+
+    // 解释 query_terms 对文档 ord 的 BM25 评分（S8.8，调试/调优用）。
+    // 用与 search() 完全相同的 idf/tf_norm 公式，逐 term 给出分项。
+    // 与 search 一致：参数可被 params_override 覆盖。
+    [[nodiscard]] auto explain(
+        const std::vector<std::string>& query_terms,
+        std::uint64_t ord,
+        const LiveChecker& live_checker,
+        const Bm25Params* params_override = nullptr) const -> ScoreExplanation;
 
     auto save(std::string_view path) const -> bool;
     auto load(std::string_view path) -> bool;
@@ -216,7 +250,8 @@ private:
     auto search_wand(
         const std::vector<std::string>& query_terms,
         std::size_t k,
-        const LiveChecker& live_checker) const -> std::vector<SearchResult>;
+        const LiveChecker& live_checker,
+        const Bm25Params& params) const -> std::vector<SearchResult>;
 };
 
 }  // namespace bitcask::bm25

@@ -349,3 +349,83 @@ TEST(SearchLayer, HighlightFullwidthText) {
     EXPECT_EQ(snippet.find("\xEF\xBF\xBD"), std::string::npos)
         << "snippet contains UTF-8 replacement char (garbage): " << snippet;
 }
+
+// S8.10：BM25+ 的 δ 应提升分数（每个命中 term 加 idf*δ），且 explain 与 search
+// 在 δ>0 下仍一致（δ 加在所有评分路径）。
+TEST(SearchLayer, Bm25PlusDeltaBoostsScore) {
+    auto config = default_config();
+    SearchLayer layer(config);
+    layer.on_write("doc1", 0, "hello world foo bar baz", 1, 100, 50, 1000);
+
+    auto def = layer.search_text("hello", 10);
+    ASSERT_TRUE(def.has_value());
+    ASSERT_FALSE(def->empty());
+
+    bitcask::bm25::Bm25Params p{1.2F, 0.75F, 1.0F};  // delta=1.0
+    auto plus = layer.search_text("hello", 10, &p);
+    ASSERT_TRUE(plus.has_value());
+    ASSERT_FALSE(plus->empty());
+
+    // BM25+ 分数应高于标准 BM25（δ 加了正的下界贡献）。
+    EXPECT_GT(plus->at(0).score, def->at(0).score);
+
+    // explain 在同样 δ 下 total 应与 search 分数一致。
+    auto exp = layer.explain("hello", "doc1", &p);
+    ASSERT_TRUE(exp.has_value());
+    EXPECT_NEAR(exp->total, plus->at(0).score, 1e-4);
+}
+
+// S8.8：explain() 的分项总分应等于 search() 返回的实际 BM25 分数（同一公式）。
+TEST(SearchLayer, ExplainMatchesSearchScore) {
+    auto config = default_config();
+    SearchLayer layer(config);
+    layer.on_write("doc1", 0, "hello world foo", 1, 100, 50, 1000);
+    layer.on_write("doc2", 1, "hello hello bar baz", 1, 200, 50, 1001);
+
+    auto results = layer.search_text("hello world", 10);
+    ASSERT_TRUE(results.has_value());
+    ASSERT_FALSE(results->empty());
+
+    for (auto& hit : *results) {
+        auto exp = layer.explain("hello world", hit.key);
+        ASSERT_TRUE(exp.has_value()) << "key=" << hit.key;
+        // explain 的 total 应与 search 给出的 score 一致（同一评分公式）。
+        EXPECT_NEAR(exp->total, hit.score, 1e-4) << "key=" << hit.key;
+        // 至少有一个 term 有非零贡献（hello 命中两篇）。
+        bool any_contrib = false;
+        for (auto& ts : exp->terms) if (ts.contribution > 0.0F) any_contrib = true;
+        EXPECT_TRUE(any_contrib);
+    }
+}
+
+// explain 对不存在的 key 返回 nullopt。
+TEST(SearchLayer, ExplainMissingKey) {
+    auto config = default_config();
+    SearchLayer layer(config);
+    layer.on_write("doc1", 0, "hello world", 1, 100, 50, 1000);
+    EXPECT_FALSE(layer.explain("hello", "nonexistent").has_value());
+}
+
+// S8.5：查询时覆盖 k1/b 应改变 BM25 分数（验证 params_override 真正生效）。
+TEST(SearchLayer, QueryTimeBm25ParamsOverride) {
+    auto config = default_config();
+    SearchLayer layer(config);
+    // 两篇文档 doc_len 不同，b 参数（长度归一化）会影响其相对分数。
+    layer.on_write("doc1", 0, "hello hello hello", 1, 100, 50, 1000);
+    layer.on_write("doc2", 1, "hello world foo bar baz qux quux corge", 1, 200, 50, 1001);
+
+    auto def = layer.search_text("hello", 10);
+    ASSERT_TRUE(def.has_value());
+    ASSERT_FALSE(def->empty());
+    double def_top_score = def->at(0).score;
+
+    // b=0 关闭长度归一化，分数应与默认（b=0.75）不同。
+    bitcask::bm25::Bm25Params p{1.2F, 0.0F};
+    auto ovr = layer.search_text("hello", 10, &p);
+    ASSERT_TRUE(ovr.has_value());
+    ASSERT_FALSE(ovr->empty());
+    double ovr_top_score = ovr->at(0).score;
+
+    EXPECT_NE(def_top_score, ovr_top_score)
+        << "override b=0 should change score vs default b=0.75";
+}

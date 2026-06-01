@@ -87,15 +87,25 @@ public:
                      std::uint32_t new_total_sz);
 
     // ---- 搜索（词袋模式）----
+    // params_override 非空时按查询覆盖默认 BM25 k1/b（S8.5）。
     [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
-    search_text(std::string_view query, std::size_t k) const;
+    search_text(std::string_view query, std::size_t k,
+                const bm25::Bm25Params* params_override = nullptr) const;
 
     // ---- 搜索（短语模式）----
     [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
-    search_phrase(std::string_view query, std::size_t k) const;
+    search_phrase(std::string_view query, std::size_t k,
+                  const bm25::Bm25Params* params_override = nullptr) const;
 
     [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
-    bool_search(std::string_view query, std::size_t k) const;
+    bool_search(std::string_view query, std::size_t k,
+                const bm25::Bm25Params* params_override = nullptr) const;
+
+    // ---- 评分解释（S8.8，调试/调优）----
+    // 解释 query 对外部 key 文档的 BM25 评分分项。key 不存在返回 nullopt。
+    [[nodiscard]] std::optional<bm25::ScoreExplanation>
+    explain(std::string_view query, std::string_view key,
+            const bm25::Bm25Params* params_override = nullptr) const;
 
     // ---- 搜索（带高亮）----
     [[nodiscard]] std::expected<std::vector<SearchHitEx>, std::string>

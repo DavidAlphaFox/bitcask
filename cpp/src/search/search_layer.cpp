@@ -82,12 +82,14 @@ void SearchLayer::on_relocate(std::string_view key, std::uint64_t ord,
 }
 
 std::expected<std::vector<SearchHit>, std::string>
-SearchLayer::search_text(std::string_view query, std::size_t k) const {
+SearchLayer::search_text(std::string_view query, std::size_t k,
+                         const bm25::Bm25Params* params_override) const {
     auto term_freqs = analyzer_->analyze(query);
     if (term_freqs.empty()) return std::vector<SearchHit>{};
 
+    // S8.5：自定义 k1/b 的查询绕过缓存——避免与默认参数结果互相污染。
     auto cache_key = CacheKey::make("text", query, k);
-    auto* cached = cache_.get(cache_key);
+    auto* cached = params_override ? nullptr : cache_.get(cache_key);
 
     std::vector<bm25::SearchResult> results;
     if (cached) {
@@ -99,8 +101,8 @@ SearchLayer::search_text(std::string_view query, std::size_t k) const {
             terms.push_back(term);
         }
 
-        results = inverted_->search(terms, k, index_);
-        cache_.put(cache_key, results, terms);
+        results = inverted_->search(terms, k, index_, params_override);
+        if (!params_override) cache_.put(cache_key, results, terms);
     }
 
     std::vector<SearchHit> hits;
@@ -114,12 +116,13 @@ SearchLayer::search_text(std::string_view query, std::size_t k) const {
 }
 
 std::expected<std::vector<SearchHit>, std::string>
-SearchLayer::search_phrase(std::string_view query, std::size_t k) const {
+SearchLayer::search_phrase(std::string_view query, std::size_t k,
+                           const bm25::Bm25Params* params_override) const {
     auto term_freqs = analyzer_->analyze(query);
     if (term_freqs.empty()) return std::vector<SearchHit>{};
 
     auto cache_key = CacheKey::make("phrase", query, k);
-    auto* cached = cache_.get(cache_key);
+    auto* cached = params_override ? nullptr : cache_.get(cache_key);
 
     std::vector<bm25::SearchResult> results;
     if (cached) {
@@ -131,8 +134,8 @@ SearchLayer::search_phrase(std::string_view query, std::size_t k) const {
             terms.push_back(term);
         }
 
-        results = inverted_->search_phrase(terms, k, index_);
-        cache_.put(cache_key, results, terms);
+        results = inverted_->search_phrase(terms, k, index_, params_override);
+        if (!params_override) cache_.put(cache_key, results, terms);
     }
 
     std::vector<SearchHit> hits;
@@ -146,21 +149,22 @@ SearchLayer::search_phrase(std::string_view query, std::size_t k) const {
 }
 
 std::expected<std::vector<SearchHit>, std::string>
-SearchLayer::bool_search(std::string_view query, std::size_t k) const {
+SearchLayer::bool_search(std::string_view query, std::size_t k,
+                         const bm25::Bm25Params* params_override) const {
     auto query_node = bitcask::bm25::parse_query(query);
     if (query_node.term.empty() && query_node.children.empty()) {
         return std::vector<SearchHit>{};
     }
 
     auto cache_key = CacheKey::make("bool", query, k);
-    auto* cached = cache_.get(cache_key);
+    auto* cached = params_override ? nullptr : cache_.get(cache_key);
 
     std::vector<bm25::SearchResult> results;
     if (cached) {
         results = *cached;
     } else {
-        results = inverted_->bool_search(query_node, k, index_);
-        if (!results.empty()) {
+        results = inverted_->bool_search(query_node, k, index_, params_override);
+        if (!params_override && !results.empty()) {
             // 收集 MUST/SHOULD/MUST_NOT 全部叶子词，作为该缓存条目的词集。
             std::vector<std::string> must, should, must_not;
             bm25::collect_terms(query_node, must, should, must_not);
@@ -179,6 +183,20 @@ SearchLayer::bool_search(std::string_view query, std::size_t k) const {
         hits.push_back(SearchHit{std::move(*ext_id), r.ord, r.score});
     }
     return hits;
+}
+
+std::optional<bm25::ScoreExplanation>
+SearchLayer::explain(std::string_view query, std::string_view key,
+                     const bm25::Bm25Params* params_override) const {
+    auto slot = index_.get(key);
+    if (!slot) return std::nullopt;
+
+    auto term_freqs = analyzer_->analyze(query);
+    std::vector<std::string> terms;
+    terms.reserve(term_freqs.size());
+    for (auto& [term, _] : term_freqs) terms.push_back(term);
+
+    return inverted_->explain(terms, slot->ord, index_, params_override);
 }
 
 void SearchLayer::recover_doc(std::string_view key, std::uint64_t ord,

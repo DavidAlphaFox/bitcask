@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <fstream>
+#include <cstdint>
 
 #include "bitcask/analyzer.hpp"
 #include "bitcask/inverted.hpp"
@@ -578,6 +580,48 @@ TEST(InvertedIndex, SaveLoadWithFinalizedPostings) {
     auto phrase_results = idx2.search_phrase({"hello", "world"}, 10, checker);
     ASSERT_EQ(phrase_results.size(), 1u);
     EXPECT_EQ(phrase_results[0].ord, 0u);
+
+    cleanup();
+}
+
+// 回归 S9.4 验证缺口：手工构造 v3 格式快照（positions 为原始 u32 数组，
+// 非 v4 的 gap 压缩），确认 v4 代码能向后兼容读入。
+// 此前 load 版本检查 `ver != kInvVersion && ver != 2 && ver != 1` 漏了 v3，
+// 会拒绝 v3 快照——已改为范围检查 `ver < 1 || ver > kInvVersion`。
+TEST(InvertedIndex, LoadV3SnapshotBackwardCompat) {
+    auto tmp = std::filesystem::temp_directory_path() / "inv_v3_compat.inv";
+    auto cleanup = [&]() { std::filesystem::remove(tmp); };
+    cleanup();
+
+    auto w32 = [](std::ofstream& f, std::uint32_t v) { f.write(reinterpret_cast<char*>(&v), 4); };
+    auto w64 = [](std::ofstream& f, std::uint64_t v) { f.write(reinterpret_cast<char*>(&v), 8); };
+
+    const std::uint32_t kMagic = 0x494E5632;
+    auto sh = std::hash<std::string_view>{}(std::string_view("hello")) % 64;
+
+    {
+        std::ofstream f(tmp.string(), std::ios::binary);
+        w32(f, kMagic); w32(f, 3); w32(f, 2 /*N*/); w64(f, 2 /*sdl*/);
+        for (std::uint32_t s = 0; s < 64; ++s) {
+            if (s == sh) {
+                w32(f, 1);                                   // term_count
+                std::string term = "hello";
+                w32(f, static_cast<std::uint32_t>(term.size()));
+                f.write(term.data(), static_cast<std::streamsize>(term.size()));
+                w32(f, 2);                                   // pc=2
+                w32(f, 0);                                   // comp=0（未压缩分支）
+                w64(f, 0); w32(f, 1); w32(f, 1); w32(f, 0);  // ord0,tf1,pos{0}
+                w64(f, 1); w32(f, 1); w32(f, 1); w32(f, 0);  // ord1,tf1,pos{0}
+            } else {
+                w32(f, 0);                                   // term_count=0
+            }
+        }
+    }
+
+    InvertedIndex idx;
+    ASSERT_TRUE(idx.load(tmp.string()));   // v3 必须被接受
+    EXPECT_EQ(idx.df("hello"), 2u);
+    EXPECT_EQ(idx.live_doc_count(), 2u);
 
     cleanup();
 }

@@ -60,7 +60,8 @@ auto PostingList::block_upper_bound(float idf, const Bm25Params& params, double 
     float tf_norm = static_cast<float>(global_max_tf) * (params.k1 + 1.0f) /
                     (static_cast<float>(global_max_tf) + params.k1 *
                      (1.0f - params.b + params.b * 1.0f / static_cast<float>(avgdl)));
-    return idf * tf_norm;
+    // BM25+：上界含 δ 下界项，与实际评分一致，避免 WAND 剪枝漏结果（S8.10）。
+    return idf * (tf_norm + params.delta);
 }
 
 // ===========================================================================
@@ -117,7 +118,9 @@ void InvertedIndex::remove_doc(
 auto InvertedIndex::search(
     const std::vector<std::string>& query_terms,
     std::size_t k,
-    const LiveChecker& live_checker) const -> std::vector<SearchResult> {
+    const LiveChecker& live_checker,
+    const Bm25Params* params_override) const -> std::vector<SearchResult> {
+    const Bm25Params& params = params_override ? *params_override : params_;
     struct TermPostings {
         std::string term;
         PostingList pl_copy;
@@ -139,7 +142,7 @@ auto InvertedIndex::search(
     std::size_t total_postings = 0;
     for (auto& tp : tps) total_postings += tp.pl_copy.items.size();
     if (total_postings >= kWandThreshold) {
-        return search_wand(query_terms, k, live_checker);
+        return search_wand(query_terms, k, live_checker, params);
     }
 
     // 读取全局统计（shared_lock）。
@@ -175,11 +178,11 @@ auto InvertedIndex::search(
 
                     auto dl = live_checker.doc_len(ord);
                     auto tf_norm = static_cast<float>(posting.tf) *
-                                   (params_.k1 + 1.0F) /
-                                   (static_cast<float>(posting.tf) + params_.k1 *
-                                    (1.0F - params_.b + params_.b *
+                                   (params.k1 + 1.0F) /
+                                   (static_cast<float>(posting.tf) + params.k1 *
+                                    (1.0F - params.b + params.b *
                                      static_cast<float>(dl) / static_cast<float>(avgdl)));
-                    local[ord] += static_cast<float>(idf) * tf_norm;
+                    local[ord] += static_cast<float>(idf) * (tf_norm + params.delta);
                 }
             }
             return local;
@@ -218,13 +221,74 @@ auto InvertedIndex::search(
 }
 
 // ===========================================================================
+// explain —— BM25 评分分项解释（S8.8）
+// ===========================================================================
+
+auto InvertedIndex::explain(
+    const std::vector<std::string>& query_terms,
+    std::uint64_t ord,
+    const LiveChecker& live_checker,
+    const Bm25Params* params_override) const -> ScoreExplanation {
+    const Bm25Params& params = params_override ? *params_override : params_;
+
+    ScoreExplanation out;
+    out.terms.reserve(query_terms.size());
+
+    const auto N = live_doc_count_;
+    const auto sum_dl = sum_doc_len_;
+    const double avgdl = N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
+    const auto dl = live_checker.doc_len(ord);
+
+    for (const auto& term : query_terms) {
+        TermScore ts;
+        ts.term = term;
+
+        auto& shard = shard_for(term);
+        tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+        if (!shard.inverted.find(acc, term)) {
+            // term 不在索引：df=0、各项 0，仍记录以示「未命中」。
+            out.terms.push_back(std::move(ts));
+            continue;
+        }
+        const PostingList& pl = acc->second;
+        auto ords = pl.decompress_ords();
+
+        // 与 search() 一致地算 live df。
+        std::size_t live_df = 0;
+        for (std::size_t i = 0; i < pl.items.size(); ++i) {
+            if (live_checker.is_live(ords[i])) ++live_df;
+        }
+        ts.df = live_df;
+        if (live_df == 0) { out.terms.push_back(std::move(ts)); continue; }
+
+        ts.idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) /
+                                (static_cast<double>(live_df) + 0.5));
+
+        // 找该 ord 的 posting 取 tf（不在该文档则 tf=0，贡献 0）。
+        auto idx = pl.find(ord);
+        if (idx < pl.items.size()) {
+            ts.tf = pl.items[idx].tf;
+            ts.tf_norm = static_cast<float>(ts.tf) * (params.k1 + 1.0F) /
+                         (static_cast<float>(ts.tf) + params.k1 *
+                          (1.0F - params.b + params.b *
+                           static_cast<float>(dl) / static_cast<float>(avgdl)));
+            ts.contribution = static_cast<float>(ts.idf) * (ts.tf_norm + params.delta);
+            out.total += ts.contribution;
+        }
+        out.terms.push_back(std::move(ts));
+    }
+    return out;
+}
+
+// ===========================================================================
 // Block-Max WAND
 // ===========================================================================
 
 auto InvertedIndex::search_wand(
     const std::vector<std::string>& query_terms,
     std::size_t k,
-    const LiveChecker& live_checker) const -> std::vector<SearchResult> {
+    const LiveChecker& live_checker,
+    const Bm25Params& params) const -> std::vector<SearchResult> {
     struct TermPostings {
         std::string term;
         PostingList pl_copy;
@@ -266,7 +330,7 @@ auto InvertedIndex::search_wand(
         }
         tp.idf = static_cast<float>(std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) /
                                              (static_cast<double>(live_df) + 0.5)));
-        tp.list_upper_bound = tp.pl_copy.block_upper_bound(tp.idf, params_, avgdl);
+        tp.list_upper_bound = tp.pl_copy.block_upper_bound(tp.idf, params, avgdl);
     }
 
     using Entry = std::pair<float, std::uint64_t>;
@@ -307,10 +371,10 @@ auto InvertedIndex::search_wand(
 
             const auto* block = tps[i].pl_copy.block_for_ord(pivot_ord);
             if (block != nullptr) {
-                float block_tf_norm = static_cast<float>(block->max_tf) * (params_.k1 + 1.0f) /
-                                      (static_cast<float>(block->max_tf) + params_.k1 *
-                                       (1.0f - params_.b + params_.b * 1.0f / static_cast<float>(avgdl)));
-                float block_upper = tps[i].idf * block_tf_norm;
+                float block_tf_norm = static_cast<float>(block->max_tf) * (params.k1 + 1.0f) /
+                                      (static_cast<float>(block->max_tf) + params.k1 *
+                                       (1.0f - params.b + params.b * 1.0f / static_cast<float>(avgdl)));
+                float block_upper = tps[i].idf * (block_tf_norm + params.delta);
                 float remaining_needed = threshold;
                 if (!heap.empty()) remaining_needed = threshold - heap.top().first + 1e-6f;
                 if (block_upper < remaining_needed) {
@@ -336,11 +400,11 @@ auto InvertedIndex::search_wand(
 
                 auto dl = live_checker.doc_len(pivot_ord);
                 auto tf_norm = static_cast<float>(tps[i].pl_copy.items[tps[i].cursor].tf) *
-                               (params_.k1 + 1.0f) /
-                               (static_cast<float>(tps[i].pl_copy.items[tps[i].cursor].tf) + params_.k1 *
-                                (1.0f - params_.b + params_.b *
+                               (params.k1 + 1.0f) /
+                               (static_cast<float>(tps[i].pl_copy.items[tps[i].cursor].tf) + params.k1 *
+                                (1.0f - params.b + params.b *
                                  static_cast<float>(dl) / static_cast<float>(avgdl)));
-                score += tps[i].idf * tf_norm;
+                score += tps[i].idf * (tf_norm + params.delta);
             }
 
             if (score >= threshold) {
@@ -393,8 +457,10 @@ auto InvertedIndex::search_wand(
 auto InvertedIndex::search_phrase(
     const std::vector<std::string>& query_terms,
     std::size_t k,
-    const LiveChecker& live_checker) const -> std::vector<SearchResult> {
+    const LiveChecker& live_checker,
+    const Bm25Params* params_override) const -> std::vector<SearchResult> {
     if (query_terms.empty()) return {};
+    const Bm25Params& params = params_override ? *params_override : params_;
 
     struct TermPostings {
         std::string term;
@@ -462,11 +528,11 @@ auto InvertedIndex::search_phrase(
         if (phrase_tf > 0) {
             auto dl = live_checker.doc_len(posting_ord);
             auto tf_norm = static_cast<float>(phrase_tf) *
-                           (params_.k1 + 1.0F) /
-                           (static_cast<float>(phrase_tf) + params_.k1 *
-                            (1.0F - params_.b + params_.b *
+                           (params.k1 + 1.0F) /
+                           (static_cast<float>(phrase_tf) + params.k1 *
+                            (1.0F - params.b + params.b *
                              static_cast<float>(dl) / static_cast<float>(avgdl)));
-            scores[posting_ord] += static_cast<float>(idf) * tf_norm;
+            scores[posting_ord] += static_cast<float>(idf) * (tf_norm + params.delta);
         }
     }
 
@@ -495,7 +561,9 @@ auto InvertedIndex::search_phrase(
 auto InvertedIndex::bool_search(
     const QueryNode& query,
     std::size_t k,
-    const LiveChecker& live_checker) const -> std::vector<SearchResult> {
+    const LiveChecker& live_checker,
+    const Bm25Params* params_override) const -> std::vector<SearchResult> {
+    const Bm25Params& params = params_override ? *params_override : params_;
     std::vector<std::string> must_terms;
     std::vector<std::string> should_terms;
     std::vector<std::string> must_not_terms;
@@ -667,11 +735,11 @@ auto InvertedIndex::bool_search(
 
             auto dl = live_checker.doc_len(posting_ord);
             auto tf_norm = static_cast<float>(tp.pl_copy.items[i].tf) *
-                           (params_.k1 + 1.0F) /
-                           (static_cast<float>(tp.pl_copy.items[i].tf) + params_.k1 *
-                            (1.0F - params_.b + params_.b *
+                           (params.k1 + 1.0F) /
+                           (static_cast<float>(tp.pl_copy.items[i].tf) + params.k1 *
+                            (1.0F - params.b + params.b *
                              static_cast<float>(dl) / static_cast<float>(avgdl)));
-            it->second += idf * tf_norm;
+            it->second += idf * (tf_norm + params.delta);
         }
     }
 
@@ -885,7 +953,9 @@ auto InvertedIndex::load(std::string_view path) -> bool {
     if (magic != kInvMagic) {
         std::fclose(f); return false;
     }
-    if (ver != kInvVersion && ver != 2 && ver != 1) {
+    // 接受 1..kInvVersion 的所有版本（向后兼容）。S9.4 升到 v4 时此处漏列 v3，
+    // 导致 v3 快照被拒——改为范围检查，避免再漏。
+    if (ver < 1 || ver > kInvVersion) {
         std::fclose(f); return false;
     }
 
