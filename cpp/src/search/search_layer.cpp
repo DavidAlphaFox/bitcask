@@ -67,10 +67,14 @@ void SearchLayer::on_write_fields(
     std::uint32_t total_sz, std::uint32_t tstamp) {
     std::uint32_t total_doc_len = 0;
     auto& field_lens = ord_field_lens_[ord];
-    field_lens.reserve(fields.size());
+    field_lens.reserve(fields.size() + 1);
+
+    const std::string default_field(kDefaultField);
+    std::string catchall;          // 非默认字段文本拼接，作 catch-all 默认字段内容
+    bool wrote_default = false;    // 是否已有字段直接写入默认字段
 
     for (auto& [fname, ftext] : fields) {
-        const std::string field = fname.empty() ? std::string(kDefaultField) : fname;
+        const std::string field = fname.empty() ? default_field : fname;
         auto term_data = analyzer_->analyze_with_positions(ftext);
         std::uint32_t flen = 0;
         for (auto& [_, data] : term_data) flen += data.first;
@@ -79,6 +83,26 @@ void SearchLayer::on_write_fields(
         }
         field_lens.push_back({field, flen});
         total_doc_len += flen;
+
+        if (field == default_field) {
+            wrote_default = true;
+        } else {
+            if (!catchall.empty()) catchall.push_back(' ');
+            catchall += ftext;
+        }
+    }
+
+    // catch-all（S8.6 修复）：把非默认字段文本合并进默认字段，使
+    // search_text/phrase/near（只查默认字段）也能命中多字段文档。
+    // 若已有字段直接写默认字段，则不重复合并（避免双写）。
+    if (!wrote_default && !catchall.empty()) {
+        auto ca_data = analyzer_->analyze_with_positions(catchall);
+        if (!ca_data.empty()) {
+            field_index(default_field).add_doc(ord, ca_data);
+            std::uint32_t ca_len = 0;
+            for (auto& [_, data] : ca_data) ca_len += data.first;
+            field_lens.push_back({default_field, ca_len});
+        }
     }
 
     index_.put_doc(key, ord,

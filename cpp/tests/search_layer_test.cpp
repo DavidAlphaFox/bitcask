@@ -430,6 +430,38 @@ TEST(SearchLayer, MultiFieldRouting) {
     EXPECT_EQ(r2->at(0).key, "doc2");
 }
 
+// S8.6 catch-all 修复（Erlang REPL 实测发现）：多字段文档必须能被普通
+// search_text（只查默认字段）命中——on_write_fields 把字段文本合并进默认字段。
+TEST(SearchLayer, MultiFieldVisibleToPlainSearch) {
+    SearchLayerConfig config{
+        .analyzer_config = bitcask::text::AnalyzerConfig{
+            .type = bitcask::text::AnalyzerType::Whitespace},
+        .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F}
+    };
+    SearchLayer layer(config);
+    layer.on_write_fields("doc1", 0,
+        {{"title", "quick brown"}, {"body", "lazy dog"}}, 1, 100, 50, 1000);
+    layer.on_write_fields("doc2", 1,
+        {{"title", "lazy cat"}, {"body", "quick fox"}}, 1, 200, 50, 1001);
+
+    // 普通词袋搜索（默认字段）应命中两文档（quick 各在某字段）。
+    auto r = layer.search_text("quick", 10);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->size(), 2u);
+
+    // 短语（默认字段 catch-all）："quick brown" 来自 doc1 的 title。
+    auto rp = layer.search_phrase("quick brown", 10);
+    ASSERT_TRUE(rp.has_value());
+    ASSERT_EQ(rp->size(), 1u);
+    EXPECT_EQ(rp->at(0).key, "doc1");
+
+    // 字段限定仍精确：title:quick 只命中 doc1。
+    auto rf = layer.search_fields("title:quick", 10);
+    ASSERT_TRUE(rf.has_value());
+    ASSERT_EQ(rf->size(), 1u);
+    EXPECT_EQ(rf->at(0).key, "doc1");
+}
+
 // S8.6：跨字段查询 + boost 影响排序。
 TEST(SearchLayer, MultiFieldBoostRanking) {
     SearchLayerConfig config{
