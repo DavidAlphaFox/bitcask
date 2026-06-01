@@ -235,7 +235,16 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
 
         Entry e;
         e.key          = std::move(rec->key);
-        e.value        = std::move(rec->value);
+        // 磁盘上 kDoc value 是 DocValue 编码（text 段 = 原始 value），与
+        // Cask::get 一致地解码取 text 段，避免把 doc 头/长度前缀漏给 caller。
+        // 墓碑 record 不是 DocValue 编码，按原始字节上交（通常为空/marker）。
+        if (value_is_tomb) {
+            e.value = std::move(rec->value);
+        } else {
+            auto dv = codec::decode_doc_value(std::span<const std::byte>(rec->value));
+            if (!dv) return std::unexpected(err(CaskError::kIo, "corrupt DocValue"));
+            e.value.assign(dv->text.begin(), dv->text.end());
+        }
         e.tstamp       = rec->tstamp;
         e.file_id      = proxy->file_id;
         e.offset       = proxy->offset;
