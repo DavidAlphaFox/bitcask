@@ -63,7 +63,7 @@ struct AnalyzerConfig {
     std::uint32_t max_n = 3;
     bool enable_stop_words = false;                  // 启用停用词过滤
     std::vector<std::string> stop_words;             // 自定义停用词表（空则用内置默认）
-    std::string dict_path;                           // jieba 词典目录（空=内嵌 priv/dict/）
+    std::string dict_path;                           // jieba 词典目录；必须有效，由调用方（Erlang facade 默认填 priv/dict）保证
 };
 
 // --------------------------------------------------------------------------

@@ -48,6 +48,7 @@ struct DocSlot {
     DocLoc        loc;
     std::uint32_t tstamp  = 0;
     std::uint32_t doc_len = 0;   // BM25 token 数（V2 由 analyzer 填）
+    std::uint64_t ord     = 0;   // 该文档的 ord（仅 get() 返回时填充；slots_ 内存的副本不依赖此值）
 };
 
 struct IndexInfo {

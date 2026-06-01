@@ -70,7 +70,9 @@ std::optional<DocSlot> Index::get(std::string_view ext_id) const {
     }
     const std::uint64_t ord = it->second;
     // ext2ord 指向的 ord 必然存活（删除时已 erase），这里直接返回 slot。
-    return slots_[ord];
+    DocSlot s = slots_[ord];
+    s.ord = ord;   // 让 caller（如 SearchLayer::on_delete）拿到 ord，无需另查
+    return s;
 }
 
 std::optional<std::string> Index::ord_to_ext(std::uint64_t ord) const {

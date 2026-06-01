@@ -19,7 +19,8 @@ namespace bitcask::text {
 class JiebaAnalyzer final : public Analyzer {
 public:
     // dict_dir: jieba 词典文件所在目录，需包含 jieba.dict.utf8 / hmm_model.utf8 等。
-    //           为空时使用内嵌默认路径。
+    //           必须是有效目录——当前实现无空路径回退，空串会拼成 "/jieba.dict.utf8"
+    //           导致加载失败。运行时由 Erlang facade（bitcask:open）默认填 priv/dict。
     explicit JiebaAnalyzer(const std::string& dict_dir = {},
                            std::uint32_t min_n = 2, std::uint32_t max_n = 3,
                            bool enable_stop_words = false,
