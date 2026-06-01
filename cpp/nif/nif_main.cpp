@@ -61,7 +61,7 @@ namespace {
 ErlNifFunc kNifFuncs[] = {
     // --- cask_*：KV 存储 + 搜索（统一 API）---
     {"cask_open",              2, nif_cask_open,             ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"cask_close",             1, nif_cask_close,            0},
+    {"cask_close",             1, nif_cask_close,            ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"cask_get",               2, nif_cask_get,              0},
     {"cask_put",               3, nif_cask_put,              0},
     {"cask_delete",            2, nif_cask_delete,           0},

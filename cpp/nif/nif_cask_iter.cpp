@@ -6,6 +6,8 @@
 //
 // 线程模型见 nif_main.cpp 顶部的统一说明。
 
+#include <optional>
+
 #include "atoms.hpp"
 #include "bitcask/cask.hpp"
 #include "nif_helpers.hpp"
@@ -27,9 +29,13 @@ static void release_iter(std::unique_ptr<CaskIter>& iter) {
 
 // 迭代器 next 的公共逻辑：调用 iter->next()，处理错误和 EOI，
 // 成功时构造 key/value 二进制 term。
-// 返回 nullptr 表示错误或 EOI（调用方应直接返回 out_term）；
-// 返回 entry 指针表示成功（key_bin/val_bin 已填充）。
-static const CaskIterEntry* iter_next_common(
+// 返回 nullopt 表示错误或 EOI（调用方应直接返回 out_term）；
+// 返回 Entry（值）表示成功（key_bin/val_bin 已填充）。
+//
+// 注意：返回值是 Entry 的拷贝，不是指向 iter->next() 内部临时量的指针——
+// 后者在本函数返回后即析构，会留下悬空引用。调用方读取 file_id/offset 等
+// 标量字段时必须用这个拷贝。
+static std::optional<CaskIter::Entry> iter_next_common(
     ErlNifEnv* env,
     CaskIter* iter,
     ERL_NIF_TERM eoi_term,    // EOI 时返回的 term（done 或 not_found）
@@ -40,20 +46,20 @@ static const CaskIterEntry* iter_next_common(
     auto r = iter->next();
     if (!r) {
         out_term = fault_to_term(env, r.error());
-        return nullptr;
+        return std::nullopt;
     }
     if (!r->has_value()) {
         out_term = eoi_term;
-        return nullptr;
+        return std::nullopt;
     }
     const auto& e = **r;
     key_bin = make_binary_checked(env, e.key);
     val_bin = make_binary_checked(env, e.value);
     if (!key_bin || !val_bin) {
         out_term = make_error(env, atoms().allocation_error);
-        return nullptr;
+        return std::nullopt;
     }
-    return &e;
+    return e;  // 拷贝出 Entry，使其生命周期独立于局部 r
 }
 
 }  // namespace
@@ -91,7 +97,7 @@ ERL_NIF_TERM nif_cask_fold_next(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM
     auto* ih = cask_iter_handle(env, argv[0]);
     if (!ih || !ih->iter) return enif_make_badarg(env);
     ERL_NIF_TERM out, key_bin, val_bin;
-    auto* e = iter_next_common(env, ih->iter.get(), atoms().done, out, key_bin, val_bin);
+    auto e = iter_next_common(env, ih->iter.get(), atoms().done, out, key_bin, val_bin);
     if (!e) return out;
     return enif_make_tuple3(env, atoms().ok, key_bin, val_bin);
 }
@@ -102,7 +108,7 @@ ERL_NIF_TERM nif_cask_fold_next_full(ErlNifEnv* env, int /*argc*/, const ERL_NIF
     auto* ih = cask_iter_handle(env, argv[0]);
     if (!ih || !ih->iter) return enif_make_badarg(env);
     ERL_NIF_TERM out, key_bin, val_bin;
-    auto* e = iter_next_common(env, ih->iter.get(), atoms().done, out, key_bin, val_bin);
+    auto e = iter_next_common(env, ih->iter.get(), atoms().done, out, key_bin, val_bin);
     if (!e) return out;
     ERL_NIF_TERM tup[8] = {
         atoms().ok,
@@ -161,7 +167,7 @@ ERL_NIF_TERM nif_cask_iterator_next(ErlNifEnv* env, int /*argc*/, const ERL_NIF_
         return make_error(env, atoms().iteration_not_started);
     }
     ERL_NIF_TERM out, key_bin, val_bin;
-    auto* e = iter_next_common(env, h->iter.get(), atoms().not_found, out, key_bin, val_bin);
+    auto e = iter_next_common(env, h->iter.get(), atoms().not_found, out, key_bin, val_bin);
     if (!e) return out;
     ERL_NIF_TERM tup[7] = {
         atoms().ok,
