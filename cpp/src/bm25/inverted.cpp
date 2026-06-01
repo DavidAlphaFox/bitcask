@@ -418,20 +418,39 @@ auto InvertedIndex::search_phrase(
 
     auto& first_pl = tps[0].pl_copy;
     auto first_ords = first_pl.decompress_ords();
+
+    // live_df 只依赖 first term 的 posting list（与具体候选 doc 无关），
+    // 提到循环外算一次，避免每个匹配 doc 重算 O(D)（S9.7）。
+    std::size_t live_df = 0;
+    for (std::size_t j = 0; j < first_pl.items.size(); ++j) {
+        if (live_checker.is_live(first_ords[j])) ++live_df;
+    }
+    auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
+
     for (std::size_t i = 0; i < first_pl.items.size(); ++i) {
         auto& posting = first_pl.items[i];
         auto posting_ord = first_ords[i];
         if (!live_checker.is_live(posting_ord)) continue;
+
+        // 把「在其余 term 的 posting list 里定位本 doc」提到 start_pos 循环外：
+        // idx 对固定 (doc, term) 不变，原先每个 start_pos 都重查一次 O(log D)（S9.7）。
+        // 任一 other term 在本 doc 不存在 → 整 doc 不可能成短语，直接跳过。
+        bool doc_has_all_terms = true;
+        std::vector<const std::vector<std::uint32_t>*> other_pos(tps.size(), nullptr);
+        for (std::size_t t = 1; t < tps.size(); ++t) {
+            auto& other_pl = tps[t].pl_copy;
+            auto idx = other_pl.find(posting_ord);
+            if (idx >= other_pl.items.size()) { doc_has_all_terms = false; break; }
+            other_pos[t] = &other_pl.items[idx].positions;
+        }
+        if (!doc_has_all_terms) continue;
 
         std::uint32_t phrase_tf = 0;
         for (auto start_pos : posting.positions) {
             bool match = true;
             for (std::size_t t = 1; t < tps.size(); ++t) {
                 auto needed = static_cast<std::uint32_t>(start_pos + t);
-                auto& other_pl = tps[t].pl_copy;
-                auto idx = other_pl.find(posting_ord);
-                if (idx >= other_pl.items.size()) { match = false; break; }
-                auto& pos_list = other_pl.items[idx].positions;
+                const auto& pos_list = *other_pos[t];
                 if (!std::binary_search(pos_list.begin(), pos_list.end(), needed)) {
                     match = false;
                     break;
@@ -441,11 +460,6 @@ auto InvertedIndex::search_phrase(
         }
 
         if (phrase_tf > 0) {
-            std::size_t live_df = 0;
-            for (std::size_t j = 0; j < first_pl.items.size(); ++j) {
-                if (live_checker.is_live(first_ords[j])) ++live_df;
-            }
-            auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
             auto dl = live_checker.doc_len(posting_ord);
             auto tf_norm = static_cast<float>(phrase_tf) *
                            (params_.k1 + 1.0F) /

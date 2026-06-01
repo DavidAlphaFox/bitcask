@@ -167,6 +167,24 @@ TEST(InvertedIndex, PhraseSearchNoFalsePositive) {
     EXPECT_TRUE(results.empty());
 }
 
+// 同一文档内短语多次出现 → phrase_tf>1，应比只出现一次的文档分数高。
+// 回归 S9.7：把 other_pl.find 提到 start_pos 循环外后，内层多次 binary_search
+// 的计数路径仍需正确。
+TEST(InvertedIndex, PhraseSearchRepeatedInDoc) {
+    InvertedIndex idx;
+    idx.add_doc(0, {{"a", tp(2, {0, 2})}, {"b", tp(2, {1, 3})}});  // "a b a b" → 2 次
+    idx.add_doc(1, {{"a", tp(1, {0})}, {"b", tp(1, {1})}});         // "a b" → 1 次
+
+    FakeLiveChecker checker;
+    checker.doc_lens[0] = 4;
+    checker.doc_lens[1] = 2;
+
+    auto results = idx.search_phrase({"a", "b"}, 10, checker);
+    ASSERT_EQ(results.size(), 2u);
+    EXPECT_EQ(results[0].ord, 0u);  // phrase_tf=2 排在前
+    EXPECT_GT(results[0].score, results[1].score);
+}
+
 TEST(InvertedIndex, PhraseSearchSkipsDeleted) {
     InvertedIndex idx;
     idx.add_doc(0, {{"hello", tp(1, {0})}, {"world", tp(1, {1})}});

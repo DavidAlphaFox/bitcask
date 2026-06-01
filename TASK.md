@@ -379,7 +379,7 @@ ctest **206/206 全部通过**（含此前一贯失败的 10 个 Jieba 测试，
 |---|------|---------|---------|--------|------|
 | **S9.6** | bool_search 缓存 decompress_ords | `inverted.cpp` | 核实后修正子分析：`set_intersection` 对已排序序列本就是 O(n+m) 双指针、**不慢**（子分析误判「逐两比较」）。真正低效是同一 PostingList 在一次 bool_search 里被 `decompress_ords()` 解压 6 次（must_not/must/should×2/idf/评分各一次）。修法：给 `TermPostings` 加 `ords` 缓存，收集时解压一次，6 处复用。纯收益、不碰锁语义、不改算法/结果。✅ ctest 206/206（含 5 个 bool_search 用例）<br>**关联修复见 S9.6b** | 低 | ✅ |
 | **S9.6b** | 修复 MUST+SHOULD 候选集语义 bug | `inverted.cpp` `inverted_test.cpp` | 实测确认 bug：`+hello world`（MUST hello + SHOULD world）会返回只含 world、不含 hello 的 doc2（违反 MUST 语义）。根因：must 非空时仍无条件把 should ords 追加进 candidates（原 592-600）。修法：删除该段——MUST 定候选集、SHOULD 只参与打分（评分循环遍历 all_tps 对候选内 ord 累加，加分不受影响）。顺带消除了 S9.6 记的「should 分支重复收集」。实测：修后 `+hello world`→{0,1}，且 doc0（含 world 加分 0.78）> doc1（0.52），打分仍正确。新增回归测试 `BoolSearchMustWithShouldBoost`。✅ ctest 207/207 | 🔴 高 | ✅ |
-| **S9.7** | 短语位置匹配加 skip | `inverted.cpp:427` 附近 | `O(短语长×posting×log(pos))`；position 加 skip index，3~5 词短语提升 30~50% | 低 | ☐ |
+| **S9.7** | 短语匹配消除循环不变量重复 | `inverted.cpp` `inverted_test.cpp` | 核实后修正子分析：skip index 收益有限（binary_search 已 log）。真正低效是循环不变量重算：①`other_pl.find(posting_ord)`（O(log D) 二分）在**每个 start_pos** 内重复调用，但 idx 对固定 (doc,term) 不变 → 提到 start_pos 循环外，每 (doc,term) 只查一次，并缓存 pos_list 指针；any other term 不在本 doc → 提前跳过整 doc。②`live_df`（O(D)）原在每个匹配 doc 内重算 → 提到 doc 循环外只算一次。纯收益、零语义变化。新增回归测试 `PhraseSearchRepeatedInDoc`（phrase_tf>1）。✅ ctest 208/208 | 低 | ✅ |
 | **S9.8** | 分词 `min_token_length` | `analyzer.hpp/.cpp` | 过滤 1~2 字符无意义拉丁 token，削减英文索引体积 | 低 | ☐ |
 | **S9.9** | jieba 二次归一化对齐 | `jieba_analyzer.cpp` | `jieba_cut`（内部 normalize）与 `nfkc_fold` 归一化差异致字节 offset 错位，可能搞乱高亮/回退判定（正确性） | 低 | ☐ |
 
