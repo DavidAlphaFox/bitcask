@@ -266,3 +266,32 @@ TEST(AnalyzerFactory, StopWordsThroughConfig) {
     EXPECT_NE(tfs.find("cat"), tfs.end());
     EXPECT_NE(tfs.find("mat"), tfs.end());
 }
+
+// S9.8：min_token_length 过滤短拉丁词。
+TEST(WhitespaceAnalyzer, MinTokenLengthFiltersShortLatin) {
+    WhitespaceAnalyzer a(3);
+    auto tfs = a.analyze("a of cat hello");
+    EXPECT_EQ(tfs.find("a"), tfs.end());     // 1 codepoint → 过滤
+    EXPECT_EQ(tfs.find("of"), tfs.end());    // 2 → 过滤
+    EXPECT_NE(tfs.find("cat"), tfs.end());   // 3 → 保留
+    EXPECT_NE(tfs.find("hello"), tfs.end()); // 5 → 保留
+}
+
+// S9.8：默认 min_token_length=1 不过滤（向后兼容）。
+TEST(WhitespaceAnalyzer, DefaultKeepsShortTokens) {
+    WhitespaceAnalyzer a;
+    auto tfs = a.analyze("a of cat");
+    EXPECT_NE(tfs.find("a"), tfs.end());
+    EXPECT_NE(tfs.find("of"), tfs.end());
+    EXPECT_NE(tfs.find("cat"), tfs.end());
+}
+
+// S9.8 关键：min_token_length 只作用于拉丁整词，CJK n-gram 不受影响。
+// 否则 min>=2/3 会删光中文 bi-gram 索引。
+TEST(NgramAnalyzer, MinTokenLengthDoesNotAffectCjkNgrams) {
+    NgramAnalyzer a(2, 3, false, {}, 3);  // min_token_length=3
+    auto tfs = a.analyze("北京 a of");
+    EXPECT_NE(tfs.find("北京"), tfs.end());  // CJK bi-gram（2 codepoint）必须保留
+    EXPECT_EQ(tfs.find("a"), tfs.end());     // 拉丁短词过滤
+    EXPECT_EQ(tfs.find("of"), tfs.end());
+}

@@ -34,13 +34,15 @@ auto AnalyzerFactory::create(const AnalyzerConfig& config)
             }
             return std::make_unique<NgramAnalyzer>(
                 config.min_n, config.max_n,
-                config.enable_stop_words, config.stop_words);
+                config.enable_stop_words, config.stop_words,
+                config.min_token_length);
         case AnalyzerType::Whitespace:
-            return std::make_unique<WhitespaceAnalyzer>();
+            return std::make_unique<WhitespaceAnalyzer>(config.min_token_length);
         case AnalyzerType::Jieba:
             return std::make_unique<JiebaAnalyzer>(
                 config.dict_path, config.min_n, config.max_n,
-                config.enable_stop_words, config.stop_words);
+                config.enable_stop_words, config.stop_words,
+                config.min_token_length);
     }
     return nullptr;
 }
@@ -120,8 +122,10 @@ const std::vector<std::string>& default_stop_words() {
 
 NgramAnalyzer::NgramAnalyzer(std::uint32_t min_n, std::uint32_t max_n,
                              bool enable_stop_words,
-                             std::vector<std::string> custom_stop_words)
-    : min_n_(min_n), max_n_(max_n), enable_stop_words_(enable_stop_words) {
+                             std::vector<std::string> custom_stop_words,
+                             std::uint32_t min_token_length)
+    : min_n_(min_n), max_n_(max_n), enable_stop_words_(enable_stop_words),
+      min_token_length_(min_token_length) {
     if (enable_stop_words_) {
         const auto& defaults = default_stop_words();
         const auto& src = custom_stop_words.empty()
@@ -163,15 +167,18 @@ auto NgramAnalyzer::analyze_with_positions(std::string_view text) const -> TermP
     };
 
     auto emit_word = [&](std::size_t start, std::size_t end) {
-        auto& first = cps[start];
-        auto& last = cps[end - 1];
-        auto term = std::string(
-            normalized.data() + first.byte_off,
-            (last.byte_off + last.byte_len) - first.byte_off);
-        if (!term.empty()) {
-            auto& [tf, positions] = tpm[std::move(term)];
-            ++tf;
-            positions.push_back(pos);
+        // S9.8：拉丁整词按 codepoint 长度过滤；短词丢弃但 pos 仍递增（位置语义不变）。
+        if (end - start >= min_token_length_) {
+            auto& first = cps[start];
+            auto& last = cps[end - 1];
+            auto term = std::string(
+                normalized.data() + first.byte_off,
+                (last.byte_off + last.byte_len) - first.byte_off);
+            if (!term.empty()) {
+                auto& [tf, positions] = tpm[std::move(term)];
+                ++tf;
+                positions.push_back(pos);
+            }
         }
         ++pos;
     };
@@ -254,15 +261,18 @@ auto WhitespaceAnalyzer::analyze_with_positions(std::string_view text) const -> 
         while (i < cps.size() && !detail::is_unicode_space(cps[i].cp)) {
             ++i;
         }
-        auto& first = cps[word_start];
-        auto& last = cps[i - 1];
-        auto term = std::string(
-            normalized.data() + first.byte_off,
-            (last.byte_off + last.byte_len) - first.byte_off);
-        if (!term.empty()) {
-            auto& [tf, positions] = tpm[std::move(term)];
-            ++tf;
-            positions.push_back(pos);
+        // S9.8：按 codepoint 长度过滤短词；短词丢弃但 pos 仍递增。
+        if (i - word_start >= min_token_length_) {
+            auto& first = cps[word_start];
+            auto& last = cps[i - 1];
+            auto term = std::string(
+                normalized.data() + first.byte_off,
+                (last.byte_off + last.byte_len) - first.byte_off);
+            if (!term.empty()) {
+                auto& [tf, positions] = tpm[std::move(term)];
+                ++tf;
+                positions.push_back(pos);
+            }
         }
         ++pos;
     }
@@ -302,16 +312,19 @@ auto WhitespaceAnalyzer::analyze_with_offsets(std::string_view text) const -> Te
         while (i < cps.size() && !detail::is_unicode_space(cps[i].cp)) {
             ++i;
         }
-        auto& first = cps[word_start];
-        auto& last = cps[i - 1];
-        auto term = std::string(
-            normalized.data() + first.byte_off,
-            (last.byte_off + last.byte_len) - first.byte_off);
-        if (!term.empty()) {
-            auto& infos = ttm[std::move(term)];
-            infos.push_back(TokenInfo{pos,
-                                      static_cast<std::uint32_t>(first.byte_off),
-                                      static_cast<std::uint32_t>(last.byte_off + last.byte_len)});
+        // S9.8：按 codepoint 长度过滤短词；短词丢弃但 pos 仍递增。
+        if (i - word_start >= min_token_length_) {
+            auto& first = cps[word_start];
+            auto& last = cps[i - 1];
+            auto term = std::string(
+                normalized.data() + first.byte_off,
+                (last.byte_off + last.byte_len) - first.byte_off);
+            if (!term.empty()) {
+                auto& infos = ttm[std::move(term)];
+                infos.push_back(TokenInfo{pos,
+                                          static_cast<std::uint32_t>(first.byte_off),
+                                          static_cast<std::uint32_t>(last.byte_off + last.byte_len)});
+            }
         }
         ++pos;
     }

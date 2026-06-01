@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include "bitcask/analyzer.hpp"
 
 namespace bitcask::text {
@@ -12,6 +14,8 @@ namespace bitcask::text {
 class WhitespaceAnalyzer final : public Analyzer {
 public:
     WhitespaceAnalyzer() = default;
+    explicit WhitespaceAnalyzer(std::uint32_t min_token_length)
+        : min_token_length_(min_token_length) {}
 
     [[nodiscard]] auto analyze(std::string_view text) const
         -> TermFreqMap override;
@@ -25,6 +29,9 @@ public:
     [[nodiscard]] auto type() const noexcept -> AnalyzerType override {
         return AnalyzerType::Whitespace;
     }
+
+private:
+    std::uint32_t min_token_length_ = 1;   // 整词最小 codepoint 长度（S9.8），1=不过滤
 };
 
 }  // namespace bitcask::text

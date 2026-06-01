@@ -24,7 +24,8 @@ public:
     explicit JiebaAnalyzer(const std::string& dict_dir = {},
                            std::uint32_t min_n = 2, std::uint32_t max_n = 3,
                            bool enable_stop_words = false,
-                           std::vector<std::string> custom_stop_words = {});
+                           std::vector<std::string> custom_stop_words = {},
+                           std::uint32_t min_token_length = 1);
 
     ~JiebaAnalyzer() override;
 
@@ -68,6 +69,7 @@ private:
     std::uint32_t max_n_;
     bool enable_stop_words_;
     std::unordered_set<std::string> stop_words_;
+    std::uint32_t min_token_length_ = 1;   // 拉丁整词最小 codepoint 长度（S9.8），1=不过滤
 };
 
 }  // namespace bitcask::text

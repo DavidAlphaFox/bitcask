@@ -62,8 +62,10 @@ JiebaAnalyzer::~JiebaAnalyzer() = default;
 JiebaAnalyzer::JiebaAnalyzer(const std::string& dict_dir,
                              std::uint32_t min_n, std::uint32_t max_n,
                              bool enable_stop_words,
-                             std::vector<std::string> custom_stop_words)
-    : min_n_(min_n), max_n_(max_n), enable_stop_words_(enable_stop_words) {
+                             std::vector<std::string> custom_stop_words,
+                             std::uint32_t min_token_length)
+    : min_n_(min_n), max_n_(max_n), enable_stop_words_(enable_stop_words),
+      min_token_length_(min_token_length) {
     jieba_ = std::make_unique<JiebaImpl>(dict_dir);
 
     if (enable_stop_words_) {
@@ -140,6 +142,13 @@ auto JiebaAnalyzer::collect_tokens(std::string_view text) const
                 has_cjk = true;
                 break;
             }
+        }
+
+        // S9.8：非 CJK 的短拉丁词按 codepoint 长度过滤（CJK 词不受限）；
+        // 跳过该词但 pos 仍递增，保持位置语义一致。
+        if (!has_cjk && word_cps.size() < min_token_length_) {
+            ++pos;
+            continue;
         }
 
         // 在整个 cps 中朴素查找该词的 codepoint 序列首次出现位置。
