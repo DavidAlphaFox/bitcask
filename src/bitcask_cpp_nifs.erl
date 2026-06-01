@@ -19,6 +19,7 @@
          cask_search_text/3,
          cask_search_phrase/3,
          cask_bool_search/3,
+         cask_search_fields/3,
          cask_fold_start/3,
          cask_fold_start/4,
          cask_fold_next/1,
@@ -67,6 +68,7 @@ cask_close_write_file(_Ref)   -> erlang:nif_error({error, not_loaded}).
 cask_search_text(_Ref, _Q, _K)   -> erlang:nif_error({error, not_loaded}).
 cask_search_phrase(_Ref, _Q, _K) -> erlang:nif_error({error, not_loaded}).
 cask_bool_search(_Ref, _Q, _K)   -> erlang:nif_error({error, not_loaded}).
+cask_search_fields(_Ref, _Q, _K) -> erlang:nif_error({error, not_loaded}).
 cask_fold_start(_R, _MA, _MP) -> erlang:nif_error({error, not_loaded}).
 cask_fold_start(_R, _MA, _MP, _SeeTomb) -> erlang:nif_error({error, not_loaded}).
 cask_fold_next(_IterRef)      -> erlang:nif_error({error, not_loaded}).

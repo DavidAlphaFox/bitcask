@@ -46,12 +46,14 @@ struct IndexTask {
     IndexOp              op;
     std::string          key;
     std::uint64_t        ord       = 0;
-    std::string          text;         // Add 操作的文档文本
+    std::string          text;         // Add 操作的文档文本（单字段路径）
     std::uint32_t        file_id   = 0;
     std::uint64_t        offset    = 0;
     std::uint32_t        total_sz  = 0;
     std::uint32_t        tstamp    = 0;
     std::uint32_t        doc_len   = 0; // token 总数（BM25 统计用）
+    // S8.6 多字段：非空时走 on_write_fields；text 字段保留兼容单字段路径。
+    std::vector<std::pair<std::string, std::string>> fields;
 };
 
 // 索引任务队列：多生产者（put/delete 线程）→ 单消费者（Index Pool worker）。

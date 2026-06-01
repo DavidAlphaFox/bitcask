@@ -329,7 +329,7 @@
 | **S8.3** | 模糊搜索（Fuzzy） | `inverted.cpp` | Levenshtein edit distance 匹配；"helo" → "hello" | 低 |
 | **S8.4** | 通配符搜索 | `inverted.cpp` | 前缀通配 `te*`、后缀 `*st`；需 term 字典 + 前缀树 | 低 |
 | **S8.5** | 查询时 k1/b 调节 ✅ | `inverted.hpp/.cpp` `search_layer.hpp/.cpp` | InvertedIndex 4 个查询函数 + SearchLayer search_text/phrase/bool_search 加可选 `const Bm25Params*`，nullptr=用默认。WAND 上界估算用同组参数（剪枝正确）。override 查询绕过缓存（避免与默认结果互污染）。范围到 C++ SearchLayer 层（Cask/NIF 未扩散）。新增测试 `QueryTimeBm25ParamsOverride`（b=0 vs b=0.75 分数不同）。✅ ctest 218/218 | 低 |
-| **S8.6** | 多字段索引 + 权重 | `search_layer.hpp` | DocValue 多字段（title/body）独立索引 + field boost `title^3` | 低 |
+| **S8.6** | 多字段索引 + 权重 ✅ | codec / search_layer / query_parser / cask / nif / bitcask.erl | 四阶段完成：①DocValue v2 加 fields 段（空 fields 写 v1 字节不变，向后兼容）②SearchLayer `inverted_`→`map<field,InvertedIndex>`，per-field 统计隔离 + manifest 多文件快照 + R3 doc_len 辅助表 ③QueryNode 加 field/boost，parse_query 解析 `field:term^boost`（R5 防 http:// 误判）④DocInput/IndexTask/put_doc/NIF parse_doc_map（enif_map_iterator）/cask_search_fields 全打通。端到端实测：Erlang `put_doc(#{title=>,body=>})` + `search_fields("title:apple")` 字段路由正确。✅ ctest 234/234 + eunit 38/38。计划见 plans/tranquil-watching-sutton.md | 低 |
 | **S8.7** | 近邻搜索（带距离） | `inverted.cpp` | `search_phrase` 支持 `NEAR/N` 窗口而非严格连续 | 低 |
 | **S8.8** | 评分解释 explain() API ✅ | `inverted.hpp/.cpp` `search_layer.hpp/.cpp` | 新增 `TermScore`/`ScoreExplanation` 结构 + `InvertedIndex::explain(terms, ord, ...)`（用与 search 完全相同的 idf/tf_norm 公式逐 term 给分项）+ `SearchLayer::explain(query, key)`（key→ord→inverted::explain，key 不存在返回 nullopt）。新增测试 `ExplainMatchesSearchScore`（total 与 search score EXPECT_NEAR 一致）+ `ExplainMissingKey`。✅ ctest 220/220 | 低 |
 | **S8.9** | 增量索引持久化 | `inverted.cpp` | append-only WAL 而非全量 snapshot；减少 sync 开销 | 低 |

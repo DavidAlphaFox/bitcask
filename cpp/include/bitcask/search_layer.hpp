@@ -33,6 +33,10 @@
 
 namespace bitcask::search {
 
+// 默认字段名（S8.6）：旧单 text 文档 / 无字段限定查询都映射到此字段，
+// 使新旧路径收敛。用不可见控制字符前缀避免与用户字段名冲突。
+inline constexpr std::string_view kDefaultField = "\x01default";
+
 // SearchLayer 配置。
 struct SearchLayerConfig {
     text::AnalyzerConfig analyzer_config;
@@ -75,6 +79,13 @@ public:
                   std::uint32_t file_id, std::uint64_t offset,
                   std::uint32_t total_sz, std::uint32_t tstamp);
 
+    // ---- 多字段写入（S8.6）----
+    // fields: (字段名, 文本) 列表，每字段独立分词建索引。空字段名映射到默认字段。
+    void on_write_fields(std::string_view key, std::uint64_t ord,
+                         const std::vector<std::pair<std::string, std::string>>& fields,
+                         std::uint32_t file_id, std::uint64_t offset,
+                         std::uint32_t total_sz, std::uint32_t tstamp);
+
     // ---- 文档删除：移除索引 ----
     // key: 要删除的 key
     // tomb_ord: 墓碑 record 的 ord（用于 index_.remove）
@@ -100,6 +111,14 @@ public:
     [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
     bool_search(std::string_view query, std::size_t k,
                 const bm25::Bm25Params* params_override = nullptr) const;
+
+    // ---- 多字段搜索（S8.6）----
+    // 解析 `field:term^boost` 语法：有字段限定的词查对应字段索引，无限定的词
+    // 查默认字段；各词得分 × boost，同一文档跨字段累加；返回 top-k。
+    // 不含字段语法时等价于在默认字段做词袋搜索。
+    [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
+    search_fields(std::string_view query, std::size_t k,
+                  const bm25::Bm25Params* params_override = nullptr) const;
 
     // ---- 评分解释（S8.8，调试/调优）----
     // 解释 query 对外部 key 文档的 BM25 评分分项。key 不存在返回 nullopt。
@@ -189,9 +208,20 @@ private:
             std::list<std::pair<std::uint64_t, std::string>>::iterator> map_;
     };
 
+    // 取或建某字段的 InvertedIndex（S8.6 阶段2）。
+    bm25::InvertedIndex& field_index(std::string_view field);
+    // 取某字段的 InvertedIndex（只读，不存在返回 nullptr）。
+    const bm25::InvertedIndex* field_index(std::string_view field) const;
+
     SearchLayerConfig  config_;
     index::Index      index_;
-    std::unique_ptr<bm25::InvertedIndex> inverted_;
+    // S8.6：每字段一个 InvertedIndex（字段间 avgdl/idf 隔离）。
+    // 旧单 text 文档与无字段限定查询都走 kDefaultField。
+    std::unordered_map<std::string, std::unique_ptr<bm25::InvertedIndex>> fields_;
+    // R3：ord → (字段名 → 该字段 doc_len)，供 on_delete 按字段精确扣减统计。
+    // 仅多字段路径填充；单 text 路径用 index_ 的 doc_len 即可（默认字段）。
+    std::unordered_map<std::uint64_t,
+                       std::vector<std::pair<std::string, std::uint32_t>>> ord_field_lens_;
     std::unique_ptr<text::Analyzer>      analyzer_;
     mutable SearchCache cache_;
     mutable DocTextLru  doc_texts_;   // mutable：const 查询路径里 get() 会提升 LRU 顺序

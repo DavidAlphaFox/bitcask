@@ -201,6 +201,27 @@ bool parse_doc_map(ErlNifEnv* env, ERL_NIF_TERM map_term, DocInput& doc) {
             doc.meta = as_bytes(mb);
         }
     }
+    // S8.6 多字段：遍历 map，把 text/meta 之外的「atom 键 → binary 值」作为命名字段。
+    // span 指向 NIF binary（put_doc 同步编码完才返回，生命周期安全）。
+    ErlNifMapIterator iter;
+    if (enif_map_iterator_create(env, map_term, &iter, ERL_NIF_MAP_ITERATOR_FIRST)) {
+        ERL_NIF_TERM k, v;
+        while (enif_map_iterator_get_pair(env, &iter, &k, &v)) {
+            char namebuf[256];
+            int n = enif_get_atom(env, k, namebuf, sizeof(namebuf), ERL_NIF_LATIN1);
+            if (n > 0) {
+                std::string name(namebuf, static_cast<std::size_t>(n - 1));  // 去末尾 NUL
+                if (name != "text" && name != "meta") {
+                    ErlNifBinary fb{};
+                    if (enif_inspect_binary(env, v, &fb)) {
+                        doc.fields.push_back({std::move(name), as_bytes(fb)});
+                    }
+                }
+            }
+            enif_map_iterator_next(env, &iter);
+        }
+        enif_map_iterator_destroy(env, &iter);
+    }
     return true;
 }
 

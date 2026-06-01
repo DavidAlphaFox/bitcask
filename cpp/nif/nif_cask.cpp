@@ -141,4 +141,10 @@ ERL_NIF_TERM nif_cask_bool_search(ErlNifEnv* env, int argc,
     return bool_search_impl(env, argc, argv);
 }
 
+// S8.6：多字段搜索（field:term^boost）。复用 search_impl（签名同 search_text）。
+ERL_NIF_TERM nif_cask_search_fields(ErlNifEnv* env, int argc,
+                                    const ERL_NIF_TERM argv[]) {
+    return search_impl(env, argc, argv, &Cask::search_fields);
+}
+
 }  // namespace bitcask::nif

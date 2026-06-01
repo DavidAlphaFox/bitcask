@@ -375,6 +375,71 @@ TEST(SearchLayer, Bm25PlusDeltaBoostsScore) {
     EXPECT_NEAR(exp->total, plus->at(0).score, 1e-4);
 }
 
+// S8.6：多字段写入 + field:term 字段路由。
+TEST(SearchLayer, MultiFieldRouting) {
+    SearchLayerConfig config{
+        .analyzer_config = bitcask::text::AnalyzerConfig{
+            .type = bitcask::text::AnalyzerType::Whitespace},
+        .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F}
+    };
+    SearchLayer layer(config);
+    // doc1: title 含 "apple"，body 含 "banana"
+    layer.on_write_fields("doc1", 0,
+        {{"title", "apple fruit"}, {"body", "banana split dessert"}},
+        1, 100, 50, 1000);
+    // doc2: title 含 "banana"，body 含 "apple"
+    layer.on_write_fields("doc2", 1,
+        {{"title", "banana bread"}, {"body", "apple pie recipe"}},
+        1, 200, 50, 1001);
+
+    // title:apple 只应命中 doc1（apple 在 doc1 的 title、doc2 的 body）。
+    auto r = layer.search_fields("title:apple", 10);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->size(), 1u);
+    EXPECT_EQ(r->at(0).key, "doc1");
+
+    // title:banana 只应命中 doc2。
+    auto r2 = layer.search_fields("title:banana", 10);
+    ASSERT_TRUE(r2.has_value());
+    ASSERT_EQ(r2->size(), 1u);
+    EXPECT_EQ(r2->at(0).key, "doc2");
+}
+
+// S8.6：跨字段查询 + boost 影响排序。
+TEST(SearchLayer, MultiFieldBoostRanking) {
+    SearchLayerConfig config{
+        .analyzer_config = bitcask::text::AnalyzerConfig{
+            .type = bitcask::text::AnalyzerType::Whitespace},
+        .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F}
+    };
+    SearchLayer layer(config);
+    layer.on_write_fields("doc1", 0, {{"title", "x"}, {"body", "apple"}}, 1, 100, 50, 1000);
+    layer.on_write_fields("doc2", 1, {{"title", "apple"}, {"body", "y"}}, 1, 200, 50, 1001);
+
+    // title:apple^5 body:apple：doc2(title 命中×5) 应排在 doc1(body 命中×1) 前。
+    auto r = layer.search_fields("title:apple^5 body:apple", 10);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->size(), 2u);
+    EXPECT_EQ(r->at(0).key, "doc2");
+    EXPECT_GT(r->at(0).score, r->at(1).score);
+}
+
+// S8.6：on_write_fields 后 on_delete 清掉所有字段。
+TEST(SearchLayer, MultiFieldDelete) {
+    SearchLayerConfig config{
+        .analyzer_config = bitcask::text::AnalyzerConfig{
+            .type = bitcask::text::AnalyzerType::Whitespace},
+        .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F}
+    };
+    SearchLayer layer(config);
+    layer.on_write_fields("doc1", 0, {{"title", "apple"}, {"body", "banana"}}, 1, 100, 50, 1000);
+    ASSERT_EQ(layer.search_fields("title:apple", 10)->size(), 1u);
+
+    layer.on_delete("doc1", 1);
+    EXPECT_TRUE(layer.search_fields("title:apple", 10)->empty());
+    EXPECT_TRUE(layer.search_fields("body:banana", 10)->empty());
+}
+
 // S8.8：explain() 的分项总分应等于 search() 返回的实际 BM25 分数（同一公式）。
 TEST(SearchLayer, ExplainMatchesSearchScore) {
     auto config = default_config();

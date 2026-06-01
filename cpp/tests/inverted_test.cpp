@@ -377,6 +377,51 @@ TEST(QueryParser, WhitespaceOnly) {
     EXPECT_TRUE(node.term.empty());
 }
 
+// S8.6：字段限定 field:term。
+TEST(QueryParser, FieldQualified) {
+    auto node = parse_query("title:hello");
+    EXPECT_EQ(node.field, "title");
+    EXPECT_EQ(node.term, "hello");
+    EXPECT_FLOAT_EQ(node.boost, 1.0F);
+}
+
+// S8.6：boost ^N。
+TEST(QueryParser, BoostSuffix) {
+    auto node = parse_query("hello^3");
+    EXPECT_EQ(node.term, "hello");
+    EXPECT_TRUE(node.field.empty());
+    EXPECT_FLOAT_EQ(node.boost, 3.0F);
+}
+
+// S8.6：field:term^boost 组合。
+TEST(QueryParser, FieldAndBoost) {
+    auto node = parse_query("title:hello^2.5");
+    EXPECT_EQ(node.field, "title");
+    EXPECT_EQ(node.term, "hello");
+    EXPECT_FLOAT_EQ(node.boost, 2.5F);
+}
+
+// S8.6 R5：http://x、12:30 不应被误判为字段限定。
+TEST(QueryParser, ColonNotFieldWhenInvalidName) {
+    auto n1 = parse_query("http://example.com");
+    EXPECT_TRUE(n1.field.empty());  // "http" 后是 "//"，但整体仍按 term（冒号右是 //）
+    auto n2 = parse_query(":leading");
+    EXPECT_TRUE(n2.field.empty());  // 冒号在首位，colon>0 不满足
+}
+
+// S8.6：多 token 混合字段/boost/前缀。
+TEST(QueryParser, MixedFieldBoost) {
+    auto node = parse_query("+title:foo^2 body:bar");
+    ASSERT_EQ(node.children.size(), 2u);
+    EXPECT_EQ(node.children[0].op, QueryOp::MUST);
+    EXPECT_EQ(node.children[0].field, "title");
+    EXPECT_EQ(node.children[0].term, "foo");
+    EXPECT_FLOAT_EQ(node.children[0].boost, 2.0F);
+    EXPECT_EQ(node.children[1].op, QueryOp::SHOULD);
+    EXPECT_EQ(node.children[1].field, "body");
+    EXPECT_EQ(node.children[1].term, "bar");
+}
+
 TEST(InvertedIndex, BoolSearchShould) {
     InvertedIndex idx;
     idx.add_doc(0, {{"hello", tp(1, {0})}, {"world", tp(1, {1})}});

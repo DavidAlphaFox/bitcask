@@ -33,6 +33,8 @@ enum class QueryOp : std::uint8_t {
 struct QueryNode {
     QueryOp               op;
     std::string           term;                     // 叶子节点查询词
+    std::string           field;                    // 字段限定（S8.6，空=默认字段）
+    float                 boost = 1.0F;             // 字段/词权重（S8.6）
     std::vector<QueryNode> children;               // 非叶子子节点
 
     // 工厂方法：创建叶子节点

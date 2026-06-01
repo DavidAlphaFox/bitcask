@@ -118,9 +118,11 @@ struct TextSearchResult {
 };
 
 // put_doc 的输入结构：text 是必须的，meta 可选。
+// S8.6：fields 非空时走多字段路径（编码进 DocValue v2 fields 段 + 多字段索引）。
 struct DocInput {
-    std::span<const std::byte> text;    // required
+    std::span<const std::byte> text;    // required（多字段时可空，作默认字段）
     std::span<const std::byte> meta;    // optional
+    std::vector<std::pair<std::string, std::span<const std::byte>>> fields;  // S8.6
 };
 
 struct StatusInfo {
@@ -259,6 +261,11 @@ public:
 
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
     bool_search(std::string_view query, std::size_t k = 10);
+
+    // BM25 多字段搜索（S8.6）：支持 `field:term^boost` 语法，跨字段加权合并。
+    // 无字段限定的词等价于默认字段词袋搜索。线程安全: 否。
+    [[nodiscard]] std::expected<TextSearchResult, CaskFault>
+    search_fields(std::string_view query, std::size_t k = 10);
 
     // 访问内部 SearchLayer（用于 NIF 层）。
     [[nodiscard]] bool has_search() const { return search_ != nullptr; }

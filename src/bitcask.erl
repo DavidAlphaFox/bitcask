@@ -42,7 +42,8 @@
          is_empty_estimate/1,
          status/1,
          search_text/2, search_text/3,
-         search_phrase/2, search_phrase/3]).
+         search_phrase/2, search_phrase/3,
+         search_fields/2, search_fields/3]).
 
 -include("bitcask.hrl").
 
@@ -470,3 +471,11 @@ search_phrase(Ref, Query) ->
 
 search_phrase(Ref, Query, K) ->
     bitcask_cpp_nifs:cask_search_phrase(Ref, Query, K).
+
+%% 多字段搜索（S8.6）：支持 `field:term^boost` 语法，跨字段加权合并。
+%% 无字段限定的词等价于默认字段词袋搜索。
+search_fields(Ref, Query) ->
+    search_fields(Ref, Query, 10).
+
+search_fields(Ref, Query, K) ->
+    bitcask_cpp_nifs:cask_search_fields(Ref, Query, K).

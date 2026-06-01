@@ -426,6 +426,9 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
         cask->index_pool_->start([&search = *cask->search_](const IndexTask& task) {
             if (task.op == IndexOp::Delete) {
                 search.on_delete(task.key, task.ord);
+            } else if (!task.fields.empty()) {
+                search.on_write_fields(task.key, task.ord, task.fields,
+                                       task.file_id, task.offset, task.total_sz, task.tstamp);
             } else {
                 search.on_write(task.key, task.ord, task.text,
                                 task.file_id, task.offset, task.total_sz, task.tstamp);
@@ -983,6 +986,26 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
         return std::unexpected(r.error());
     }
 
+    // S8.6：把 DocInput 的多字段填进 DocValueParts.fields（name→span）。
+    auto fill_parts = [&doc](codec::DocValueParts& p) {
+        for (auto& [name, val] : doc.fields) {
+            p.fields.push_back({
+                std::span<const std::byte>(reinterpret_cast<const std::byte*>(name.data()),
+                                           name.size()),
+                val});
+        }
+    };
+    // S8.6：把多字段拷成 IndexTask.fields（name→text string，异步路径需独立存储）。
+    auto task_fields = [&doc]() {
+        std::vector<std::pair<std::string, std::string>> fs;
+        fs.reserve(doc.fields.size());
+        for (auto& [name, val] : doc.fields) {
+            fs.push_back({name,
+                std::string(reinterpret_cast<const char*>(val.data()), val.size())});
+        }
+        return fs;
+    };
+
     if (active_data_ && active_file_id_ < keydir_->biggest_file_id()) {
         if (auto r = roll_active(); !r) return std::unexpected(r.error());
     }
@@ -995,6 +1018,7 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
     if (!doc.meta.empty()) {
         parts.meta = doc.meta;
     }
+    fill_parts(parts);
     codec::encode_doc_value(encoded, parts);
 
     auto w = active_data_->write(format::RecordType::kDoc, tstamp,
@@ -1020,6 +1044,7 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
         if (!doc.meta.empty()) {
             parts2.meta = doc.meta;
         }
+        fill_parts(parts2);
         codec::encode_doc_value(enc2, parts2);
         auto w2 = active_data_->write(format::RecordType::kDoc, tstamp,
                                         ord2, key,
@@ -1039,7 +1064,8 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
             std::string(bytes_to_view(key)),
             ord2,
             std::string(reinterpret_cast<const char*>(doc.text.data()), doc.text.size()),
-            active_file_id_, w2->offset, w2->total_size, tstamp, 0
+            active_file_id_, w2->offset, w2->total_size, tstamp, 0,
+            task_fields()
         });
     } else {
         submit_index_task(IndexTask{
@@ -1047,7 +1073,8 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
             std::string(bytes_to_view(key)),
             ord,
             std::string(reinterpret_cast<const char*>(doc.text.data()), doc.text.size()),
-            active_file_id_, w->offset, w->total_size, tstamp, 0
+            active_file_id_, w->offset, w->total_size, tstamp, 0,
+            task_fields()
         });
     }
     return {};
@@ -1069,6 +1096,16 @@ Cask::search_phrase(std::string_view query, std::size_t k) {
     if (!search_) return std::unexpected(err(CaskError::kNoIndex));
     flush_index();
     auto hits = search_->search_phrase(query, k);
+    if (!hits) return std::unexpected(err(CaskError::kIo, hits.error()));
+    return TextSearchResult{std::move(*hits)};
+}
+
+// search_fields：BM25 多字段搜索（S8.6），支持 field:term^boost。
+std::expected<TextSearchResult, CaskFault>
+Cask::search_fields(std::string_view query, std::size_t k) {
+    if (!search_) return std::unexpected(err(CaskError::kNoIndex));
+    flush_index();
+    auto hits = search_->search_fields(query, k);
     if (!hits) return std::unexpected(err(CaskError::kIo, hits.error()));
     return TextSearchResult{std::move(*hits)};
 }

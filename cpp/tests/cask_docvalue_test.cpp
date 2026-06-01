@@ -237,6 +237,50 @@ TEST_F(CaskDocValueTest, SearchTextAfterPut) {
     (*c)->close();
 }
 
+// S8.6：put_doc 多字段 → search_fields 字段路由，端到端经 Cask（含异步 IndexTask）。
+TEST_F(CaskDocValueTest, MultiFieldPutAndSearch) {
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.enable_search = true;
+    SearchLayerConfig sl_cfg;
+    sl_cfg.analyzer_config.type = AnalyzerType::Whitespace;
+    opts.search_config = sl_cfg;
+
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+
+    auto bytes = [](std::string_view s) {
+        return std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(s.data()), s.size());
+    };
+
+    // doc1: title="apple fruit", body="banana"
+    bitcask::DocInput d1;
+    d1.fields.push_back({"title", bytes("apple fruit")});
+    d1.fields.push_back({"body", bytes("banana split")});
+    ASSERT_TRUE((*c)->put_doc(bytes("doc1"), d1, 1000));
+
+    // doc2: title="banana", body="apple"
+    bitcask::DocInput d2;
+    d2.fields.push_back({"title", bytes("banana bread")});
+    d2.fields.push_back({"body", bytes("apple pie")});
+    ASSERT_TRUE((*c)->put_doc(bytes("doc2"), d2, 1001));
+
+    // title:apple 只命中 doc1（apple 在 doc1 title、doc2 body）。
+    auto r = (*c)->search_fields("title:apple", 10);
+    ASSERT_TRUE(r) << "search_fields failed";
+    ASSERT_EQ(r->hits.size(), 1u);
+    EXPECT_EQ(r->hits[0].ord, 0u);  // doc1 是第一个写入，ord=0
+
+    // body:apple 只命中 doc2。
+    auto r2 = (*c)->search_fields("body:apple", 10);
+    ASSERT_TRUE(r2);
+    ASSERT_EQ(r2->hits.size(), 1u);
+    EXPECT_EQ(r2->hits[0].ord, 1u);
+
+    (*c)->close();
+}
+
 TEST_F(CaskDocValueTest, SearchTextEmptyAfterRemove) {
     CaskOptions opts;
     opts.read_write = true;
