@@ -41,10 +41,13 @@
          is_frozen/1,
          is_empty_estimate/1,
          status/1,
-         search_text/2, search_text/3,
-         search_phrase/2, search_phrase/3,
-         search_fields/2, search_fields/3,
-         search_near/3, search_near/4]).
+          search_text/2, search_text/3,
+          search_phrase/2, search_phrase/3,
+          search_fields/2, search_fields/3,
+          search_near/3, search_near/4,
+          search_fuzzy/3, search_fuzzy/4,
+          search_wildcard/2, search_wildcard/3,
+          set_synonym_map/2]).
 
 -include("bitcask.hrl").
 
@@ -59,7 +62,7 @@
     small_file_threshold, expiry_grace_time,
     max_merge_size,
     analyzer, dict_path, enable_stop_words,
-    min_n, max_n, min_token_length
+    min_n, max_n, min_token_length, enable_stemming
 ]).
 
 %% =========================================================================
@@ -487,3 +490,21 @@ search_near(Ref, Query, Slop) ->
 
 search_near(Ref, Query, Slop, K) ->
     bitcask_cpp_nifs:cask_search_near(Ref, Query, Slop, K).
+
+%% 模糊搜索（S8.3）：Levenshtein 编辑距离匹配。
+search_fuzzy(Ref, Query, MaxEdit) ->
+    search_fuzzy(Ref, Query, MaxEdit, 10).
+
+search_fuzzy(Ref, Query, MaxEdit, K) ->
+    bitcask_cpp_nifs:cask_search_fuzzy(Ref, Query, MaxEdit, K).
+
+%% 通配符搜索（S8.4）：支持 * 和 ? 通配符。
+search_wildcard(Ref, Pattern) ->
+    search_wildcard(Ref, Pattern, 10).
+
+search_wildcard(Ref, Pattern, K) ->
+    bitcask_cpp_nifs:cask_search_wildcard(Ref, Pattern, K).
+
+%% 设置同义词词典（S8.2）：从文件加载，查询时自动展开。
+set_synonym_map(Ref, FilePath) ->
+    bitcask_cpp_nifs:cask_set_synonym_map(Ref, FilePath).

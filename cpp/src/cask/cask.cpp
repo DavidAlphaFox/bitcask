@@ -1130,6 +1130,31 @@ Cask::bool_search(std::string_view query, std::size_t k) {
     return TextSearchResult{std::move(*hits)};
 }
 
+// S8.3：模糊搜索（Levenshtein 编辑距离匹配）。
+std::expected<TextSearchResult, CaskFault>
+Cask::search_fuzzy(std::string_view query, std::size_t k, std::uint32_t max_edit_distance) {
+    if (!search_) return std::unexpected(err(CaskError::kNoIndex));
+    flush_index();
+    auto hits = search_->search_fuzzy(query, k, max_edit_distance);
+    if (!hits) return std::unexpected(err(CaskError::kIo, hits.error()));
+    return TextSearchResult{std::move(*hits)};
+}
+
+// S8.4：通配符搜索（* / ? 模式匹配）。
+std::expected<TextSearchResult, CaskFault>
+Cask::search_wildcard(std::string_view pattern, std::size_t k) {
+    if (!search_) return std::unexpected(err(CaskError::kNoIndex));
+    flush_index();
+    auto hits = search_->search_wildcard(pattern, k);
+    if (!hits) return std::unexpected(err(CaskError::kIo, hits.error()));
+    return TextSearchResult{std::move(*hits)};
+}
+
+// S8.2：设置同义词词典。
+void Cask::set_synonym_map(std::unique_ptr<text::SynonymMap> map) {
+    if (search_) search_->set_synonym_map(std::move(map));
+}
+
 std::expected<void, CaskFault> Cask::sync() {
     if (active_data_) {
         if (auto r = active_data_->sync(); !r) {

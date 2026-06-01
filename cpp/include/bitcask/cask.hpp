@@ -272,6 +272,17 @@ public:
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
     search_near(std::string_view query, std::uint32_t slop, std::size_t k = 10);
 
+    // S8.3：BM25 模糊搜索（Levenshtein 编辑距离匹配）。
+    [[nodiscard]] std::expected<TextSearchResult, CaskFault>
+    search_fuzzy(std::string_view query, std::size_t k, std::uint32_t max_edit_distance);
+
+    // S8.4：BM25 通配符搜索（* / ? 模式匹配）。
+    [[nodiscard]] std::expected<TextSearchResult, CaskFault>
+    search_wildcard(std::string_view pattern, std::size_t k);
+
+    // S8.2：设置同义词词典（查询时自动展开同义词）。
+    void set_synonym_map(std::unique_ptr<text::SynonymMap> map);
+
     // 访问内部 SearchLayer（用于 NIF 层）。
     [[nodiscard]] bool has_search() const { return search_ != nullptr; }
     [[nodiscard]] search::SearchLayer* search() { return search_.get(); }

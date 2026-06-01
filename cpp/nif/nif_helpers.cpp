@@ -128,6 +128,10 @@ static void parse_analyzer_option(ErlNifEnv* env, const ERL_NIF_TERM* tup,
         if (enif_get_int(env, tup[1], &v) && v >= 1) {
             o.search_config->analyzer_config.min_token_length = static_cast<std::uint32_t>(v);
         }
+    } else if (tup[0] == atoms().enable_stemming) {
+        if (tup[1] == atoms().atom_true) {
+            o.search_config->analyzer_config.enable_stemming = true;
+        }
     }
 }
 
@@ -156,7 +160,8 @@ static void parse_2tuple_option(ErlNifEnv* env, const ERL_NIF_TERM* tup,
     } else if (tup[0] == atoms().analyzer || tup[0] == atoms().dict_path
                || tup[0] == atoms().enable_stop_words
                || tup[0] == atoms().min_n || tup[0] == atoms().max_n
-               || tup[0] == atoms().min_token_length) {
+               || tup[0] == atoms().min_token_length
+               || tup[0] == atoms().enable_stemming) {
         if (!o.search_config) o.search_config.emplace();
         parse_analyzer_option(env, tup, o);
     } else {
@@ -296,6 +301,51 @@ ERL_NIF_TERM near_search_impl(ErlNifEnv* env, int, const ERL_NIF_TERM argv[]) {
         reinterpret_cast<const char*>(query_bin.data), query_bin.size);
     auto r = h->cask->search_near(query, static_cast<std::uint32_t>(slop),
                                   static_cast<std::size_t>(k));
+    if (!r) return fault_to_term(env, r.error());
+    return make_ok(env, make_search_hits(env, r->hits));
+}
+
+// S8.3：模糊搜索 NIF（argv = {ref, query, max_edit_distance, k}）。
+ERL_NIF_TERM fuzzy_search_impl(ErlNifEnv* env, int, const ERL_NIF_TERM argv[]) {
+    auto* h = checked_cask_handle(env, argv[0]);
+    ErlNifBinary query_bin{};
+    if (!h || !enif_inspect_binary(env, argv[1], &query_bin)) {
+        return enif_make_badarg(env);
+    }
+    int max_edit = get_int_with_default(env, argv[2], 1);
+    if (max_edit < 0) max_edit = 1;
+    int k = get_int_with_default(env, argv[3], 10);
+    if (k <= 0) k = 10;
+
+    if (!h->cask->has_search()) {
+        return make_error(env, atoms().no_index);
+    }
+
+    std::string_view query(
+        reinterpret_cast<const char*>(query_bin.data), query_bin.size);
+    auto r = h->cask->search_fuzzy(query, static_cast<std::size_t>(k),
+                                    static_cast<std::uint32_t>(max_edit));
+    if (!r) return fault_to_term(env, r.error());
+    return make_ok(env, make_search_hits(env, r->hits));
+}
+
+// S8.4：通配符搜索 NIF（argv = {ref, pattern, k}）。
+ERL_NIF_TERM wildcard_search_impl(ErlNifEnv* env, int, const ERL_NIF_TERM argv[]) {
+    auto* h = checked_cask_handle(env, argv[0]);
+    ErlNifBinary pattern_bin{};
+    if (!h || !enif_inspect_binary(env, argv[1], &pattern_bin)) {
+        return enif_make_badarg(env);
+    }
+    int k = get_int_with_default(env, argv[2], 10);
+    if (k <= 0) k = 10;
+
+    if (!h->cask->has_search()) {
+        return make_error(env, atoms().no_index);
+    }
+
+    std::string_view pattern(
+        reinterpret_cast<const char*>(pattern_bin.data), pattern_bin.size);
+    auto r = h->cask->search_wildcard(pattern, static_cast<std::size_t>(k));
     if (!r) return fault_to_term(env, r.error());
     return make_ok(env, make_search_hits(env, r->hits));
 }

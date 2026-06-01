@@ -21,6 +21,9 @@
          cask_bool_search/3,
          cask_search_fields/3,
          cask_search_near/4,
+         cask_search_fuzzy/4,
+         cask_search_wildcard/3,
+         cask_set_synonym_map/2,
          cask_fold_start/3,
          cask_fold_start/4,
          cask_fold_next/1,
@@ -71,6 +74,9 @@ cask_search_phrase(_Ref, _Q, _K) -> erlang:nif_error({error, not_loaded}).
 cask_bool_search(_Ref, _Q, _K)   -> erlang:nif_error({error, not_loaded}).
 cask_search_fields(_Ref, _Q, _K) -> erlang:nif_error({error, not_loaded}).
 cask_search_near(_Ref, _Q, _Slop, _K) -> erlang:nif_error({error, not_loaded}).
+cask_search_fuzzy(_Ref, _Q, _MaxEdit, _K) -> erlang:nif_error({error, not_loaded}).
+cask_search_wildcard(_Ref, _Pattern, _K) -> erlang:nif_error({error, not_loaded}).
+cask_set_synonym_map(_Ref, _Path) -> erlang:nif_error({error, not_loaded}).
 cask_fold_start(_R, _MA, _MP) -> erlang:nif_error({error, not_loaded}).
 cask_fold_start(_R, _MA, _MP, _SeeTomb) -> erlang:nif_error({error, not_loaded}).
 cask_fold_next(_IterRef)      -> erlang:nif_error({error, not_loaded}).

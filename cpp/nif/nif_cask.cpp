@@ -149,8 +149,35 @@ ERL_NIF_TERM nif_cask_search_fields(ErlNifEnv* env, int argc,
 
 // S8.7：近邻搜索（4 参：ref, query, slop, k）。
 ERL_NIF_TERM nif_cask_search_near(ErlNifEnv* env, int argc,
-                                  const ERL_NIF_TERM argv[]) {
+                                   const ERL_NIF_TERM argv[]) {
     return near_search_impl(env, argc, argv);
+}
+
+// S8.3：模糊搜索（ref, query, max_edit_distance, k）。
+ERL_NIF_TERM nif_cask_search_fuzzy(ErlNifEnv* env, int argc,
+                                    const ERL_NIF_TERM argv[]) {
+    return fuzzy_search_impl(env, argc, argv);
+}
+
+// S8.4：通配符搜索（ref, pattern, k）。
+ERL_NIF_TERM nif_cask_search_wildcard(ErlNifEnv* env, int argc,
+                                        const ERL_NIF_TERM argv[]) {
+    return wildcard_search_impl(env, argc, argv);
+}
+
+// S8.2：设置同义词词典（ref, file_path）。
+ERL_NIF_TERM nif_cask_set_synonym_map(ErlNifEnv* env, int /*argc*/,
+                                        const ERL_NIF_TERM argv[]) {
+    auto* h = checked_cask_handle(env, argv[0]);
+    if (!h || !h->cask || !h->cask->has_search()) return enif_make_badarg(env);
+    ErlNifBinary path_bin{};
+    if (!enif_inspect_binary(env, argv[1], &path_bin)) return enif_make_badarg(env);
+
+    auto map = std::make_unique<text::SynonymMap>();
+    map->load_from_file(std::string(
+        reinterpret_cast<const char*>(path_bin.data), path_bin.size));
+    h->cask->set_synonym_map(std::move(map));
+    return atoms().ok;
 }
 
 }  // namespace bitcask::nif
