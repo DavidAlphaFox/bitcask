@@ -120,6 +120,15 @@ TEST(JiebaAnalyzer, OffsetsAreRealNotZero) {
     EXPECT_GT(checked, 0u);
 }
 
+// 回归 S9.26：jieba CutForSearch 会把空格也输出为词，不应进索引。
+TEST(JiebaAnalyzer, SpaceNotIndexedAsToken) {
+    JiebaAnalyzer a(kDictDir);
+    auto tfs = a.analyze("北京大学 hello world 上海");
+    EXPECT_EQ(tfs.find(" "), tfs.end());        // 空格不应成为 term
+    EXPECT_NE(tfs.find("hello"), tfs.end());    // 真实词保留
+    EXPECT_NE(tfs.find("北京"), tfs.end());
+}
+
 TEST(JiebaAnalyzer, JapaneseFallbackNgram) {
     // jieba 词典不覆盖日文，应回退到 n-gram。
     JiebaAnalyzer a(kDictDir);

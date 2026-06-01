@@ -33,6 +33,37 @@ struct JiebaAnalyzer::JiebaImpl {
 
 namespace {
 
+// 判断一个 codepoint 是否「无检索意义」：空白（Zs / 控制空白）或标点（P*）。
+// 用于过滤 jieba CutForSearch 偶尔输出的纯空白/标点词（S9.26）。
+[[nodiscard]] bool is_noise_cp(char32_t cp) noexcept {
+    auto cat = utf8proc_category(static_cast<utf8proc_int32_t>(cp));
+    switch (cat) {
+        case UTF8PROC_CATEGORY_ZS:  // 空格分隔符
+        case UTF8PROC_CATEGORY_ZL:  // 行分隔符
+        case UTF8PROC_CATEGORY_ZP:  // 段分隔符
+        case UTF8PROC_CATEGORY_CC:  // 控制字符
+        case UTF8PROC_CATEGORY_PC:  // 标点（连接）
+        case UTF8PROC_CATEGORY_PD:  // 标点（破折）
+        case UTF8PROC_CATEGORY_PS:  // 标点（开）
+        case UTF8PROC_CATEGORY_PE:  // 标点（闭）
+        case UTF8PROC_CATEGORY_PI:  // 标点（首引号）
+        case UTF8PROC_CATEGORY_PF:  // 标点（尾引号）
+        case UTF8PROC_CATEGORY_PO:  // 标点（其它）
+            return true;
+        default:
+            return false;
+    }
+}
+
+// word 的所有 codepoint 都是噪声（空白/标点）→ 不应进索引。
+[[nodiscard]] bool is_noise_word(const std::vector<detail::CpInfo>& cps) noexcept {
+    if (cps.empty()) return true;
+    for (auto& c : cps) {
+        if (!is_noise_cp(c.cp)) return false;
+    }
+    return true;
+}
+
 const std::vector<std::string>& default_stop_words() {
     static const std::vector<std::string> words = {
         "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
@@ -135,6 +166,13 @@ auto JiebaAnalyzer::collect_tokens(std::string_view text, bool need_offsets) con
         auto word_norm = detail::nfkc_fold(word);
         auto word_cps = detail::to_codepoints(word_norm);
         if (word_cps.empty()) continue;
+
+        // S9.26：jieba CutForSearch 偶尔把空格/标点也输出为词，过滤掉纯噪声词
+        // （pos 仍递增以保持位置语义一致）。
+        if (is_noise_word(word_cps)) {
+            ++pos;
+            continue;
+        }
 
         bool has_cjk = false;
         for (auto& wc : word_cps) {
