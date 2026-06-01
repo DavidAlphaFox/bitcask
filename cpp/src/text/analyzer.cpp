@@ -4,6 +4,7 @@
 #include "bitcask/cjk_detect.hpp"
 #include "bitcask/jieba_analyzer.hpp"
 #include "bitcask/ngram_analyzer.hpp"
+#include "bitcask/stemming_analyzer.hpp"
 #include "bitcask/text_utils.hpp"
 #include "bitcask/whitespace_analyzer.hpp"
 
@@ -27,28 +28,32 @@ namespace bitcask::text {
 auto AnalyzerFactory::create(const AnalyzerConfig& config)
     -> std::unique_ptr<Analyzer>
 {
+    std::unique_ptr<Analyzer> analyzer;
     switch (config.type) {
         case AnalyzerType::Ngram:
             if (config.min_n < 1 || config.max_n < config.min_n) {
                 return nullptr;
             }
-            return std::make_unique<NgramAnalyzer>(
+            analyzer = std::make_unique<NgramAnalyzer>(
                 config.min_n, config.max_n,
                 config.enable_stop_words, config.stop_words,
                 config.min_token_length);
+            break;
         case AnalyzerType::Whitespace:
-            return std::make_unique<WhitespaceAnalyzer>(config.min_token_length);
+            analyzer = std::make_unique<WhitespaceAnalyzer>(config.min_token_length);
+            break;
         case AnalyzerType::Jieba:
-            return std::make_unique<JiebaAnalyzer>(
+            analyzer = std::make_unique<JiebaAnalyzer>(
                 config.dict_path, config.min_n, config.max_n,
                 config.enable_stop_words, config.stop_words,
                 config.min_token_length);
+            break;
     }
-    return nullptr;
+    if (analyzer && config.enable_stemming) {
+        analyzer = std::make_unique<StemmingAnalyzer>(std::move(analyzer));
+    }
+    return analyzer;
 }
-
-// ===========================================================================
-// Analyzer 默认实现
 // ===========================================================================
 
 auto Analyzer::analyze_with_offsets(std::string_view text) const -> TermTokenMap {

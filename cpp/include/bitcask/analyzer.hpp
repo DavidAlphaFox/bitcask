@@ -68,6 +68,8 @@ struct AnalyzerConfig {
     // 仅作用于拉丁/空白切分的整词路径，CJK 的 n-gram 不受影响。
     // 默认 1 = 不过滤（向后兼容）。索引与查询两侧一致生效。
     std::uint32_t min_token_length = 1;
+    // 英文词干提取（S8.1）：对各分词结果做 Porter 词干化处理。"running" → "run"。默认关闭。
+    bool enable_stemming = false;
 };
 
 // --------------------------------------------------------------------------
