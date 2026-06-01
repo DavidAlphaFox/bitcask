@@ -175,13 +175,17 @@ Offset    kMaxOffsetV2 (= 2^63 - 1)
 
 ## 五、DocValue 格式（kDoc value 打包）
 
-`type = kDoc` 的 record 其 value 编码为 DocValue 格式——一个包含可选
-vector、text、meta 三个部分的可选打包二进制结构。
+`type = kDoc` 的 record 其 value 编码为 DocValue 格式——可选 vector、text、
+meta、fields 四段的打包二进制结构。
+
+> **统一编码**：纯 KV 模式 `put(key, binary)` 与索引模式 `put_doc` 写入的
+> value **都编码为 DocValue**——KV 的 binary 放进 text 段。因此 `get` 返回的
+> 是解码后的 text；fold/stream/list_keys 也必须解码取 text 段（见 §九）。
 
 ```
 偏移   字段              字节数  说明
 ────────────────────────────────────────────
-0      Ver               1       布局版本；当前为 1
+0      Ver               1       布局版本：1=无 fields 段；2=含 fields 段（S8.6）
 1      Flags             1       位掩码（见下）
 2      Vector 段（可选，Flags&0x01 时存在）
          Dim            4       f32 元素个数（大端）
@@ -193,6 +197,13 @@ X      Text 段（可选，Flags&0x02 时存在）
 Y      Meta 段（可选，Flags&0x04 时存在）
          Len             4       字节长度（大端）
          字节数组         Len    序列化数据（msgpack/CBOR 等）
+Z      Fields 段（可选，Flags&0x10 时存在；S8.6 多字段）
+         FieldCount     2       字段数（大端 u16）
+         重复 FieldCount 次：
+           NameLen      2       字段名字节长度（大端 u16）
+           Name         NameLen 字段名 UTF-8
+           ValLen       4       字段值字节长度（大端 u32）
+           Value        ValLen  字段值 UTF-8
 ```
 
 ### Flags 字节（偏移 1）
@@ -203,8 +214,15 @@ Y      Meta 段（可选，Flags&0x04 时存在）
 | 1   | `has_text`      | Text 段存在                               |
 | 2   | `has_meta`      | Meta 段存在                               |
 | 3   | `vec_quantized` | Vector 段含量化数据（未来扩展；V1 不支持） |
+| 4   | `has_fields`    | Fields 段存在（S8.6 多字段）              |
 
-三个可选段存在时**按 vector→text→meta 顺序**排列，由 Flags 决定哪些存在。
+四个可选段存在时**按 vector→text→meta→fields 顺序**排列，由 Flags 决定哪些存在。
+
+### 版本兼容（S8.6）
+
+- **编码**：`encode_doc_value` 仅当存在 fields 段时写 `Ver=2`；否则写 `Ver=1`，
+  字节与旧实现完全一致（保证旧数据/旧测试字节级不变）。
+- **解码**：`decode_doc_value` 接受 `Ver ∈ {1, 2}`（范围式兼容）。
 
 ### Vector 段
 
@@ -222,7 +240,19 @@ Y      Meta 段（可选，Flags&0x04 时存在）
 - `Len`：序列化元数据的字节长度，大端 u32。
 - Payload：任意序列化字节（msgpack、CBOR 等）。
 
-来源：`cpp/include/bitcask/format.hpp`（`kDoc value 打包`注释）。
+### Fields 段（S8.6 多字段）
+
+- 用于 `put_doc(#{title=>..., body=>...})` 这类多字段文档。
+- 每个字段是 `(NameLen, Name, ValLen, Value)`，字段名/值均为 UTF-8。
+- **索引侧**：每个字段建立独立的 InvertedIndex（字段间 BM25 统计隔离），
+  查询语法 `field:term^boost` 路由到对应字段。
+- **catch-all（S9.29）**：写入多字段文档时，各字段文本另会拼接合并进**默认
+  字段**索引，使无字段限定的 `search_text`/`search_phrase`/`search_near`
+  （只查默认字段）也能命中多字段文档。取舍：拼接会模糊原字段边界，短语
+  查询可能跨字段误匹配（全文搜索可接受；字段限定查询不受影响）。
+
+来源：`cpp/include/bitcask/format.hpp` + `cpp/src/fileops/codec.cpp`
+（`encode_doc_value` / `decode_doc_value`）。
 
 ---
 
@@ -341,6 +371,8 @@ NFS 上 `O_EXCL` 不可靠，但 bitcask 也不该跑在网络文件系统上。
 - Ord 字段：8 字节，大端，单调递增，永不复用。
 - 墓碑标志在 hint packed offset 的**最高位**（字节 10..17，位 63），
   Offset 限于 63 位。
-- DocValue：Ver=1，Flags 在偏移 1 处，各段按 vector→text→meta 排序。
+- DocValue：Flags 在偏移 1 处，各段按 vector→text→meta→fields 排序；
+  Ver=1（无 fields 段，字节同旧实现）或 Ver=2（含 fields 段，S8.6），
+  解码接受 Ver∈{1,2}。
 
 所有这些常量集中在 `cpp/include/bitcask/format.hpp`，是本格式的唯一权威来源。
