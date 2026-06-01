@@ -47,6 +47,20 @@ private:
     auto jieba_cut(std::string_view text) const
         -> std::vector<std::pair<std::string, std::uint32_t>>;
 
+    // 切词的中间产物：单条 token + 其在「归一化文本」上的字节区间。
+    // 是 analyze_with_positions / analyze_with_offsets 的共同数据来源，
+    // 保证两者对同一文本得到完全一致的 token 集与顺序。
+    // 注意：byte 区间相对 NFKC 归一化后的文本，与 ngram/whitespace 路径的
+    // 契约一致（highlighter 在纯规范文本下正确；非规范文本的系统性错位见 S9.19）。
+    struct JiebaToken {
+        std::string   term;
+        std::uint32_t position;
+        std::uint32_t start_byte;  // 归一化文本字节偏移
+        std::uint32_t end_byte;    // 归一化文本字节偏移（不含）
+    };
+    [[nodiscard]] auto collect_tokens(std::string_view text) const
+        -> std::vector<JiebaToken>;
+
     struct JiebaImpl;
     std::unique_ptr<JiebaImpl> jieba_;
 

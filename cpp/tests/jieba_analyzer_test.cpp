@@ -2,6 +2,7 @@
 
 #include "bitcask/analyzer.hpp"
 #include "bitcask/jieba_analyzer.hpp"
+#include "bitcask/text_utils.hpp"
 
 using namespace bitcask::text;
 
@@ -93,6 +94,30 @@ TEST(AnalyzerFactory, CreateJieba) {
     auto tfs = a->analyze("南京市长江大桥");
     EXPECT_NE(tfs.find("南京"), tfs.end());
     EXPECT_NE(tfs.find("大桥"), tfs.end());
+}
+
+// 回归 S9.9：jieba 路径 analyze_with_offsets 此前把所有 byte offset 填成 0，
+// 导致 jieba 分词的文档高亮永远生成不出片段。修复后应产出真实的、相对
+// 归一化文本的字节区间，且区间切出的子串精确等于 term。
+TEST(JiebaAnalyzer, OffsetsAreRealNotZero) {
+    JiebaAnalyzer a(kDictDir);
+    std::string text = "北京大学很有名";
+    auto norm = detail::nfkc_fold(text);
+    auto ttm = a.analyze_with_offsets(text);
+
+    ASSERT_FALSE(ttm.empty());
+    std::size_t checked = 0;
+    for (auto& [term, infos] : ttm) {
+        for (auto& info : infos) {
+            // 修复后：CJK token 必有非零区间。
+            ASSERT_GT(info.end_byte, info.start_byte) << "term=" << term;
+            ASSERT_LE(info.end_byte, norm.size());
+            // 区间切出的子串必须等于 term（offset 落在正确坐标系）。
+            EXPECT_EQ(norm.substr(info.start_byte, info.end_byte - info.start_byte), term);
+            ++checked;
+        }
+    }
+    EXPECT_GT(checked, 0u);
 }
 
 TEST(JiebaAnalyzer, JapaneseFallbackNgram) {

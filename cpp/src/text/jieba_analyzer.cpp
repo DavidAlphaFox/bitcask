@@ -98,64 +98,42 @@ auto JiebaAnalyzer::jieba_cut(std::string_view text) const
 }
 
 // ===========================================================================
-// analyze_with_positions
+// collect_tokens —— analyze_with_positions / analyze_with_offsets 的共同来源
 // ===========================================================================
+//
+// 产出有序 token 列表，每条带「归一化文本」上的字节区间。
+// jieba 词的 term key 沿用原始词（与索引/查询一致），但 byte 区间是它在
+// 归一化文本中匹配到的位置；jieba 未覆盖的 CJK 段回退 n-gram，term 与 byte
+// 区间都直接取自归一化文本。停用词过滤在此统一完成。
 
-auto JiebaAnalyzer::analyze_with_positions(std::string_view text) const
-    -> TermPositionsMap
+auto JiebaAnalyzer::collect_tokens(std::string_view text) const
+    -> std::vector<JiebaToken>
 {
-    if (text.empty()) return {};
+    std::vector<JiebaToken> tokens;
+    if (text.empty()) return tokens;
 
-    // Step 1: NFKC 归一化（用于 n-gram 回退路径和最终输出一致性）。
+    // Step 1: NFKC 归一化（n-gram 回退路径 + 高亮 offset 的统一坐标系）。
     auto normalized = detail::nfkc_fold(text);
-    if (normalized.empty()) return {};
+    if (normalized.empty()) return tokens;
 
-    // Step 2: jieba CutForSearch 对原始文本切词。
-    //         cppjieba 内部已做归一化处理，直接传入原始文本即可。
+    // Step 2: jieba CutForSearch 切词。
     auto jieba_words = jieba_cut(text);
 
-    // Step 3: 收集 jieba 已识别的 CJK 字符的 byte offset，
-    //         用于检测 jieba 未覆盖的 CJK 段（回退 n-gram）。
-    //         我们用归一化后的文本做 codepoint 分析。
+    // Step 3: 在归一化文本上做 codepoint 分析（定位 jieba 词 + 检测未覆盖 CJK 段）。
     auto cps = detail::to_codepoints(normalized);
 
-    // 构建 jieba 已覆盖的字节范围集合（在归一化文本上的投影）。
-    // 简化策略：直接用 jieba 输出的词记录 position，对未识别 CJK 做回退。
-
-    TermPositionsMap tpm;
     std::uint32_t pos = 0;
-
-    // 将 jieba 词直接记录到 tpm。
-    for (auto& [word, byte_off] : jieba_words) {
-        auto& [tf, positions] = tpm[word];
-        ++tf;
-        positions.push_back(pos);
-        ++pos;
-    }
-
-    // Step 4: 对 jieba 未覆盖的 CJK 字符段做 n-gram 回退。
-    //         策略：在归一化文本上，找出所有 jieba 没有覆盖的 CJK 连续段，
-    //         对这些段做 bi/tri-gram 切分。
-    //
-    //         简化实现：遍历归一化文本的 codepoint 序列，找出 CJK 连续段，
-    //         检查该段是否已被 jieba 完全覆盖。未覆盖部分做 n-gram。
-
-    // 构建已覆盖的字节范围（在原始文本上）
-    // 由于归一化可能改变字节偏移，我们用简化策略：
-    // 对 jieba 输出的每个词，检查它是否为纯 CJK。如果 jieba 把一段 CJK
-    // 输出为单个词（如"北京"），则该段已覆盖。
-    // 对于 jieba 未能识别的孤立 CJK 字符（如日文字符），回退 n-gram。
-
-    // 收集 jieba 已处理的 CJK 字符（通过在归一化文本上匹配）
     std::vector<bool> cjk_covered(cps.size(), false);
 
+    // jieba 词：在归一化 cps 序列中定位，记录 byte 区间。
+    // CutForSearch 会对同一段输出重叠的子词与全词（如"北京""大学""北京大学"），
+    // 其顺序与文本位置并不单调，故不能用单调游标定位——每个词独立从头查找
+    // 首次匹配。同词多次出现时高亮取首次位置（高亮为尽力而为，非索引正确性）。
     for (auto& [word, _] : jieba_words) {
-        // 对每个 jieba 词，在归一化文本中查找匹配的 CJK codepoint 段
         auto word_norm = detail::nfkc_fold(word);
         auto word_cps = detail::to_codepoints(word_norm);
-
         if (word_cps.empty()) continue;
-        // 只标记 CJK 字符的覆盖
+
         bool has_cjk = false;
         for (auto& wc : word_cps) {
             if (detail::is_cjk(wc.cp) && !detail::is_cjk_punct(wc.cp)) {
@@ -163,28 +141,37 @@ auto JiebaAnalyzer::analyze_with_positions(std::string_view text) const
                 break;
             }
         }
-        if (!has_cjk) continue;
 
-        // 在 cps 序列中查找匹配位置（朴素搜索）
+        // 在整个 cps 中朴素查找该词的 codepoint 序列首次出现位置。
+        std::size_t found = cps.size();
         for (std::size_t si = 0; si + word_cps.size() <= cps.size(); ++si) {
             bool match = true;
             for (std::size_t wi = 0; wi < word_cps.size(); ++wi) {
-                if (cps[si + wi].cp != word_cps[wi].cp) {
-                    match = false;
-                    break;
-                }
+                if (cps[si + wi].cp != word_cps[wi].cp) { match = false; break; }
             }
-            if (match) {
+            if (match) { found = si; break; }
+        }
+
+        std::uint32_t sb = 0, eb = 0;
+        if (found < cps.size()) {
+            auto& first_cp = cps[found];
+            auto& last_cp  = cps[found + word_cps.size() - 1];
+            sb = static_cast<std::uint32_t>(first_cp.byte_off);
+            eb = static_cast<std::uint32_t>(last_cp.byte_off + last_cp.byte_len);
+            if (has_cjk) {
                 for (std::size_t wi = 0; wi < word_cps.size(); ++wi) {
-                    cjk_covered[si + wi] = true;
+                    cjk_covered[found + wi] = true;
                 }
-                si += word_cps.size() - 1;
-                break;
             }
         }
+        // 未定位到（罕见，如归一化差异）时 sb==eb==0：高亮跳过该 token，
+        // 但仍保留它进索引语义（term/position 不丢）。
+
+        tokens.push_back({word, pos, sb, eb});
+        ++pos;
     }
 
-    // 找出未覆盖的 CJK 连续段，做 n-gram 回退
+    // jieba 未覆盖的 CJK 连续段 → bi/tri-gram 回退（term 与 byte 均取归一化文本）。
     {
         std::size_t i = 0;
         while (i < cps.size()) {
@@ -196,19 +183,17 @@ auto JiebaAnalyzer::analyze_with_positions(std::string_view text) const
                        !cjk_covered[i]) {
                     ++i;
                 }
-                // 对这段未覆盖的 CJK 做 n-gram
                 auto n = i - run_start;
                 for (std::size_t gram = min_n_; gram <= max_n_; ++gram) {
                     if (gram > n) break;
                     for (std::size_t j = run_start; j + gram <= i; ++j) {
                         auto& first_cp = cps[j];
                         auto& last_cp = cps[j + gram - 1];
-                        auto term = std::string(
-                            normalized.data() + first_cp.byte_off,
-                            (last_cp.byte_off + last_cp.byte_len) - first_cp.byte_off);
-                        auto& [tf, positions] = tpm[std::move(term)];
-                        ++tf;
-                        positions.push_back(pos);
+                        auto sb = static_cast<std::uint32_t>(first_cp.byte_off);
+                        auto eb = static_cast<std::uint32_t>(last_cp.byte_off + last_cp.byte_len);
+                        tokens.push_back({
+                            std::string(normalized.data() + sb, eb - sb),
+                            pos, sb, eb});
                     }
                 }
                 ++pos;
@@ -218,17 +203,30 @@ auto JiebaAnalyzer::analyze_with_positions(std::string_view text) const
         }
     }
 
-    // Step 5: 停用词过滤
+    // 停用词过滤（与原 analyze_with_positions 行为一致）。
     if (enable_stop_words_ && !stop_words_.empty()) {
-        for (auto it = tpm.begin(); it != tpm.end();) {
-            if (stop_words_.count(it->first)) {
-                it = tpm.erase(it);
-            } else {
-                ++it;
-            }
-        }
+        tokens.erase(
+            std::remove_if(tokens.begin(), tokens.end(),
+                           [&](const JiebaToken& t) { return stop_words_.count(t.term) != 0; }),
+            tokens.end());
     }
 
+    return tokens;
+}
+
+// ===========================================================================
+// analyze_with_positions
+// ===========================================================================
+
+auto JiebaAnalyzer::analyze_with_positions(std::string_view text) const
+    -> TermPositionsMap
+{
+    TermPositionsMap tpm;
+    for (auto& tok : collect_tokens(text)) {
+        auto& [tf, positions] = tpm[tok.term];
+        ++tf;
+        positions.push_back(tok.position);
+    }
     return tpm;
 }
 
@@ -247,15 +245,9 @@ auto JiebaAnalyzer::analyze(std::string_view text) const -> TermFreqMap {
 }
 
 auto JiebaAnalyzer::analyze_with_offsets(std::string_view text) const -> TermTokenMap {
-    auto tpm = analyze_with_positions(text);
     TermTokenMap ttm;
-    ttm.reserve(tpm.size());
-    for (auto& [term, data] : tpm) {
-        auto& infos = ttm[term];
-        infos.reserve(data.second.size());
-        for (auto p : data.second) {
-            infos.push_back(TokenInfo{p, 0, 0});
-        }
+    for (auto& tok : collect_tokens(text)) {
+        ttm[tok.term].push_back(TokenInfo{tok.position, tok.start_byte, tok.end_byte});
     }
     return ttm;
 }
