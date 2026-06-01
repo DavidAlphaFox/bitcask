@@ -63,6 +63,9 @@ struct Atoms {
     ERL_NIF_TERM whitespace;
     ERL_NIF_TERM dict_path;
     ERL_NIF_TERM enable_stop_words;
+    ERL_NIF_TERM min_n;
+    ERL_NIF_TERM max_n;
+    ERL_NIF_TERM min_token_length;
 
     // 线程安全: 否（写入静态状态）；仅 on_load 调用一次。
     void init(ErlNifEnv* env) noexcept;

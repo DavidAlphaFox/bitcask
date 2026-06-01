@@ -56,7 +56,8 @@
     frag_threshold, dead_bytes_threshold,
     small_file_threshold, expiry_grace_time,
     max_merge_size,
-    analyzer, dict_path, enable_stop_words
+    analyzer, dict_path, enable_stop_words,
+    min_n, max_n, min_token_length
 ]).
 
 %% =========================================================================

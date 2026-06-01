@@ -55,6 +55,9 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     whitespace         = a("whitespace");
     dict_path          = a("dict_path");
     enable_stop_words  = a("enable_stop_words");
+    min_n              = a("min_n");
+    max_n              = a("max_n");
+    min_token_length   = a("min_token_length");
 }
 
 Atoms& atoms() noexcept { return g_atoms; }

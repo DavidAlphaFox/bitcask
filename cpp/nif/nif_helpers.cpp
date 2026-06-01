@@ -113,6 +113,21 @@ static void parse_analyzer_option(ErlNifEnv* env, const ERL_NIF_TERM* tup,
         if (tup[1] == atoms().atom_true) {
             o.search_config->analyzer_config.enable_stop_words = true;
         }
+    } else if (tup[0] == atoms().min_n) {
+        int v = 0;
+        if (enif_get_int(env, tup[1], &v) && v >= 1) {
+            o.search_config->analyzer_config.min_n = static_cast<std::uint32_t>(v);
+        }
+    } else if (tup[0] == atoms().max_n) {
+        int v = 0;
+        if (enif_get_int(env, tup[1], &v) && v >= 1) {
+            o.search_config->analyzer_config.max_n = static_cast<std::uint32_t>(v);
+        }
+    } else if (tup[0] == atoms().min_token_length) {
+        int v = 0;
+        if (enif_get_int(env, tup[1], &v) && v >= 1) {
+            o.search_config->analyzer_config.min_token_length = static_cast<std::uint32_t>(v);
+        }
     }
 }
 
@@ -139,7 +154,9 @@ static void parse_2tuple_option(ErlNifEnv* env, const ERL_NIF_TERM* tup,
             o.o_sync = true;
         }
     } else if (tup[0] == atoms().analyzer || tup[0] == atoms().dict_path
-               || tup[0] == atoms().enable_stop_words) {
+               || tup[0] == atoms().enable_stop_words
+               || tup[0] == atoms().min_n || tup[0] == atoms().max_n
+               || tup[0] == atoms().min_token_length) {
         if (!o.search_config) o.search_config.emplace();
         parse_analyzer_option(env, tup, o);
     } else {
