@@ -158,6 +158,34 @@ TEST(InvertedIndex, PhraseSearchLatin) {
     EXPECT_EQ(results[0].ord, 0u);
 }
 
+// S8.7：近邻搜索。doc "quick brown fox"，quick@0 fox@2（间隔 brown）。
+TEST(InvertedIndex, NearSearchSlop) {
+    InvertedIndex idx;
+    idx.add_doc(0, {{"quick", tp(1, {0})}, {"brown", tp(1, {1})}, {"fox", tp(1, {2})}});
+    FakeLiveChecker checker;
+    checker.doc_lens[0] = 3;
+
+    // slop=0（=严格短语）：quick 后紧跟 fox？不，中间隔了 brown → 不匹配。
+    EXPECT_TRUE(idx.search_near({"quick", "fox"}, 10, 0, checker).empty());
+    // slop=1：允许间隙 1 → quick(0) → fox 在 (0,2] 内 → 匹配。
+    auto r = idx.search_near({"quick", "fox"}, 10, 1, checker);
+    ASSERT_EQ(r.size(), 1u);
+    EXPECT_EQ(r[0].ord, 0u);
+}
+
+// S8.7：近邻保持顺序——逆序不匹配。
+TEST(InvertedIndex, NearSearchOrdered) {
+    InvertedIndex idx;
+    idx.add_doc(0, {{"fox", tp(1, {0})}, {"quick", tp(1, {2})}});  // fox 在前
+    FakeLiveChecker checker;
+    checker.doc_lens[0] = 3;
+    // 查 "quick fox"（要求 quick 在前），即使 slop 大也不匹配（顺序错）。
+    EXPECT_TRUE(idx.search_near({"quick", "fox"}, 10, 5, checker).empty());
+    // 查 "fox quick"（正确顺序）→ slop=1 匹配。
+    auto r = idx.search_near({"fox", "quick"}, 10, 1, checker);
+    ASSERT_EQ(r.size(), 1u);
+}
+
 TEST(InvertedIndex, PhraseSearchNoFalsePositive) {
     InvertedIndex idx;
     idx.add_doc(0, {{"the", tp(1, {0})}, {"fox", tp(1, {1})}, {"quick", tp(1, {2})}});

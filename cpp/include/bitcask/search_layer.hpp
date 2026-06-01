@@ -108,6 +108,12 @@ public:
     search_phrase(std::string_view query, std::size_t k,
                   const bm25::Bm25Params* params_override = nullptr) const;
 
+    // ---- 搜索（近邻模式，S8.7）----
+    // term 按 query 词序出现且相邻间隙 ≤ slop。slop=0 等价短语。
+    [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
+    search_near(std::string_view query, std::uint32_t slop, std::size_t k,
+                const bm25::Bm25Params* params_override = nullptr) const;
+
     [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
     bool_search(std::string_view query, std::size_t k,
                 const bm25::Bm25Params* params_override = nullptr) const;

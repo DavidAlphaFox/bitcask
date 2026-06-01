@@ -40,6 +40,7 @@ ERL_NIF_TERM nif_cask_search_text       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_phrase     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_bool_search       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_fields     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_search_near       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_fold_start        (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_fold_start4       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_fold_next         (ErlNifEnv*, int, const ERL_NIF_TERM[]);
@@ -73,6 +74,7 @@ ErlNifFunc kNifFuncs[] = {
     {"cask_search_phrase",      3, nif_cask_search_phrase,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"cask_bool_search",        3, nif_cask_bool_search,     ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"cask_search_fields",      3, nif_cask_search_fields,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"cask_search_near",        4, nif_cask_search_near,     ERL_NIF_DIRTY_JOB_CPU_BOUND},
     // 迭代：fold 系列（独立 IterRef，可多个并发）
     {"cask_fold_start",        3, nif_cask_fold_start,       0},
     {"cask_fold_start",        4, nif_cask_fold_start4,      0},

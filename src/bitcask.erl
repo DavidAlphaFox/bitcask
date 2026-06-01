@@ -43,7 +43,8 @@
          status/1,
          search_text/2, search_text/3,
          search_phrase/2, search_phrase/3,
-         search_fields/2, search_fields/3]).
+         search_fields/2, search_fields/3,
+         search_near/3, search_near/4]).
 
 -include("bitcask.hrl").
 
@@ -479,3 +480,10 @@ search_fields(Ref, Query) ->
 
 search_fields(Ref, Query, K) ->
     bitcask_cpp_nifs:cask_search_fields(Ref, Query, K).
+
+%% 近邻搜索（S8.7）：term 按 Query 词序出现且相邻间隙 ≤ Slop。Slop=0 即短语。
+search_near(Ref, Query, Slop) ->
+    search_near(Ref, Query, Slop, 10).
+
+search_near(Ref, Query, Slop, K) ->
+    bitcask_cpp_nifs:cask_search_near(Ref, Query, Slop, K).

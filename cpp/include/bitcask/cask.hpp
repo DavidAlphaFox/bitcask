@@ -267,6 +267,11 @@ public:
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
     search_fields(std::string_view query, std::size_t k = 10);
 
+    // BM25 近邻搜索（S8.7）：term 按序出现且相邻间隙 ≤ slop。slop=0 即短语。
+    // 线程安全: 否。
+    [[nodiscard]] std::expected<TextSearchResult, CaskFault>
+    search_near(std::string_view query, std::uint32_t slop, std::size_t k = 10);
+
     // 访问内部 SearchLayer（用于 NIF 层）。
     [[nodiscard]] bool has_search() const { return search_ != nullptr; }
     [[nodiscard]] search::SearchLayer* search() { return search_.get(); }

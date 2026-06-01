@@ -454,9 +454,10 @@ auto InvertedIndex::search_wand(
     return results;
 }
 
-auto InvertedIndex::search_phrase(
+auto InvertedIndex::search_phrase_impl(
     const std::vector<std::string>& query_terms,
     std::size_t k,
+    std::uint32_t slop,
     const LiveChecker& live_checker,
     const Bm25Params* params_override) const -> std::vector<SearchResult> {
     if (query_terms.empty()) return {};
@@ -513,14 +514,17 @@ auto InvertedIndex::search_phrase(
 
         std::uint32_t phrase_tf = 0;
         for (auto start_pos : posting.positions) {
+            // 有序匹配：term t 必须在 (prev, prev+1+slop] 内出现（slop=0 即精确相邻）。
             bool match = true;
+            std::uint32_t prev = start_pos;
             for (std::size_t t = 1; t < tps.size(); ++t) {
-                auto needed = static_cast<std::uint32_t>(start_pos + t);
                 const auto& pos_list = *other_pos[t];
-                if (!std::binary_search(pos_list.begin(), pos_list.end(), needed)) {
-                    match = false;
-                    break;
-                }
+                const std::uint32_t lo = prev + 1;
+                const std::uint32_t hi = prev + 1 + slop;  // 闭区间上界
+                // 找 >= lo 的第一个 position。
+                auto it = std::lower_bound(pos_list.begin(), pos_list.end(), lo);
+                if (it == pos_list.end() || *it > hi) { match = false; break; }
+                prev = *it;  // 推进到该 term 的匹配位置（贪心取最早，保证后续窗口最大）
             }
             if (match) ++phrase_tf;
         }
@@ -556,6 +560,23 @@ auto InvertedIndex::search_phrase(
     }
     std::reverse(results.begin(), results.end());
     return results;
+}
+
+auto InvertedIndex::search_phrase(
+    const std::vector<std::string>& query_terms,
+    std::size_t k,
+    const LiveChecker& live_checker,
+    const Bm25Params* params_override) const -> std::vector<SearchResult> {
+    return search_phrase_impl(query_terms, k, /*slop=*/0, live_checker, params_override);
+}
+
+auto InvertedIndex::search_near(
+    const std::vector<std::string>& query_terms,
+    std::size_t k,
+    std::uint32_t slop,
+    const LiveChecker& live_checker,
+    const Bm25Params* params_override) const -> std::vector<SearchResult> {
+    return search_phrase_impl(query_terms, k, slop, live_checker, params_override);
 }
 
 auto InvertedIndex::bool_search(

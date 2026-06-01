@@ -1110,6 +1110,16 @@ Cask::search_fields(std::string_view query, std::size_t k) {
     return TextSearchResult{std::move(*hits)};
 }
 
+// search_near：BM25 近邻搜索（S8.7）。
+std::expected<TextSearchResult, CaskFault>
+Cask::search_near(std::string_view query, std::uint32_t slop, std::size_t k) {
+    if (!search_) return std::unexpected(err(CaskError::kNoIndex));
+    flush_index();
+    auto hits = search_->search_near(query, slop, k);
+    if (!hits) return std::unexpected(err(CaskError::kIo, hits.error()));
+    return TextSearchResult{std::move(*hits)};
+}
+
 // bool_search：BM25 布尔搜索（AND/OR/NOT）。
 std::expected<TextSearchResult, CaskFault>
 Cask::bool_search(std::string_view query, std::size_t k) {

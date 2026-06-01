@@ -210,6 +210,37 @@ SearchLayer::search_phrase(std::string_view query, std::size_t k,
 }
 
 std::expected<std::vector<SearchHit>, std::string>
+SearchLayer::search_near(std::string_view query, std::uint32_t slop, std::size_t k,
+                         const bm25::Bm25Params* params_override) const {
+    // 近邻依赖查询词序：用 analyze_with_positions 取每词 position，按 position 排序，
+    // 还原 query 中的词序（analyze 返回的 map 无序，不能直接用）。
+    auto tpm = analyzer_->analyze_with_positions(query);
+    if (tpm.empty()) return std::vector<SearchHit>{};
+
+    std::vector<std::pair<std::uint32_t, std::string>> ordered;  // (position, term)
+    for (auto& [term, data] : tpm) {
+        for (auto pos : data.second) ordered.push_back({pos, term});
+    }
+    std::sort(ordered.begin(), ordered.end());
+    std::vector<std::string> terms;
+    terms.reserve(ordered.size());
+    for (auto& [_, term] : ordered) terms.push_back(term);
+
+    std::vector<bm25::SearchResult> results;
+    const auto* inv = field_index(kDefaultField);
+    if (inv) results = inv->search_near(terms, k, slop, index_, params_override);
+
+    std::vector<SearchHit> hits;
+    hits.reserve(results.size());
+    for (auto& r : results) {
+        auto ext_id = index_.ord_to_ext(r.ord);
+        if (!ext_id) continue;
+        hits.push_back(SearchHit{std::move(*ext_id), r.ord, r.score});
+    }
+    return hits;
+}
+
+std::expected<std::vector<SearchHit>, std::string>
 SearchLayer::bool_search(std::string_view query, std::size_t k,
                          const bm25::Bm25Params* params_override) const {
     auto query_node = bitcask::bm25::parse_query(query);

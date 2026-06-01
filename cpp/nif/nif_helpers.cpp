@@ -276,6 +276,30 @@ ERL_NIF_TERM search_impl(ErlNifEnv* env, int, const ERL_NIF_TERM argv[],
     return make_ok(env, make_search_hits(env, r->hits));
 }
 
+// 近邻搜索 NIF（S8.7）：argv = {ref, query, slop, k}。
+ERL_NIF_TERM near_search_impl(ErlNifEnv* env, int, const ERL_NIF_TERM argv[]) {
+    auto* h = checked_cask_handle(env, argv[0]);
+    ErlNifBinary query_bin{};
+    if (!h || !enif_inspect_binary(env, argv[1], &query_bin)) {
+        return enif_make_badarg(env);
+    }
+    int slop = get_int_with_default(env, argv[2], 0);
+    if (slop < 0) slop = 0;
+    int k = get_int_with_default(env, argv[3], 10);
+    if (k <= 0) k = 10;
+
+    if (!h->cask->has_search()) {
+        return make_error(env, atoms().no_index);
+    }
+
+    std::string_view query(
+        reinterpret_cast<const char*>(query_bin.data), query_bin.size);
+    auto r = h->cask->search_near(query, static_cast<std::uint32_t>(slop),
+                                  static_cast<std::size_t>(k));
+    if (!r) return fault_to_term(env, r.error());
+    return make_ok(env, make_search_hits(env, r->hits));
+}
+
 ERL_NIF_TERM bool_search_impl(ErlNifEnv* env, int, const ERL_NIF_TERM argv[]) {
     auto* h = checked_cask_handle(env, argv[0]);
     ErlNifBinary query_bin{};

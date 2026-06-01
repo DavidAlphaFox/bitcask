@@ -195,6 +195,15 @@ public:
         const LiveChecker& live_checker,
         const Bm25Params* params_override = nullptr) const -> std::vector<SearchResult>;
 
+    // 近邻搜索（S8.7）：term 按查询顺序出现，相邻 term 间隙 ≤ slop。
+    // slop=0 等价于 search_phrase（严格相邻）。复用 positions。
+    [[nodiscard]] auto search_near(
+        const std::vector<std::string>& query_terms,
+        std::size_t k,
+        std::uint32_t slop,
+        const LiveChecker& live_checker,
+        const Bm25Params* params_override = nullptr) const -> std::vector<SearchResult>;
+
     [[nodiscard]] auto bool_search(
         const QueryNode& query,
         std::size_t k,
@@ -252,6 +261,15 @@ private:
         std::size_t k,
         const LiveChecker& live_checker,
         const Bm25Params& params) const -> std::vector<SearchResult>;
+
+    // search_phrase / search_near 的共同实现（S8.7）：slop=0 为严格短语，
+    // slop>0 允许相邻 term 间隙 ≤ slop（有序近邻）。
+    auto search_phrase_impl(
+        const std::vector<std::string>& query_terms,
+        std::size_t k,
+        std::uint32_t slop,
+        const LiveChecker& live_checker,
+        const Bm25Params* params_override) const -> std::vector<SearchResult>;
 };
 
 }  // namespace bitcask::bm25

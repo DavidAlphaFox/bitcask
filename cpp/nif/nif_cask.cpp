@@ -147,4 +147,10 @@ ERL_NIF_TERM nif_cask_search_fields(ErlNifEnv* env, int argc,
     return search_impl(env, argc, argv, &Cask::search_fields);
 }
 
+// S8.7：近邻搜索（4 参：ref, query, slop, k）。
+ERL_NIF_TERM nif_cask_search_near(ErlNifEnv* env, int argc,
+                                  const ERL_NIF_TERM argv[]) {
+    return near_search_impl(env, argc, argv);
+}
+
 }  // namespace bitcask::nif
