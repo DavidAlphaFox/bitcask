@@ -10,6 +10,7 @@ SearchLayer::SearchLayer(const SearchLayerConfig& config)
     , inverted_(std::make_unique<bm25::InvertedIndex>(config.bm25_params))
     , analyzer_(text::AnalyzerFactory::create(config.analyzer_config))
     , cache_(config.cache_max_entries)
+    , doc_texts_(config.doc_text_cache_max)
 {
 }
 
@@ -20,8 +21,11 @@ void SearchLayer::on_write(std::string_view key, std::uint64_t ord,
     auto term_data = analyzer_->analyze_with_positions(text);
 
     std::uint32_t doc_len = 0;
-    for (auto& [_, data] : term_data) {
+    std::vector<std::string> changed_terms;
+    changed_terms.reserve(term_data.size());
+    for (auto& [term, data] : term_data) {
         doc_len += data.first;
+        changed_terms.push_back(term);
     }
 
     index_.put_doc(key, ord,
@@ -33,18 +37,33 @@ void SearchLayer::on_write(std::string_view key, std::uint64_t ord,
     if (!term_data.empty()) {
         inverted_->add_doc(ord, term_data);
     }
-    doc_texts_[ord] = std::string(text);
-    cache_.invalidate();
+    doc_texts_.put(ord, std::string(text));
+    // S9.2：只失效查询词与本文档词集有交集的缓存条目。
+    cache_.invalidate_terms(changed_terms);
 }
 
 std::optional<std::uint64_t> SearchLayer::on_delete(std::string_view key, std::uint64_t tomb_ord) {
     auto slot = index_.get(key);
     if (!slot) return std::nullopt;
 
+    // S9.2：取被删文档词集做选择性失效。原文 LRU 命中则精确 analyze；
+    // miss（冷文档被挤出）则降级为整缓存失效（安全但粗粒度）。
+    const std::string* text = doc_texts_.get(slot->ord);
+    std::vector<std::string> changed_terms;
+    if (text) {
+        auto tf = analyzer_->analyze(*text);
+        changed_terms.reserve(tf.size());
+        for (auto& [term, _] : tf) changed_terms.push_back(term);
+    }
+
     inverted_->remove_doc(slot->doc_len, {});
     index_.remove(key, tomb_ord);
-    doc_texts_.erase(slot->doc_len);
-    cache_.invalidate();
+    doc_texts_.erase(slot->ord);
+    if (text) {
+        cache_.invalidate_terms(changed_terms);
+    } else {
+        cache_.invalidate();
+    }
     return tomb_ord;
 }
 
@@ -80,7 +99,7 @@ SearchLayer::search_text(std::string_view query, std::size_t k) const {
         }
 
         results = inverted_->search(terms, k, index_);
-        cache_.put(cache_key, results);
+        cache_.put(cache_key, results, terms);
     }
 
     std::vector<SearchHit> hits;
@@ -112,7 +131,7 @@ SearchLayer::search_phrase(std::string_view query, std::size_t k) const {
         }
 
         results = inverted_->search_phrase(terms, k, index_);
-        cache_.put(cache_key, results);
+        cache_.put(cache_key, results, terms);
     }
 
     std::vector<SearchHit> hits;
@@ -141,7 +160,13 @@ SearchLayer::bool_search(std::string_view query, std::size_t k) const {
     } else {
         results = inverted_->bool_search(query_node, k, index_);
         if (!results.empty()) {
-            cache_.put(cache_key, results);
+            // 收集 MUST/SHOULD/MUST_NOT 全部叶子词，作为该缓存条目的词集。
+            std::vector<std::string> must, should, must_not;
+            bm25::collect_terms(query_node, must, should, must_not);
+            std::vector<std::string> terms = std::move(must);
+            terms.insert(terms.end(), should.begin(), should.end());
+            terms.insert(terms.end(), must_not.begin(), must_not.end());
+            cache_.put(cache_key, results, std::move(terms));
         }
     }
 
@@ -175,7 +200,7 @@ void SearchLayer::recover_doc(std::string_view key, std::uint64_t ord,
     if (!term_data.empty()) {
         inverted_->add_doc(ord, term_data);
     }
-    doc_texts_[ord] = std::string(text);
+    doc_texts_.put(ord, std::string(text));
     cache_.invalidate();
 }
 
@@ -211,7 +236,7 @@ void SearchLayer::rebuild_index(DocReader doc_reader) {
         if (term_data.empty()) return;
 
         new_inv->add_doc(ord, term_data);
-        doc_texts_[ord] = *text;
+        doc_texts_.put(ord, *text);
     });
 
     new_inv->finalize_all_postings();
@@ -239,7 +264,7 @@ SearchLayer::search_text_highlight(std::string_view query, std::size_t k,
         }
 
         results = inverted_->search(terms, k, index_);
-        cache_.put(cache_key, results);
+        cache_.put(cache_key, results, terms);
     }
 
     std::vector<SearchHitEx> hits;
@@ -248,25 +273,28 @@ SearchLayer::search_text_highlight(std::string_view query, std::size_t k,
         auto ext_id = index_.ord_to_ext(r.ord);
         if (!ext_id) continue;
 
-        auto it = doc_texts_.find(r.ord);
-        if (it == doc_texts_.end()) continue;
-
-        auto token_offsets = analyzer_->analyze_with_offsets(it->second);
-        std::unordered_map<std::string, std::vector<text::TokenInfo>> query_token_offsets;
-        for (auto& [term, _] : term_freqs) {
-            auto it_token = token_offsets.find(term);
-            if (it_token != token_offsets.end()) {
-                query_token_offsets[term] = it_token->second;
+        // S9.3：原文 LRU 命中才生成高亮片段；冷文档被挤出（miss）时降级为
+        // 无片段的 hit，而非整条丢弃——保证结果集不因 LRU 容量而缩水。
+        const std::string* doc_text = doc_texts_.get(r.ord);
+        std::vector<Snippet> snippets;
+        if (doc_text) {
+            auto token_offsets = analyzer_->analyze_with_offsets(*doc_text);
+            std::unordered_map<std::string, std::vector<text::TokenInfo>> query_token_offsets;
+            for (auto& [term, _] : term_freqs) {
+                auto it_token = token_offsets.find(term);
+                if (it_token != token_offsets.end()) {
+                    query_token_offsets[term] = it_token->second;
+                }
             }
+            auto hl_result = highlight(*doc_text, query_token_offsets, opts);
+            snippets = std::move(hl_result.snippets);
         }
-
-        auto hl_result = highlight(it->second, query_token_offsets, opts);
 
         hits.push_back(SearchHitEx{
             std::move(*ext_id),
             r.ord,
             r.score,
-            std::move(hl_result.snippets)
+            std::move(snippets)
         });
     }
     return hits;

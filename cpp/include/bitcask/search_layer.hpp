@@ -16,7 +16,9 @@
 #pragma once
 
 #include <cstdint>
+#include <list>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -36,6 +38,9 @@ struct SearchLayerConfig {
     text::AnalyzerConfig analyzer_config;
     bm25::Bm25Params     bm25_params;
     std::size_t          cache_max_entries = 256;  // 缓存最大条目数，0 禁用
+    // 高亮原文 LRU 上限（S9.3）：只缓存最近写入/查询的文档原文，避免全文常驻。
+    // 0 表示不缓存（高亮恒拿不到原文 → 降级为无片段），默认 1024 篇。
+    std::size_t          doc_text_cache_max = 1024;
 };
 
 // 搜索结果条目。
@@ -125,12 +130,61 @@ public:
     [[nodiscard]] const index::Index& index() const { return index_; }
 
 private:
+    // 高亮原文 LRU（S9.3）：ord → 原文，带容量上限。只为高亮路径服务；
+    // 冷文档被挤出后高亮降级为无片段，不影响 BM25 检索本身。
+    // 非线程安全——与 SearchLayer 整体一致，由 caller 串行化。
+    class DocTextLru {
+    public:
+        explicit DocTextLru(std::size_t cap) : cap_(cap) {}
+
+        void put(std::uint64_t ord, std::string text) {
+            if (cap_ == 0) return;
+            if (auto it = map_.find(ord); it != map_.end()) {
+                it->second->second = std::move(text);
+                lru_.splice(lru_.begin(), lru_, it->second);
+                return;
+            }
+            lru_.emplace_front(ord, std::move(text));
+            map_[ord] = lru_.begin();
+            while (lru_.size() > cap_) {
+                map_.erase(lru_.back().first);
+                lru_.pop_back();
+            }
+        }
+
+        // 命中返回原文指针并提升为最近使用；未命中返回 nullptr。
+        const std::string* get(std::uint64_t ord) {
+            auto it = map_.find(ord);
+            if (it == map_.end()) return nullptr;
+            lru_.splice(lru_.begin(), lru_, it->second);
+            return &it->second->second;
+        }
+
+        void erase(std::uint64_t ord) {
+            auto it = map_.find(ord);
+            if (it == map_.end()) return;
+            lru_.erase(it->second);
+            map_.erase(it);
+        }
+
+        void clear() {
+            lru_.clear();
+            map_.clear();
+        }
+
+    private:
+        std::size_t cap_;
+        std::list<std::pair<std::uint64_t, std::string>> lru_;  // front=最近
+        std::unordered_map<std::uint64_t,
+            std::list<std::pair<std::uint64_t, std::string>>::iterator> map_;
+    };
+
     SearchLayerConfig  config_;
     index::Index      index_;
     std::unique_ptr<bm25::InvertedIndex> inverted_;
     std::unique_ptr<text::Analyzer>      analyzer_;
     mutable SearchCache cache_;
-    std::unordered_map<std::uint64_t, std::string> doc_texts_;
+    mutable DocTextLru  doc_texts_;   // mutable：const 查询路径里 get() 会提升 LRU 顺序
 };
 
 }  // namespace bitcask::search
