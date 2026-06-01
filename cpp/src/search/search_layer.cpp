@@ -1,4 +1,5 @@
 #include "bitcask/search_layer.hpp"
+#include "bitcask/text_utils.hpp"
 
 #include <utility>
 
@@ -278,7 +279,11 @@ SearchLayer::search_text_highlight(std::string_view query, std::size_t k,
         const std::string* doc_text = doc_texts_.get(r.ord);
         std::vector<Snippet> snippets;
         if (doc_text) {
-            auto token_offsets = analyzer_->analyze_with_offsets(*doc_text);
+            // S9.19：analyze_with_offsets 产出的 byte offset 相对「归一化文本」，
+            // 故 highlight 也必须在归一化文本上切片，否则非规范文本（全角/组合
+            // 字符等）会因坐标系不一致切出乱码。NFKC 幂等，传 norm 再归一化无害。
+            std::string norm = text::detail::nfkc_fold(*doc_text);
+            auto token_offsets = analyzer_->analyze_with_offsets(norm);
             std::unordered_map<std::string, std::vector<text::TokenInfo>> query_token_offsets;
             for (auto& [term, _] : term_freqs) {
                 auto it_token = token_offsets.find(term);
@@ -286,7 +291,7 @@ SearchLayer::search_text_highlight(std::string_view query, std::size_t k,
                     query_token_offsets[term] = it_token->second;
                 }
             }
-            auto hl_result = highlight(*doc_text, query_token_offsets, opts);
+            auto hl_result = highlight(norm, query_token_offsets, opts);
             snippets = std::move(hl_result.snippets);
         }
 

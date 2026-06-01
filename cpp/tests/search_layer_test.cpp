@@ -323,3 +323,29 @@ TEST(SearchLayer, CacheDisabledTest) {
 
     EXPECT_EQ(result1->at(0).key, result2->at(0).key);
 }
+
+// 回归 S9.19：非规范文本（全角字母）的高亮。analyze_with_offsets 的 offset
+// 相对归一化文本，highlight 必须也在归一化文本上切片，否则会切出 UTF-8 乱码
+// （修复前 "ＨＥＬＬＯ world" 查 "world" 会高亮成 "<em>Ｌ\xef\xbf\xbd</em>"）。
+TEST(SearchLayer, HighlightFullwidthText) {
+    SearchLayerConfig config{
+        .analyzer_config = bitcask::text::AnalyzerConfig{
+            .type = bitcask::text::AnalyzerType::Whitespace},
+        .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F}
+    };
+    SearchLayer layer(config);
+
+    // 全角 "ＨＥＬＬＯ"（每字符 3 字节）+ 半角 " world"。NFKC 折成 "hello world"。
+    layer.on_write("doc1", 0, "ＨＥＬＬＯ world", 1, 100, 50, 1000);
+
+    auto hits = layer.search_text_highlight("world", 10);
+    ASSERT_TRUE(hits.has_value());
+    ASSERT_EQ(hits->size(), 1u);
+    ASSERT_FALSE(hits->at(0).highlights.empty());
+
+    // 片段必须精确高亮 "world"，且不含 UTF-8 替换字符（U+FFFD = EF BF BD）。
+    const auto& snippet = hits->at(0).highlights[0].text;
+    EXPECT_NE(snippet.find("<em>world</em>"), std::string::npos) << "snippet=" << snippet;
+    EXPECT_EQ(snippet.find("\xEF\xBF\xBD"), std::string::npos)
+        << "snippet contains UTF-8 replacement char (garbage): " << snippet;
+}
