@@ -59,7 +59,11 @@ private:
         std::uint32_t start_byte;  // 归一化文本字节偏移
         std::uint32_t end_byte;    // 归一化文本字节偏移（不含）
     };
-    [[nodiscard]] auto collect_tokens(std::string_view text) const
+    // need_offsets=false（索引路径）时跳过非 CJK 词的 byte offset 定位扫描，
+    // 仅 has_cjk 词仍定位（cjk_covered 标记是索引必需）。need_offsets=true
+    // （高亮路径）时所有词都定位以填 start_byte/end_byte。
+    [[nodiscard]] auto collect_tokens(std::string_view text,
+                                      bool need_offsets) const
         -> std::vector<JiebaToken>;
 
     struct JiebaImpl;

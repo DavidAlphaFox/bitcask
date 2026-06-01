@@ -108,7 +108,7 @@ auto JiebaAnalyzer::jieba_cut(std::string_view text) const
 // 归一化文本中匹配到的位置；jieba 未覆盖的 CJK 段回退 n-gram，term 与 byte
 // 区间都直接取自归一化文本。停用词过滤在此统一完成。
 
-auto JiebaAnalyzer::collect_tokens(std::string_view text) const
+auto JiebaAnalyzer::collect_tokens(std::string_view text, bool need_offsets) const
     -> std::vector<JiebaToken>
 {
     std::vector<JiebaToken> tokens;
@@ -152,13 +152,19 @@ auto JiebaAnalyzer::collect_tokens(std::string_view text) const
         }
 
         // 在整个 cps 中朴素查找该词的 codepoint 序列首次出现位置。
+        // 该查找有两个用途：①填 byte offset（仅高亮需要）；②标记 cjk_covered
+        // （索引必需，决定哪些 CJK 段回退 n-gram）。因此 has_cjk 词必须查；
+        // 非 CJK 词只为 offset，若 !need_offsets（索引路径）则跳过——省掉纯拉丁
+        // 词的 O(cps长度) 扫描（S9 复审：S9.9 把高亮开销带进了索引路径）。
         std::size_t found = cps.size();
-        for (std::size_t si = 0; si + word_cps.size() <= cps.size(); ++si) {
-            bool match = true;
-            for (std::size_t wi = 0; wi < word_cps.size(); ++wi) {
-                if (cps[si + wi].cp != word_cps[wi].cp) { match = false; break; }
+        if (has_cjk || need_offsets) {
+            for (std::size_t si = 0; si + word_cps.size() <= cps.size(); ++si) {
+                bool match = true;
+                for (std::size_t wi = 0; wi < word_cps.size(); ++wi) {
+                    if (cps[si + wi].cp != word_cps[wi].cp) { match = false; break; }
+                }
+                if (match) { found = si; break; }
             }
-            if (match) { found = si; break; }
         }
 
         std::uint32_t sb = 0, eb = 0;
@@ -231,7 +237,7 @@ auto JiebaAnalyzer::analyze_with_positions(std::string_view text) const
     -> TermPositionsMap
 {
     TermPositionsMap tpm;
-    for (auto& tok : collect_tokens(text)) {
+    for (auto& tok : collect_tokens(text, /*need_offsets=*/false)) {
         auto& [tf, positions] = tpm[tok.term];
         ++tf;
         positions.push_back(tok.position);
@@ -255,7 +261,7 @@ auto JiebaAnalyzer::analyze(std::string_view text) const -> TermFreqMap {
 
 auto JiebaAnalyzer::analyze_with_offsets(std::string_view text) const -> TermTokenMap {
     TermTokenMap ttm;
-    for (auto& tok : collect_tokens(text)) {
+    for (auto& tok : collect_tokens(text, /*need_offsets=*/true)) {
         ttm[tok.term].push_back(TokenInfo{tok.position, tok.start_byte, tok.end_byte});
     }
     return ttm;
