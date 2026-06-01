@@ -113,3 +113,32 @@ TEST(Highlighter, SearchTextHighlightIntegration) {
     }
     EXPECT_TRUE(found_doc1 || found_doc2);
 }
+
+// 回归 S9.20：单次出现的词不应产出多个相同片段。
+// 修复前 select_best_fragments 每轮在不变的 range 集上选同一窗口，
+// 产出 max_fragments(默认3) 个完全相同的片段。
+TEST(Highlighter, NoDuplicateFragmentsForSingleOccurrence) {
+    auto layer = SearchLayer(whitespace_config());
+    layer.on_write("key1", 0, "hello world foo bar", 1, 100, 50, 1000);
+
+    auto result = layer.search_text_highlight("world", 10);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_EQ(result->at(0).highlights.size(), 1u);  // 只 1 个片段，不重复
+}
+
+// 远距两次出现应产出 2 个不同片段（确认去重未退化成永远只 1 个）。
+TEST(Highlighter, TwoFarApartOccurrencesGiveTwoFragments) {
+    auto layer = SearchLayer(whitespace_config());
+    std::string text = "world ";
+    for (int i = 0; i < 40; ++i) text += "xpad ";  // ~200 字节填充 > fragment_size(120)
+    text += "world tail";
+    layer.on_write("key1", 0, text, 1, 100, 50, 1000);
+
+    auto result = layer.search_text_highlight("world", 10);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1u);
+    const auto& hl = result->at(0).highlights;
+    ASSERT_EQ(hl.size(), 2u);
+    EXPECT_NE(hl[0].text, hl[1].text);  // 两个片段必须不同
+}

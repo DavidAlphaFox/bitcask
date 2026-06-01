@@ -35,20 +35,23 @@ std::vector<OffsetRange> select_best_fragments(
     std::size_t max_fragments) {
     if (sorted_ranges.empty()) return {};
 
+    // S9.20：每轮在「尚未被已选片段覆盖」的 range 里贪心选最佳窗口，选定后
+    // 移除窗口内的 range，再选下一个——避免反复选中同一窗口产出重复片段。
+    std::vector<OffsetRange> remaining_ranges(sorted_ranges);
     std::vector<OffsetRange> selected;
     std::size_t remaining = max_fragments;
 
-    while (remaining > 0 && !sorted_ranges.empty()) {
-        std::size_t best_start = sorted_ranges[0].start;
-        std::size_t best_end = sorted_ranges[0].end;
+    while (remaining > 0 && !remaining_ranges.empty()) {
+        std::size_t best_start = remaining_ranges[0].start;
+        std::size_t best_end = remaining_ranges[0].end;
         std::size_t best_count = 0;
 
-        for (std::size_t i = 0; i < sorted_ranges.size(); ++i) {
-            std::size_t window_start = sorted_ranges[i].start;
+        for (const auto& anchor : remaining_ranges) {
+            std::size_t window_start = anchor.start;
             std::size_t window_end = window_start + fragment_size;
 
             std::size_t count = 0;
-            for (auto& r : sorted_ranges) {
+            for (auto& r : remaining_ranges) {
                 if (r.start >= window_start && r.start < window_end) {
                     ++count;
                 }
@@ -57,17 +60,26 @@ std::vector<OffsetRange> select_best_fragments(
             if (count > best_count) {
                 best_count = count;
                 best_start = window_start;
-                best_end = std::min<std::size_t>(window_end, sorted_ranges.back().end);
+                best_end = std::min<std::size_t>(window_end, remaining_ranges.back().end);
             }
         }
 
         if (best_count == 0) {
-            best_start = sorted_ranges[0].start;
-            best_end = std::min<std::size_t>(best_start + fragment_size, sorted_ranges.back().end);
+            best_start = remaining_ranges[0].start;
+            best_end = std::min<std::size_t>(best_start + fragment_size,
+                                             remaining_ranges.back().end);
         }
 
         selected.push_back({static_cast<std::uint32_t>(best_start),
                            static_cast<std::uint32_t>(best_end)});
+
+        // 消费掉落在本片段窗口内的 range，下一轮只在剩余 range 中选。
+        remaining_ranges.erase(
+            std::remove_if(remaining_ranges.begin(), remaining_ranges.end(),
+                           [&](const OffsetRange& r) {
+                               return r.start >= best_start && r.start < best_end;
+                           }),
+            remaining_ranges.end());
         --remaining;
     }
 
