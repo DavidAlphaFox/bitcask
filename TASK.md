@@ -328,12 +328,12 @@
 | **S8.2** | 同义词扩展 | `analyzer.hpp/.cpp` | 同义词词典 + 查询时展开；"NYC" → {"NYC", "New York"} | 低 |
 | **S8.3** | 模糊搜索（Fuzzy） | `inverted.cpp` | Levenshtein edit distance 匹配；"helo" → "hello" | 低 |
 | **S8.4** | 通配符搜索 | `inverted.cpp` | 前缀通配 `te*`、后缀 `*st`；需 term 字典 + 前缀树 | 低 |
-| **S8.5** | 查询时 k1/b 调节 | `inverted.hpp` / `cask.hpp` | `search(query, k, params)` 可选 Bm25Params 覆盖 | 低 |
+| **S8.5** | 查询时 k1/b 调节 ✅ | `inverted.hpp/.cpp` `search_layer.hpp/.cpp` | InvertedIndex 4 个查询函数 + SearchLayer search_text/phrase/bool_search 加可选 `const Bm25Params*`，nullptr=用默认。WAND 上界估算用同组参数（剪枝正确）。override 查询绕过缓存（避免与默认结果互污染）。范围到 C++ SearchLayer 层（Cask/NIF 未扩散）。新增测试 `QueryTimeBm25ParamsOverride`（b=0 vs b=0.75 分数不同）。✅ ctest 218/218 | 低 |
 | **S8.6** | 多字段索引 + 权重 | `search_layer.hpp` | DocValue 多字段（title/body）独立索引 + field boost `title^3` | 低 |
 | **S8.7** | 近邻搜索（带距离） | `inverted.cpp` | `search_phrase` 支持 `NEAR/N` 窗口而非严格连续 | 低 |
-| **S8.8** | 评分解释 API | `inverted.hpp` / `cask.hpp` | `explain(query, ord)` 返回各 term 的 IDF/TF/BM25 分项得分 | 低 |
+| **S8.8** | 评分解释 explain() API ✅ | `inverted.hpp/.cpp` `search_layer.hpp/.cpp` | 新增 `TermScore`/`ScoreExplanation` 结构 + `InvertedIndex::explain(terms, ord, ...)`（用与 search 完全相同的 idf/tf_norm 公式逐 term 给分项）+ `SearchLayer::explain(query, key)`（key→ord→inverted::explain，key 不存在返回 nullopt）。新增测试 `ExplainMatchesSearchScore`（total 与 search score EXPECT_NEAR 一致）+ `ExplainMissingKey`。✅ ctest 220/220 | 低 |
 | **S8.9** | 增量索引持久化 | `inverted.cpp` | append-only WAL 而非全量 snapshot；减少 sync 开销 | 低 |
-| **S8.10** | BM25+ / BM25L 变体 | `inverted.cpp` | 可选 δ 参数的 BM25 变体，针对长文档优化 | 低 |
+| **S8.10** | BM25+ 变体（δ 参数）✅ | `inverted.hpp/.cpp` | `Bm25Params` 加 `delta`（默认 0=标准 BM25）。所有评分路径（search/wand/phrase/bool/explain）贡献从 `idf·tf_norm` 改为 `idf·(tf_norm+δ)`；WAND 块上界 `block_upper_bound` 也加 δ（与实际评分一致，避免剪枝漏结果）。缓解长文档过度惩罚（Lv&Zhai 2011）。新增测试 `Bm25PlusDeltaBoostsScore`（δ=1 分数更高 + explain 一致）。✅ ctest 221/221 | 低 |
 
 ---
 
@@ -370,7 +370,7 @@ ctest **206/206 全部通过**（含此前一贯失败的 10 个 Jieba 测试，
 
 | **S9.17** | 修复迭代器悬空指针 UB | `nif_cask_iter.cpp` | `iter_next_common` 原返回 `&e`（指向局部 `r` 内部，函数返回后析构 → 悬空），调用方读 `e->file_id` 等是 UB。改为返回 `std::optional<CaskIter::Entry>`（值拷贝，生命周期独立）；三个调用方 `auto* e` → `auto e`。✅ 全量构建 + ctest 206/206（含 sanitizers）通过 | 🔴 高 | ✅ |
 | **S9.18** | C++ 注释与新行为对齐 | `analyzer.hpp:66` `jieba_analyzer.hpp:21` | 原注释称「dict_path 空=内嵌 priv/dict/」，实则无回退、空路径必失败。改为「必须有效，由 Erlang facade 默认填 priv/dict（S9.16）」，并说明空串会拼成 `/jieba.dict.utf8` 加载失败 | 🟡 中 | ✅ |
-| **S9.4** | position 列 gap+VByte 压缩（仅磁盘） | `inverted.cpp` save/load | 核实后修正子分析：内存压缩会拖慢短语匹配（`binary_search` 需随机访问，VByte 变长不支持），故只压**磁盘 save/load**，内存仍 `vector<uint32_t>`、短语查询零影响。新增 `kInvVersion=4`：positions 落盘走 `gap_encode`/`gap_decode`（count+comp_size+字节流），v1/2/3 旧快照按原始 u32 读（load 分派 `ver==2\|\|3`→`ver>=2`、`ver==3`→`ver>=3`）。实测 positions 40000B→~10KB（约 75% 压缩），往返一致。✅ ctest 206/206。⚠️ 旧版本快照读取仅逻辑保留兼容分支、未实跑 v3 文件验证 | 🟡 中 | ✅ |
+| **S9.4** | position 列 gap+VByte 压缩（仅磁盘） | `inverted.cpp` save/load | 核实后修正子分析：内存压缩会拖慢短语匹配（`binary_search` 需随机访问，VByte 变长不支持），故只压**磁盘 save/load**，内存仍 `vector<uint32_t>`、短语查询零影响。新增 `kInvVersion=4`：positions 落盘走 `gap_encode`/`gap_decode`（count+comp_size+字节流），v1/2/3 旧快照按原始 u32 读（load 分派 `ver==2\|\|3`→`ver>=2`、`ver==3`→`ver>=3`）。实测 positions 40000B→~10KB（约 75% 压缩），往返一致。✅ ctest 206/206。**S9.27 已补 v3 实跑验证**（并揭出版本检查漏 v3 的真 bug） | 🟡 中 | ✅ |
 | **S9.5** | ~~搜索避免整体拷贝 PostingList~~ | `inverted.cpp` | **核实后判定不做**：`pl_copy` 是**有意设计**——`const_accessor` 持桶级读锁，拷贝后立即出作用域放锁，让查询不长期占桶锁、不阻塞并发 `add_doc`。改 `const&` 须让 accessor 活到查询结束 → 整个查询期间持多个桶读锁 → 牺牲读写并发度。子分析「纯收益」误判。另查 search/wand 路径无冗余 `decompress_ords`，无可省的二次拷贝。保留现状 | 🟡 中 | ❌不做 |
 
 #### 待核实（子分析产出，未亲验，优先级低）
@@ -389,7 +389,8 @@ ctest **206/206 全部通过**（含此前一贯失败的 10 个 Jieba 测试，
 | **S9.20** | 修复高亮重复片段 | `highlighter.cpp` `highlighter_test.cpp` | 根因：`select_best_fragments` 在 const& 的 `sorted_ranges` 上循环 max_fragments(默认3) 次，每轮选同一最佳窗口、从不消费已覆盖 range → 产出 3 个完全相同片段。修法：用可变副本 `remaining_ranges`，每选定一个片段后 `remove_if` 掉落在该窗口 `[best_start,best_end)` 内的 range，下一轮在剩余里选；range 耗尽即停。实测：单次出现 → 1 片段（原 3 个相同）；远距两次出现 → 2 个不同片段。新增回归测试 `NoDuplicateFragmentsForSingleOccurrence` + `TwoFarApartOccurrencesGiveTwoFragments`。✅ ctest 215/215 | 低 | ✅ |
 | **S9.24** | jieba 索引路径免 offset 定位（修 S9.9 回归） | `jieba_analyzer.hpp/.cpp` | S9.9 为填高亮 byte offset，让 `collect_tokens` 对每个 jieba 词做 O(cps长度) 朴素查找——但索引路径（`analyze_with_positions`）只需 term+position，不需 offset，却也付了此成本。修法：`collect_tokens(text, need_offsets)`；非 CJK 词在 `!need_offsets` 时跳过查找（has_cjk 词仍查，因 cjk_covered 标记是索引必需）。索引路径传 false、高亮传 true。实测：索引/高亮 term 集完全一致（混合文档 7 term），高亮路径拉丁词仍有 offset。✅ ctest 215/215 | 中 | ✅ |
 | **S9.25** | is_cjk 收窄全角 ASCII 范围（防御） | `cjk_detect.hpp` | `is_cjk` 把 FF01–FF5E 整段判 CJK，含全角字母/数字（语义是 Latin，不该判 CJK），且注释自相矛盾。核实：因 `is_cjk` 只在 NFKC 后调用、全角已折半角，**当前不触发**（实测全角 Ａ→a 走 Latin，正确）。删除该行 + 修正注释，防未来未归一化路径踩雷。行为不变。✅ ctest 215/215 | 低 | ✅ |
-| **S9.26** | jieba 把空格当 token 入索引 | `jieba_analyzer.cpp` collect_tokens | 复审实测发现：`"北京大学 hello world 上海"` 索引出一个 `' '`（空格）term——jieba CutForSearch 把空格也输出为词。预存行为，污染索引（空格 term 无检索意义）。应在 collect_tokens 过滤纯空白/标点词。**未做** | 低 | ☐ |
+| **S9.26** | 修复 jieba 把空格/标点当 token 入索引 | `jieba_analyzer.cpp` collect_tokens | 复审实测发现：`"北京大学 hello world 上海"` 索引出一个 `' '`（空格）term——jieba CutForSearch 把空格也输出为词，污染索引。修法：collect_tokens 加 `is_noise_word`（基于 utf8proc_category 判全空白 Z*/控制 Cc + 全标点 P*），纯噪声词跳过（pos 仍递增）。实测：修后 6 term（原 7，空格消失），真实词全保留。新增回归测试 `SpaceNotIndexedAsToken`。✅ ctest 216/216 | 低 | ✅ |
+| **S9.27** | 修复 load 版本检查漏 v3 + 补 v3 兼容实跑验证 | `inverted.cpp` `inverted_test.cpp` | 验证 S9.4 兼容缺口时发现**真 bug**：load 入口检查 `ver != kInvVersion && ver != 2 && ver != 1`（kInvVersion=4）→ **拒绝 v3 快照**（虽然 load 体内有 ver>=3 分派逻辑，入口先挡掉）。S9.4 升 v4 时漏列 v3。修法：改范围检查 `ver < 1 || ver > kInvVersion`。验证：手工构造 v3 字节（positions 原始 u32 数组，comp=0 分支）实跑——修前 load 拒绝、修后 df=2/live=2 正确。新增回归测试 `LoadV3SnapshotBackwardCompat`。✅ ctest 217/217 | 🟡 中 | ✅ |
 
 ---
 
