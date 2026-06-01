@@ -7,8 +7,12 @@ using namespace bitcask::text;
 
 namespace {
 
-// 构建目录下的 cppjieba dict 路径。
-const char* kDictDir = "/tmp/bitcask-jieba-build3/_deps/cppjieba-src/dict";
+// cppjieba 词典目录：由 CMake 通过 BITCASK_JIEBA_DICT_DIR 注入真实路径
+// （指向 _deps/cppjieba-src/dict）。未经 CMake 直接编译时回退到相对路径。
+#ifndef BITCASK_JIEBA_DICT_DIR
+#define BITCASK_JIEBA_DICT_DIR "_deps/cppjieba-src/dict"
+#endif
+const char* kDictDir = BITCASK_JIEBA_DICT_DIR;
 
 }  // namespace
 

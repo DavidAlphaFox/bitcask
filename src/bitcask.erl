@@ -98,11 +98,32 @@ open(Dirname, Opts) ->
                false -> []
            end,
     %% 选项归一化：Opts 显式给的 > app env > 不下传
-    Extra = [{K, V} || K <- ?CASK_PASSTHROUGH_OPTS,
-                       (V = opt_value(K, Opts)) =/= undefined],
+    Extra0 = [{K, V} || K <- ?CASK_PASSTHROUGH_OPTS,
+                        (V = opt_value(K, Opts)) =/= undefined],
+    Extra = maybe_default_dict_path(Extra0),
     case bitcask_cpp_nifs:cask_open(Dirname, Base ++ Extra) of
         {ok, CaskRef}  -> CaskRef;
         {error, _} = E -> E
+    end.
+
+%% analyzer=jieba 且未显式指定 dict_path 时，默认指向 priv/dict
+%% （构建时由 CMake 把 cppjieba 词典拷到此处）。其它分词器或已显式
+%% 给了 dict_path 时原样返回。
+maybe_default_dict_path(Opts) ->
+    case proplists:get_value(analyzer, Opts) of
+        jieba ->
+            case proplists:is_defined(dict_path, Opts) of
+                true  -> Opts;
+                false ->
+                    case code:priv_dir(bitcask) of
+                        {error, _} -> Opts;
+                        Dir ->
+                            %% NIF 侧 dict_path 走 enif_inspect_binary，必须是 binary。
+                            Path = filename:join(Dir, "dict"),
+                            [{dict_path, list_to_binary(Path)} | Opts]
+                    end
+            end;
+        _ -> Opts
     end.
 
 %% 选项查询的统一入口：显式 Opts > application env > undefined。

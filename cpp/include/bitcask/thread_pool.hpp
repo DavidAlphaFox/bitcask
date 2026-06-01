@@ -27,8 +27,8 @@
 #include <thread>
 #include <vector>
 
-#include <tbb/concurrent_bounded_queue.h>
-#include <tbb/global_control.h>
+#include <oneapi/tbb/concurrent_queue.h>  // concurrent_bounded_queue（oneTBB 已并入此头）
+#include <oneapi/tbb/global_control.h>
 
 namespace bitcask {
 

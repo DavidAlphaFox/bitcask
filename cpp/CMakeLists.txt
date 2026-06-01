@@ -152,7 +152,7 @@ if(EXISTS "${CMAKE_BINARY_DIR}/_deps/utf8proc-src/CMakeLists.txt")
 else()
     FetchContent_Declare(
         utf8proc
-        GIT_REPOSITORY https://github.com/JulieStrings/utf8proc.git
+        GIT_REPOSITORY https://github.com/JuliaStrings/utf8proc.git
         GIT_TAG        v2.10.0
         GIT_SHALLOW    TRUE
     )
@@ -161,14 +161,39 @@ endif()
 
 # ---------------------------------------------------------------------------
 # cppjieba — jieba 中文分词（header-only，依赖 limonp）。
+# 优先复用 _deps 下手动 clone 的源码；缺失时用 FetchContent 拉取
+# （与上方 utf8proc 同样的 _deps-then-fetch 模式）。
 # ---------------------------------------------------------------------------
 if(NOT TARGET cppjieba)
+    if(NOT EXISTS "${CMAKE_BINARY_DIR}/_deps/cppjieba-src/include/cppjieba/Jieba.hpp")
+        FetchContent_Declare(
+            cppjieba
+            GIT_REPOSITORY https://github.com/yanyiwu/cppjieba.git
+            GIT_TAG        v5.6.7
+            GIT_SHALLOW    TRUE
+        )
+        FetchContent_Declare(
+            limonp
+            GIT_REPOSITORY https://github.com/yanyiwu/limonp.git
+            GIT_TAG        v1.0.2
+            GIT_SHALLOW    TRUE
+        )
+        # header-only：只 populate 取源码，不 add_subdirectory（无需它们的构建）。
+        FetchContent_Populate(cppjieba)
+        FetchContent_Populate(limonp)
+    endif()
+
     add_library(cppjieba INTERFACE)
     target_include_directories(cppjieba INTERFACE
         "${CMAKE_BINARY_DIR}/_deps/cppjieba-src/include"
         "${CMAKE_BINARY_DIR}/_deps/limonp-src/include"
     )
 endif()
+
+# cppjieba 自带的词典目录（jieba.dict.utf8 等），供测试 fixture 定位词典。
+# 两条获取分支（FetchContent / _deps 预填充）布局一致，统一指向此处。
+set(BITCASK_JIEBA_DICT_DIR "${CMAKE_BINARY_DIR}/_deps/cppjieba-src/dict"
+    CACHE INTERNAL "cppjieba 词典目录")
 
 # ---------------------------------------------------------------------------
 # bitcask_text — 文本分词器（Analyzer 抽象基类 + NgramAnalyzer + 工厂）。
@@ -223,6 +248,13 @@ if(Erlang_INCLUDE_DIR)
         set_target_properties(bitcask_cpp PROPERTIES
             LIBRARY_OUTPUT_DIRECTORY "${BITCASK_PRIV_DIR}"
         )
+        # 把 cppjieba 词典拷到 priv/dict，供运行时 jieba 分词默认加载
+        # （bitcask.erl 的 maybe_default_dict_path 会指向此目录）。
+        add_custom_command(TARGET bitcask_cpp POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${BITCASK_JIEBA_DICT_DIR}" "${BITCASK_PRIV_DIR}/dict"
+            COMMENT "Copying cppjieba dict to priv/dict"
+            VERBATIM)
     endif()
 endif()
 

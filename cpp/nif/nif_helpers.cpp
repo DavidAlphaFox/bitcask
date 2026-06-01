@@ -232,7 +232,7 @@ ERL_NIF_TERM search_impl(ErlNifEnv* env, int, const ERL_NIF_TERM argv[],
 
     std::string_view query(
         reinterpret_cast<const char*>(query_bin.data), query_bin.size);
-    auto r = (h->cask->*search_fn)(query, static_cast<std::size_t>(k));
+    auto r = ((*h->cask).*search_fn)(query, static_cast<std::size_t>(k));
     if (!r) return fault_to_term(env, r.error());
 
     return make_ok(env, make_search_hits(env, r->hits));

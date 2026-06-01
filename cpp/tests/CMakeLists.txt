@@ -95,6 +95,9 @@ target_link_libraries(bitcask_jieba_analyzer_test PRIVATE
     bitcask_warnings
     bitcask_sanitizers
 )
+# 注入 cppjieba 词典目录的真实路径，替代源码里硬编码的 /tmp 旧构建路径。
+target_compile_definitions(bitcask_jieba_analyzer_test PRIVATE
+    BITCASK_JIEBA_DICT_DIR="${BITCASK_JIEBA_DICT_DIR}")
 
 add_executable(bitcask_keydir_test keydir_test.cpp)
 target_link_libraries(bitcask_keydir_test PRIVATE
