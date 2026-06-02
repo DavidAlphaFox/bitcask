@@ -109,7 +109,7 @@ kDoc value:
 
 flags 位:  bit0=has_vector  bit1=has_text  bit2=has_meta  bit3=vec_quantized
 
-vector 段 (has_vector):  [dim:u32][ f32×dim  或  量化码字 ]
+vector 段 (has_vector):  [dim:varint][ f32×dim  或  量化码字 ]
 text   段 (has_text):    [len:u32][ utf8 字节 ]
 meta   段 (has_meta):    [len:u32][ 序列化字节 (msgpack/CBOR) ]
 ```

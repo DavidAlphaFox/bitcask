@@ -240,6 +240,38 @@ active data 文件」的只读句柄快照**：
 - `cask_merge` 挂 `ERL_NIF_DIRTY_JOB_IO_BOUND`，在 dirty 调度器跑，**不卡 BEAM
   主调度线程**，其它进程的读写照常被调度。
 
+### file_id 分配：writer 与 merger 各写各的文件
+
+merge 期间「正在写新文件」的有两方，但写的是**不同文件、不同句柄**，不共享：
+
+- **writer** 的 `put` append 到自己的 active 文件（`active_data_`）。
+- **merger** 的 `run_merge` 新建自己的输出文件（`out_data`，`kCreate`）。
+
+file_id 由 keydir 的**单调计数器** `increment_file_id()` 统一分配（`biggest_file_id_ += 1`，
+writer 的 `ensure_active_writer` 与 merger 共用它）。文件名里的 `<tstamp>` 字段存的就是
+这个计数器值，**不是墙钟时间**。
+
+典型时序（当前 biggest = N，writer active = N）：
+
+```
+① merger 开 run_merge → increment_file_id() → N+1，输出写到 N+1
+② writer 下次 put 发现 active(N) < biggest(N+1)
+   → roll_active → increment_file_id() → N+2，新 active = N+2
+```
+
+所以「merger 写 N+1、writer 写 N+2」在「merger 先分配」的时序下成立，且字面连号。
+但**具体谁拿 N+1 取决于谁先调** `increment_file_id`；真正保证的不变量是：
+
+> **writer 的 active file_id 永远被顶到 merger 输出之上。**
+
+机制：writer 每次 put 前查 `biggest_file_id()`，发现被 merger 推进了就主动
+`roll_active` 到 ≥ biggest（`cask.cpp` put 路径）。这条不变量是正确性的核心——keydir
+用 **file_id 大小判 newest/staleness**：merger 搬的是旧数据快照（语义更旧，必须更小
+id），writer 的新写必须更大 id，于是并发改同一 key 时 writer 的值（大 id）天然胜出，
+merger 搬进 N+1 的那份被判 stale、沦为死字节下轮清。若 writer 误写进 ≤ merger 的 id，
+keydir 会当 merge-race 拒掉（`kAlreadyExists`）→ 由主动 roll + put 后的 roll-retry 兜住，
+不会 silent drop。
+
 ---
 
 ## 6. 索引模式（SearchLayer）的并发

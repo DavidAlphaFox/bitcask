@@ -21,7 +21,7 @@
 | **ord** | 引擎单调分配的写入序号，per-write，永不复用。磁盘 record header [9..16] |
 | **KeyDir** | `key → (file_id, offset, total_sz, epoch, tstamp, ord)` 内存哈希表 |
 | **SearchLayer** | 可选的搜索层：Index + InvertedIndex + Analyzer，挂在 Cask 内部 |
-| **DocValue** | 统一的 value 编码格式：`[Ver=1][Flags][段1][段2]...`（见 format.hpp） |
+| **DocValue** | 统一的 value 编码格式：`[Ver=3][Flags][段1][段2]...`，长度用 varint（见 format.hpp / format-zh.md §五） |
 | **bitcask.meta** | 目录级模式标记文件，索引模式创建，KV 模式不存在 |
 | **CAS** | Compare-And-Swap，merge 用 `(old_file_id, old_offset)` 条件更新 KeyDir |
 
@@ -31,15 +31,16 @@
 
 ### 1.1 Value 格式统一
 
-所有 value 都使用 DocValue 格式存储（Ver=1, Flags, Sections）：
+所有 value 都使用 DocValue 格式存储（当前 Ver=3：长度/计数用 VByte varint，
+fields 段存 field id；详见 format-zh.md §五）：
 
 ```
 KV 模式 put(Ref, <<"k">>, <<"hello">>):
-  Value = DocValue{Ver=1, Flags=0x02(hasText), Len=5, "hello"}
-  开销 = 6 字节（Ver=1 + Flags=1 + Len=4）
+  Value = DocValue{Ver=3, Flags=0x02(hasText), Len=5(varint), "hello"}
+  开销 = 3 字节（Ver 1B + Flags 1B + Len 1B varint）
 
 索引模式 put(Ref, <<"k">>, #{text => <<"hello">>, meta => <<"data">>}):
-  Value = DocValue{Ver=1, Flags=0x06(hasText|hasMeta), Len=5, "hello", Len=4, "data"}
+  Value = DocValue{Ver=3, Flags=0x06(hasText|hasMeta), Len=5, "hello", Len=4, "data"}（各 Len 为 varint）
 ```
 
 ### 1.2 ord 统一分配

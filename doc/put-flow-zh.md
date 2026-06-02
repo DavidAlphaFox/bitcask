@@ -51,7 +51,7 @@ put(Ref, Key, Value)     -> bitcask_cpp_nifs:cask_put(Ref, Key, Value).
    - tstamp == 0 时取当前 Unix 秒
 4. ★ DocValue 编码
    - 用 codec::encode_doc_value 把 value 打包成 DocValue（text 段 = 原始 value）
-   - encoded = [Ver:1][Flags:1][Len:4][text bytes]
+   - encoded = [Ver=3][Flags][Len:varint][text bytes]
 5. ★ 分配 ord
    - ord = keydir_->alloc_ord()（全局单调递增序号）
 6. 估算本次 record 字节数
@@ -112,7 +112,7 @@ put(Ref, Key, Value)     -> bitcask_cpp_nifs:cask_put(Ref, Key, Value).
 17     KeySz     大端 u16（2 B）
 19     ValueSz   大端 u32（4 B）
 23     Key       原样字节
-23+KS  Value     DocValue 打包字节（kDoc 时）：[Ver:1][Flags:1][可选段...]
+23+KS  Value     DocValue 打包字节（kDoc 时）：[Ver=3][Flags][可选段…]（段长 varint）
 ```
 
 CRC 覆盖 `Type..Value`（即偏移 4 起的所有内容），不包含 CRC 字段本身。
@@ -129,17 +129,19 @@ write，文件虽然带 O_APPEND 打开，但这里显式追踪偏移，方便 t
 `codec::encode_doc_value` 将 value 编码为：
 
 ```
-偏移   字段              字节数  说明
+偏移   字段              字节数   说明
 ───────────────────────────────────────────
-0      Ver               1       1
-1      Flags             1       位掩码：bit0=has_vector, bit1=has_text, bit2=has_meta
-2      Text段（has_text 时）
-         Len             4       字节长度（大端）
-         字节数组         Len    UTF-8 文本
-[后续为可选的 vector/meta 段]
+0      Ver               1        当前 = 3
+1      Flags             1        bit0=has_vector bit1=has_text bit2=has_meta bit4=has_fields
+       各段按 vector→text→meta→fields 顺序、由 Flags 决定存在；长度/计数全 varint：
+         vector?  [Dim:varint][f32×Dim 小端]
+         text?    [Len:varint][bytes]
+         meta?    [Len:varint][bytes]
+         fields?  [FieldCount:varint] ×{[FieldId:varint][ValLen:varint][value]}
 ```
 
-普通 `put(K,V)` 写入时只有 text 段（原始 value 作为 UTF-8 文本）。
+普通 `put(K,V)` 写入时只有 text 段（原始 value 作为 UTF-8 文本）。完整布局与
+field id（schema interning）见 `format-zh.md` §五。
 
 ### `HintFile::write` (`cpp/src/fileops/hint_file.cpp`)
 
@@ -211,7 +213,7 @@ bitcask:put(R,K,V)
   ←─ ok
 ```
 
-DocValue 编码将原始 value 打包为 `[Ver:1][Flags:1][Len:4][text bytes]`——
+DocValue 编码将原始 value 打包为 `[Ver=3][Flags][Len:varint][text bytes]`——
 普通 put 只含 text 段。写入 record 的 type = kDoc，ord = alloc_ord()
 返回的单调递增序号。
 

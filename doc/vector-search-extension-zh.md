@@ -33,7 +33,7 @@
 | 层 | 状态 | 文件 / 位置 |
 |---|---|---|
 | **磁盘格式** | ✅ | `format.hpp` / `codec.hpp` 中 DocValue 已有 `optional<span<const float>> vector`，`kFlagHasVector` 标志位已定义 |
-| **编解码** | ✅ | `encode_doc_value` / `decode_doc_value` 已支持 `[dim:u32][f32×dim]` 的读写 |
+| **编解码** | ✅ | `encode_doc_value` / `decode_doc_value` 已支持 `[dim:varint][f32×dim]` 的读写（DocValue v3） |
 | **存储** | ✅ | 向量作为 DocValue 的一部分已落盘 |
 | **BM25 倒排** | ✅ | `InvertedIndex` + `SearchLayer::search_text/fields/phrase` 已可用 |
 | **HNSW 索引** | ❌ | 未实现 |
@@ -91,7 +91,7 @@ kDoc value:
 
 flags 位:  bit0=has_vector  bit1=has_text  bit2=has_meta  bit3=vec_quantized
 
-vector 段 (has_vector):  [dim:u32][ f32×dim  或  量化码字 ]
+vector 段 (has_vector):  [dim:varint][ f32×dim  或  量化码字 ]
 ```
 
 无需修改：`vector` 段已存在并已编解码。本设计只新增「使用方式」（检索路径）。
@@ -113,7 +113,7 @@ vector 段 (has_vector):  [dim:u32][ f32×dim  或  量化码字 ]
 │ Value（ValueSz 字节）= DocValue 打包                                  │
 │  ┌──────┬───────┬───────────────────┬─────────────┬────────────────┐ │
 │  │ Ver  │ Flags │ vector 段(可选)    │ text段(可选) │ meta段(可选)   │ │
-│  │ u8   │ u8    │ [dim:u32][f32×dim] │ [len][utf8] │ [len][bytes]   │ │
+│  │ u8   │ u8    │ [dim:varint][f32×dim] │ [len][utf8] │ [len][bytes]   │ │
 │  │ [0]  │ [1]   │ [2..]             │             │                │ │
 │  └──────┴───────┴───────────────────┴─────────────┴────────────────┘ │
 └──────────────────────────────────────────────────────────────────────┘
@@ -126,19 +126,20 @@ header = 23 字节（固定）
 
 写入 `key="doc1"`, `text="hello world"`, `vector=768维 f32`:
 
+> ⚠️ 下面这个字节例子用的是**早期固定宽度布局**（dim/len 各 4 字节大端），便于
+> 直观对照偏移。**当前 DocValue v3 中 dim/len 已改 VByte varint**（768→2 字节
+> `0x80 0x06`、11→1 字节），实际偏移会相应缩短，权威定义见 `format-zh.md` §五。
+
 ```
 Flags = 0x03 (has_vector | has_text)
 
-Value 内容（精确字节）:
-  [0]       Ver       = 0x01
+Value 内容（早期固定宽度示意）:
+  [0]       Ver       = 0x03
   [1]       Flags     = 0x03
-  [2..5]    dim       = 0x00000300   (768，大端)
+  [2..5]    dim       = 768           (v3 为 varint)
   [6..3113]           = f32[768]     (3072 字节，小端)
-  [3114..3117] len    = 0x0000000B   (11，大端)
+  [3114..3117] len    = 11            (v3 为 varint)
   [3118..3128]        = "hello world"
-
-ValueSz = 1 + 1 + 4 + 3072 + 4 + 11 = 3093 字节
-整条 record 总长 = 23 + 4 + 3093 = 3120 字节
 ```
 
 #### 各段 offset 定位（O(1)）

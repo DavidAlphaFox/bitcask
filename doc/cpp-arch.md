@@ -20,6 +20,7 @@ cpp/
 │   ├── merger.hpp           # Merger: merge execution (rewrites live records)
 │   ├── cask.hpp             # Cask: end-user KV+search facade (open/get/put/delete/search/merge)
 │   ├── meta_file.hpp        # bitcask.meta: mode persistence (KV vs Index)
+│   ├── field_schema.hpp     # FieldSchema: 字段名↔id append-only 注册表（DocValue v3 fields）
 │   ├── collection.hpp       # Collection: standalone document + BM25 search facade
 │   ├── collection_registry.hpp # CollectionRegistry: named-collection cache
 │   ├── index.hpp            # Index: in-memory document side tables (ext2ord/slots/ord2ext/live)
@@ -43,11 +44,12 @@ cpp/
 │   ├── bm25/                # inverted.cpp
 │   └── text/                # analyzer.cpp, jieba_analyzer.cpp
 ├── nif/                     # erl_nif glue → bitcask_cpp.so
-│   ├── nif_main.cpp         # ErlNifFunc table + on_load (21 NIF functions)
+│   ├── nif_main.cpp         # ErlNifFunc table + on_load (28 NIF 入口)
 │   ├── nif_cask.cpp         # cask_* functions (open/close/get/put/delete/sync/search/merge)
 │   ├── nif_cask_iter.cpp    # cask_fold_* + cask_iterator_* (fold/iterator NIFs)
 │   ├── nif_cask_admin.cpp   # cask_status / cask_needs_merge / cask_is_empty / cask_is_frozen
-│   ├── nif_helpers.cpp/hpp  # option parsing, binary conversion utilities
+│   ├── nif_helpers.cpp/hpp  # 资源句柄 / DocInput 解析 / 错误翻译 / run_search 骨架 / term 构造
+│   ├── nif_options.cpp      # open/2 选项解析（parse_options，单一职责）
 │   ├── atoms.cpp/hpp        # cached ERL_NIF_TERM atoms
 │   ├── resources.cpp/hpp    # ErlNifResourceType registration
 │   ├── term_conv.hpp        # Erlang term ↔ C++ conversion helpers
@@ -152,7 +154,7 @@ The Erlang facade (`src/bitcask.erl`) dispatches ALL operations to the C++ NIF
 (`bitcask_cpp_nifs`). There is no legacy mode — `bitcask_legacy.erl` has been
 deleted.
 
-21 NIF functions are registered:
+28 NIF functions are registered:
 
 | Group | Functions |
 |-------|-----------|

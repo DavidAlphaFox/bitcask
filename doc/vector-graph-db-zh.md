@@ -39,7 +39,7 @@ Bitcask 引擎之上做一个向量数据库或图数据库」。配合 `doc/cpp
 
 核心是 **ANN（近似最近邻）查询**：`search(q, k)` 返回与 q 最近的 k 个向量。
 
-1. **向量值编解码层** — value 存 `[dim:u32][f32 × dim]` 或量化字节；
+1. **向量值编解码层** — value 存 `[dim:varint][f32 × dim]` 或量化字节；
    扩展 `codec.hpp` 即可，Bitcask 现成。
 2. **ANN 索引（最大工程量）** — 选型 HNSW（召回/延迟最好）或 IVF-PQ（省内存）。
    建议：**向量原始数据放 Bitcask，HNSW 图索引单独管理**（HNSW 是增量多层
