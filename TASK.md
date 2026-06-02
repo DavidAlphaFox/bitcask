@@ -443,6 +443,22 @@ ctest **206/206 全部通过**（含此前一贯失败的 10 个 Jieba 测试，
 
 ---
 
+### S11 — DocValue 磁盘格式优化（2026-06-02）
+
+**背景**：审查多字段存储格式时发现两类冗余——①固定 4B 长度前缀对小字段浪费；
+②每条 record 内联存字段名（append-only 下同 schema 百万文档重复百万次，merge 后再付一遍）。
+统一升级 DocValue 到 **v3**（项目不考虑向后兼容，已更新黄金 fixture）。
+
+| # | 目标 | 改动范围 | 关键内容 | 状态 |
+|---|------|---------|---------|------|
+| **#2** | 变长长度前缀 | `format.hpp` `codec.cpp` `codec_test.cpp` | 所有长度/计数（Dim/text/meta/FieldCount/字段值长）从固定 4B/2B u32/u16 BE 改 VByte varint（算法同 `vbyte.hpp`，对 std::byte 缓冲操作）。小字段省 2–3B。黄金 fixture 重算（`0303820000803f...`，注意 VByte 末字节高位=终止标记，varint(2)=0x82）。✅ codec 26/26 | ✅ |
+| **#1** | 字段名字典（schema interning） | 新建 `field_schema.hpp` `codec.{hpp,cpp}` `cask.{hpp,cpp}` `cask_docvalue_test.cpp` | DocValue 的 fields 段存 **FieldId(varint)** 而非内联字段名。新增 header-only `FieldSchema`：append-only `<dir>/field.schema`（每新字段追加 `[u16 名长][name]`，id=出现序），`intern`(并发安全, shared→unique 双检 + fwrite+fflush)/`name_of`/`open`(顺序重放)。Cask 持 `field_schema_`，open/upgrade 时加载，`put_doc` 把字段名 intern 成 id 写入。codec 保持纯函数（DocField 带 id，名字映射在 Cask 层）。**关键发现**：4 个 `decode_doc_value` 调用点无一读 `dv->fields[].name`（字段名是只写不读的预留），故读侧改动面≈0。merge 逐字节复制 value、不重编码 → field id 跨 merge 不变（schema 同目录持久）。新增 `FieldSchema.InternDeterministicAndReverseLookup`/`PersistsAcrossReopen` + codec `FieldIdMultibyteVarint`。✅ ctest 316/316 + eunit 38/38（多字段 NIF e2e 走真实 schema） | ✅ |
+
+**收益示例**（3 字段 doc，名 title/body/author）：结构开销从 ~35B/record（2B fieldcount + 3×(2B 名长+名+4B 值长)）降到 ~7B/record（1B fieldcount + 3×(1B id + 1B 值长)），字段名全局只存一份。append-only + merge 双重放大。
+**未做**（更大、需单独设计）：#3 value 压缩（zstd/LZ4，会破坏 decode 的 zero-copy span）、#4 向量量化（V3/HNSW）。
+
+---
+
 ## 未来任务
 
 ### V3 — HNSW 单图 + search_vector（暂缓）

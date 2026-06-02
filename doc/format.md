@@ -197,24 +197,35 @@ is treated as missing and the keydir is rebuilt from the data file.
 ## 5. DocValue format (kDoc value packing)
 
 Records with `type = kDoc` store their value in DocValue format — a
-packed binary structure containing optional vector, text, and metadata
-sections.
+packed binary structure containing optional vector, text, meta, and
+fields sections.
+
+> **Current version `Ver = 3` (S11)**: all lengths/counts are **VByte
+> varints**; the fields section stores **field ids** (not inlined field
+> names). No backward compatibility — `decode_doc_value` accepts `Ver == 3`
+> only. Below, `varint` means VByte (see "VByte varints").
 
 ```
-offset  field         size  notes
+offset  field         size    notes
 ────────────────────────────────────────────
-0       Ver           1     layout version; currently 1
-1       Flags         1     bitmask (see below)
-2       Vector section (optional)
-         Dim          4     number of f32 elements (big-endian)
-         f32 array    Dim×4  little-endian f32 values
-         [or quantized bytes if vecQuantized flag is set — future]
-X       Text section  (optional, only if Flags&0x02)
-         Len          4     byte length (big-endian)
-         bytes        Len   UTF-8 text
-Y       Meta section  (optional, only if Flags&0x04)
-         Len          4     byte length (big-endian)
-         bytes        Len   serialized (msgpack/CBOR)
+0       Ver           1       layout version, currently 3
+1       Flags         1       bitmask (see below)
+2       Vector section (optional, Flags&0x01)
+         Dim          varint  number of f32 elements
+         f32 array    Dim×4   little-endian f32 values
+         [or quantized bytes if vec_quantized flag is set — future]
+X       Text section  (optional, Flags&0x02)
+         Len          varint  byte length
+         bytes        Len     UTF-8 text
+Y       Meta section  (optional, Flags&0x04)
+         Len          varint  byte length
+         bytes        Len     serialized (msgpack/CBOR)
+Z       Fields section (optional, Flags&0x10; multi-field)
+         FieldCount   varint  number of fields
+         repeated FieldCount times:
+           FieldId    varint  field id (assigned by field.schema registry)
+           ValLen     varint  field value byte length
+           Value      ValLen  field value UTF-8
 ```
 
 ### Flags byte (offset 1)
@@ -225,27 +236,58 @@ Y       Meta section  (optional, only if Flags&0x04)
 | 1   | `has_text`       | Text section present                         |
 | 2   | `has_meta`       | Meta section present                         |
 | 3   | `vec_quantized`  | Vector section contains quantized data (future) |
+| 4   | `has_fields`     | Fields section present (multi-field)         |
 
-The three optional sections appear **in vector→text→meta order** whenever
+Optional sections appear **in vector→text→meta→fields order** whenever
 present.  The Flags byte determines which sections exist.
 
-### Vector section
+### VByte varints (S11, #2)
 
-- `Dim`: number of f32 elements (not byte count), big-endian u32.
-- Payload: either `Dim × 4` little-endian f32 values, or quantized bytes
-  (future; V1 rejects `vec_quantized = 1` as unsupported).
+All lengths/counts (Dim, section Lens, FieldCount, FieldId) use VByte,
+replacing the old fixed 4B/2B big-endian integers to save the fixed prefix
+on small fields.
 
-### Text section
+- Each byte holds 7 data bits; the **high bit is the terminator** (`1` = last
+  byte). Note this is the *opposite* of LEB128's continuation bit, e.g.
+  `varint(2) = 0x82` (`2 | 0x80`), not `0x02`.
+- Algorithm in `vbyte.hpp`; codec-local `std::byte` helpers are
+  `vbyte_append` / `vbyte_read`.
 
-- `Len`: byte length of the UTF-8 text, big-endian u32.
-- Payload: raw UTF-8 bytes.
+### Vector / Text / Meta sections
 
-### Meta section
+- Vector: `Dim` is the f32 element count (not byte count); payload is
+  `Dim×4` little-endian f32 values, or quantized codewords (future;
+  `vec_quantized = 1` currently errors).
+- Text / Meta: `Len` is the payload byte length; payload is raw bytes
+  (Text is UTF-8, Meta is arbitrary serialized bytes).
 
-- `Len`: byte length of the serialized metadata, big-endian u32.
-- Payload: arbitrary serialized bytes (msgpack, CBOR, etc.).
+### Fields section + field-name registry (S11, #1)
 
-Source: `cpp/include/bitcask/format.hpp` (`kDoc value packing` comment).
+The old format **inlined field names** ("title"/"body"...) in every record;
+append-only, the same schema across many docs repeats names endlessly. v3
+stores **field ids** instead, keeping each name once in a registry.
+
+- **Registry**: append-only file `<dir>/field.schema`; each new field name
+  appends `[NameLen:u16 BE][name]`, and **id = order of appearance** (0-based).
+  Replayed sequentially on open to restore name↔id. See `field_schema.hpp`
+  (`FieldSchema::open/intern/name_of`); Cask loads it on `open`/`upgrade`,
+  and `put_doc` interns field names to ids before encoding.
+- **Codec stays pure**: `DocField{id, value}`; the name↔id mapping lives in
+  the Cask layer. `decode_doc_value` only recovers the id.
+- **Write-only today**: none of the current `decode_doc_value` call sites read
+  field names (the fields section is reserved for a future "rebuild the
+  multi-field index from data files"), so the id switch has ~zero read-side
+  blast radius.
+- **Merge-safe**: merge copies the value verbatim (no re-encode), so field ids
+  survive merge unchanged (the schema persists in the same directory).
+
+Index side (orthogonal to storage): each field gets its own InvertedIndex
+(isolated BM25 stats); `field:term^boost` routes to the right field. A
+catch-all (S9.29) also merges field texts into the default-field index so
+unqualified `search_text`/`search_phrase`/`search_near` still match.
+
+Source: `cpp/include/bitcask/format.hpp` + `cpp/src/fileops/codec.cpp`
+(`encode_doc_value` / `decode_doc_value`) + `cpp/include/bitcask/field_schema.hpp`.
 
 ---
 
@@ -377,7 +419,8 @@ break:
 - Ord field: 8 bytes, big-endian, monotonically increasing, never reused.
 - Tombstone flag in hints lives in the **high bit of the packed
   offset field** (bytes 10..17, bit 63), capping `Offset` at 63 bits.
-- DocValue: Ver=1, Flags at offset 1, sections ordered vector→text→meta.
+- DocValue: Ver=3, Flags at offset 1, sections ordered vector→text→meta→fields;
+  all lengths/counts are VByte varints; fields store field ids (see §5).
 
 `cpp/include/bitcask/format.hpp` is the single source of truth for these
 constants.

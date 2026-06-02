@@ -182,27 +182,30 @@ meta、fields 四段的打包二进制结构。
 > value **都编码为 DocValue**——KV 的 binary 放进 text 段。因此 `get` 返回的
 > 是解码后的 text；fold/stream/list_keys 也必须解码取 text 段（见 §九）。
 
+> **当前版本 `Ver = 3`（S11）**：所有长度/计数改为 **VByte 变长**；fields 段
+> 存 **字段 id**（而非内联字段名）。不考虑向后兼容，`decode_doc_value` 只接受
+> `Ver == 3`。下表 `varint` 即 VByte 编码（见「VByte 变长」小节）。
+
 ```
 偏移   字段              字节数  说明
 ────────────────────────────────────────────
-0      Ver               1       布局版本：1=无 fields 段；2=含 fields 段（S8.6）
+0      Ver               1       布局版本，当前 = 3
 1      Flags             1       位掩码（见下）
 2      Vector 段（可选，Flags&0x01 时存在）
-         Dim            4       f32 元素个数（大端）
+         Dim            varint  f32 元素个数
          f32 数组        Dim×4   小端 f32 值
-         [若 Flags&0x08 置位，则为量化码字——未来扩展；V1 不支持]
+         [若 Flags&0x08 置位，则为量化码字——未来扩展；当前不支持]
 X      Text 段（可选，Flags&0x02 时存在）
-         Len             4       字节长度（大端）
+         Len            varint  字节长度
          字节数组         Len    UTF-8 文本
 Y      Meta 段（可选，Flags&0x04 时存在）
-         Len             4       字节长度（大端）
+         Len            varint  字节长度
          字节数组         Len    序列化数据（msgpack/CBOR 等）
-Z      Fields 段（可选，Flags&0x10 时存在；S8.6 多字段）
-         FieldCount     2       字段数（大端 u16）
+Z      Fields 段（可选，Flags&0x10 时存在；多字段）
+         FieldCount     varint  字段数
          重复 FieldCount 次：
-           NameLen      2       字段名字节长度（大端 u16）
-           Name         NameLen 字段名 UTF-8
-           ValLen       4       字段值字节长度（大端 u32）
+           FieldId      varint  字段 id（由 field.schema 注册表分配）
+           ValLen       varint  字段值字节长度
            Value        ValLen  字段值 UTF-8
 ```
 
@@ -213,46 +216,56 @@ Z      Fields 段（可选，Flags&0x10 时存在；S8.6 多字段）
 | 0   | `has_vector`    | Vector 段存在                             |
 | 1   | `has_text`      | Text 段存在                               |
 | 2   | `has_meta`      | Meta 段存在                               |
-| 3   | `vec_quantized` | Vector 段含量化数据（未来扩展；V1 不支持） |
-| 4   | `has_fields`    | Fields 段存在（S8.6 多字段）              |
+| 3   | `vec_quantized` | Vector 段含量化数据（未来扩展；当前不支持） |
+| 4   | `has_fields`    | Fields 段存在（多字段）                    |
 
 四个可选段存在时**按 vector→text→meta→fields 顺序**排列，由 Flags 决定哪些存在。
 
-### 版本兼容（S8.6）
+### VByte 变长（S11，#2）
 
-- **编码**：`encode_doc_value` 仅当存在 fields 段时写 `Ver=2`；否则写 `Ver=1`，
-  字节与旧实现完全一致（保证旧数据/旧测试字节级不变）。
-- **解码**：`decode_doc_value` 接受 `Ver ∈ {1, 2}`（范围式兼容）。
+所有长度/计数（Dim、各段 Len、FieldCount、FieldId）用 VByte 编码，取代旧版固定
+4B/2B 大端整数，省掉小字段的固定前缀开销。
 
-### Vector 段
+- 每字节低 7 位为数据；**最高位 = 终止标记**（`1` 表示末字节）。
+- ⚠️ 注意：终止位语义与 LEB128 的「续位」相反。例如 `varint(2) = 0x82`
+  （`2 | 0x80`），不是 `0x02`——改黄金 fixture 时易错。
+- 算法见 `vbyte.hpp`；codec 内对 `std::byte` 缓冲的实现为
+  `vbyte_append` / `vbyte_read`。
 
-- `Dim`：f32 元素个数（不是字节数），大端 u32。
-- Payload：要么是 `Dim × 4` 个小端 f32 值，要么是量化码字（未来扩展；
-  V1 若 `vec_quantized = 1` 则报错）。
+### Vector / Text / Meta 段
 
-### Text 段
+- Vector：`Dim` 为 f32 元素个数（非字节数），payload 为 `Dim×4` 个小端 f32，
+  或量化码字（未来扩展；`vec_quantized=1` 当前报错）。
+- Text / Meta：`Len` 为 payload 字节长度，payload 为原始字节（Text 是 UTF-8，
+  Meta 是任意序列化字节）。
 
-- `Len`：UTF-8 文本的字节长度，大端 u32。
-- Payload：原始 UTF-8 字节。
+### Fields 段 + 字段名注册表（S11，#1）
 
-### Meta 段
+旧版每条 record **内联存字段名**（"title"/"body"...），append-only 下同 schema
+的海量文档把字段名重复无数次。v3 改为存 **字段 id**，字段名只在注册表存一份。
 
-- `Len`：序列化元数据的字节长度，大端 u32。
-- Payload：任意序列化字节（msgpack、CBOR 等）。
+- **注册表**：append-only 文件 `<dir>/field.schema`，每个新字段名追加一条
+  `[NameLen:u16 大端][name]`，**id = 出现顺序**（0 基）。open 时顺序重放还原
+  name↔id。实现见 `field_schema.hpp`（`FieldSchema::open/intern/name_of`），
+  Cask 在 `open`/`upgrade` 时加载，`put_doc` 把字段名 `intern` 成 id 后编码。
+- **codec 保持纯函数**：`DocField{id, value}`，名字↔id 映射只在 Cask 层；
+  `decode_doc_value` 只还原 id。
+- **只写不读**：当前 4 个 `decode_doc_value` 调用点都不读字段名（fields 段是为
+  「将来从数据文件重建多字段索引」预留），故 id 化的读侧改动面≈0。
+- **merge 安全**：merge 逐字节复制 value、不重编码，field id 跨 merge 不变
+  （schema 与数据同目录持久）。
 
-### Fields 段（S8.6 多字段）
+**索引侧**（与存储格式正交）：每个字段建独立 InvertedIndex（BM25 统计隔离），
+查询 `field:term^boost` 路由到对应字段。**catch-all（S9.29）**：写多字段文档时
+各字段文本另拼接进**默认字段**索引，使无字段限定的 `search_text`/`search_phrase`/
+`search_near` 也能命中（取舍：拼接模糊原字段边界，短语可能跨字段误匹配；字段
+限定查询不受影响）。
 
-- 用于 `put_doc(#{title=>..., body=>...})` 这类多字段文档。
-- 每个字段是 `(NameLen, Name, ValLen, Value)`，字段名/值均为 UTF-8。
-- **索引侧**：每个字段建立独立的 InvertedIndex（字段间 BM25 统计隔离），
-  查询语法 `field:term^boost` 路由到对应字段。
-- **catch-all（S9.29）**：写入多字段文档时，各字段文本另会拼接合并进**默认
-  字段**索引，使无字段限定的 `search_text`/`search_phrase`/`search_near`
-  （只查默认字段）也能命中多字段文档。取舍：拼接会模糊原字段边界，短语
-  查询可能跨字段误匹配（全文搜索可接受；字段限定查询不受影响）。
+**收益**（3 字段 doc，名 title/body/author）：结构开销从 ~35B/record 降到
+~7B/record，字段名全局只存一份；append-only + merge 双重放大。
 
 来源：`cpp/include/bitcask/format.hpp` + `cpp/src/fileops/codec.cpp`
-（`encode_doc_value` / `decode_doc_value`）。
+（`encode_doc_value` / `decode_doc_value`）+ `cpp/include/bitcask/field_schema.hpp`。
 
 ---
 
@@ -371,8 +384,8 @@ NFS 上 `O_EXCL` 不可靠，但 bitcask 也不该跑在网络文件系统上。
 - Ord 字段：8 字节，大端，单调递增，永不复用。
 - 墓碑标志在 hint packed offset 的**最高位**（字节 10..17，位 63），
   Offset 限于 63 位。
-- DocValue：Flags 在偏移 1 处，各段按 vector→text→meta→fields 排序；
-  Ver=1（无 fields 段，字节同旧实现）或 Ver=2（含 fields 段，S8.6），
-  解码接受 Ver∈{1,2}。
+- DocValue：当前 Ver=3，Flags 在偏移 1 处，各段按 vector→text→meta→fields
+  排序；所有长度/计数为 VByte 变长，fields 段存字段 id（见 §五）。解码只接受
+  Ver==3（不向后兼容）。
 
 所有这些常量集中在 `cpp/include/bitcask/format.hpp`，是本格式的唯一权威来源。
