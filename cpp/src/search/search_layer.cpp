@@ -23,7 +23,7 @@ bm25::InvertedIndex& SearchLayer::field_index(std::string_view field) {
     auto it = fields_.find(std::string(field));
     if (it == fields_.end()) {
         it = fields_.emplace(std::string(field),
-                             std::make_unique<bm25::InvertedIndex>(config_.bm25_params)).first;
+                             std::make_unique<bm25::InvertedIndex>(config_.bm25_params, config_.index_positions)).first;
     }
     return *it->second;
 }
@@ -496,7 +496,7 @@ std::expected<bool, std::string> SearchLayer::load_snapshot(std::string_view pat
             if (!std::getline(mf, field)) {
                 return std::unexpected("manifest truncated for " + base);
             }
-            auto inv = std::make_unique<bm25::InvertedIndex>(config_.bm25_params);
+            auto inv = std::make_unique<bm25::InvertedIndex>(config_.bm25_params, config_.index_positions);
             if (!inv->load(base + ".f" + std::to_string(i) + ".inv")) {
                 return std::unexpected("failed to load field snapshot " + field);
             }
@@ -511,7 +511,7 @@ std::expected<bool, std::string> SearchLayer::load_snapshot(std::string_view pat
         return true;
     }
     // 回退：无 manifest 时尝试旧单文件格式 → 映射到默认字段（向后兼容）。
-    auto inv_fallback = std::make_unique<bm25::InvertedIndex>(config_.bm25_params);
+    auto inv_fallback = std::make_unique<bm25::InvertedIndex>(config_.bm25_params, config_.index_positions);
     if (!inv_fallback->load(base)) {
         return std::unexpected(std::string("failed to load snapshot from ") + base);
     }
@@ -522,7 +522,7 @@ std::expected<bool, std::string> SearchLayer::load_snapshot(std::string_view pat
 
 void SearchLayer::rebuild_index(DocReader doc_reader) {
     // 阶段2a：仍按默认字段重建（多字段从 DocValue 取字段在阶段4打通）。
-    auto new_inv = std::make_unique<bm25::InvertedIndex>(config_.bm25_params);
+    auto new_inv = std::make_unique<bm25::InvertedIndex>(config_.bm25_params, config_.index_positions);
     doc_texts_.clear();
 
     index_.for_each_live([&](std::uint64_t ord,
@@ -552,6 +552,15 @@ void SearchLayer::rebuild_index(DocReader doc_reader) {
     }
 
     cache_.invalidate();
+}
+
+std::size_t SearchLayer::compact(double dead_ratio_threshold) {
+    std::size_t total = 0;
+    for (auto& [field, inv] : fields_) {
+        total += inv->compact(index_, dead_ratio_threshold);
+    }
+    if (total > 0) cache_.invalidate();  // posting 行变了，缓存可能含陈旧结果
+    return total;
 }
 
 std::expected<std::vector<SearchHitEx>, std::string>

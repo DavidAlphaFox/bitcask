@@ -46,6 +46,10 @@ struct SearchLayerConfig {
     // 高亮原文 LRU 上限（S9.3）：只缓存最近写入/查询的文档原文，避免全文常驻。
     // 0 表示不缓存（高亮恒拿不到原文 → 降级为无片段），默认 1024 篇。
     std::size_t          doc_text_cache_max = 1024;
+    // 是否索引词位置（S10.10）。默认 true。置 false 时倒排不存 positions，
+    // 大幅省内存——代价：search_phrase / search_near 失效（无位置可匹配，返回空）。
+    // 仅做 search_text/bool/fuzzy/wildcard 的部署可关闭。
+    bool                 index_positions = true;
 };
 
 // 搜索结果条目。
@@ -170,6 +174,11 @@ public:
     using DocReader = std::function<std::optional<std::string>(
         std::uint32_t, std::uint64_t, std::uint32_t)>;
     void rebuild_index(DocReader doc_reader);
+
+    // 死点压实（S10.11）：对各字段倒排里死点占比 ≥ threshold 的 posting list，
+    // 用 index_（LiveChecker）重建只留 live ord，回收高 churn 累积的死点。
+    // 比 rebuild_index 轻（不重读磁盘、不重新分词）；分数无关。返回压实的 list 数。
+    std::size_t compact(double dead_ratio_threshold = 0.5);
 
     // ---- 访问内部组件（Phase 4 集成用）----
     [[nodiscard]] index::Index&       index()       { return index_; }
