@@ -807,3 +807,139 @@ TEST(InvertedIndex, BlockMaxWandSingleTerm) {
         EXPECT_FLOAT_EQ(results_wand[i].score, results_daat[i].score);
     }
 }
+
+// S10.6 回归：在线（未 finalize）索引也应增量封块，使 WAND 走块跳跃。
+// ① add_doc 满 kBlockSize 后 blocks 非空（此前要等 finalize_all_postings）。
+// ② 增量块下 WAND 结果与 finalize 后完全一致（块跳跃是精确剪枝，不改 top-k）。
+// ③ finalize 后块数为含部分尾块的规范数（验证 note_appended 与 finalize 不重复/不冲突）。
+TEST(InvertedIndex, IncrementalBlocksOnLiveIndex) {
+    constexpr std::uint64_t kDocs = 600;  // 2 term × 600 = 1200 posting ≥ kWandThreshold(1024)
+    InvertedIndex idx;
+    for (std::uint64_t i = 0; i < kDocs; ++i) {
+        std::uint32_t tf = static_cast<std::uint32_t>((i % 17) + 1);
+        idx.add_doc(i, {{"common", tp(tf, {0})}, {"rare", tp(1, {1})}});
+    }
+
+    FakeLiveChecker checker;
+    for (std::uint64_t i = 0; i < kDocs; ++i) checker.doc_lens[i] = 10;
+
+    // ① 在线索引（未 finalize）：blocks 已增量封满块，仅含整块。
+    {
+        auto& shard = idx.shard_for("common");
+        tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+        ASSERT_TRUE(shard.inverted.find(acc, "common"));
+        ASSERT_EQ(acc->second.blocks.size(), kDocs / PostingList::kBlockSize);  // 600/128=4 满块
+        for (auto& blk : acc->second.blocks) {
+            EXPECT_EQ(blk.count, PostingList::kBlockSize);
+        }
+    }
+
+    auto live = idx.search({"common", "rare"}, 10, checker);
+
+    // ② finalize 后再搜，结果必须与在线一致。
+    idx.finalize_all_postings();
+    auto after = idx.search({"common", "rare"}, 10, checker);
+
+    ASSERT_EQ(live.size(), after.size());
+    for (std::size_t i = 0; i < live.size(); ++i) {
+        EXPECT_EQ(live[i].ord, after[i].ord);
+        EXPECT_FLOAT_EQ(live[i].score, after[i].score);
+    }
+
+    // ③ finalize 后块数为含部分尾块的规范数 ceil(600/128)=5。
+    {
+        auto& shard = idx.shard_for("common");
+        tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+        ASSERT_TRUE(shard.inverted.find(acc, "common"));
+        EXPECT_EQ(acc->second.blocks.size(),
+                  (kDocs + PostingList::kBlockSize - 1) / PostingList::kBlockSize);
+    }
+}
+
+// S10.10：index_positions=false 时不存 positions（省内存）。
+// 普通 BM25 搜索照常工作；短语搜索因无位置可匹配返回空。
+TEST(InvertedIndex, IndexPositionsDisabled) {
+    InvertedIndex idx(Bm25Params{}, /*index_positions=*/false);
+    EXPECT_FALSE(idx.index_positions());
+
+    idx.add_doc(0, {{"quick", tp(1, {0})}, {"brown", tp(1, {1})}});
+    idx.add_doc(1, {{"quick", tp(1, {0})}, {"fox", tp(1, {1})}});
+
+    FakeLiveChecker checker;
+    checker.doc_lens[0] = 2;
+    checker.doc_lens[1] = 2;
+
+    // 普通搜索正常。
+    auto res = idx.search({"quick"}, 10, checker);
+    EXPECT_EQ(res.size(), 2u);
+
+    // positions 未存：posting 的 positions 为空。
+    {
+        auto& shard = idx.shard_for("quick");
+        tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+        ASSERT_TRUE(shard.inverted.find(acc, "quick"));
+        for (auto& p : acc->second.items) {
+            EXPECT_TRUE(p.positions.empty());
+        }
+    }
+
+    // 短语搜索无位置可匹配 → 空。
+    auto phrase = idx.search_phrase({"quick", "brown"}, 10, checker);
+    EXPECT_TRUE(phrase.empty());
+}
+
+// 对照：默认 index_positions=true 时 positions 正常存、短语可匹配。
+TEST(InvertedIndex, IndexPositionsEnabledByDefault) {
+    InvertedIndex idx;  // 默认构造
+    EXPECT_TRUE(idx.index_positions());
+
+    idx.add_doc(0, {{"quick", tp(1, {0})}, {"brown", tp(1, {1})}});
+
+    FakeLiveChecker checker;
+    checker.doc_lens[0] = 2;
+
+    auto phrase = idx.search_phrase({"quick", "brown"}, 10, checker);
+    ASSERT_EQ(phrase.size(), 1u);
+    EXPECT_EQ(phrase[0].ord, 0u);
+}
+
+// S10.11：死点占比 ≥ 阈值时压实，删掉死 posting；结果集与分数不变（透明优化）。
+TEST(InvertedIndex, CompactRemovesDeadPostingsPreservesScores) {
+    InvertedIndex idx;
+    for (std::uint64_t i = 0; i < 200; ++i) {
+        idx.add_doc(i, {{"term", tp(static_cast<std::uint32_t>((i % 5) + 1), {0})}});
+    }
+    EXPECT_EQ(idx.df("term"), 200u);  // posting 行含死点
+
+    FakeLiveChecker checker;
+    for (std::uint64_t i = 0; i < 200; ++i) checker.doc_lens[i] = 10;
+    // 标记奇数 ord 为死（is_live=false）。
+    for (std::uint64_t i = 1; i < 200; i += 2) checker.doc_lens.erase(i);
+
+    auto before = idx.search({"term"}, 100, checker);
+
+    auto n = idx.compact(checker, 0.4);  // 50% 死 ≥ 0.4 → 压实
+    EXPECT_EQ(n, 1u);
+    EXPECT_EQ(idx.df("term"), 100u);  // 死 posting 已删，只剩 live
+
+    auto after = idx.search({"term"}, 100, checker);
+    ASSERT_EQ(before.size(), after.size());
+    for (std::size_t i = 0; i < before.size(); ++i) {
+        EXPECT_EQ(before[i].ord, after[i].ord);
+        EXPECT_FLOAT_EQ(before[i].score, after[i].score);
+    }
+}
+
+// S10.11：死点占比低于阈值时不压实（避免无谓重建）。
+TEST(InvertedIndex, CompactSkipsBelowThreshold) {
+    InvertedIndex idx;
+    for (std::uint64_t i = 0; i < 100; ++i) idx.add_doc(i, {{"term", tp(1, {0})}});
+
+    FakeLiveChecker checker;
+    for (std::uint64_t i = 0; i < 100; ++i) checker.doc_lens[i] = 10;
+    checker.doc_lens.erase(0);  // 仅 1% 死
+
+    auto n = idx.compact(checker, 0.5);
+    EXPECT_EQ(n, 0u);
+    EXPECT_EQ(idx.df("term"), 100u);  // 未压实
+}

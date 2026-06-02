@@ -121,6 +121,25 @@ TEST(InvertedIndexFuzzy, TopK) {
     EXPECT_EQ(results[0].ord, 1u);
 }
 
+// S10.2 回归：两个 query 词同时模糊命中同一 vocab term（"hello"），
+// 该 term 只应被计分一次。修复前翻倍 IDF 贡献，分数约为单词查询的 2 倍。
+TEST(InvertedIndexFuzzy, NoDoubleCountWhenTwoQueryTermsMatchSameTerm) {
+    InvertedIndex idx;
+    idx.add_doc(0, {{"hello", tp(1, {0})}});
+
+    FakeLiveChecker checker;
+    checker.doc_lens[0] = 10;
+
+    auto single = idx.search_fuzzy({"helo"}, 10, 1, checker);
+    auto doubled = idx.search_fuzzy({"helo", "hallo"}, 10, 1, checker);
+
+    ASSERT_EQ(single.size(), 1u);
+    ASSERT_EQ(doubled.size(), 1u);
+    EXPECT_EQ(single[0].ord, doubled[0].ord);
+    // 去重后分数与单词查询一致（修复前 doubled 约为 single 的 2 倍）。
+    EXPECT_NEAR(single[0].score, doubled[0].score, 1e-5F);
+}
+
 TEST(SearchLayerFuzzy, FindsDocsWithTypos) {
     auto config = default_config();
     SearchLayer layer(config);

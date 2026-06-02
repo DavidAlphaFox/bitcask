@@ -161,6 +161,35 @@ TEST(InvertedIndexWildcard, TopK) {
     EXPECT_EQ(results[0].ord, 1u);
 }
 
+// S10.4 回归：词表跨多个 shard，并行扫描须收齐全部匹配项、不漏不重。
+// 200 个匹配 "termNNN" 的词（各落不同 doc，hash 后散布在 64 个 shard）+ 干扰词。
+TEST(InvertedIndexWildcard, ParallelScanCollectsAllMatches) {
+    InvertedIndex idx;
+    FakeLiveChecker checker;
+    constexpr std::uint64_t kMatch = 200;
+    for (std::uint64_t i = 0; i < kMatch; ++i) {
+        idx.add_doc(i, {{"term" + std::to_string(i), tp(1, {0})}});
+        checker.doc_lens[i] = 10;
+    }
+    // 干扰词：不匹配 "term*"。
+    for (std::uint64_t i = 0; i < 50; ++i) {
+        std::uint64_t ord = kMatch + i;
+        idx.add_doc(ord, {{"other" + std::to_string(i), tp(1, {0})}});
+        checker.doc_lens[ord] = 10;
+    }
+
+    auto results = idx.search_wildcard("term*", 1000, checker);
+    EXPECT_EQ(results.size(), kMatch);  // 每个匹配词各 1 篇 doc，应全部命中
+
+    std::vector<std::uint64_t> ords;
+    for (auto& r : results) ords.push_back(r.ord);
+    std::sort(ords.begin(), ords.end());
+    ASSERT_EQ(ords.size(), kMatch);
+    EXPECT_TRUE(std::unique(ords.begin(), ords.end()) == ords.end());  // 无重复
+    EXPECT_EQ(ords.front(), 0u);
+    EXPECT_EQ(ords.back(), kMatch - 1);
+}
+
 TEST(SearchLayerWildcard, PrefixSearch) {
     auto config = default_config();
     SearchLayer layer(config);
