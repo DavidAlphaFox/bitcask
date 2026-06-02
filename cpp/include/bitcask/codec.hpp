@@ -83,19 +83,21 @@ decode_data_record(std::span<const std::byte> buf);
 // kDoc value 打包/解包（§2.4）。仅用于 type==kDoc 的 record 的 VALUE 段。
 // ---------------------------------------------------------------------------
 
-// 命名字段（S8.6 多字段）：name/value 都是 zero-copy span。
+// 命名字段（S8.6 多字段）。#1：磁盘上存 field id（schema interning），不再内联
+// 字段名。encode 输入 / decode 输出都用 id；name ↔ id 由 Cask 的 field.schema 维护。
+// value 是 zero-copy span（指进原 buffer）。
 struct DocField {
-    std::span<const std::byte> name;
+    std::uint32_t              id = 0;
     std::span<const std::byte> value;
 };
 
 // encode 输入：三段皆可选（nullopt = 该段缺省，不写 flag）。vector 是 f32
-// 向量（V1 不量化）。fields 非空时写 fields 段并升版本为 v2（S8.6）。
+// 向量（V1 不量化）。fields 非空时写 fields 段（DocField.id 已由 caller 经 schema 解析）。
 struct DocValueParts {
     std::optional<std::span<const float>>      vector;
     std::optional<std::span<const std::byte>>  text;
     std::optional<std::span<const std::byte>>  meta;
-    std::vector<DocField>                      fields;  // 空 = 不写 fields 段、Ver=1
+    std::vector<DocField>                      fields;  // 空 = 不写 fields 段
 };
 
 // 解码后的 kDoc value 视图。各段是 zero-copy span，生命周期跟着输入 buf。
@@ -112,7 +114,7 @@ struct DocValueView {
     std::span<const std::byte> vector_raw;
     std::span<const std::byte> text;
     std::span<const std::byte> meta;
-    std::vector<DocField>      fields;      // S8.6：解出的命名字段（zero-copy span）
+    std::vector<DocField>      fields;      // 解出的字段（id + zero-copy value span）
 };
 
 // 把 {vector,text,meta} 打包成 kDoc value，append 到 out。返回写入字节数。

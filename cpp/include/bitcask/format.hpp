@@ -64,29 +64,28 @@ inline constexpr std::uint64_t kMaxOffsetV2 = 0x7FFF'FFFF'FFFF'FFFFull;
 inline constexpr std::uint64_t kTombMaskV2 = 0x8000'0000'0000'0000ull;
 
 // ---------------------------------------------------------------------------
-// kDoc value 打包布局（写在 kDoc record 的 VALUE 段）。设计见 §2.4：
-//   [0]      Ver         u8   (布局版本号，当前 = kDocValueVersion)
+// kDoc value 打包布局（写在 kDoc record 的 VALUE 段）。设计见 §2.4。
+//   [0]      Ver         u8   (布局版本号，当前 = kDocValueVersion = 3)
 //   [1]      Flags       u8   (见下方 kFlag* 位)
-//   [可选] vector 段：  [Dim:u32 大端][ f32×Dim 小端  或  量化码字 ]
-//   [可选] text   段：  [Len:u32 大端][ utf8 字节 ]
-//   [可选] meta   段：  [Len:u32 大端][ 序列化字节(msgpack/CBOR) ]
-//   [可选] fields 段（v2，S8.6）：[FieldCount:u16 大端] ×
-//          { [NameLen:u16 大端][name utf8][ValLen:u32 大端][value utf8] }
+//   [可选] vector 段：  [Dim:varint][ f32×Dim 小端  或  量化码字 ]
+//   [可选] text   段：  [Len:varint][ utf8 字节 ]
+//   [可选] meta   段：  [Len:varint][ 序列化字节(msgpack/CBOR) ]
+//   [可选] fields 段：  [FieldCount:varint] × { [FieldId:varint][ValLen:varint][value] }
 // 各段按 vector→text→meta→fields 定序出现，由 Flags 决定是否存在（向量段放
 // 最前，便于 HNSW 重建按 Dim O(1) 切片）。
 //
-// 字节序：长度类整数(Dim/Len)大端，沿用本文件契约；向量 f32 数组固定小端
-// （x86/ARM64 原生零转换，见 §2.4）。
+// 长度/计数全部用 VByte 变长（#2，省小字段的固定 4B 前缀）；向量 f32 数组固定
+// 小端（x86/ARM64 原生零转换，见 §2.4）。
 //
-// 版本兼容（S8.6）：encode 仅当存在 fields 段时写 Ver=2，否则写 Ver=1，字节
-// 与旧实现完全一致；decode 接受 Ver∈{1,2}（范围式兼容，参考 inverted 的 S9.27）。
+// fields 段存 FieldId（u32 的 varint）而非字段名（#1，schema interning）：
+// 字段名 ↔ id 映射由 Cask 的 append-only field.schema 注册表维护，避免每条
+// record 重复内联字段名。decode 是纯函数、只还原 id，由上层用 schema 译回名字。
+//
+// 版本：v3 统一格式（不再有 v1/v2 的 fields 区分，fields 仅由 Flags 标记）。
+// 项目不考虑向后兼容；decode 只接受 Ver==3。
 // ---------------------------------------------------------------------------
-inline constexpr std::uint8_t kDocValueVersion       = 1;  // 默认（无 fields 段）
-inline constexpr std::uint8_t kDocValueVersionFields = 2;  // 含 fields 段（S8.6）
+inline constexpr std::uint8_t kDocValueVersion    = 3;  // varint 长度 + fieldId（#1/#2）
 inline constexpr std::size_t  kDocValueHeaderSize = 2;  // Ver + Flags
-inline constexpr std::size_t  kSectionLenSize     = 4;  // 各段 Dim/Len 字段宽度
-inline constexpr std::size_t  kFieldCountSize     = 2;  // fields 段 FieldCount 宽度
-inline constexpr std::size_t  kFieldNameLenSize   = 2;  // 字段名长度宽度
 
 inline constexpr std::uint8_t kFlagHasVector    = 0x01;
 inline constexpr std::uint8_t kFlagHasText      = 0x02;

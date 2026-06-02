@@ -313,6 +313,7 @@ Cask::upgrade(std::string_view dirname,
     auto cask = std::make_unique<Cask>();
     cask->dirname_ = std::string(dirname);
     cask->meta_config_ = new_mc;
+    cask->field_schema_.open((fs::path(dirname) / "field.schema").string());  // #1
 
     cask->search_ = std::make_unique<search::SearchLayer>(search_config);
 
@@ -341,6 +342,9 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
     // 目录不存在就建（mkdir -p 语义）。已存在不报错。
     std::error_code ec;
     fs::create_directories(cask->dirname_, ec);
+
+    // 字段名 ↔ id 注册表（#1）：加载已有 + 打开追加句柄。
+    cask->field_schema_.open((fs::path(cask->dirname_) / "field.schema").string());
 
     // 锁分配：
     //   - 普通 writer 拿 bitcask.write.lock；
@@ -986,13 +990,11 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
         return std::unexpected(r.error());
     }
 
-    // S8.6：把 DocInput 的多字段填进 DocValueParts.fields（name→span）。
-    auto fill_parts = [&doc](codec::DocValueParts& p) {
+    // #1：把 DocInput 的多字段名 intern 成 id，填进 DocValueParts.fields。
+    // 字段名只在 field.schema 存一份，DocValue 里存小整数 id（varint）。
+    auto fill_parts = [&doc, this](codec::DocValueParts& p) {
         for (auto& [name, val] : doc.fields) {
-            p.fields.push_back({
-                std::span<const std::byte>(reinterpret_cast<const std::byte*>(name.data()),
-                                           name.size()),
-                val});
+            p.fields.push_back({field_schema_.intern(name), val});
         }
     };
     // S8.6：把多字段拷成 IndexTask.fields（name→text string，异步路径需独立存储）。

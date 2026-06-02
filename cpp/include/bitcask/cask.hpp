@@ -39,6 +39,7 @@
 #include "bitcask/merge_policy.hpp"
 #include "bitcask/merger.hpp"
 #include "bitcask/meta_file.hpp"
+#include "bitcask/field_schema.hpp"
 #include "bitcask/search_layer.hpp"
 #include "bitcask/thread_pool.hpp"
 
@@ -343,6 +344,10 @@ private:
 
     std::string dirname_;
     CaskOptions opts_;
+
+    // 字段名 ↔ id 注册表（#1）：put_doc 把多字段名 intern 成 id 写进 DocValue。
+    // open/upgrade 时加载 <dir>/field.schema。
+    FieldSchema field_schema_;
 
     // keydir（多个 Cask 可能通过 registry 共享同一个）
     std::shared_ptr<keydir::KeyDir> keydir_;

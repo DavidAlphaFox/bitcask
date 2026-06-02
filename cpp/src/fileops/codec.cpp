@@ -49,6 +49,32 @@ constexpr std::uint64_t be_load_u64(const std::byte* p) noexcept {
     return v;
 }
 
+// VByte 变长整数（DocValue v3 的段长度/计数/字段 id 用，#1/#2）。
+// 算法同 vbyte.hpp：低 7 位数据，最高位 1=末字节。这里直接对 std::byte 缓冲操作。
+inline void vbyte_append(std::vector<std::byte>& out, std::uint64_t val) {
+    while (val >= 128) {
+        out.push_back(static_cast<std::byte>(val & 0x7F));
+        val >>= 7;
+    }
+    out.push_back(static_cast<std::byte>(val | 0x80));
+}
+
+// 从 buf[pos] 读一个 VByte，成功写出 val 并推进 pos；越界/编码过长返回 false。
+inline bool vbyte_read(std::span<const std::byte> buf, std::size_t& pos, std::uint64_t& val) {
+    std::uint64_t result = 0;
+    std::uint64_t shift  = 0;
+    while (true) {
+        if (pos >= buf.size()) return false;
+        const auto byte = static_cast<std::uint8_t>(buf[pos++]);
+        result |= static_cast<std::uint64_t>(byte & 0x7F) << shift;
+        if (byte & 0x80) break;
+        shift += 7;
+        if (shift >= 64) return false;  // 防御：超过 u64 的非法编码
+    }
+    val = result;
+    return true;
+}
+
 }  // namespace
 
 // 一次性算 CRC——薄包装 zlib::crc32(0, ...)。
@@ -164,60 +190,33 @@ std::size_t encode_doc_value(std::vector<std::byte>& out, const DocValueParts& p
     if (parts.meta)   flags |= format::kFlagHasMeta;
     if (has_fields)   flags |= format::kFlagHasFields;
 
-    // 仅当存在 fields 段时升版本为 v2；否则写 v1，字节与旧实现完全一致（S8.6）。
-    out.push_back(static_cast<std::byte>(
-        has_fields ? format::kDocValueVersionFields : format::kDocValueVersion));
+    out.push_back(static_cast<std::byte>(format::kDocValueVersion));  // v3：统一版本
     out.push_back(static_cast<std::byte>(flags));
 
-    // 追加一个「带 u32 大端长度前缀」的字节段。
-    auto append_len = [&out](std::uint32_t n) {
+    // 追加「varint 长度前缀 + 原始字节」的段（text/meta/字段值用，#2）。
+    auto append_bytes = [&out](std::span<const std::byte> s) {
+        vbyte_append(out, s.size());
         const std::size_t at = out.size();
-        out.resize(at + format::kSectionLenSize);
-        be_store_u32(out.data() + at, n);
+        out.resize(at + s.size());
+        if (!s.empty()) std::memcpy(out.data() + at, s.data(), s.size());
     };
 
     if (parts.vector) {
         const auto& v = *parts.vector;
-        assert(v.size() <= 0xFFFF'FFFFull);
-        append_len(static_cast<std::uint32_t>(v.size()));  // Dim
+        vbyte_append(out, v.size());  // Dim（元素个数）
         const std::size_t at = out.size();
         const std::size_t bytes = v.size() * sizeof(float);
         out.resize(at + bytes);
         if (bytes) std::memcpy(out.data() + at, v.data(), bytes);  // f32 LE
     }
-    if (parts.text) {
-        const auto& t = *parts.text;
-        append_len(static_cast<std::uint32_t>(t.size()));
-        const std::size_t at = out.size();
-        out.resize(at + t.size());
-        if (!t.empty()) std::memcpy(out.data() + at, t.data(), t.size());
-    }
-    if (parts.meta) {
-        const auto& m = *parts.meta;
-        append_len(static_cast<std::uint32_t>(m.size()));
-        const std::size_t at = out.size();
-        out.resize(at + m.size());
-        if (!m.empty()) std::memcpy(out.data() + at, m.data(), m.size());
-    }
-    // fields 段（S8.6）：[FieldCount:u16 BE] × { [NameLen:u16][name][ValLen:u32][value] }
+    if (parts.text) append_bytes(*parts.text);
+    if (parts.meta) append_bytes(*parts.meta);
+    // fields 段（#1）：[FieldCount:varint] × { [FieldId:varint][ValLen:varint][value] }
     if (has_fields) {
-        assert(parts.fields.size() <= 0xFFFFu);
-        const std::size_t fc_at = out.size();
-        out.resize(fc_at + format::kFieldCountSize);
-        be_store_u16(out.data() + fc_at,
-                     static_cast<std::uint16_t>(parts.fields.size()));
+        vbyte_append(out, parts.fields.size());
         for (const auto& f : parts.fields) {
-            assert(f.name.size() <= 0xFFFFu);
-            const std::size_t n_at = out.size();
-            out.resize(n_at + format::kFieldNameLenSize);
-            be_store_u16(out.data() + n_at, static_cast<std::uint16_t>(f.name.size()));
-            const std::size_t nb_at = out.size();
-            out.resize(nb_at + f.name.size());
-            if (!f.name.empty()) std::memcpy(out.data() + nb_at, f.name.data(), f.name.size());
-            append_len(static_cast<std::uint32_t>(f.value.size()));
-            const std::size_t vb_at = out.size();
-            out.resize(vb_at + f.value.size());
-            if (!f.value.empty()) std::memcpy(out.data() + vb_at, f.value.data(), f.value.size());
+            vbyte_append(out, f.id);
+            append_bytes(f.value);
         }
     }
     return out.size() - base;
@@ -230,8 +229,8 @@ decode_doc_value(std::span<const std::byte> buf) {
     }
     const std::uint8_t ver   = static_cast<std::uint8_t>(buf[0]);
     const std::uint8_t flags = static_cast<std::uint8_t>(buf[1]);
-    // 范围式版本兼容（S8.6）：v1（无 fields）与 v2（含 fields 段）都接受。
-    if (ver != format::kDocValueVersion && ver != format::kDocValueVersionFields) {
+    // v3 统一格式；不考虑向后兼容，只接受当前版本。
+    if (ver != format::kDocValueVersion) {
         return std::unexpected(DecodeError::kUnsupportedVersion);
     }
 
@@ -245,12 +244,11 @@ decode_doc_value(std::span<const std::byte> buf) {
 
     std::size_t pos = format::kDocValueHeaderSize;
 
-    // 读一个 [u32 大端字节长度][payload] 段（text/meta 用），推进 pos。
+    // 读一个 [varint 字节长度][payload] 段（text/meta/字段值用），推进 pos。
     auto read_bytes_section =
         [&buf, &pos](std::span<const std::byte>& out_span) -> bool {
-        if (buf.size() < pos + format::kSectionLenSize) return false;
-        const std::uint32_t len = be_load_u32(buf.data() + pos);
-        pos += format::kSectionLenSize;
+        std::uint64_t len = 0;
+        if (!vbyte_read(buf, pos, len)) return false;
         if (buf.size() < pos + len) return false;
         out_span = buf.subspan(pos, len);
         pos += len;
@@ -258,21 +256,20 @@ decode_doc_value(std::span<const std::byte> buf) {
     };
 
     if (v.has_vector) {
-        // vector 段：[Dim:u32 元素个数][f32×Dim 小端]。Dim 是元素数、非字节数。
+        // vector 段：[Dim:varint 元素个数][f32×Dim 小端]。Dim 是元素数、非字节数。
         // 量化布局（vec_quantized）留待后续，V1 不写也不读。
         if (v.vec_quantized) {
             return std::unexpected(DecodeError::kUnsupportedVersion);
         }
-        if (buf.size() < pos + format::kSectionLenSize) {
+        std::uint64_t dim = 0;
+        if (!vbyte_read(buf, pos, dim)) {
             return std::unexpected(DecodeError::kBufferTooShort);
         }
-        const std::uint32_t dim = be_load_u32(buf.data() + pos);
-        pos += format::kSectionLenSize;
         const std::size_t bytes = static_cast<std::size_t>(dim) * sizeof(float);
         if (buf.size() < pos + bytes) {
             return std::unexpected(DecodeError::kBufferTooShort);
         }
-        v.dim = dim;
+        v.dim = static_cast<std::uint32_t>(dim);
         v.vector_raw = buf.subspan(pos, bytes);
         pos += bytes;
     }
@@ -282,24 +279,20 @@ decode_doc_value(std::span<const std::byte> buf) {
     if (v.has_meta && !read_bytes_section(v.meta)) {
         return std::unexpected(DecodeError::kBufferTooShort);
     }
-    // fields 段（S8.6）：[FieldCount:u16] × { [NameLen:u16][name][ValLen:u32][value] }
+    // fields 段（#1）：[FieldCount:varint] × { [FieldId:varint][ValLen:varint][value] }
     if (v.has_fields) {
-        if (buf.size() < pos + format::kFieldCountSize) {
+        std::uint64_t fc = 0;
+        if (!vbyte_read(buf, pos, fc)) {
             return std::unexpected(DecodeError::kBufferTooShort);
         }
-        const std::uint16_t fc = be_load_u16(buf.data() + pos);
-        pos += format::kFieldCountSize;
         v.fields.reserve(fc);
-        for (std::uint16_t i = 0; i < fc; ++i) {
-            if (buf.size() < pos + format::kFieldNameLenSize) {
+        for (std::uint64_t i = 0; i < fc; ++i) {
+            std::uint64_t id = 0;
+            if (!vbyte_read(buf, pos, id)) {
                 return std::unexpected(DecodeError::kBufferTooShort);
             }
-            const std::uint16_t nlen = be_load_u16(buf.data() + pos);
-            pos += format::kFieldNameLenSize;
-            if (buf.size() < pos + nlen) return std::unexpected(DecodeError::kBufferTooShort);
             DocField f;
-            f.name = buf.subspan(pos, nlen);
-            pos += nlen;
+            f.id = static_cast<std::uint32_t>(id);
             if (!read_bytes_section(f.value)) {
                 return std::unexpected(DecodeError::kBufferTooShort);
             }
