@@ -1,5 +1,6 @@
-// nif_helpers.hpp 的实现。拆分为独立编译单元，避免在 header 里暴露 parse_options
-// 等较长的函数体。
+// nif_helpers.hpp 的实现：资源句柄提取、DocInput 解析、错误翻译、搜索骨架
+// run_search、迭代器创建、Erlang term 构造等跨 .cpp 共用的辅助。
+// （选项解析 parse_options 已拆到 nif_options.cpp。）
 
 #include "nif_helpers.hpp"
 
@@ -7,7 +8,6 @@
 
 #include "atoms.hpp"
 #include "bitcask/cask.hpp"
-#include "bitcask/analyzer.hpp"
 #include "bitcask/search_layer.hpp"
 #include "resources.hpp"
 #include "term_conv.hpp"
@@ -42,150 +42,8 @@ CaskIterHandle* cask_iter_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept {
     return get_resource_handle<CaskIterHandle>(env, term, g_cask_iter_resource_type);
 }
 
-// ---------------------------------------------------------------------------
-// 选项解析
-// ---------------------------------------------------------------------------
-
-// ===========================================================================
-// 选项解析（open/2 的 proplist 参数）
-//
-// 格式：[atom, {Key, Value}, ...]
-// 不识别的键静默跳过，与 legacy 语义一致。
-// ===========================================================================
-
-static void parse_atom_option(ERL_NIF_TERM head, CaskOptions& o) {
-    // 解析裸 atom 选项（read_write / merge_only）。
-    if (head == atoms().read_write) {
-        o.read_write = true;
-    } else if (head == atoms().merge_only) {
-        o.merge_only = true;
-        o.read_write = true;
-    }
-}
-
-static void parse_merge_option(ErlNifEnv* env, const ERL_NIF_TERM* tup,
-                                merge::PolicyOptions& p) {
-    // 解析合并策略相关选项 {frag_merge_trigger, Int} 等。
-    if (tup[0] == atoms().frag_merge_trigger) {
-        int v = 0;
-        if (enif_get_int(env, tup[1], &v)) p.frag_merge_trigger = v;
-    } else if (tup[0] == atoms().dead_bytes_merge_trigger) {
-        ErlNifUInt64 v = 0;
-        if (enif_get_uint64(env, tup[1], &v)) p.dead_bytes_merge_trigger = v;
-    } else if (tup[0] == atoms().frag_threshold) {
-        int v = 0;
-        if (enif_get_int(env, tup[1], &v)) p.frag_threshold = v;
-    } else if (tup[0] == atoms().dead_bytes_threshold) {
-        ErlNifUInt64 v = 0;
-        if (enif_get_uint64(env, tup[1], &v)) p.dead_bytes_threshold = v;
-    } else if (tup[0] == atoms().small_file_threshold) {
-        ErlNifUInt64 v = 0;
-        if (enif_get_uint64(env, tup[1], &v)) p.small_file_threshold = v;
-    } else if (tup[0] == atoms().expiry_grace_time) {
-        int v = 0;
-        if (enif_get_int(env, tup[1], &v) && v >= 0) {
-            p.expiry_grace_time = static_cast<std::uint32_t>(v);
-        }
-    } else if (tup[0] == atoms().max_merge_size) {
-        ErlNifUInt64 v = 0;
-        if (enif_get_uint64(env, tup[1], &v)) p.max_merge_size = v;
-    }
-}
-
-static void parse_analyzer_option(ErlNifEnv* env, const ERL_NIF_TERM* tup,
-                                  CaskOptions& o) {
-    // 解析搜索/分词器选项 {analyzer, jieba|ngram|whitespace} 等。
-    if (tup[0] == atoms().analyzer) {
-        if (tup[1] == atoms().jieba) {
-            o.search_config->analyzer_config.type = text::AnalyzerType::Jieba;
-        } else if (tup[1] == atoms().ngram) {
-            o.search_config->analyzer_config.type = text::AnalyzerType::Ngram;
-        } else if (tup[1] == atoms().whitespace) {
-            o.search_config->analyzer_config.type = text::AnalyzerType::Whitespace;
-        }
-    } else if (tup[0] == atoms().dict_path) {
-        ErlNifBinary bin{};
-        if (enif_inspect_binary(env, tup[1], &bin)) {
-            o.search_config->analyzer_config.dict_path = std::string(
-                reinterpret_cast<const char*>(bin.data), bin.size);
-        }
-    } else if (tup[0] == atoms().enable_stop_words) {
-        if (tup[1] == atoms().atom_true) {
-            o.search_config->analyzer_config.enable_stop_words = true;
-        }
-    } else if (tup[0] == atoms().min_n) {
-        int v = 0;
-        if (enif_get_int(env, tup[1], &v) && v >= 1) {
-            o.search_config->analyzer_config.min_n = static_cast<std::uint32_t>(v);
-        }
-    } else if (tup[0] == atoms().max_n) {
-        int v = 0;
-        if (enif_get_int(env, tup[1], &v) && v >= 1) {
-            o.search_config->analyzer_config.max_n = static_cast<std::uint32_t>(v);
-        }
-    } else if (tup[0] == atoms().min_token_length) {
-        int v = 0;
-        if (enif_get_int(env, tup[1], &v) && v >= 1) {
-            o.search_config->analyzer_config.min_token_length = static_cast<std::uint32_t>(v);
-        }
-    } else if (tup[0] == atoms().enable_stemming) {
-        if (tup[1] == atoms().atom_true) {
-            o.search_config->analyzer_config.enable_stemming = true;
-        }
-    }
-}
-
-static void parse_2tuple_option(ErlNifEnv* env, const ERL_NIF_TERM* tup,
-                                CaskOptions& o) {
-    // 解析二元组选项，分发到 merge/analyzer/general 处理器。
-    if (tup[0] == atoms().read_write) {
-        o.read_write = (tup[1] == atoms().atom_true);
-    } else if (tup[0] == atoms().max_file_size) {
-        ErlNifUInt64 v = 0;
-        if (enif_get_uint64(env, tup[1], &v)) o.max_file_size = v;
-    } else if (tup[0] == atoms().expiry_secs) {
-        int v = 0;
-        if (enif_get_int(env, tup[1], &v) && v > 0) {
-            o.expiry_secs = static_cast<std::uint32_t>(v);
-        }
-    } else if (tup[0] == atoms().tombstone_version) {
-        int v = 0;
-        if (enif_get_int(env, tup[1], &v) && v == 2) {
-            o.tombstone_version = 2;
-        }
-    } else if (tup[0] == atoms().sync_strategy) {
-        if (tup[1] == atoms().o_sync) {
-            o.o_sync = true;
-        }
-    } else if (tup[0] == atoms().analyzer || tup[0] == atoms().dict_path
-               || tup[0] == atoms().enable_stop_words
-               || tup[0] == atoms().min_n || tup[0] == atoms().max_n
-               || tup[0] == atoms().min_token_length
-               || tup[0] == atoms().enable_stemming) {
-        if (!o.search_config) o.search_config.emplace();
-        parse_analyzer_option(env, tup, o);
-    } else {
-        parse_merge_option(env, tup, o.policy);
-    }
-}
-
-CaskOptions parse_options(ErlNifEnv* env, ERL_NIF_TERM list) {
-    CaskOptions o;
-    ERL_NIF_TERM head, tail = list;
-    while (enif_get_list_cell(env, tail, &head, &tail)) {
-        if (enif_is_atom(env, head)) {
-            parse_atom_option(head, o);
-            continue;
-        }
-        int arity = 0;
-        const ERL_NIF_TERM* tup = nullptr;
-        if (!enif_get_tuple(env, head, &arity, &tup) || arity != 2) continue;
-        parse_2tuple_option(env, tup, o);
-    }
-    if (o.expiry_secs > 0) o.policy.expiry_secs = o.expiry_secs;
-    if (o.search_config) o.enable_search = true;
-    return o;
-}
+// 注：open/2 的选项解析（parse_options 及其 parse_*_option 辅助）已拆到
+// nif_options.cpp（单一职责），声明仍在 nif_helpers.hpp。
 
 // ---------------------------------------------------------------------------
 // DocInput 解析
@@ -255,120 +113,23 @@ ERL_NIF_TERM fault_to_term(ErlNifEnv* env, const CaskFault& f) noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// 搜索 NIF 共用实现
+// 搜索 NIF 统一骨架（见 nif_helpers.hpp 的 run_search 说明）
 // ---------------------------------------------------------------------------
 
-ERL_NIF_TERM search_impl(ErlNifEnv* env, int, const ERL_NIF_TERM argv[],
-                          SearchFn search_fn) {
-    auto* h = checked_cask_handle(env, argv[0]);
+ERL_NIF_TERM run_search(ErlNifEnv* env, ERL_NIF_TERM ref_term,
+                        ERL_NIF_TERM query_term, const SearchInvoker& invoke) {
+    // checked_cask_handle 已保证返回非空时 h->cask 也非空。
+    auto* h = checked_cask_handle(env, ref_term);
     ErlNifBinary query_bin{};
-    if (!h || !enif_inspect_binary(env, argv[1], &query_bin)) {
+    if (!h || !enif_inspect_binary(env, query_term, &query_bin)) {
         return enif_make_badarg(env);
     }
-
-    int k = get_int_with_default(env, argv[2], 10);
-    if (k <= 0) k = 10;
-
     if (!h->cask->has_search()) {
         return make_error(env, atoms().no_index);
     }
-
-    std::string_view query(
-        reinterpret_cast<const char*>(query_bin.data), query_bin.size);
-    auto r = ((*h->cask).*search_fn)(query, static_cast<std::size_t>(k));
+    // 策略闭包负责具体怎么搜；query span 生命周期与 query_bin 同步，调用同步完成。
+    auto r = invoke(*h->cask, as_string_view(query_bin));
     if (!r) return fault_to_term(env, r.error());
-
-    return make_ok(env, make_search_hits(env, r->hits));
-}
-
-// 近邻搜索 NIF（S8.7）：argv = {ref, query, slop, k}。
-ERL_NIF_TERM near_search_impl(ErlNifEnv* env, int, const ERL_NIF_TERM argv[]) {
-    auto* h = checked_cask_handle(env, argv[0]);
-    ErlNifBinary query_bin{};
-    if (!h || !enif_inspect_binary(env, argv[1], &query_bin)) {
-        return enif_make_badarg(env);
-    }
-    int slop = get_int_with_default(env, argv[2], 0);
-    if (slop < 0) slop = 0;
-    int k = get_int_with_default(env, argv[3], 10);
-    if (k <= 0) k = 10;
-
-    if (!h->cask->has_search()) {
-        return make_error(env, atoms().no_index);
-    }
-
-    std::string_view query(
-        reinterpret_cast<const char*>(query_bin.data), query_bin.size);
-    auto r = h->cask->search_near(query, static_cast<std::uint32_t>(slop),
-                                  static_cast<std::size_t>(k));
-    if (!r) return fault_to_term(env, r.error());
-    return make_ok(env, make_search_hits(env, r->hits));
-}
-
-// S8.3：模糊搜索 NIF（argv = {ref, query, max_edit_distance, k}）。
-ERL_NIF_TERM fuzzy_search_impl(ErlNifEnv* env, int, const ERL_NIF_TERM argv[]) {
-    auto* h = checked_cask_handle(env, argv[0]);
-    ErlNifBinary query_bin{};
-    if (!h || !enif_inspect_binary(env, argv[1], &query_bin)) {
-        return enif_make_badarg(env);
-    }
-    int max_edit = get_int_with_default(env, argv[2], 1);
-    if (max_edit < 0) max_edit = 1;
-    int k = get_int_with_default(env, argv[3], 10);
-    if (k <= 0) k = 10;
-
-    if (!h->cask->has_search()) {
-        return make_error(env, atoms().no_index);
-    }
-
-    std::string_view query(
-        reinterpret_cast<const char*>(query_bin.data), query_bin.size);
-    auto r = h->cask->search_fuzzy(query, static_cast<std::size_t>(k),
-                                    static_cast<std::uint32_t>(max_edit));
-    if (!r) return fault_to_term(env, r.error());
-    return make_ok(env, make_search_hits(env, r->hits));
-}
-
-// S8.4：通配符搜索 NIF（argv = {ref, pattern, k}）。
-ERL_NIF_TERM wildcard_search_impl(ErlNifEnv* env, int, const ERL_NIF_TERM argv[]) {
-    auto* h = checked_cask_handle(env, argv[0]);
-    ErlNifBinary pattern_bin{};
-    if (!h || !enif_inspect_binary(env, argv[1], &pattern_bin)) {
-        return enif_make_badarg(env);
-    }
-    int k = get_int_with_default(env, argv[2], 10);
-    if (k <= 0) k = 10;
-
-    if (!h->cask->has_search()) {
-        return make_error(env, atoms().no_index);
-    }
-
-    std::string_view pattern(
-        reinterpret_cast<const char*>(pattern_bin.data), pattern_bin.size);
-    auto r = h->cask->search_wildcard(pattern, static_cast<std::size_t>(k));
-    if (!r) return fault_to_term(env, r.error());
-    return make_ok(env, make_search_hits(env, r->hits));
-}
-
-ERL_NIF_TERM bool_search_impl(ErlNifEnv* env, int, const ERL_NIF_TERM argv[]) {
-    auto* h = checked_cask_handle(env, argv[0]);
-    ErlNifBinary query_bin{};
-    if (!h || !enif_inspect_binary(env, argv[1], &query_bin)) {
-        return enif_make_badarg(env);
-    }
-
-    int k = get_int_with_default(env, argv[2], 10);
-    if (k <= 0) k = 10;
-
-    if (!h->cask->has_search()) {
-        return make_error(env, atoms().no_index);
-    }
-
-    std::string_view query(
-        reinterpret_cast<const char*>(query_bin.data), query_bin.size);
-    auto r = h->cask->bool_search(query, static_cast<std::size_t>(k));
-    if (!r) return fault_to_term(env, r.error());
-
     return make_ok(env, make_search_hits(env, r->hits));
 }
 

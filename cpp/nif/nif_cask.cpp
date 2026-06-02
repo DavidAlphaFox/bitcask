@@ -126,56 +126,75 @@ ERL_NIF_TERM nif_cask_close_write_file(ErlNifEnv* env, int /*argc*/,
     return atoms().ok;
 }
 
-ERL_NIF_TERM nif_cask_search_text(ErlNifEnv* env, int argc,
+// 以下 8 个搜索 NIF 都委托给 run_search 统一骨架（见 nif_helpers.hpp）：
+// 各入口只负责解析自己的整型参数，再把「具体怎么搜」作为闭包传入。
+// argv 约定：3 参版 = {ref, query, k}；4 参版 = {ref, query, extra, k}。
+
+ERL_NIF_TERM nif_cask_search_text(ErlNifEnv* env, int /*argc*/,
                                     const ERL_NIF_TERM argv[]) {
-    return search_impl(env, argc, argv, &Cask::search_text);
+    const auto k = static_cast<std::size_t>(get_positive_int(env, argv[2], 10));
+    return run_search(env, argv[0], argv[1],
+        [k](Cask& c, std::string_view q) { return c.search_text(q, k); });
 }
 
-ERL_NIF_TERM nif_cask_search_phrase(ErlNifEnv* env, int argc,
+ERL_NIF_TERM nif_cask_search_phrase(ErlNifEnv* env, int /*argc*/,
                                      const ERL_NIF_TERM argv[]) {
-    return search_impl(env, argc, argv, &Cask::search_phrase);
+    const auto k = static_cast<std::size_t>(get_positive_int(env, argv[2], 10));
+    return run_search(env, argv[0], argv[1],
+        [k](Cask& c, std::string_view q) { return c.search_phrase(q, k); });
 }
 
-ERL_NIF_TERM nif_cask_bool_search(ErlNifEnv* env, int argc,
+ERL_NIF_TERM nif_cask_bool_search(ErlNifEnv* env, int /*argc*/,
                                    const ERL_NIF_TERM argv[]) {
-    return bool_search_impl(env, argc, argv);
+    const auto k = static_cast<std::size_t>(get_positive_int(env, argv[2], 10));
+    return run_search(env, argv[0], argv[1],
+        [k](Cask& c, std::string_view q) { return c.bool_search(q, k); });
 }
 
-// S8.6：多字段搜索（field:term^boost）。复用 search_impl（签名同 search_text）。
-ERL_NIF_TERM nif_cask_search_fields(ErlNifEnv* env, int argc,
+// S8.6：多字段搜索（field:term^boost）。
+ERL_NIF_TERM nif_cask_search_fields(ErlNifEnv* env, int /*argc*/,
                                     const ERL_NIF_TERM argv[]) {
-    return search_impl(env, argc, argv, &Cask::search_fields);
+    const auto k = static_cast<std::size_t>(get_positive_int(env, argv[2], 10));
+    return run_search(env, argv[0], argv[1],
+        [k](Cask& c, std::string_view q) { return c.search_fields(q, k); });
 }
 
-// S8.7：近邻搜索（4 参：ref, query, slop, k）。
-ERL_NIF_TERM nif_cask_search_near(ErlNifEnv* env, int argc,
+// S8.7：近邻搜索（4 参：ref, query, slop, k）。slop 非负，默认 0。
+ERL_NIF_TERM nif_cask_search_near(ErlNifEnv* env, int /*argc*/,
                                    const ERL_NIF_TERM argv[]) {
-    return near_search_impl(env, argc, argv);
+    const auto slop = static_cast<std::uint32_t>(get_nonneg_int(env, argv[2], 0));
+    const auto k    = static_cast<std::size_t>(get_positive_int(env, argv[3], 10));
+    return run_search(env, argv[0], argv[1],
+        [slop, k](Cask& c, std::string_view q) { return c.search_near(q, slop, k); });
 }
 
-// S8.3：模糊搜索（ref, query, max_edit_distance, k）。
-ERL_NIF_TERM nif_cask_search_fuzzy(ErlNifEnv* env, int argc,
+// S8.3：模糊搜索（ref, query, max_edit_distance, k）。距离非负，默认 1。
+ERL_NIF_TERM nif_cask_search_fuzzy(ErlNifEnv* env, int /*argc*/,
                                     const ERL_NIF_TERM argv[]) {
-    return fuzzy_search_impl(env, argc, argv);
+    const auto max_edit = static_cast<std::uint32_t>(get_nonneg_int(env, argv[2], 1));
+    const auto k        = static_cast<std::size_t>(get_positive_int(env, argv[3], 10));
+    return run_search(env, argv[0], argv[1],
+        [max_edit, k](Cask& c, std::string_view q) { return c.search_fuzzy(q, k, max_edit); });
 }
 
 // S8.4：通配符搜索（ref, pattern, k）。
-ERL_NIF_TERM nif_cask_search_wildcard(ErlNifEnv* env, int argc,
+ERL_NIF_TERM nif_cask_search_wildcard(ErlNifEnv* env, int /*argc*/,
                                         const ERL_NIF_TERM argv[]) {
-    return wildcard_search_impl(env, argc, argv);
+    const auto k = static_cast<std::size_t>(get_positive_int(env, argv[2], 10));
+    return run_search(env, argv[0], argv[1],
+        [k](Cask& c, std::string_view p) { return c.search_wildcard(p, k); });
 }
 
 // S8.2：设置同义词词典（ref, file_path）。
 ERL_NIF_TERM nif_cask_set_synonym_map(ErlNifEnv* env, int /*argc*/,
                                         const ERL_NIF_TERM argv[]) {
     auto* h = checked_cask_handle(env, argv[0]);
-    if (!h || !h->cask || !h->cask->has_search()) return enif_make_badarg(env);
+    if (!h || !h->cask->has_search()) return enif_make_badarg(env);
     ErlNifBinary path_bin{};
     if (!enif_inspect_binary(env, argv[1], &path_bin)) return enif_make_badarg(env);
 
     auto map = std::make_unique<text::SynonymMap>();
-    map->load_from_file(std::string(
-        reinterpret_cast<const char*>(path_bin.data), path_bin.size));
+    map->load_from_file(std::string(as_string_view(path_bin)));
     h->cask->set_synonym_map(std::move(map));
     return atoms().ok;
 }

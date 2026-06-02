@@ -10,7 +10,10 @@
 #pragma once
 
 #include <cstdint>
+#include <expected>
+#include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <erl_nif.h>
@@ -53,23 +56,19 @@ ERL_NIF_TERM fault_to_term(ErlNifEnv* env, const CaskFault& f) noexcept;
 // 提取成功返回 true；字段缺失或类型不对时返回 false。
 bool parse_doc_map(ErlNifEnv* env, ERL_NIF_TERM map_term, DocInput& doc);
 
-// 搜索 NIF 共用实现：提取 handle + query + k，调用 search_fn，构造结果。
-// search_fn 是指向 Cask::search_text 或 Cask::search_phrase 的成员函数指针。
-using SearchFn = std::expected<TextSearchResult, CaskFault> (Cask::*)(std::string_view, std::size_t);
-ERL_NIF_TERM search_impl(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[],
-                          SearchFn search_fn);
-
-// bool_search NIF 共用实现：提取 handle + query + k，调用 bool_search，构造结果。
-ERL_NIF_TERM bool_search_impl(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
-
-// 近邻搜索 NIF（S8.7）：argv = {ref, query, slop, k}。
-ERL_NIF_TERM near_search_impl(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
-
-// S8.3：模糊搜索 NIF（argv = {ref, query, max_edit_distance, k}）。
-ERL_NIF_TERM fuzzy_search_impl(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
-
-// S8.4：通配符搜索 NIF（argv = {ref, pattern, k}）。
-ERL_NIF_TERM wildcard_search_impl(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+// 搜索 NIF 的统一骨架（Strategy 模式，用 std::function 承载策略）。
+//
+// 8 个搜索 NIF（text/phrase/fields/bool/near/fuzzy/wildcard）的前后处理完全相同：
+//   取 handle → 校验 → 取 query binary → 校验 → has_search 检查 → 调用 → 错误翻译
+//   / 构造 {ok, [{Key,Ord,Score}]}。
+// 唯一不同的是「真正怎么搜」。把这步抽成一个闭包 invoke(Cask&, query)，由各 NIF
+// 入口捕获自己的参数（k / slop / max_edit）后传入，从而把 5 份重复 impl 收敛为一处。
+//
+// invoke 返回 cask 层的搜索结果（含 hits）；本函数负责把它翻成 Erlang term。
+using SearchInvoker =
+    std::function<std::expected<TextSearchResult, CaskFault>(Cask&, std::string_view)>;
+ERL_NIF_TERM run_search(ErlNifEnv* env, ERL_NIF_TERM ref_term,
+                        ERL_NIF_TERM query_term, const SearchInvoker& invoke);
 
 // fold_start / fold_start4 共用实现。
 // 创建迭代器、启动快照、包装成 NIF 资源 term。

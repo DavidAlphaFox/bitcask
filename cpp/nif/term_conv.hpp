@@ -68,16 +68,18 @@ inline int get_int_with_default(ErlNifEnv* env, ERL_NIF_TERM term,
     return v;
 }
 
-// 分配 size 字节的 ErlNifBinary，把 src 拷进去后返回 term。
-// 分配失败时返回调用方提供的 oom_term（一般是 atom allocation_error 或
-// {error, allocation_error} 元组）。
-inline ERL_NIF_TERM make_binary_from_bytes(ErlNifEnv* env,
-                                            std::span<const std::byte> src,
-                                            ERL_NIF_TERM oom_term) {
-    ErlNifBinary bin;
-    if (!enif_alloc_binary(src.size(), &bin)) return oom_term;
-    if (!src.empty()) std::memcpy(bin.data, src.data(), src.size());
-    return enif_make_binary(env, &bin);
+// 解析「必须为正」的整数参数（如 top-k）：非数字或 ≤0 一律回落到 default_val。
+inline int get_positive_int(ErlNifEnv* env, ERL_NIF_TERM term,
+                            int default_val) noexcept {
+    const int v = get_int_with_default(env, term, default_val);
+    return v > 0 ? v : default_val;
+}
+
+// 解析「必须非负」的整数参数（如 slop / max_edit_distance）：负数回落到 default_val。
+inline int get_nonneg_int(ErlNifEnv* env, ERL_NIF_TERM term,
+                          int default_val) noexcept {
+    const int v = get_int_with_default(env, term, default_val);
+    return v >= 0 ? v : default_val;
 }
 
 // 从 8 字节 native-endian binary term 里读 uint64。Erlang 那边写
@@ -118,8 +120,7 @@ inline ERL_NIF_TERM make_error(ErlNifEnv* env, ERL_NIF_TERM reason) noexcept {
     return enif_make_tuple2(env, enif_make_atom(env, "error"), reason);
 }
 
-// 分配二进制并拷贝数据，失败时返回 0（无效 term）。
-// 比 make_binary_from_bytes 更简洁：调用方只需检查返回值是否为 0。
+// 分配二进制并拷贝数据，失败时返回 0（无效 term）；调用方只需检查返回值是否为 0。
 inline ERL_NIF_TERM make_binary_checked(ErlNifEnv* env, std::span<const std::byte> src) noexcept {
     ErlNifBinary bin;
     if (!enif_alloc_binary(src.size(), &bin)) return 0;
