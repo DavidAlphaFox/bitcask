@@ -478,6 +478,35 @@ NIF 层本已模块化（atoms/resources/term_conv/helpers/main/cask/iter/admin�
 
 ---
 
+### S13 — 修复 fold 与并发 merge 的文件竞争（2026-06-02）
+
+**背景**：审查 merge 对读写的影响时发现的**真实并发缺口**。keydir 有 epoch/frozen/
+IterHandle 机制，但核实后确认它只钉「keydir 的 key 修订快照」（fold 的 MVCC），
+**不钉 data file**（keydir 无任何文件级 refcount，grep 零结果）；且 merge 两侧都
+**不 gate 在 frozen**（C++ `needs_merge` + Erlang `do_merge`/`cask_merge_run` 都只看
+阈值/时间窗口）。
+
+**Bug**：`CaskIter::next` 通过 `parent_->read_file`（共享 `read_files_` 缓存）读
+value，而 `Cask::merge` 无条件 erase 缓存 fd + unlink 旧文件。于是一个长 fold 跨越
+一次并发 merge 时，其 epoch 快照里某 key 解析出的旧 `(file_id, offset)` 指向已被
+unlink 的文件 → `read_file` 重新 open 失败 → **fold 中途报 `{error,_}`**。legacy riak
+bitcask 靠 fold 启动时 pin 一份 readable_files 句柄快照规避，本实现改走共享缓存后
+丢了这层保护（`merger.hpp` 注释自承「M3.3 精简版不处理并发 race」）。
+
+| # | 目标 | 改动 | 关键内容 |
+|---|------|------|---------|
+| **S13.1** | fold pin 文件句柄快照（方案1） | `cask.hpp` `cask.cpp` | `CaskIter` 加 `pinned_files_`（`map<file_id, unique_ptr<DataFile>>`）+ `pin_files()`。`start()` 在 `kOk` 后 `scan_dir` 打开**目录下全部 data 文件**的只读句柄并 pin（active 文件除外——merge 不合并它）；`next()` 优先用 pin 的句柄、未 pin 的退回 `read_file`；`release()` 清空 pin。**原理**：已 open 的 fd 让 inode 在 Linux 上存活，merge unlink 旧文件不影响 fold 后续 pread |
+
+**取舍**：① 每个并发 fold pin 住全部非 active 文件的 fd（large DB 下 fd 数 = 文件数，
+与 legacy 一致，fold 本就重）② start→pin 之间仍有极窄窗口（pin 前 merge 抢先 unlink），
+但已覆盖 fold 全程这个真正的长窗口。点 get 本就基本无害（unlink 是 merge 最后一步、
+单次 NIF 不让出线程）。
+**验证**：新增 `FoldSurvivesConcurrentMergeUnlink`（小 max_file_size 滚多文件 → fold
+中触发 merge unlink → 续读全部 20 key 正确）。**测试有牙**：临时把 `pin_files` 改 no-op
+确认它在 unlink 后 fail，还原后通过。✅ ctest 316→**317/317** + eunit 44/44。
+
+---
+
 ## 未来任务
 
 ### V3 — HNSW 单图 + search_vector（暂缓）
