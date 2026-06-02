@@ -11,7 +11,7 @@
 // === 锁模型（§4） ===
 //   写入按 term hash 分片，tbb::concurrent_hash_map 提供桶级锁。
 //   查询（search）无锁读——concurrent_hash_map 支持并发迭代。
-//   全局统计（live_doc_count_ / sum_doc_len_）仍用 stats_mutex_ 保护。
+//   全局统计（live_doc_count_ / sum_doc_len_）用 atomic（S10.1，去锁）。
 //
 // === df 漂移 ===
 //   V2 查询时过滤 live=0 的 ord，接受 df 轻微偏大。merge 时重算 df。
@@ -21,6 +21,7 @@
 #include <oneapi/tbb/concurrent_hash_map.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -79,6 +80,10 @@ struct PostingList {
     // Block-Max WAND 跳跃索引（finalize 后计算）。
     std::vector<PostingBlock> blocks;
 
+    // 全局最大 tf 缓存（S10.9）：block_upper_bound 此前每次重扫全 items 求最大 tf；
+    // 改为增量维护（note_appended 追加时更新，load 后重算），查询直接读。
+    std::uint32_t max_tf = 0;
+
     // 压缩所有 ord 为 VByte gap 编码，并计算块元数据。
     void finalize() {
         if (items.empty() || finalized) return;
@@ -88,7 +93,9 @@ struct PostingList {
         compressed_ords = codec::gap_encode(ords);
         finalized = true;
 
-        // 计算 Block-Max WAND 元数据。
+        // 计算 Block-Max WAND 元数据。S10.6：先 clear——增量封块（seal_full_blocks）
+        // 可能已建若干满块，这里重建为含「部分尾块」的规范集（覆盖之），避免重复追加。
+        blocks.clear();
         if (items.size() >= kBlockSize) {
             std::size_t n = items.size();
             std::size_t block_count = (n + kBlockSize - 1) / kBlockSize;
@@ -105,6 +112,63 @@ struct PostingList {
                 blocks.push_back({base, last, max_tf, start, end - start});
             }
         }
+    }
+
+    // 增量封块（S10.6）：把已攒满 kBlockSize 的整块封进 blocks，尾部不足一块不封。
+    // ord 单调递增（alloc_ord 全局递增）→ 新 posting 必落在末尾，O(1) 摊还。
+    // 不变量：增量阶段 blocks 仅含满块（count==kBlockSize）；部分尾块只由 finalize 产生。
+    void seal_full_blocks() {
+        std::size_t sealed = blocks.size() * kBlockSize;
+        while (items.size() - sealed >= kBlockSize) {
+            std::size_t start = sealed;
+            std::size_t end = start + kBlockSize;
+            std::uint32_t max_tf = 0;
+            for (std::size_t i = start; i < end; ++i) {
+                if (items[i].tf > max_tf) max_tf = items[i].tf;
+            }
+            blocks.push_back({items[start].ord, items[end - 1].ord, max_tf, start, kBlockSize});
+            sealed += kBlockSize;
+        }
+    }
+
+    // add_doc 追加一条 posting 后调用（S10.6）：让在线索引也具备 WAND 块跳跃。
+    void note_appended() {
+        // S10.9：增量维护全局 max_tf（新 posting 必在末尾）。
+        if (!items.empty() && items.back().tf > max_tf) max_tf = items.back().tf;
+        // 之前 finalize 过：压缩 ord 失效，decompress_ords 退回 items 源（保证正确）。
+        if (finalized) {
+            finalized = false;
+            compressed_ords.clear();
+        }
+        // finalize 可能留下不满的尾块；增量封块要求 blocks 仅含满块，先弹掉它。
+        if (!blocks.empty() && blocks.back().count < kBlockSize) {
+            blocks.pop_back();
+        }
+        seal_full_blocks();
+    }
+
+    // 死点压实（S10.11）：删除 is_live(ord)==false 的 posting，重建派生态。
+    // items 原本按 ord 升序，过滤保序 → 压实后仍有序。返回是否实际删了。
+    // 分数无关：live_df/idf/avgdl 都只数 live，压实只是不再扫死点。
+    template <typename IsLive>
+    bool compact(const IsLive& is_live) {
+        std::vector<Posting> kept;
+        kept.reserve(items.size());
+        for (auto& p : items) {
+            if (is_live(p.ord)) kept.push_back(std::move(p));
+        }
+        if (kept.size() == items.size()) return false;  // 无死点，不动
+        items = std::move(kept);
+        // 重建派生态（compressed_ords/finalized/blocks/max_tf）。
+        compressed_ords.clear();
+        finalized = false;
+        blocks.clear();
+        max_tf = 0;
+        for (auto& p : items) {
+            if (p.tf > max_tf) max_tf = p.tf;
+        }
+        seal_full_blocks();  // 仅封满块（与增量一致，尾部留给后续 finalize）
+        return true;
     }
 
     // 解压返回 ord 数组。
@@ -167,7 +231,10 @@ class InvertedIndex {
 public:
     InvertedIndex() = default;
     ~InvertedIndex();
-    explicit InvertedIndex(Bm25Params params);
+    // index_positions=false 时不存 positions（S10.10，省内存，短语/近邻失效）。
+    explicit InvertedIndex(Bm25Params params, bool index_positions = true);
+
+    [[nodiscard]] bool index_positions() const { return index_positions_; }
 
     // ---- 写 ----
 
@@ -251,6 +318,13 @@ public:
     // 压缩所有 posting list 的 ord 为 VByte gap 编码。
     void finalize_all_postings();
 
+    // 死点压实（S10.11）：对死点占比 ≥ dead_ratio_threshold 的 posting list，
+    // 用 live_checker 重建只留 live ord。高 churn 下死 ord 长期累积、每查询都扫，
+    // 此操作回收之。非查询热路径（持每 key 写锁，与查询互斥）；分数无关。
+    // 返回被压实的 posting list 数。
+    auto compact(const LiveChecker& live_checker, double dead_ratio_threshold = 0.5)
+        -> std::size_t;
+
     // WAL 支持（S8.9）：启用后 add_doc/remove_doc 自动追加到 WAL 文件。
     void enable_wal(std::string_view path);
     void disable_wal();
@@ -273,11 +347,14 @@ private:
 
     std::array<Shard, kShardCount> shards_;
     Bm25Params params_;
+    bool index_positions_ = true;  // S10.10：false 时 add_doc 丢弃 positions
 
-    // 全局统计（用原子或独立 mutex 保护；V2 写路径串行，简单用 mutable）。
-    mutable std::shared_mutex stats_mutex_;
-    std::uint64_t live_doc_count_ = 0;
-    std::uint64_t sum_doc_len_   = 0;
+    // 全局统计（S10.1）：改用 atomic 去掉 stats_mutex_。
+    // 此前 search()/explain()/wand 等查询路径裸读这两个字段而写路径持锁，
+    // 并发查询+写=data race（UB）。atomic 既消 race 又免锁（写路径 V2 串行，
+    // remove_doc 的 guard 用 load+fetch_sub 即可）。
+    std::atomic<std::uint64_t> live_doc_count_{0};
+    std::atomic<std::uint64_t> sum_doc_len_{0};
 
     // WAL（S8.9）。
     std::unique_ptr<InvertedWal> wal_;

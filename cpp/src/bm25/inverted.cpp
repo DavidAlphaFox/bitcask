@@ -55,10 +55,9 @@ auto PostingList::block_for_ord(std::uint64_t ord) const -> const PostingBlock* 
 
 auto PostingList::block_upper_bound(float idf, const Bm25Params& params, double avgdl) const -> float {
     if (items.empty()) return 0.0f;
-    std::uint32_t global_max_tf = 0;
-    for (const auto& p : items) {
-        if (p.tf > global_max_tf) global_max_tf = p.tf;
-    }
+    // S10.9：直接读缓存的 global max_tf（note_appended 增量维护 / load 后重算），
+    // 不再每次重扫全 items。
+    std::uint32_t global_max_tf = max_tf;
     float tf_norm = static_cast<float>(global_max_tf) * (params.k1 + 1.0f) /
                     (static_cast<float>(global_max_tf) + params.k1 *
                      (1.0f - params.b + params.b * 1.0f / static_cast<float>(avgdl)));
@@ -72,8 +71,8 @@ auto PostingList::block_upper_bound(float idf, const Bm25Params& params, double 
 
 InvertedIndex::~InvertedIndex() = default;
 
-InvertedIndex::InvertedIndex(Bm25Params params)
-    : params_(params) {}
+InvertedIndex::InvertedIndex(Bm25Params params, bool index_positions)
+    : params_(params), index_positions_(index_positions) {}
 
 auto InvertedIndex::shard_for(std::string_view term) -> Shard& {
     auto h = std::hash<std::string_view>{}(term);
@@ -96,15 +95,18 @@ void InvertedIndex::add_doc(
         auto& shard = shard_for(term);
         tbb::concurrent_hash_map<std::string, PostingList>::accessor acc;
         shard.inverted.insert(acc, term);
-        acc->second.items.push_back({ord, tf, positions});
+        // S10.10：index_positions_=false 时不存 positions（省内存，短语/近邻失效）。
+        if (index_positions_) {
+            acc->second.items.push_back({ord, tf, positions});
+        } else {
+            acc->second.items.push_back({ord, tf, {}});
+        }
+        acc->second.note_appended();  // S10.6：增量封块，在线索引也吃 WAND 块跳跃
         doc_len += tf;
     }
 
-    {
-        std::unique_lock lock(stats_mutex_);
-        ++live_doc_count_;
-        sum_doc_len_ += doc_len;
-    }
+    live_doc_count_.fetch_add(1, std::memory_order_relaxed);
+    sum_doc_len_.fetch_add(doc_len, std::memory_order_relaxed);
 
     if (wal_) wal_->append_add_doc(ord, WalTermPositions(term_data.begin(), term_data.end()));
 }
@@ -112,10 +114,13 @@ void InvertedIndex::add_doc(
 void InvertedIndex::remove_doc(
     std::uint32_t doc_len,
     const std::unordered_map<std::string, std::uint32_t>& term_freqs) {
-    std::unique_lock lock(stats_mutex_);
-    if (live_doc_count_ > 0) --live_doc_count_;
-    if (sum_doc_len_ >= doc_len) sum_doc_len_ -= doc_len;
-    lock.unlock();
+    // 写路径 V2 串行，guard 用 load + fetch_sub（reader 侧裸 load 已无 race）。
+    if (live_doc_count_.load(std::memory_order_relaxed) > 0) {
+        live_doc_count_.fetch_sub(1, std::memory_order_relaxed);
+    }
+    if (sum_doc_len_.load(std::memory_order_relaxed) >= doc_len) {
+        sum_doc_len_.fetch_sub(doc_len, std::memory_order_relaxed);
+    }
 
     if (wal_) wal_->append_remove_doc(doc_len, term_freqs);
 }
@@ -152,9 +157,9 @@ auto InvertedIndex::search(
         return search_wand(query_terms, k, live_checker, params);
     }
 
-    // 读取全局统计（shared_lock）。
-    auto N = live_doc_count_;
-    auto sum_dl = sum_doc_len_;
+    // 读取全局统计（atomic load，S10.1 去锁）。
+    auto N = live_doc_count_.load(std::memory_order_relaxed);
+    auto sum_dl = sum_doc_len_.load(std::memory_order_relaxed);
     auto avgdl = N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
 
     // 并行 BM25 评分：parallel_reduce 按查询词分片，线程本地 map 无锁累加。
@@ -168,10 +173,13 @@ auto InvertedIndex::search(
                 auto& pl_copy = tps[ti].pl_copy;
                 auto ords = pl_copy.decompress_ords();
 
-                // 计算该词的 live df。
+                // 计算该词的 live df。S10.7：一遍 is_live 缓存到 live[]，
+                // 评分循环复用，避免每 posting 第二次虚调用 is_live。
+                std::vector<char> live(ords.size());
                 std::size_t live_df = 0;
                 for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
-                    if (live_checker.is_live(ords[i])) ++live_df;
+                    live[i] = static_cast<char>(live_checker.is_live(ords[i]));
+                    if (live[i]) ++live_df;
                 }
                 if (live_df == 0) continue;
 
@@ -179,9 +187,9 @@ auto InvertedIndex::search(
 
                 // 逐 posting 累加 BM25 分数到线程本地 map。
                 for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
+                    if (!live[i]) continue;
                     auto& posting = pl_copy.items[i];
                     auto ord = ords[i];
-                    if (!live_checker.is_live(ord)) continue;
 
                     auto dl = live_checker.doc_len(ord);
                     auto tf_norm = static_cast<float>(posting.tf) *
@@ -241,8 +249,8 @@ auto InvertedIndex::explain(
     ScoreExplanation out;
     out.terms.reserve(query_terms.size());
 
-    const auto N = live_doc_count_;
-    const auto sum_dl = sum_doc_len_;
+    const auto N = live_doc_count_.load(std::memory_order_relaxed);
+    const auto sum_dl = sum_doc_len_.load(std::memory_order_relaxed);
     const double avgdl = N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
     const auto dl = live_checker.doc_len(ord);
 
@@ -320,8 +328,8 @@ auto InvertedIndex::search_wand(
     }
     if (tps.empty()) return {};
 
-    auto N = live_doc_count_;
-    auto sum_dl = sum_doc_len_;
+    auto N = live_doc_count_.load(std::memory_order_relaxed);
+    auto sum_dl = sum_doc_len_.load(std::memory_order_relaxed);
     auto avgdl = N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
 
     // 计算每个 term 的 IDF 和上界分数。
@@ -344,53 +352,66 @@ auto InvertedIndex::search_wand(
     std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
     float threshold = 0.0f;
 
+    // S10.5：每轮只排序索引数组，避免 std::sort 整体搬运含 4 个 vector 的
+    // TermPostings（pl_copy 的 items/compressed_ords/blocks + ords）。
+    // order[i] 给出按当前 ord 升序的第 i 个 term 在 tps 中的下标。
+    std::vector<std::size_t> order(tps.size());
+    for (std::size_t i = 0; i < tps.size(); ++i) order[i] = i;
+
     while (true) {
-        // 按当前 ord 升序排列。
-        std::sort(tps.begin(), tps.end(),
-                  [](const TermPostings& a, const TermPostings& b) {
-                      if (a.cursor >= a.ords.size() && b.cursor >= b.ords.size()) return false;
-                      if (a.cursor >= a.ords.size()) return true;
-                      if (b.cursor >= b.ords.size()) return false;
-                      return a.ords[a.cursor] < b.ords[b.cursor];
+        // 按当前 ord 升序排列（保留原比较器语义：耗尽的 term 排前面，会被下方 continue 跳过）。
+        std::sort(order.begin(), order.end(),
+                  [&tps](std::size_t a, std::size_t b) {
+                      const auto& ta = tps[a];
+                      const auto& tb = tps[b];
+                      bool a_ex = ta.cursor >= ta.ords.size();
+                      bool b_ex = tb.cursor >= tb.ords.size();
+                      if (a_ex && b_ex) return false;
+                      if (a_ex) return true;
+                      if (b_ex) return false;
+                      return ta.ords[ta.cursor] < tb.ords[tb.cursor];
                   });
 
-        std::size_t pivot_idx = 0;
+        std::size_t pivot_pos = 0;  // pivot 在排序序列 order 中的位置
         float acc_score = 0.0f;
         bool pivot_found = false;
 
-        for (std::size_t i = 0; i < tps.size(); ++i) {
-            if (tps[i].cursor >= tps[i].ords.size()) continue;
-            acc_score += tps[i].list_upper_bound;
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            auto& tp = tps[order[i]];
+            if (tp.cursor >= tp.ords.size()) continue;
+            acc_score += tp.list_upper_bound;
             if (acc_score >= threshold) {
-                pivot_idx = i;
+                pivot_pos = i;
                 pivot_found = true;
                 break;
             }
         }
         if (!pivot_found) break;
 
-        auto pivot_ord = tps[pivot_idx].ords[tps[pivot_idx].cursor];
+        auto& pivot_tp = tps[order[pivot_pos]];
+        auto pivot_ord = pivot_tp.ords[pivot_tp.cursor];
 
         bool any_skipped = false;
-        for (std::size_t i = 0; i <= pivot_idx; ++i) {
-            if (tps[i].cursor >= tps[i].ords.size()) continue;
-            if (tps[i].ords[tps[i].cursor] != pivot_ord) continue;
+        for (std::size_t i = 0; i <= pivot_pos; ++i) {
+            auto& tp = tps[order[i]];
+            if (tp.cursor >= tp.ords.size()) continue;
+            if (tp.ords[tp.cursor] != pivot_ord) continue;
 
-            const auto* block = tps[i].pl_copy.block_for_ord(pivot_ord);
+            const auto* block = tp.pl_copy.block_for_ord(pivot_ord);
             if (block != nullptr) {
                 float block_tf_norm = static_cast<float>(block->max_tf) * (params.k1 + 1.0f) /
                                       (static_cast<float>(block->max_tf) + params.k1 *
                                        (1.0f - params.b + params.b * 1.0f / static_cast<float>(avgdl)));
-                float block_upper = tps[i].idf * (block_tf_norm + params.delta);
+                float block_upper = tp.idf * (block_tf_norm + params.delta);
                 float remaining_needed = threshold;
                 if (!heap.empty()) remaining_needed = threshold - heap.top().first + 1e-6f;
                 if (block_upper < remaining_needed) {
                     // 跳过到下一个块边界。
                     std::size_t next_start = block->start_idx + block->count;
-                    if (next_start >= tps[i].ords.size()) {
-                        tps[i].cursor = tps[i].ords.size();
+                    if (next_start >= tp.ords.size()) {
+                        tp.cursor = tp.ords.size();
                     } else {
-                        tps[i].cursor = next_start;
+                        tp.cursor = next_start;
                     }
                     any_skipped = true;
                 }
@@ -401,11 +422,12 @@ auto InvertedIndex::search_wand(
         // 所有 term 在 pivot_ord 处都值得关注，计算实际分数。
         if (live_checker.is_live(pivot_ord)) {
             float score = 0.0f;
+            // S10.8：dl 只依赖 pivot_ord，提到 term 循环外取一次（原先每个匹配 term 重取）。
+            auto dl = live_checker.doc_len(pivot_ord);
             for (std::size_t i = 0; i < tps.size(); ++i) {
                 if (tps[i].cursor >= tps[i].ords.size()) continue;
                 if (tps[i].ords[tps[i].cursor] != pivot_ord) continue;
 
-                auto dl = live_checker.doc_len(pivot_ord);
                 auto tf_norm = static_cast<float>(tps[i].pl_copy.items[tps[i].cursor].tf) *
                                (params.k1 + 1.0f) /
                                (static_cast<float>(tps[i].pl_copy.items[tps[i].cursor].tf) + params.k1 *
@@ -484,8 +506,8 @@ auto InvertedIndex::search_phrase_impl(
         tps.push_back({term, acc->second});
     }
 
-    auto N = live_doc_count_;
-    auto sum_dl = sum_doc_len_;
+    auto N = live_doc_count_.load(std::memory_order_relaxed);
+    auto sum_dl = sum_doc_len_.load(std::memory_order_relaxed);
     auto avgdl = N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
 
     std::unordered_map<std::uint64_t, float> scores;
@@ -597,20 +619,31 @@ auto InvertedIndex::search_wildcard(
         std::string term;
         PostingList pl_copy;
     };
-    std::vector<TermPostings> tps;
 
-    for (auto& shard : shards_) {
-        for (auto& [term, plist] : shard.inverted) {
-            if (wildcard_match(pattern, term)) {
-                tps.push_back({term, plist});
+    // S10.4：并行扫词表匹配 pattern。按 shard 下标分区，每个 shard 至多被一个任务
+    // 遍历（互不重叠），与既有「查询无锁读」模型一致（拷贝 plist 不持桶锁）。
+    std::vector<TermPostings> tps = tbb::parallel_reduce(
+        tbb::blocked_range<std::size_t>(0, kShardCount),
+        std::vector<TermPostings>{},
+        [&](const tbb::blocked_range<std::size_t>& range, std::vector<TermPostings> local) {
+            for (std::size_t s = range.begin(); s < range.end(); ++s) {
+                for (auto& [term, plist] : shards_[s].inverted) {
+                    if (wildcard_match(pattern, term)) {
+                        local.push_back({term, plist});
+                    }
+                }
             }
-        }
-    }
+            return local;
+        },
+        [](std::vector<TermPostings> a, const std::vector<TermPostings>& b) {
+            a.insert(a.end(), b.begin(), b.end());
+            return a;
+        });
 
     if (tps.empty()) return {};
 
-    auto N = live_doc_count_;
-    auto sum_dl = sum_doc_len_;
+    auto N = live_doc_count_.load(std::memory_order_relaxed);
+    auto sum_dl = sum_doc_len_.load(std::memory_order_relaxed);
     auto avgdl = N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
 
     using ScoreMap = std::unordered_map<std::uint64_t, float>;
@@ -623,18 +656,21 @@ auto InvertedIndex::search_wildcard(
                 auto& pl_copy = tps[ti].pl_copy;
                 auto ords = pl_copy.decompress_ords();
 
+                // S10.7：一遍 is_live 缓存到 live[]，评分循环复用，避免每 posting 二次虚调用。
+                std::vector<char> live(ords.size());
                 std::size_t live_df = 0;
                 for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
-                    if (live_checker.is_live(ords[i])) ++live_df;
+                    live[i] = static_cast<char>(live_checker.is_live(ords[i]));
+                    if (live[i]) ++live_df;
                 }
                 if (live_df == 0) continue;
 
                 auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
 
                 for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
+                    if (!live[i]) continue;
                     auto& posting = pl_copy.items[i];
                     auto ord = ords[i];
-                    if (!live_checker.is_live(ord)) continue;
 
                     auto dl = live_checker.doc_len(ord);
                     auto tf_norm = static_cast<float>(posting.tf) *
@@ -806,8 +842,8 @@ auto InvertedIndex::bool_search(
 
     if (candidates.empty()) return {};
 
-    auto N = live_doc_count_;
-    auto sum_dl = sum_doc_len_;
+    auto N = live_doc_count_.load(std::memory_order_relaxed);
+    auto sum_dl = sum_doc_len_.load(std::memory_order_relaxed);
     auto avgdl = N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
 
     std::vector<TermPostings> all_tps;
@@ -901,11 +937,21 @@ auto InvertedIndex::search_fuzzy(
     };
     std::vector<TermPostings> tps;
 
-    for (auto& query_term : query_terms) {
-        for (auto& shard : shards_) {
-            for (auto& [term, plist] : shard.inverted) {
+    // 翻转循环：vocab term 放外层、query term 放内层 + break。
+    // ① S10.2：每个 vocab term 至多入 tps 一次——原先 query 多词模糊命中同一 term
+    //    会重复 push，导致该 posting list 被评分两遍、IDF 贡献翻倍。
+    // ② S10.3：跑 O(n·m) levenshtein 前先按字节长度差剪枝——编辑距离 ≥ |长度差|，
+    //    故长度差 > max_edit 时必不匹配，省掉绝大多数 DP（levenshtein 按字节算，用字节长度）。
+    for (auto& shard : shards_) {
+        for (auto& [term, plist] : shard.inverted) {
+            for (auto& query_term : query_terms) {
+                auto len_diff = term.size() > query_term.size()
+                                    ? term.size() - query_term.size()
+                                    : query_term.size() - term.size();
+                if (len_diff > max_edit_distance) continue;
                 if (levenshtein_distance(query_term, term) <= max_edit_distance) {
                     tps.push_back({term, plist});
+                    break;
                 }
             }
         }
@@ -913,8 +959,8 @@ auto InvertedIndex::search_fuzzy(
 
     if (tps.empty()) return {};
 
-    auto N = live_doc_count_;
-    auto sum_dl = sum_doc_len_;
+    auto N = live_doc_count_.load(std::memory_order_relaxed);
+    auto sum_dl = sum_doc_len_.load(std::memory_order_relaxed);
     auto avgdl = N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
 
     using ScoreMap = std::unordered_map<std::uint64_t, float>;
@@ -927,18 +973,21 @@ auto InvertedIndex::search_fuzzy(
                 auto& pl_copy = tps[ti].pl_copy;
                 auto ords = pl_copy.decompress_ords();
 
+                // S10.7：一遍 is_live 缓存到 live[]，评分循环复用，避免每 posting 二次虚调用。
+                std::vector<char> live(ords.size());
                 std::size_t live_df = 0;
                 for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
-                    if (live_checker.is_live(ords[i])) ++live_df;
+                    live[i] = static_cast<char>(live_checker.is_live(ords[i]));
+                    if (live[i]) ++live_df;
                 }
                 if (live_df == 0) continue;
 
                 auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
 
                 for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
+                    if (!live[i]) continue;
                     auto& posting = pl_copy.items[i];
                     auto ord = ords[i];
-                    if (!live_checker.is_live(ord)) continue;
 
                     auto dl = live_checker.doc_len(ord);
                     auto tf_norm = static_cast<float>(posting.tf) *
@@ -985,19 +1034,17 @@ auto InvertedIndex::search_fuzzy(
 // ---- 统计 ----
 
 auto InvertedIndex::live_doc_count() const -> std::uint64_t {
-    std::shared_lock lock(stats_mutex_);
-    return live_doc_count_;
+    return live_doc_count_.load(std::memory_order_relaxed);
 }
 
 auto InvertedIndex::sum_doc_len() const -> std::uint64_t {
-    std::shared_lock lock(stats_mutex_);
-    return sum_doc_len_;
+    return sum_doc_len_.load(std::memory_order_relaxed);
 }
 
 auto InvertedIndex::avg_doc_len() const -> double {
-    std::shared_lock lock(stats_mutex_);
-    if (live_doc_count_ == 0) return 0.0;
-    return static_cast<double>(sum_doc_len_) / static_cast<double>(live_doc_count_);
+    auto n = live_doc_count_.load(std::memory_order_relaxed);
+    if (n == 0) return 0.0;
+    return static_cast<double>(sum_doc_len_.load(std::memory_order_relaxed)) / static_cast<double>(n);
 }
 
 auto InvertedIndex::df(std::string_view term) const -> std::size_t {
@@ -1026,6 +1073,38 @@ void InvertedIndex::finalize_all_postings() {
     }
 }
 
+auto InvertedIndex::compact(const LiveChecker& live_checker, double dead_ratio_threshold)
+    -> std::size_t {
+    std::size_t compacted = 0;
+    for (auto& shard : shards_) {
+        // 先快照 key 列表（迭代不改 map 结构），再逐 key 持写 accessor 压实：
+        // 写锁与并发查询的 const_accessor 互斥，保证查询不读到半压实状态。
+        std::vector<std::string> keys;
+        for (auto it = shard.inverted.begin(); it != shard.inverted.end(); ++it) {
+            keys.push_back(it->first);
+        }
+        for (auto& key : keys) {
+            tbb::concurrent_hash_map<std::string, PostingList>::accessor acc;
+            if (!shard.inverted.find(acc, key)) continue;
+            auto& pl = acc->second;
+            if (pl.items.empty()) continue;
+
+            std::size_t dead = 0;
+            for (auto& p : pl.items) {
+                if (!live_checker.is_live(p.ord)) ++dead;
+            }
+            if (dead == 0) continue;
+            double ratio = static_cast<double>(dead) / static_cast<double>(pl.items.size());
+            if (ratio < dead_ratio_threshold) continue;
+
+            if (pl.compact([&](std::uint64_t ord) { return live_checker.is_live(ord); })) {
+                ++compacted;
+            }
+        }
+    }
+    return compacted;
+}
+
 // ---- 持久化 ----
 
 static constexpr std::uint32_t kInvMagic   = 0x494E5632;
@@ -1037,9 +1116,8 @@ auto InvertedIndex::save(std::string_view path) const -> bool {
     auto* f = std::fopen(std::string(path).c_str(), "wb");
     if (!f) return false;
 
-    std::shared_lock stats_lock(stats_mutex_);
-    std::uint32_t N = static_cast<std::uint32_t>(live_doc_count_);
-    std::uint64_t sdl = sum_doc_len_;
+    std::uint32_t N = static_cast<std::uint32_t>(live_doc_count_.load(std::memory_order_relaxed));
+    std::uint64_t sdl = sum_doc_len_.load(std::memory_order_relaxed);
 
     auto write_u32 = [&](std::uint32_t v) { return std::fwrite(&v, 4, 1, f) == 1; };
     auto write_u64 = [&](std::uint64_t v) { return std::fwrite(&v, 8, 1, f) == 1; };
@@ -1246,15 +1324,16 @@ auto InvertedIndex::load(std::string_view path) -> bool {
                     }
                 }
             }
+            // S10.9：load 后重算缓存的 global max_tf（落盘格式不含此字段，派生量）。
+            for (auto& p : pl.items) {
+                if (p.tf > pl.max_tf) pl.max_tf = p.tf;
+            }
             shard.inverted.emplace(std::move(term), std::move(pl));
         }
     }
 
-    {
-        std::unique_lock lock(stats_mutex_);
-        live_doc_count_ = N;
-        sum_doc_len_ = sdl;
-    }
+    live_doc_count_.store(N, std::memory_order_relaxed);
+    sum_doc_len_.store(sdl, std::memory_order_relaxed);
 
     std::fclose(f);
     return true;
