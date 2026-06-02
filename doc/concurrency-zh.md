@@ -205,6 +205,41 @@ merger 用 `merge_only` 选项 open（内部由 `bitcask:merge/N` 触发，不�
 所以稳态可以是：**1 writer + 1 merger + N readers** 同时活跃，互不
 阻塞。这是 bitcask 跑生产负载的标准并发栈。
 
+### merge 对读写的影响（正确性 vs 性能）
+
+merge 设计成**对读写无阻塞**，靠的不是锁、而是 keydir 分片锁 + CAS + 文件
+生命周期管理：
+
+| 路径 | 影响 | 为什么安全 |
+|------|------|-----------|
+| **写** | 不阻塞 | merge 不抢 `write.lock`；并发改同一 key → merge 的 CAS（带 old_file_id/offset）失败、writer 赢，merge 拷贝沦为死字节下轮再清；writer 发现 `biggest_file_id` 被 merger 推进就 `roll_active` 到更大 id。无写丢失。 |
+| **点 get** | 不阻塞 | merge「先写新文件 + CAS keydir、**最后**才 unlink 旧文件」；单次 `cask_get` NIF 从 keydir.get 到 pread 不让出线程，要读到被删文件得被 OS 抢占跨越整个 merge——实践可忽略。 |
+| **fold** | 不阻塞（**S13** 修复） | 见下。 |
+
+**fold 的文件句柄快照（S13）**：fold 跨越多次 `fold_next` NIF、墙钟时间长，
+是真正可能撞上 merge unlink 的路径。keydir 的 epoch/frozen 只钉「key 修订快照」
+（fold 看到稳定 key 集），**不钉 data file**（keydir 无文件级 refcount），且 merge
+两侧都不 gate 在 frozen。所以 `CaskIter` 在 **start 时 pin 一份「目录下全部非
+active data 文件」的只读句柄快照**：
+
+- `next()` 优先从 pin 的句柄 pread；merge 即便 unlink 了旧文件，已 open 的 fd
+  让 inode 在 Linux 上存活，fold 照常读到。
+- `release()` 时才关掉这些 fd——被 fold pin 住的旧文件，磁盘空间要等 fold 结束
+  才真正回收。
+- 代价：每个并发 fold 占用「文件数」量级的 fd（与 legacy riak bitcask 的
+  readable_files 快照一致，fold 本就重）。
+
+> 这一层修复前是个真实 bug：fold 走共享 `read_file` 缓存读 value，merge 无条件
+> unlink，长 fold 会因旧文件消失而中途报 `{error,_}`。
+
+**性能影响才是 merge 的真实代价**（不是阻塞）：
+
+- merge 回读旧文件 + 写新文件，跟正常读写**抢磁盘 IO / CPU**。
+- **索引模式下最重**：每次 merge 后**同步**全量 `rebuild_index`（回读所有 live
+  文档、重新分词、建全新 InvertedIndex）+ `save_snapshot`。纯 KV 无此项。
+- `cask_merge` 挂 `ERL_NIF_DIRTY_JOB_IO_BOUND`，在 dirty 调度器跑，**不卡 BEAM
+  主调度线程**，其它进程的读写照常被调度。
+
 ---
 
 ## 6. 索引模式（SearchLayer）的并发

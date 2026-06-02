@@ -497,10 +497,18 @@ bitcask 靠 fold 启动时 pin 一份 readable_files 句柄快照规避，本实
 |---|------|------|---------|
 | **S13.1** | fold pin 文件句柄快照（方案1） | `cask.hpp` `cask.cpp` | `CaskIter` 加 `pinned_files_`（`map<file_id, unique_ptr<DataFile>>`）+ `pin_files()`。`start()` 在 `kOk` 后 `scan_dir` 打开**目录下全部 data 文件**的只读句柄并 pin（active 文件除外——merge 不合并它）；`next()` 优先用 pin 的句柄、未 pin 的退回 `read_file`；`release()` 清空 pin。**原理**：已 open 的 fd 让 inode 在 Linux 上存活，merge unlink 旧文件不影响 fold 后续 pread |
 
-**取舍**：① 每个并发 fold pin 住全部非 active 文件的 fd（large DB 下 fd 数 = 文件数，
-与 legacy 一致，fold 本就重）② start→pin 之间仍有极窄窗口（pin 前 merge 抢先 unlink），
-但已覆盖 fold 全程这个真正的长窗口。点 get 本就基本无害（unlink 是 merge 最后一步、
-单次 NIF 不让出线程）。
+**正确性论证**：pin 放在 epoch 快照（`iter_->start`）之后是**充分**的，不存在可触发的时序
+窗口。两个条件互斥：① fold 在 epoch E 解析到文件 F ⟹ merge 尚未把该 key 从 F 搬走，即其
+CAS 晚于 epoch 快照；② F 在 `pin_files` 扫到前被 unlink。但 merge 的 unlink **严格在所有
+CAS 之后、且隔着整个 run_merge 尾巴 +（索引模式的）全量重建**，这一大段不可能塞进
+「epoch 快照 → pin_files 扫描」那条亚微秒缝隙 → 凡 fold 在 A 时指向的 F，B 时必然还在 →
+必被 pin。更根本地：fold 看不到比自己 epoch 更新的文件，它能引用的文件都在快照前就已落盘、
+故都会被 pin（merge 输出/新写入 epoch 更大，fold 不可见，且本次 fold 期间不会被 unlink，
+走 `read_file` 回退）。
+**取舍**：① 每个并发 fold pin 住全部非 active 文件的 fd（large DB 下 fd 数 = 文件数，与
+legacy 一致，fold 本就重），被 pin 的旧文件磁盘空间延迟到 fold release 才回收。② 唯一边角是
+**非时序**的：`pin_files` 若因 fd 耗尽/权限 open 失败，该文件不受保护（运维资源上限，非并发
+race）。点 get 本就基本无害（unlink 是 merge 最后一步、单次 NIF 不让出线程）。
 **验证**：新增 `FoldSurvivesConcurrentMergeUnlink`（小 max_file_size 滚多文件 → fold
 中触发 merge unlink → 续读全部 20 key 正确）。**测试有牙**：临时把 `pin_files` 改 no-op
 确认它在 unlink 后 fail，还原后通过。✅ ctest 316→**317/317** + eunit 44/44。
