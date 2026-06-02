@@ -15,7 +15,7 @@ All operations go through `bitcask_cpp_nifs` → `priv/bitcask_cpp.so`.
 
 ```sh
 rebar3 compile        # builds priv/bitcask_cpp.so
-rebar3 as test eunit  # 90+ Erlang tests
+rebar3 eunit          # Erlang/NIF tests (eunit)
 rebar3 do xref, dialyzer
 ```
 
@@ -26,7 +26,7 @@ Erlang ≥ 22.0 required.
 ```sh
 cmake -S . -B _build/cmake -DBUILD_TESTING=ON
 cmake --build _build/cmake -j
-ctest --test-dir _build/cmake --output-on-failure   # ~167 GoogleTests
+ctest --test-dir _build/cmake --output-on-failure   # 300+ GoogleTests
 ```
 
 Sanitizers (one at a time — ASan and TSan are mutually exclusive):
@@ -47,28 +47,52 @@ cmake --build _build/bench -j
 _build/bench/cpp/bench/bitcask_bench
 ```
 
-## Quick example
+## Quick start (`rebar3 shell`)
+
+Build the NIF and drop into an Erlang shell with the app on the path:
+
+```sh
+rebar3 shell        # runs `rebar3 compile` first, then starts the REPL
+```
+
+**Key/value mode** — plain binary values:
 
 ```erlang
 1> R = bitcask:open("/tmp/db", [read_write]).
+#Ref<0.1234.5678.90>
 2> bitcask:put(R, <<"k">>, <<"hello">>).
 ok
 3> bitcask:get(R, <<"k">>).
-{ok, <<"hello">>}
+{ok,<<"hello">>}
 4> bitcask:close(R).
 ok
 ```
 
-**BM25 full-text search** (open with an analyzer to enable):
+**BM25 full-text search** — open with `{analyzer, ...}` to enable. Each `put`
+indexes the value; results are `{ok, [{Key, Ord, Score}, ...]}` sorted by score:
 
 ```erlang
-1> R = bitcask:open("/tmp/db", [read_write, {analyzer, whitespace}]).
-2> bitcask:put(R, <<"d1">>, <<"hello world">>).
-3> bitcask:put(R, <<"d2">>, <<"hello bitcask">>).
-4> bitcask:search_text(R, <<"hello">>, 10).
-{ok,[{<<"d1">>,14.2},{<<"d2">>,14.2}]}
-5> bitcask:close(R).
+%% analyzer: whitespace (English) | ngram (CJK n-gram) | jieba (Chinese segmentation)
+1> R = bitcask:open("/tmp/idx", [read_write, {analyzer, whitespace}]).
+#Ref<0.9876.5432.10>
+2> bitcask:put(R, <<"d1">>, <<"the quick brown fox">>).
+ok
+3> bitcask:put(R, <<"d2">>, <<"a lazy brown dog">>).
+ok
+4> bitcask:search_text(R, <<"brown">>).               % both match
+{ok,[{<<"d2">>,1,0.18232},{<<"d1">>,0,0.18232}]}
+5> bitcask:search_phrase(R, <<"quick brown">>).       % only d1 has them adjacent
+{ok,[{<<"d1">>,0,0.69315}]}
+6> bitcask:search_fuzzy(R, <<"quikc">>, 2).           % typo, edit distance ≤ 2
+{ok,[{<<"d1">>,0,0.69315}]}
+7> bitcask:search_wildcard(R, <<"fox*">>).            % prefix wildcard
+{ok,[{<<"d1">>,0,0.69315}]}
+8> bitcask:close(R).
+ok
 ```
+
+> Calling any `search_*` on a cask opened **without** an analyzer returns
+> `{error, no_index}`.
 
 ## API highlights
 
@@ -79,7 +103,9 @@ ok
 | `fold/3,6`, `fold_keys/3,6`, `list_keys/1` | Iteration |
 | `stream/1`, `next/1`, `stop/1`, `with_stream/2` | Streaming iteration |
 | `merge/1,2,3`, `needs_merge/1,2`, `status/1` | Merge management |
-| `search_text/2,3`, `search_phrase/2,3` | BM25 full-text search |
+| `search_text/2,3`, `search_phrase/2,3`, `search_fields/2,3` | BM25 search (full-text / phrase / `field:term^boost`) |
+| `search_near/3,4`, `search_fuzzy/3,4`, `search_wildcard/2,3` | Proximity / fuzzy (edit-distance) / wildcard search |
+| `set_synonym_map/2` | Load a synonym dictionary |
 | `is_empty_estimate/1`, `is_frozen/1`, `close_write_file/1` | Utilities |
 
 ## Documentation
@@ -103,8 +129,8 @@ ok
 ## Project status
 
 - **C++ NIF** covers all core KV operations (`get`/`put`/`delete`/`sync`/`fold`/`merge`)
-- **BM25 full-text search** is operational (`search_text`/`search_phrase`)
-- **Jieba Chinese analyzer** integrated
+- **BM25 full-text search** is operational — text / phrase / fields / proximity / fuzzy / wildcard, plus synonyms and snippet highlighting
+- **Jieba Chinese analyzer** integrated (whitespace / n-gram / jieba)
 - **Typed record format** (`kDoc`/`kTombstone` with per-write ordinal) is the default
 - **Unified architecture** (merging Cask + Collection) is planned — see `TASK.md` (U0–U6)
 
