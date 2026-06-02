@@ -185,9 +185,17 @@ public:
     [[nodiscard]] bool is_iterating() const noexcept { return iter_ != nullptr; }
 
 private:
+    // S13：fold 启动时 pin 一份「目录下全部 data file」的只读句柄快照。
+    // 并发 merge 在 fold 期间 unlink 旧文件时，已 open 的 fd 让 inode 在
+    // Linux 上存活，next() 仍能从 pin 的句柄 pread——不会因文件被删而失败。
+    // 不含 active write file（merge 从不合并它，交给 parent_->read_file）。
+    void pin_files();
+
     Cask* parent_;
     std::unique_ptr<keydir::IterHandle> iter_;
     bool see_tombstones_ = false;
+    std::unordered_map<std::uint32_t,
+                       std::unique_ptr<fileops::DataFile>> pinned_files_;
 };
 
 // --- Cask ------------------------------------------------------------------

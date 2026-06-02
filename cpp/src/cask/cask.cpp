@@ -170,7 +170,31 @@ CaskIter::start(int maxage, int maxputs, std::uint32_t now_sec,
     iter_ = parent_->keydir_->make_iter();
     auto r = iter_->start(now_sec, maxage, maxputs);
     see_tombstones_ = see_tombstones;
+    // S13：真正开始迭代后（kOk），pin 当前目录下所有 data file 的只读句柄快照，
+    // 让并发 merge 在本次 fold 期间 unlink 旧文件不影响后续 next() 的 pread。
+    // kOutOfDate 时 caller 会重试，不在此处 pin。
+    if (r == keydir::StartIterResult::kOk) {
+        pin_files();
+    }
     return r;  // kOk or kOutOfDate (kAlreadyIterating handled above)
+}
+
+// 扫描目录、open 全部 data file 的只读句柄并 pin 住（S13）。best-effort：
+// 扫描或单个 open 失败时跳过该文件，next() 对其退回 parent_->read_file（仍可
+// 工作，只是少了「文件被 merge 删除」的保护）。active write file 不 pin——
+// merge 从不合并 active 文件，且 parent_ 已为它持有 RW 句柄。
+void CaskIter::pin_files() {
+    pinned_files_.clear();
+    auto scan = fileops::scan_dir(parent_->dirname_);
+    if (!scan) return;
+    for (const auto& e : *scan) {
+        const auto fid = static_cast<std::uint32_t>(e.tstamp);
+        if (parent_->active_data_ && fid == parent_->active_file_id_) continue;
+        auto df = fileops::DataFile::open(e.data_path, fileops::DataFile::Mode::kRead);
+        if (!df) continue;
+        pinned_files_.emplace(
+            fid, std::make_unique<fileops::DataFile>(std::move(*df)));
+    }
 }
 
 std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
@@ -211,7 +235,15 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
             return std::optional<Entry>{std::move(e)};
         }
 
-        auto* df = parent_->read_file(proxy->file_id);
+        // S13：优先用 fold 启动时 pin 的句柄（merge 可能已 unlink 该文件，但
+        // 已 open 的 fd 仍可读）；未 pin 的（active 文件 / fold 后新建的文件）
+        // 退回共享 read_file——这些文件不会在本次 fold 期间被 merge 删除。
+        fileops::DataFile* df = nullptr;
+        if (auto pit = pinned_files_.find(proxy->file_id); pit != pinned_files_.end()) {
+            df = pit->second.get();
+        } else {
+            df = parent_->read_file(proxy->file_id);
+        }
         if (!df) {
             return std::unexpected(err(CaskError::kIo,
                 "open read file_id=" + std::to_string(proxy->file_id)));
@@ -260,6 +292,8 @@ void CaskIter::release() noexcept {
         iter_->release();
         iter_.reset();
     }
+    // S13：关掉 pin 的只读 fd；若文件已被 merge unlink，此刻 inode 才真正释放。
+    pinned_files_.clear();
 }
 
 // =============================================================================

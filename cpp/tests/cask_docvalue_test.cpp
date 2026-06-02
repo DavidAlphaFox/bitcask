@@ -1,7 +1,10 @@
 #include <gtest/gtest.h>
 #include <bitcask/cask.hpp>
 #include <bitcask/codec.hpp>
+#include <bitcask/data_file.hpp>  // parse_data_tstamp（S13 测试枚举 data 文件）
+#include <algorithm>
 #include <filesystem>
+#include <map>
 #include <vector>
 
 namespace {
@@ -644,6 +647,77 @@ TEST_F(CaskUpgradeTest, UpgradePreservesDeletes) {
     EXPECT_EQ(sr_rm->hits.size(), 0u);
 
     (*upg)->close();
+}
+
+// --- S13: fold 文件句柄快照 pin —— fold 跨越并发 merge 的 unlink 仍正确 ---
+//
+// 复现：小 max_file_size 滚出多个 data 文件 → 开 fold（next() 一次触发 pin）→
+// 对 sealed 文件做 merge（relocate live record 到新文件 + unlink 旧文件）→
+// 继续 fold 到结束。修复前 fold 会因旧文件被删、read_file 重新 open 失败而报错；
+// 修复后从 pin 的 fd 读，仍能拿到全部 key 的正确 value。
+TEST_F(CaskDocValueTest, FoldSurvivesConcurrentMergeUnlink) {
+    namespace fs = std::filesystem;
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.max_file_size = 256;  // 强制 roll 出多个 data 文件
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+    auto& cask = **c;
+
+    // 写 20 个不同 key（都 live），40 字节 value 撑大文件、散落到多个文件。
+    constexpr int N = 20;
+    std::map<std::vector<std::byte>, std::vector<std::byte>> expected;
+    for (int i = 0; i < N; ++i) {
+        std::vector<std::byte> key{std::byte{'k'}, static_cast<std::byte>(i)};
+        std::vector<std::byte> val(40, static_cast<std::byte>(i));
+        ASSERT_TRUE(cask.put(key, val, static_cast<std::uint32_t>(1000 + i)));
+        expected[key] = val;
+    }
+
+    // 收集所有 data 文件，按 file_id 排序；除最后一个（active）外都作 merge 输入。
+    std::vector<std::pair<std::uint32_t, std::string>> files;
+    for (const auto& de : fs::directory_iterator(tmpdir_)) {
+        const auto name = de.path().filename().string();
+        if (auto t = bitcask::fileops::parse_data_tstamp(name)) {
+            files.push_back({static_cast<std::uint32_t>(*t), de.path().string()});
+        }
+    }
+    ASSERT_GE(files.size(), 2u) << "max_file_size 应已滚出多个文件";
+    std::sort(files.begin(), files.end());
+    std::vector<std::string> to_merge;
+    for (std::size_t i = 0; i + 1 < files.size(); ++i) to_merge.push_back(files[i].second);
+
+    // 开 fold，next() 一次 → 触发 pin_files（pin 住 sealed 文件的只读 fd）。
+    auto it = cask.make_iter();
+    auto sr = it->start();
+    ASSERT_TRUE(sr);
+    ASSERT_EQ(*sr, bitcask::keydir::StartIterResult::kOk);
+    auto first = it->next();
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(first->has_value());
+
+    // fold 进行中触发 merge：relocate live record 到新文件并 unlink 掉 to_merge。
+    auto mr = cask.merge(to_merge);
+    ASSERT_TRUE(mr);
+    for (const auto& p : to_merge) {
+        EXPECT_FALSE(fs::exists(p)) << "merge 后旧文件应被 unlink：" << p;
+    }
+
+    // 继续 fold 到结束：收集所有 entry。没有 pin 的话这里会 read_file 失败报错。
+    std::map<std::vector<std::byte>, std::vector<std::byte>> got;
+    got[(*first)->key] = (*first)->value;
+    while (true) {
+        auto e = it->next();
+        ASSERT_TRUE(e) << "fold next 在 merge unlink 后失败（pin 未生效？）";
+        if (!e->has_value()) break;
+        got[(*e)->key] = (*e)->value;
+    }
+    it->release();
+
+    // fold 应原样看到全部 20 个 key 的正确 value（快照 + pin 双重保证）。
+    EXPECT_EQ(got, expected);
+
+    cask.close();
 }
 
 // --- #1: FieldSchema 注册表 ---
