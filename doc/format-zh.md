@@ -67,6 +67,51 @@ append-only 的 record 序列，文件本身无 header，record 之间无 paddin
 
 整条 record 长度 = `23 + KeySz + ValueSz`，header 固定 23 字节。
 
+### 完整布局（两层嵌套）
+
+一条 record 是**两层嵌套**：外层是 record 框架，`Value` 段在 `type = kDoc`
+时本身又是一个打包的 **DocValue v3**（详见 §五）。统一架构下纯 KV 模式的
+`put(key, binary)` 也走 DocValue——binary 放进 text 段。
+
+```
+┌─ data record ───────────────────────────────────────────────┐
+│ CRC(4) Type(1) Tstamp(4) Ord(8) KeySz(2) ValueSz(4)  ← 头 23B │
+│ Key (KeySz 字节)                                              │
+│ Value (ValueSz 字节)                                          │
+│   └─ kDoc 时 = DocValue v3 ─────────────────────────────┐    │
+│      [Ver=3][Flags]                                      │    │
+│        vector? [Dim:varint][f32×Dim 小端]      Flags&0x01│    │
+│        text?   [Len:varint][bytes]             Flags&0x02│    │
+│        meta?   [Len:varint][bytes]             Flags&0x04│    │
+│        fields? [FieldCount:varint] ×           Flags&0x10│    │
+│                  {[FieldId:varint][ValLen:varint][value]}│    │
+│   ──────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────┘
+   CRC 覆盖 Type..Value 全部字节（含内层 DocValue）。
+```
+
+**例 ① 纯 KV `put("user:1","hello")`**（binary 进 text 段）：
+
+```
+头(23B, KeySz=6 ValueSz=8) │ "user:1" │ 03 02 85 "hello"
+                             key(6B)     Ver=3 Flags=has_text Len=5(0x85=5|0x80) "hello"
+```
+整条 = 23 + 6 + 8 = **37 字节**。
+
+**例 ② 多字段 `put_doc(#{title=>"a", body=>"b"})`**（title→id0、body→id1）：
+
+```
+value: 03 10 │ 82 │ 80 81 "a" │ 81 81 "b"
+       Ver=3 has_fields │ Count=2 │ id=0 ValLen=1 "a" │ id=1 ValLen=1 "b"
+```
+字段名 `title`/`body` **不在 record 里**，只在 `<dir>/field.schema` 注册表存一份。
+
+**例 ③ 墓碑**：`Type=1`，`ValueSz=0`（Value 空），靠 Ord/key 标记删除。
+
+> append-only：每次 put/update/delete 都追加一条新 record，同 key 旧版本成为
+> 死字节，由 merge 按阈值回收（merge 逐字节复制 live record，不重编码 →
+> DocValue 字节与 field id 原样保留）。
+
 | 字段       | 宽度  | 含义                                              |
 |------------|-----|--------------------------------------------------|
 | `crc`      |  4 B | CRC-32 (zlib) 覆盖 `type..value`                 |

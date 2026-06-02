@@ -459,6 +459,25 @@ ctest **206/206 全部通过**（含此前一贯失败的 10 个 Jieba 测试，
 
 ---
 
+### S12 — NIF 层重构（2026-06-02）
+
+**目标**：C++ 最佳实践 / 高内聚低耦合 / 函数抽象去重复 / 适当设计模式 / 完善中文注释。
+NIF 层本已模块化（atoms/resources/term_conv/helpers/main/cask/iter/admin），本轮针对
+残留重复与耦合做精修。**行为不变**（纯重构），eunit 38/38 + 端到端 5 类搜索实测通过。
+
+| # | 目标 | 改动 | 关键内容 |
+|---|------|------|---------|
+| **S12.1** | 统一搜索骨架（Strategy） | `nif_helpers.{hpp,cpp}` `nif_cask.cpp` | 5 个 `*_search_impl`（search/bool/near/fuzzy/wildcard，~115 行）90% 是同一套样板（取 handle→查 query binary→has_search→调用→fault_to_term/make_ok）。抽成单个 `run_search(env, ref, query, SearchInvoker)`，`SearchInvoker = std::function<expected<TextSearchResult,CaskFault>(Cask&, string_view)>` 承载「具体怎么搜」的策略闭包。8 个搜索 NIF 入口变成 3-4 行薄 lambda 包装（k/slop/max_edit 由闭包捕获）。**设计取舍**：NIF glue 是函数式的，正确的「设计模式」是高阶函数/Strategy，强行套继承反而是 cargo-cult，故用 std::function（小捕获走 SBO 无堆分配） |
+| **S12.2** | 选项解析拆出独立 TU | 新建 `nif_options.cpp` | `parse_options` + `parse_*_option`（~130 行）从 nif_helpers.cpp 移出，单一职责（高内聚）。声明仍在 nif_helpers.hpp，调用方不变。加 typed 提取小工具 `opt_int`/`opt_u64`/`opt_u32_min`（min 校验），消除每分支重复的 `enif_get_int + 范围检查 + 赋值` |
+| **S12.3** | term_conv 清理 + 复用 | `term_conv.hpp` `nif_cask.cpp` `nif_options.cpp` | ① 删 dead `make_binary_from_bytes`（零调用、且是 `make_binary_checked` 的劣化重复）② 加 `get_positive_int`（k）/`get_nonneg_int`（slop/max_edit）替代散落的 `if(v<=0)v=10` ③ 多处手写 `reinterpret_cast<const char*>(bin.data)` 改用已有的 `as_string_view`（run_search/dict_path/set_synonym_map） |
+
+**效果**：nif_helpers.cpp 424→185 行；5 份搜索样板→1 个 run_search；选项解析独立成 TU。
+✅ `bitcask_cpp.so` 重建 + erl 实测 search_text/phrase/fuzzy/wildcard 结果正确。
+
+| **S12.4** | run_search 边界 eunit 用例 | 新建 `test/bitcask_search_boundary_tests.erl` | 此前 eunit **完全没覆盖搜索**（搜索测试都在 C++ 侧），run_search 仅靠手动 erl 验证。补 6 个用例：① no_index（KV 模式 6 个搜索接口全返回 `{error,no_index}`）② k≤0 回落默认 10（k=0/-5 结果与 k=10 一致；near/fuzzy 4 参版也覆盖）③ 空 query / 无命中 → `{ok,[]}` ④ 正向回归（text/phrase/fuzzy/wildcard 各命中预期文档）。✅ eunit 38→**44/44** |
+
+---
+
 ## 未来任务
 
 ### V3 — HNSW 单图 + search_vector（暂缓）
