@@ -396,6 +396,53 @@ ctest **206/206 全部通过**（含此前一贯失败的 10 个 Jieba 测试，
 
 ---
 
+### S10 — 分词 / BM25 / 倒排第二轮优化（代码审查产出，2026-06-02）
+
+**背景**：S9 那轮已修掉大部分问题；本轮针对 `inverted.cpp` / `inverted.hpp` / `analyzer.cpp`
+再做一次静态审查，下列均经实代码核实（给了 file:line），但未跑 benchmark/TSan 实证，
+故实现时**每项先验证再标 ✅**。按性价比排序。
+
+#### 🔴 正确性 / UB 类
+
+| # | 目标 | 改动范围 | 关键内容 | 优先级 | 状态 |
+|---|------|---------|---------|--------|------|
+| **S10.1** | 统计字段读路径无锁 data race（UB） | `inverted.hpp/.cpp` | `search()`（`inverted.cpp:156-158`）裸读 `live_doc_count_`/`sum_doc_len_`，而 `add_doc`(:104)/`remove_doc`(:115) 在 `unique_lock(stats_mutex_)` 下写 → 并发查询+写=数据竞争 UB（`explain`/`search_wand`/`search_phrase_impl`/`bool_search`/fuzzy/wildcard 全部裸读）。修法：两字段改 `std::atomic<std::uint64_t>`，去掉 `stats_mutex_`，既消 race 又免锁。`avg_doc_len()` 等访问器一并简化。✅ 改 `std::atomic<std::uint64_t>` + `fetch_add`/`fetch_sub`/`load(relaxed)`，删掉 `stats_mutex_` 及全部 shared_lock/unique_lock；ctest 307/307。TSan 单独核实：`search()` 的 `parallel_reduce` 路径有一处**预存** TSan 报告（baseline stash 后同样 4 warning，与本项无关，疑似 TSan 看不见 TBB 调度器 happens-before 的误报） | 🔴 高 | ✅ |
+| **S10.2** | fuzzy 同一词被重复计分 | `inverted.cpp` `fuzzy_test.cpp` | `search_fuzzy`(:904-912) 外层 `for query_term` 内层扫全词表，多个 query term 模糊命中同一 vocab term 时被 `push_back` 两次 → 同一 posting list 在 `parallel_reduce` 评分两遍、IDF 贡献翻倍。修法：翻转循环（vocab term 外层、query term 内层 + break），每 term 至多入 tps 一次。新增回归测试 `NoDoubleCountWhenTwoQueryTermsMatchSameTerm`（`{"helo"}` 与 `{"helo","hallo"}` 同命中 "hello"，分数 EXPECT_NEAR 一致）。✅ fuzzy 15/15 + ctest 307/307 | 🔴 高 | ✅ |
+
+#### 🟡 性能（高收益）
+
+| # | 目标 | 改动范围 | 关键内容 | 优先级 | 状态 |
+|---|------|---------|---------|--------|------|
+| **S10.3** | fuzzy 长度剪枝 + 可选并行扫描 | `inverted.cpp` | `search_fuzzy`(:904) 对全词表每 term 跑 O(n·m) levenshtein DP。最廉价剪枝：`abs(len(query)-len(term)) > max_edit` 时距离必 > max_edit，直接 skip（编辑距离 ≥ 长度差），省掉绝大多数 DP。可选：用 `tbb::parallel_for` 并行扫 shards（当前词匹配阶段串行，仅评分并行）。✅ 与 S10.2 同一循环重写中加入 `len_diff > max_edit_distance → continue` 前置剪枝（按字节长度）；并行扫描留待后续。fuzzy 15/15 + ctest 307/307 | 🟡 中 | ✅ |
+| **S10.4** | wildcard 全词表扫描优化 | `inverted.cpp` | `search_wildcard`(:602) 串行扫全词表跑 `wildcard_match`。带字面前缀的 pattern 本可收窄，但 hash 分片无前缀局部性 → 至少先并行扫 shards | 🟡 中 | ✅ |
+| | | | **实现**：词匹配阶段改 `tbb::parallel_reduce` over `[0,kShardCount)`，每 shard 至多被一个任务遍历（互不重叠），线程本地收集 + 合并；与既有「查询无锁读」模型一致（拷贝 plist 不持桶锁，同 search() 的 parallel_reduce 安全姿态）。前缀收窄因 hash 分片无局部性未做。新增回归 `ParallelScanCollectsAllMatches`（200 匹配词散布 64 shard + 50 干扰词 → 全收齐、无重、ord 连续）。✅ wildcard 18/18 + ctest 309/309 + eunit 38/38 | | |
+| **S10.5** | WAND 每轮对含 vector 的结构体整体 sort | `inverted.cpp` | `search_wand`(:349) 每个 pivot 迭代 `std::sort(tps...)`，而 `TermPostings` 含 `pl_copy`(items/compressed_ords/blocks) + `ords` 四个 vector，按值 swap 在搬这些 vector，远超 O(t log t) 比较本身。修法：排序 `vector<int>` 索引/指针，`tps` 本体不动 | 🟡 中 | ✅ |
+| | | | **实现**：引入 `std::vector<std::size_t> order`（0..n-1），每轮 `std::sort(order...)` 只搬 size_t；pivot 累加/skip 循环改走 `tps[order[i]]`，pivot_idx→pivot_pos（order 中位置）。**完整保留原比较器语义**（含「耗尽 term 排前面、由 continue 跳过」的细节）+ 评分/推进/耗尽检查等顺序无关循环不动。行为等价由 WAND 精确性对比测试（BlockMaxWand* + IncrementalBlocksOnLiveIndex 的 `EXPECT_FLOAT_EQ`）保证。✅ inverted 50/50 + ctest 308/308 + eunit 38/38 | | |
+| **S10.6** | 增量写从不 finalize → WAND 块跳跃失效 | `inverted.cpp` `search_layer.cpp` | `finalize()` 只在 rebuild(`search_layer.cpp:541`) 调用，正常 `on_write→add_doc` 后 `finalized=false`/`blocks` 空 → `block_for_ord`(:38) 对在线索引恒返回 nullptr，WAND 退化无跳跃 DAAT；每查询 `decompress_ords` 走未压缩分支重拷一遍。修法：达阈值的 posting list 惰性/后台 finalize，或 add_doc 累积增量 finalize | 🟡 中 | ✅ |
+| | | | **实现**：`PostingList::seal_full_blocks()`（攒满 kBlockSize 即封一整块，O(1) 摊还，靠 ord 单调递增）+ `note_appended()`（add_doc 每追加一条调用：失效过期压缩态、弹掉 finalize 留的部分尾块、再封满块）。不变量：增量阶段 blocks 仅含满块，部分尾块只由 finalize 产生；`finalize()` 加 `blocks.clear()` 保证幂等覆盖。在线索引（未 finalize）现 `block_for_ord` 返回非空 → WAND 真正块跳跃。`decompress_ords` 在 finalized=false 时退回 items 源，正确。**取舍**：`save_snapshot` 不 finalize（const），存盘仍丢 blocks（预存行为，load 后需重 finalize 才有块）。新增回归 `IncrementalBlocksOnLiveIndex`（在线 blocks 非空+全满块 / 与 finalize 后结果 EXPECT_FLOAT_EQ 一致 / finalize 后块数=ceil）。✅ inverted 50/50 + ctest 308/308 + eunit 38/38 | | |
+
+#### 🟢 性能（中低，顺手）
+
+| # | 目标 | 改动范围 | 关键内容 | 优先级 | 状态 |
+|---|------|---------|---------|--------|------|
+| **S10.7** | 每 posting 两次 is_live 虚调用 | `inverted.cpp` | `search`(:173-184)/`search_wildcard`(:626)/`search_fuzzy`(:930)：先一遍算 live_df 再一遍评分，`is_live`（虚函数+表查）调两次。合成单遍或先填 `vector<char> live` | 🟢 低 | ✅ |
+| | | | **实现**：三处 `parallel_reduce` 体先填 `std::vector<char> live`（一遍 `is_live` 算 live_df 顺带缓存），评分循环改判 `live[i]`，每 posting 省一次虚调用。✅ inverted 50/50 + wildcard 17/17 + fuzzy 15/15 + ctest 308/308 | | |
+| **S10.8** | WAND doc_len(pivot_ord) 内层重复取 | `inverted.cpp` | `search_wand`(:408) 同一 pivot_ord 的 `doc_len` 在遍历 term 的循环里每次重算，提到循环外取一次 | 🟢 低 | ✅ |
+| | | | **实现**：WAND 评分段 `auto dl = doc_len(pivot_ord)` 提到 term 循环外（dl 只依赖 pivot_ord）。✅ WAND 精确性对比测试通过 + ctest 308/308 | | |
+| **S10.9** | block_upper_bound 每次重扫 global_max_tf | `inverted.cpp/.hpp` | `block_upper_bound`(:56-61) 线性扫全 items 求最大 tf。可在 `finalize()` 时把全局 max_tf 存进 PostingList，查询直接读 | 🟢 低 | ✅ |
+| | | | **实现**：`PostingList` 加 `std::uint32_t max_tf`，增量维护（`note_appended` 追加时 `max(max_tf, items.back().tf)`）+ `load` 后重算（落盘格式不含此派生量）；`block_upper_bound` 直接读缓存。pl_copy 拷贝时字段随之复制。✅ WAND 精确剪枝结果不变（IncrementalBlocksOnLiveIndex 的 live vs finalized `EXPECT_FLOAT_EQ` 一致）+ ctest 308/308 | | |
+
+#### 📦 内存 / 规模化
+
+| # | 目标 | 改动范围 | 关键内容 | 优先级 | 状态 |
+|---|------|---------|---------|--------|------|
+| **S10.10** | positions 无条件常驻 | `inverted.hpp/.cpp` `search_layer` | `Posting`(:62-66) 恒带 `positions`，部署只用 search_text/从不 phrase/near 时纯开销。加 `SearchLayerConfig.index_positions` 开关，关闭时不存 positions（S9.4 已压磁盘侧，内存侧仍全量） | 🟢 低 | ✅ |
+| | | | **实现**：`InvertedIndex` 加 `index_positions_`（构造参数，默认 true 向后兼容）+ getter；`add_doc` 在 false 时 push 空 positions。`SearchLayerConfig.index_positions` 透传到 4 个 InvertedIndex 构造点（field_index + rebuild 三处）。save/load 无需改（positions.size()=0 即可）。**取舍**：关闭后 search_phrase/search_near 失效（无位置可匹配→返回空），仅适合纯 search_text/bool/fuzzy/wildcard 部署，已写入配置注释。新增回归 `IndexPositionsDisabled`（搜索正常+positions 空+短语空）/`IndexPositionsEnabledByDefault`（默认存 positions+短语命中）。✅ inverted 52/52 + ctest 311/311 + eunit 38/38 | | |
+| **S10.11** | remove 不删 posting，churn 下无界膨胀 | `inverted.cpp` | `remove_doc`(:112) 只减统计不删 posting 行（文档化 df-drift 取舍），高频改写库里死 ord 永留、每查询 live_df+评分都扫过。可加「死点占比超阈值触发该 list 压实」机制 | 🟢 低 | ✅ |
+| | | | **实现**：`PostingList::compact(is_live)`（重建只留 live，重置 compressed_ords/finalized/blocks/max_tf + seal_full_blocks，保序）+ `InvertedIndex::compact(LiveChecker, threshold=0.5)`（快照 key→逐 key 持写 accessor，死点占比≥阈值才压实，与查询 const_accessor 互斥，返回压实数）+ `SearchLayer::compact(threshold)`（用 index_ 作 LiveChecker 压实各字段+失效缓存）。**关键性质**：分数无关（live_df/idf/avgdl 都只数 live，压实只是不再扫死点）；非查询热路径。`remove_doc` 拿不到 ord（只调统计），故压实必须靠外部 LiveChecker 显式触发，而非 remove 内联。**WAL 取舍**：压实是内存操作不写 WAL，replay 会重新累积（靠 save_snapshot 持久化压实态）。新增回归 `CompactRemovesDeadPostingsPreservesScores`（50%死→压实后 df 减半、结果集+分数 EXPECT_FLOAT_EQ 一致）/`CompactSkipsBelowThreshold`（1%死不动）。✅ inverted 54/54 + ctest 313/313 + eunit 38/38 | | |
+
+---
+
 ## 未来任务
 
 ### V3 — HNSW 单图 + search_vector（暂缓）
