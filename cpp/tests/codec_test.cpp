@@ -193,14 +193,14 @@ TEST(DocValue, GoldenHex) {
 
     std::vector<std::byte> out;
     codec::encode_doc_value(out, parts);
-    // 01           ver
+    // 03           ver = 3（varint 长度 + fieldId）
     // 03           flags = has_vector|has_text
-    // 00000002     dim = 2
+    // 82           dim = 2（varint：末字节高位=终止标记，2|0x80=0x82）
     // 0000803f     1.0f little-endian
     // 00000040     2.0f little-endian
-    // 00000002     text len = 2
+    // 82           text len = 2（varint）
     // 6869         "hi"
-    EXPECT_EQ(bytes_to_hex(out), "0103000000020000803f00000040000000026869");
+    EXPECT_EQ(bytes_to_hex(out), "0303820000803f00000040826869");
 }
 
 TEST(DocValue, RoundTripAllSections) {
@@ -283,65 +283,81 @@ TEST(DocValue, DetectsTruncation) {
 
 // --- S8.6: DocValue v2 多字段段 ---
 
-// 空 fields 仍写 v1（向后兼容核心）。
-TEST(DocValue, EmptyFieldsStaysV1) {
+// 空 fields → 不设 has_fields 标记（v3 不再有 v1/v2 区分）。
+TEST(DocValue, EmptyFieldsNoFlag) {
     codec::DocValueParts parts;
     parts.text = as_bytes("hello");
     // fields 默认空
     std::vector<std::byte> out;
     codec::encode_doc_value(out, parts);
-    EXPECT_EQ(static_cast<std::uint8_t>(out[0]), kDocValueVersion);  // Ver=1
+    EXPECT_EQ(static_cast<std::uint8_t>(out[0]), kDocValueVersion);  // Ver=3
     auto v = codec::decode_doc_value(out);
     ASSERT_TRUE(v.has_value());
     EXPECT_FALSE(v->has_fields);
 }
 
-// text + 多字段 round-trip：升 v2，字段名/值正确、顺序保持。
+// text + 多字段 round-trip（#1）：fields 存 id，值正确、顺序保持。
 TEST(DocValue, MultiFieldRoundTrip) {
     const std::string text = "default text";
-    const std::string n1 = "title", v1s = "BM25 ranking";
-    const std::string n2 = "body",  v2s = "正文内容";
+    const std::string v1s = "BM25 ranking";
+    const std::string v2s = "正文内容";
     codec::DocValueParts parts;
     parts.text = as_bytes(text);
-    parts.fields.push_back({as_bytes(n1), as_bytes(v1s)});
-    parts.fields.push_back({as_bytes(n2), as_bytes(v2s)});
+    parts.fields.push_back({7, as_bytes(v1s)});   // id=7
+    parts.fields.push_back({42, as_bytes(v2s)});  // id=42
 
     std::vector<std::byte> out;
     codec::encode_doc_value(out, parts);
 
     auto v = codec::decode_doc_value(out);
     ASSERT_TRUE(v.has_value());
-    EXPECT_EQ(v->ver, kDocValueVersionFields);  // Ver=2
+    EXPECT_EQ(v->ver, kDocValueVersion);  // Ver=3
     ASSERT_TRUE(v->has_text);
     ASSERT_TRUE(v->has_fields);
     ASSERT_EQ(v->fields.size(), 2u);
     auto span_eq = [](std::span<const std::byte> s, const std::string& str) {
         return s.size() == str.size() && std::memcmp(s.data(), str.data(), str.size()) == 0;
     };
-    EXPECT_TRUE(span_eq(v->fields[0].name, n1));
+    EXPECT_EQ(v->fields[0].id, 7u);
     EXPECT_TRUE(span_eq(v->fields[0].value, v1s));
-    EXPECT_TRUE(span_eq(v->fields[1].name, n2));
+    EXPECT_EQ(v->fields[1].id, 42u);
     EXPECT_TRUE(span_eq(v->fields[1].value, v2s));
 }
 
 // 仅 fields、无 text。
 TEST(DocValue, FieldsOnly) {
-    const std::string n = "title", val = "hi";
+    const std::string val = "hi";
     codec::DocValueParts parts;
-    parts.fields.push_back({as_bytes(n), as_bytes(val)});
+    parts.fields.push_back({3, as_bytes(val)});
     std::vector<std::byte> out;
     codec::encode_doc_value(out, parts);
     auto v = codec::decode_doc_value(out);
     ASSERT_TRUE(v.has_value());
     EXPECT_FALSE(v->has_text);
     ASSERT_EQ(v->fields.size(), 1u);
+    EXPECT_EQ(v->fields[0].id, 3u);
+}
+
+// 大 field id 走多字节 varint，round-trip 正确。
+TEST(DocValue, FieldIdMultibyteVarint) {
+    const std::string val = "x";
+    codec::DocValueParts parts;
+    parts.fields.push_back({300, as_bytes(val)});     // 300 → 2 字节 varint
+    parts.fields.push_back({1000000, as_bytes(val)}); // 大 id
+    std::vector<std::byte> out;
+    codec::encode_doc_value(out, parts);
+    auto v = codec::decode_doc_value(out);
+    ASSERT_TRUE(v.has_value());
+    ASSERT_EQ(v->fields.size(), 2u);
+    EXPECT_EQ(v->fields[0].id, 300u);
+    EXPECT_EQ(v->fields[1].id, 1000000u);
 }
 
 // fields 段被截断 → kBufferTooShort，不崩。
 TEST(DocValue, DetectsFieldsTruncation) {
-    const std::string n = "title", val = "some value here";
+    const std::string val = "some value here";
     codec::DocValueParts parts;
-    parts.fields.push_back({as_bytes(n), as_bytes(val)});
+    parts.fields.push_back({1, as_bytes(val)});
     std::vector<std::byte> out;
     codec::encode_doc_value(out, parts);
     out.resize(out.size() - 3);  // 砍进字段 value

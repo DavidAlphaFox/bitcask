@@ -646,4 +646,55 @@ TEST_F(CaskUpgradeTest, UpgradePreservesDeletes) {
     (*upg)->close();
 }
 
+// --- #1: FieldSchema 注册表 ---
+
+// intern 确定性：同名同 id、新名递增；name_of 反查。
+TEST(FieldSchema, InternDeterministicAndReverseLookup) {
+    namespace fs = std::filesystem;
+    auto path = (fs::temp_directory_path() / "bitcask_fieldschema_a.schema").string();
+    fs::remove(path);
+
+    bitcask::FieldSchema s;
+    ASSERT_TRUE(s.open(path));
+
+    auto title = s.intern("title");
+    auto body  = s.intern("body");
+    EXPECT_EQ(title, 0u);
+    EXPECT_EQ(body, 1u);
+    EXPECT_EQ(s.intern("title"), title);  // 幂等
+    EXPECT_EQ(s.intern("body"), body);
+    EXPECT_EQ(s.size(), 2u);
+
+    EXPECT_EQ(s.name_of(0u), std::optional<std::string>("title"));
+    EXPECT_EQ(s.name_of(1u), std::optional<std::string>("body"));
+    EXPECT_EQ(s.name_of(99u), std::nullopt);
+
+    fs::remove(path);
+}
+
+// 持久化：重开后 name↔id 映射不变（append-only 重放）。
+TEST(FieldSchema, PersistsAcrossReopen) {
+    namespace fs = std::filesystem;
+    auto path = (fs::temp_directory_path() / "bitcask_fieldschema_b.schema").string();
+    fs::remove(path);
+
+    {
+        bitcask::FieldSchema s;
+        ASSERT_TRUE(s.open(path));
+        EXPECT_EQ(s.intern("alpha"), 0u);
+        EXPECT_EQ(s.intern("beta"), 1u);
+        EXPECT_EQ(s.intern("gamma"), 2u);
+    }
+    {
+        bitcask::FieldSchema s2;
+        ASSERT_TRUE(s2.open(path));
+        EXPECT_EQ(s2.size(), 3u);
+        EXPECT_EQ(s2.intern("alpha"), 0u);   // 旧名字 id 不变
+        EXPECT_EQ(s2.intern("beta"), 1u);
+        EXPECT_EQ(s2.intern("delta"), 3u);   // 新名字接着分配
+        EXPECT_EQ(s2.name_of(2u), std::optional<std::string>("gamma"));
+    }
+    fs::remove(path);
+}
+
 }  // namespace
