@@ -709,6 +709,34 @@ BoolMustHot/100k 5977us → **~5460us（-8%）**；PhraseHotTerm/100k
 （bitcask_cpp 无改动时仍是 no-op）。eunit 验证 BEAM 正常加载 LTO 的
 NIF .so（44/44）；ctest 322/322。
 
+### P2 — 查询路径 SIMD / 位并行优化（已评审，待实施）
+
+> 评审结论（2026-06）：反汇编 LTO 后最终二进制，BM25 评分循环 packed float
+> 指令数为 **0**——`-O3` 自动向量化被循环体内逐 posting 的 `is_live()`/
+> `doc_len()` 虚调用结构性阻断。P1 后评分数据已是扁平 SoA 数组
+> （fp.ords/fp.tfs），向量化条件具备，前置是去虚调用。
+> ISA 现状：未设 -march，基线 x86-64（SSE2）；分发策略建议 GCC
+> `target_clones` 函数多版本（零部署风险），仅在不够时上 intrinsics +
+> 运行时 dispatch。所有基准对比必须在对齐构建（B1）下做。
+
+| # | 目标 | 改动范围 | 关键内容 | 状态 |
+|---|------|---------|---------|------|
+| **P2.1** | LiveChecker 批量/位图接口（最高优先） | `inverted.hpp` / `index.cpp` / `search_layer.cpp` | 加 `fill_doc_lens(span<const uint64_t>, span<uint32_t>)` 与 live 位图视图，评分循环虚调用提出循环外；预期仅去虚调用 + 自动向量化即拿走大部分收益，先测再决定是否手写 SIMD | ⬜ |
+| **P2.2** | bool_search 求交 SIMD 化 | `inverted.cpp` | 排序数组交集换 SIMD galloping / shuffle-based（Lemire 系方案）；评估 ord 窄化 uint64→uint32（文档数 <2^32）收益翻倍 | ⬜ |
+| **P2.3** | fuzzy 换 Myers 位并行 | `inverted.cpp` 新 `myers.hpp` | O(n·m) 标量 DP → O(n·⌈m/64⌉) 位并行，原理与适配要点见 `doc/myers-bitparallel-zh.md`；k-bounded 提前终止；保留 S10.3 长度差剪枝；黄金语义对拍现 levenshtein | ⬜ |
+| **P2.4** | live 位图化（与 P2.1 联动） | `index.hpp/.cpp` | `live_` 已是 vector<bool>（注释留有 Roaring 待办）；LiveChecker 直接暴露位图，live 预扫从 10 万次虚调用变位图字节操作 | ⬜ |
+| **P2.5** | 文本侧（索引路径，独立可做） | `text_utils` / `analyzer.cpp` / wildcard | UTF-8 解码/to_codepoints 评估换 simdutf；wildcard_match 加最长字面量 `string_view::find` 预过滤（glibc memchr 已 SIMD） | ⬜ |
+| **P2.6** | 基准扩充 | `inverted_bench.cpp` | 加 fuzzy 热词基准；各项 before/after 进对齐构建 | ⬜ |
+
+**评审后明确不做**：snapshot_flat 的 SIMD AoS→SoA（内存带宽主导，且完整
+Phase 2 零拷贝会让它整体消失）；phrase 位置匹配 SIMD（分支/二分主导，
+收益边缘）；CRC32 加速（系统 zlib 1.3.1 braiding 标量已数 GB/s，KV 路径
+够用；换 zlib-ng/crc32c 涉及依赖与格式，不值）。
+
+**诚实预期**：P2.1 后标量 search 路径的 `local[ord] += score`（hash map
+scatter）不可向量化，可能成为新瓶颈——profile 后再决定是否改两阶段累加；
+WAND 路径无此问题。建议顺序：P2.1 → 基准 → P2.2 → P2.3。
+
 ### V3 — HNSW 单图 + search_vector（暂缓）
 
 ### V4 — 单域 merge
