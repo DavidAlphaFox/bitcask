@@ -231,33 +231,38 @@ auto InvertedIndex::search(
         [&](const tbb::blocked_range<std::size_t>& range, ScoreMap local) {
             for (std::size_t ti = range.begin(); ti < range.end(); ++ti) {
                 auto& fp = tps[ti].fp;
+                const std::size_t n = fp.size();
 
-                // 计算该词的 live df。S10.7：一遍 is_live 缓存到 live[]，
-                // 评分循环复用，避免每 posting 第二次虚调用 is_live。
-                // P1：在扁平快照（连续数组）上评分，cache 友好。
-                std::vector<char> live(fp.size());
+                // P2.1：live/doc_len 批量取——一次虚调用（Index 侧一次锁）完成
+                // 整列，评分浮点循环不再含虚调用，编译器可自动向量化。
+                std::vector<char> live(n);
+                live_checker.fill_is_live(fp.ords, live);
                 std::size_t live_df = 0;
-                for (std::size_t i = 0; i < fp.size(); ++i) {
-                    live[i] = static_cast<char>(live_checker.is_live(fp.ords[i]));
-                    if (live[i]) ++live_df;
+                for (std::size_t i = 0; i < n; ++i) {
+                    live_df += static_cast<std::size_t>(live[i]);
                 }
                 if (live_df == 0) continue;
 
                 auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
 
-                // 逐 posting 累加 BM25 分数到线程本地 map。
-                for (std::size_t i = 0; i < fp.size(); ++i) {
-                    if (!live[i]) continue;
-                    auto tf  = fp.tfs[i];
-                    auto ord = fp.ords[i];
+                std::vector<std::uint32_t> dls(n);
+                live_checker.fill_doc_lens(fp.ords, dls);
 
-                    auto dl = live_checker.doc_len(ord);
-                    auto tf_norm = static_cast<float>(tf) *
+                // 两阶段评分：① 纯数组浮点（可向量化；死点也算、结果不用，
+                // 保持无分支），公式与原逐 posting 版逐运算一致（分数位级不变）；
+                // ② 标量 scatter 进线程本地 map（hash 写无法向量化）。
+                std::vector<float> contrib(n);
+                const float fidf = static_cast<float>(idf);
+                for (std::size_t i = 0; i < n; ++i) {
+                    auto tf_norm = static_cast<float>(fp.tfs[i]) *
                                    (params.k1 + 1.0F) /
-                                   (static_cast<float>(tf) + params.k1 *
+                                   (static_cast<float>(fp.tfs[i]) + params.k1 *
                                     (1.0F - params.b + params.b *
-                                     static_cast<float>(dl) / static_cast<float>(avgdl)));
-                    local[ord] += static_cast<float>(idf) * (tf_norm + params.delta);
+                                     static_cast<float>(dls[i]) / static_cast<float>(avgdl)));
+                    contrib[i] = fidf * (tf_norm + params.delta);
+                }
+                for (std::size_t i = 0; i < n; ++i) {
+                    if (live[i]) local[fp.ords[i]] += contrib[i];
                 }
             }
             return local;
@@ -366,6 +371,8 @@ auto InvertedIndex::search_wand(
     struct TermPostings {
         std::string term;
         FlatPostings fp;   // P1：扁平快照，ords/tfs 兼任 DAAT 游标数组
+        std::vector<char> live;          // P2.1：与 ords 平行，批量取一次
+        std::vector<std::uint32_t> dls;  // P2.1：同上（DAAT 每 pivot 免锁免虚调用）
         std::size_t cursor = 0;
         float idf = 0.0f;
         float list_upper_bound = 0.0f;
@@ -390,10 +397,16 @@ auto InvertedIndex::search_wand(
     auto avgdl = N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
 
     // 计算每个 term 的 IDF 和上界分数。
+    // P2.1：live/doc_len 批量取一次（Index 侧各一次锁）存进 tp——
+    // DAAT 循环每 pivot 的 is_live/doc_len 改读数组，全程零虚调用零锁。
     for (auto& tp : tps) {
+        tp.live.resize(tp.fp.size());
+        live_checker.fill_is_live(tp.fp.ords, tp.live);
+        tp.dls.resize(tp.fp.size());
+        live_checker.fill_doc_lens(tp.fp.ords, tp.dls);
         std::size_t live_df = 0;
-        for (std::size_t i = 0; i < tp.fp.size(); ++i) {
-            if (live_checker.is_live(tp.fp.ords[i])) ++live_df;
+        for (std::size_t i = 0; i < tp.live.size(); ++i) {
+            live_df += static_cast<std::size_t>(tp.live[i]);
         }
         if (live_df == 0) {
             tp.idf = 0.0f;
@@ -477,10 +490,12 @@ auto InvertedIndex::search_wand(
         if (any_skipped) continue;
 
         // 所有 term 在 pivot_ord 处都值得关注，计算实际分数。
-        if (live_checker.is_live(pivot_ord)) {
+        // P2.1：live/dl 读 pivot term 的批量数组（任意在 pivot_ord 处的 term
+        // 给出同一 ord 的同一答案，取 pivot_tp 自己游标位置的即可）。
+        if (pivot_tp.live[pivot_tp.cursor]) {
             float score = 0.0f;
             // S10.8：dl 只依赖 pivot_ord，提到 term 循环外取一次（原先每个匹配 term 重取）。
-            auto dl = live_checker.doc_len(pivot_ord);
+            auto dl = pivot_tp.dls[pivot_tp.cursor];
             for (std::size_t i = 0; i < tps.size(); ++i) {
                 if (tps[i].cursor >= tps[i].fp.ords.size()) continue;
                 if (tps[i].fp.ords[tps[i].cursor] != pivot_ord) continue;
@@ -576,17 +591,23 @@ auto InvertedIndex::search_phrase_impl(
 
     // live_df 只依赖 first term 的 posting list（与具体候选 doc 无关），
     // 提到循环外算一次，避免每个匹配 doc 重算 O(D)（S9.7）。
-    // O3：ord 直接读 items[].ord，免物化 ords 数组。
-    std::size_t live_df = 0;
+    // P2.1：first term 的 live 批量取一次（Index 侧一次锁），主循环复用。
+    std::vector<std::uint64_t> first_ords(first_pl.items.size());
     for (std::size_t j = 0; j < first_pl.items.size(); ++j) {
-        if (live_checker.is_live(first_pl.items[j].ord)) ++live_df;
+        first_ords[j] = first_pl.items[j].ord;
+    }
+    std::vector<char> first_live(first_ords.size());
+    live_checker.fill_is_live(first_ords, first_live);
+    std::size_t live_df = 0;
+    for (std::size_t j = 0; j < first_live.size(); ++j) {
+        live_df += static_cast<std::size_t>(first_live[j]);
     }
     auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
 
     for (std::size_t i = 0; i < first_pl.items.size(); ++i) {
         auto& posting = first_pl.items[i];
         auto posting_ord = posting.ord;
-        if (!live_checker.is_live(posting_ord)) continue;
+        if (!first_live[i]) continue;
 
         // 把「在其余 term 的 posting list 里定位本 doc」提到 start_pos 循环外：
         // idx 对固定 (doc, term) 不变，原先每个 start_pos 都重查一次 O(log D)（S9.7）。
@@ -730,31 +751,35 @@ auto InvertedIndex::search_wildcard(
         [&](const tbb::blocked_range<std::size_t>& range, ScoreMap local) {
             for (std::size_t ti = range.begin(); ti < range.end(); ++ti) {
                 auto& fp = tps[ti].fp;
+                const std::size_t n = fp.size();
 
-                // S10.7：一遍 is_live 缓存到 live[]，评分循环复用，避免每 posting 二次虚调用。
-                // P1：在扁平快照（连续数组）上评分。
-                std::vector<char> live(fp.size());
+                // P2.1：批量取 live/doc_len + 两阶段评分（同 search()，
+                // ①纯浮点可向量化 ②标量 scatter；公式逐运算一致）。
+                std::vector<char> live(n);
+                live_checker.fill_is_live(fp.ords, live);
                 std::size_t live_df = 0;
-                for (std::size_t i = 0; i < fp.size(); ++i) {
-                    live[i] = static_cast<char>(live_checker.is_live(fp.ords[i]));
-                    if (live[i]) ++live_df;
+                for (std::size_t i = 0; i < n; ++i) {
+                    live_df += static_cast<std::size_t>(live[i]);
                 }
                 if (live_df == 0) continue;
 
                 auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
 
-                for (std::size_t i = 0; i < fp.size(); ++i) {
-                    if (!live[i]) continue;
-                    auto tf  = fp.tfs[i];
-                    auto ord = fp.ords[i];
+                std::vector<std::uint32_t> dls(n);
+                live_checker.fill_doc_lens(fp.ords, dls);
 
-                    auto dl = live_checker.doc_len(ord);
-                    auto tf_norm = static_cast<float>(tf) *
+                std::vector<float> contrib(n);
+                const float fidf = static_cast<float>(idf);
+                for (std::size_t i = 0; i < n; ++i) {
+                    auto tf_norm = static_cast<float>(fp.tfs[i]) *
                                    (params.k1 + 1.0F) /
-                                   (static_cast<float>(tf) + params.k1 *
+                                   (static_cast<float>(fp.tfs[i]) + params.k1 *
                                     (1.0F - params.b + params.b *
-                                     static_cast<float>(dl) / static_cast<float>(avgdl)));
-                    local[ord] += static_cast<float>(idf) * (tf_norm + params.delta);
+                                     static_cast<float>(dls[i]) / static_cast<float>(avgdl)));
+                    contrib[i] = fidf * (tf_norm + params.delta);
+                }
+                for (std::size_t i = 0; i < n; ++i) {
+                    if (live[i]) local[fp.ords[i]] += contrib[i];
                 }
             }
             return local;
@@ -805,6 +830,7 @@ auto InvertedIndex::bool_search(
         std::string term;
         FlatPostings fp;  // P1：扁平快照（S9.6 的 ords 缓存由 fp.ords 取代）
         bool is_must;
+        std::vector<char> live;  // P2.1：live 批量取一次，5 个使用阶段复用
     };
     // 收集一个 term 的 posting 到 dst（accessor 下拷扁平快照）。
     auto collect = [&](const std::string& term, bool is_must,
@@ -832,10 +858,22 @@ auto InvertedIndex::bool_search(
     must_not_tps.reserve(must_not_terms.size());
     for (auto& term : must_not_terms) collect(term, false, must_not_tps);
 
+    // P2.1：每个 term 的 live 批量取一次（此前 must_not/交集/should/idf/评分
+    // 五个阶段各自逐 posting 重扫 is_live——既重复又每次一锁）。
+    auto fill_live = [&](std::vector<TermPostings>& v) {
+        for (auto& tp : v) {
+            tp.live.resize(tp.fp.size());
+            live_checker.fill_is_live(tp.fp.ords, tp.live);
+        }
+    };
+    fill_live(must_tps);
+    fill_live(should_tps);
+    fill_live(must_not_tps);
+
     std::vector<std::uint64_t> must_not_ords;
     for (auto& tp : must_not_tps) {
         for (std::size_t i = 0; i < tp.fp.size(); ++i) {
-            if (live_checker.is_live(tp.fp.ords[i])) {
+            if (tp.live[i]) {
                 must_not_ords.push_back(tp.fp.ords[i]);
             }
         }
@@ -879,7 +917,7 @@ auto InvertedIndex::bool_search(
             if (!first_must && intersection.empty()) break;
             std::vector<std::uint64_t> ords;
             for (std::size_t i = 0; i < tp.fp.size(); ++i) {
-                if (live_checker.is_live(tp.fp.ords[i])) {
+                if (tp.live[i]) {
                     ords.push_back(tp.fp.ords[i]);
                 }
             }
@@ -902,7 +940,7 @@ auto InvertedIndex::bool_search(
     } else if (!should_tps.empty()) {
         for (auto& tp : should_tps) {
             for (std::size_t i = 0; i < tp.fp.size(); ++i) {
-                if (live_checker.is_live(tp.fp.ords[i])) {
+                if (tp.live[i]) {
                     candidates.push_back(tp.fp.ords[i]);
                 }
             }
@@ -947,7 +985,7 @@ auto InvertedIndex::bool_search(
     for (auto& tp : all_tps) {
         std::size_t live_df = 0;
         for (std::size_t i = 0; i < tp.fp.size(); ++i) {
-            if (live_checker.is_live(tp.fp.ords[i])) ++live_df;
+            live_df += static_cast<std::size_t>(tp.live[i]);
         }
         if (live_df == 0) continue;
         auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) /
@@ -971,7 +1009,7 @@ auto InvertedIndex::bool_search(
 
         for (std::size_t i = 0; i < tp.fp.size(); ++i) {
             auto posting_ord = tp.fp.ords[i];
-            if (!live_checker.is_live(posting_ord)) continue;
+            if (!tp.live[i]) continue;
             auto it = acc.scores.find(posting_ord);
             if (it == acc.scores.end()) continue;
 
@@ -1072,31 +1110,35 @@ auto InvertedIndex::search_fuzzy(
         [&](const tbb::blocked_range<std::size_t>& range, ScoreMap local) {
             for (std::size_t ti = range.begin(); ti < range.end(); ++ti) {
                 auto& fp = tps[ti].fp;
+                const std::size_t n = fp.size();
 
-                // S10.7：一遍 is_live 缓存到 live[]，评分循环复用，避免每 posting 二次虚调用。
-                // P1：在扁平快照（连续数组）上评分。
-                std::vector<char> live(fp.size());
+                // P2.1：批量取 live/doc_len + 两阶段评分（同 search()，
+                // ①纯浮点可向量化 ②标量 scatter；公式逐运算一致）。
+                std::vector<char> live(n);
+                live_checker.fill_is_live(fp.ords, live);
                 std::size_t live_df = 0;
-                for (std::size_t i = 0; i < fp.size(); ++i) {
-                    live[i] = static_cast<char>(live_checker.is_live(fp.ords[i]));
-                    if (live[i]) ++live_df;
+                for (std::size_t i = 0; i < n; ++i) {
+                    live_df += static_cast<std::size_t>(live[i]);
                 }
                 if (live_df == 0) continue;
 
                 auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
 
-                for (std::size_t i = 0; i < fp.size(); ++i) {
-                    if (!live[i]) continue;
-                    auto tf  = fp.tfs[i];
-                    auto ord = fp.ords[i];
+                std::vector<std::uint32_t> dls(n);
+                live_checker.fill_doc_lens(fp.ords, dls);
 
-                    auto dl = live_checker.doc_len(ord);
-                    auto tf_norm = static_cast<float>(tf) *
+                std::vector<float> contrib(n);
+                const float fidf = static_cast<float>(idf);
+                for (std::size_t i = 0; i < n; ++i) {
+                    auto tf_norm = static_cast<float>(fp.tfs[i]) *
                                    (params.k1 + 1.0F) /
-                                   (static_cast<float>(tf) + params.k1 *
+                                   (static_cast<float>(fp.tfs[i]) + params.k1 *
                                     (1.0F - params.b + params.b *
-                                     static_cast<float>(dl) / static_cast<float>(avgdl)));
-                    local[ord] += static_cast<float>(idf) * (tf_norm + params.delta);
+                                     static_cast<float>(dls[i]) / static_cast<float>(avgdl)));
+                    contrib[i] = fidf * (tf_norm + params.delta);
+                }
+                for (std::size_t i = 0; i < n; ++i) {
+                    if (live[i]) local[fp.ords[i]] += contrib[i];
                 }
             }
             return local;

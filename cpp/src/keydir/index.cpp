@@ -94,6 +94,24 @@ std::uint32_t Index::doc_len(std::uint64_t ord) const {
     return slots_[ord].doc_len;
 }
 
+void Index::fill_is_live(std::span<const std::uint64_t> ords,
+                         std::span<char> out) const {
+    std::shared_lock lk(mutex_);
+    const std::size_t bound = live_.size();
+    for (std::size_t i = 0; i < ords.size(); ++i) {
+        out[i] = static_cast<char>(ords[i] < bound && live_[ords[i]]);
+    }
+}
+
+void Index::fill_doc_lens(std::span<const std::uint64_t> ords,
+                          std::span<std::uint32_t> out) const {
+    std::shared_lock lk(mutex_);
+    const std::size_t bound = slots_.size();
+    for (std::size_t i = 0; i < ords.size(); ++i) {
+        out[i] = ords[i] < bound ? slots_[ords[i]].doc_len : 0;
+    }
+}
+
 IndexInfo Index::info() const {
     std::shared_lock lk(mutex_);
     return IndexInfo{

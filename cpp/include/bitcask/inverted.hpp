@@ -28,6 +28,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -248,6 +249,27 @@ public:
     virtual ~LiveChecker() = default;
     [[nodiscard]] virtual bool is_live(std::uint64_t ord) const = 0;
     [[nodiscard]] virtual std::uint32_t doc_len(std::uint64_t ord) const = 0;
+
+    // P2.1 批量接口。评分循环逐 posting 各调一次 is_live/doc_len 有两重代价：
+    // ① 虚调用阻断编译器对评分浮点循环的自动向量化（实测 LTO 后二进制
+    //    packed float 指令为 0）；
+    // ② Index 实现每次调用拿一次 shared_lock——10 万 posting 的热词一次
+    //    查询 = 约 20 万次锁操作。
+    // 批量版本一次虚调用 + （实现侧）一次锁完成整个数组。默认实现退化为
+    // 逐个调用，外部实现者无需改动；Index 覆写为持锁数组直读。
+    // 要求 out.size() == ords.size()。
+    virtual void fill_is_live(std::span<const std::uint64_t> ords,
+                              std::span<char> out) const {
+        for (std::size_t i = 0; i < ords.size(); ++i) {
+            out[i] = static_cast<char>(is_live(ords[i]));
+        }
+    }
+    virtual void fill_doc_lens(std::span<const std::uint64_t> ords,
+                               std::span<std::uint32_t> out) const {
+        for (std::size_t i = 0; i < ords.size(); ++i) {
+            out[i] = doc_len(ords[i]);
+        }
+    }
 };
 
 // 倒排索引。

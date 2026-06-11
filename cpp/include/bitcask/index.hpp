@@ -90,6 +90,14 @@ public:
     // LiveChecker::doc_len — 返回 ord 对应文档的 token 数，越界返回 0。
     [[nodiscard]] std::uint32_t doc_len(std::uint64_t ord) const override;
 
+    // P2.1 批量版本：一次 shared_lock 完成整个数组（逐 posting 版本每条
+    // posting 一次锁 + 一次虚调用，热词查询 = 数十万次锁操作且阻断评分
+    // 循环的自动向量化）。
+    void fill_is_live(std::span<const std::uint64_t> ords,
+                      std::span<char> out) const override;
+    void fill_doc_lens(std::span<const std::uint64_t> ords,
+                       std::span<std::uint32_t> out) const override;
+
     // ---- 内省 ----
     [[nodiscard]] IndexInfo info() const;
 
