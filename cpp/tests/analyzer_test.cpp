@@ -343,3 +343,93 @@ TEST(ToCodepoints, AsciiFastPathOffsets) {
     EXPECT_EQ(cps[2].byte_off, 4u);
     EXPECT_EQ(cps[2].byte_len, 1u);
 }
+
+// =========================================================================
+// P2.5b：CJK 恒等快路径
+// =========================================================================
+
+namespace {
+// UTF-8 编码单码点（测试辅助）。
+std::string encode_utf8(char32_t cp) {
+    std::string s;
+    if (cp < 0x80) {
+        s.push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+        s.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+        s.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+        s.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+        s.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        s.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else {
+        s.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+        s.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+        s.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        s.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+    return s;
+}
+
+// 旧实现等价的 utf8proc oracle（绕过快路径）。
+std::string nfkc_oracle(std::string_view input) {
+    if (input.empty()) return {};
+    std::string owned(input);
+    auto* out = utf8proc_NFKC_Casefold(
+        reinterpret_cast<const utf8proc_uint8_t*>(owned.c_str()));
+    if (out == nullptr) return {};
+    std::string r(reinterpret_cast<const char*>(out),
+                  std::strlen(reinterpret_cast<const char*>(out)));
+    std::free(out);
+    return r;
+}
+}  // namespace
+
+// 表成员穷举验证：nfkc_casefold_inert 标记的每个码点，经 utf8proc
+// NFKC_Casefold 后必须逐字节不变。表与 Unicode 数据不符即此测试红。
+TEST(NfkcInert, TableOracleExhaustive) {
+    using bitcask::text::detail::nfkc_casefold_inert;
+    std::size_t checked = 0;
+    for (char32_t cp = 0x80; cp <= 0xFFFF; ++cp) {
+        if (!nfkc_casefold_inert(cp)) continue;
+        auto u = encode_utf8(cp);
+        ASSERT_EQ(nfkc_oracle(u), u) << "cp=U+" << std::hex << static_cast<int>(cp);
+        ++checked;
+    }
+    EXPECT_GT(checked, 27000u);  // CJK 基本区+扩展 A+标点
+}
+
+// 黑盒对拍：从「表成员 ∪ 回退字符」混合字母表生成随机串，
+// nfkc_fold（含快路径）必须与 utf8proc oracle 逐串一致。
+TEST(NfkcInert, RandomizedAgainstOracle) {
+    using bitcask::text::detail::nfkc_fold;
+    const std::string alphabet[] = {
+        "中", "文", "搜", "索", "引", "擎",          // 快路径成员
+        "a", "B", "z", "9", " ", ",", ".",           // ASCII（含大写）
+        "、", "。", "《", "》", "—",                  // 恒等标点
+        "，", "！", "Ａ", "…", "é", "　",             // 回退触发（全角/分解/附标）
+    };
+    std::uint64_t seed = 23;
+    auto next = [&seed] {
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        return seed >> 33;
+    };
+    for (int iter = 0; iter < 3000; ++iter) {
+        std::string s;
+        auto n = next() % 24;
+        for (std::uint64_t i = 0; i < n; ++i) {
+            s += alphabet[next() % (sizeof(alphabet) / sizeof(alphabet[0]))];
+        }
+        ASSERT_EQ(nfkc_fold(s), nfkc_oracle(s)) << "s=" << s;
+    }
+}
+
+// 定向用例：目标语料形态命中快路径；全角标点正确回退折叠。
+TEST(NfkcInert, TargetedCases) {
+    using bitcask::text::detail::nfkc_fold;
+    EXPECT_EQ(nfkc_fold("北京GPU加速测试, 性能提升."),
+              "北京gpu加速测试, 性能提升.");
+    EXPECT_EQ(nfkc_fold("中文iPhone测试"), "中文iphone测试");
+    EXPECT_EQ(nfkc_fold("《标题》、正文。"), "《标题》、正文。");
+    EXPECT_EQ(nfkc_fold("全角，逗号"), "全角,逗号");      // 回退路径折叠
+    EXPECT_EQ(nfkc_fold("ＧＰＵ测试"), "gpu测试");        // 全角字母回退折叠
+}
