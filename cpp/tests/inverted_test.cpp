@@ -485,13 +485,10 @@ TEST(InvertedIndex, BoolSearchMust) {
     EXPECT_EQ(results[0].ord, 0u);
 }
 
-// review cleanup：覆盖 bool_search MUST 交集的 u64 回退路径。ord > 2^32 时
-// 窄化闸门（back() > 0xFFFFFFFF）拒绝转 u32 → 走 set_intersection 标量回退。
-// 此前该分支无测试（造不出 43 亿文档），靠大 ord 值即可强制进入——守住
-// 「u32 快路径 / u64 回退」骨架合并的正确性。
+// ord > 2^32 的 bool_search MUST 交集（intersect_u64 Inoue 原生 u64 SIMD 路径）。
 TEST(InvertedIndex, BoolSearchMustU64Fallback) {
     InvertedIndex idx;
-    const std::uint64_t base = 5'000'000'000ULL;  // > 2^32，强制 narrow_ok=false
+    const std::uint64_t base = 5'000'000'000ULL;
     idx.add_doc(base + 0, {{"hello", tp(1, {0})}, {"world", tp(1, {1})}});
     idx.add_doc(base + 1, {{"hello", tp(1, {0})}});
     idx.add_doc(base + 2, {{"world", tp(1, {0})}});
@@ -1156,44 +1153,44 @@ TEST(InvertedIndex, PhraseSearchConcurrentWithSingleWriter) {
 }
 
 // =========================================================================
-// P2.2：intersect_u32 三路实现（标量/galloping/AVX2）黑盒对拍
+// intersect_u64（Inoue 块过滤 + u64 AVX2 / galloping / 标量）黑盒对拍
 // =========================================================================
 
 #include "bitcask/intersect.hpp"
 
 namespace {
-std::vector<std::uint32_t> ref_intersect(const std::vector<std::uint32_t>& a,
-                                         const std::vector<std::uint32_t>& b) {
-    std::vector<std::uint32_t> r;
+std::vector<std::uint64_t> ref_intersect(const std::vector<std::uint64_t>& a,
+                                         const std::vector<std::uint64_t>& b) {
+    std::vector<std::uint64_t> r;
     std::set_intersection(a.begin(), a.end(), b.begin(), b.end(),
                           std::back_inserter(r));
     return r;
 }
-std::vector<std::uint32_t> make_sorted_unique(std::uint64_t& seed, std::size_t n,
-                                              std::uint32_t value_range) {
+std::vector<std::uint64_t> make_sorted_unique(std::uint64_t& seed, std::size_t n,
+                                              std::uint64_t value_range,
+                                              std::uint64_t base = 0) {
     auto next = [&seed] {
         seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
-        return static_cast<std::uint32_t>(seed >> 33);
+        return seed >> 33;
     };
-    std::vector<std::uint32_t> v(n);
-    for (auto& x : v) x = next() % value_range;
+    std::vector<std::uint64_t> v(n);
+    for (auto& x : v) x = base + static_cast<std::uint64_t>(next() % value_range);
     std::sort(v.begin(), v.end());
     v.erase(std::unique(v.begin(), v.end()), v.end());
     return v;
 }
 }  // namespace
 
-TEST(IntersectU32, AgreesWithSetIntersectionRandomized) {
+TEST(IntersectU64, AgreesWithSetIntersectionRandomized) {
     std::uint64_t seed = 7;
-    std::vector<std::uint32_t> out;
-    // 覆盖：块边界附近的大小、密集/稀疏重叠、空输入。
-    const std::size_t sizes[] = {0, 1, 7, 8, 9, 15, 16, 17, 63, 64, 200, 777};
+    std::vector<std::uint64_t> out;
+    const std::size_t sizes[] = {0, 1, 3, 4, 5, 7, 8, 9, 15, 16, 17, 63, 64, 200, 777};
     for (auto na : sizes) {
         for (auto nb : sizes) {
-            for (std::uint32_t range : {50U, 1000U, 1000000U}) {
+            for (std::uint64_t range : {50ULL, 1000ULL, 1000000ULL}) {
                 auto a = make_sorted_unique(seed, na, range);
                 auto b = make_sorted_unique(seed, nb, range);
-                intersect_u32(a, b, out);
+                intersect_u64(a, b, out);
                 ASSERT_EQ(out, ref_intersect(a, b))
                     << "na=" << na << " nb=" << nb << " range=" << range;
             }
@@ -1201,56 +1198,53 @@ TEST(IntersectU32, AgreesWithSetIntersectionRandomized) {
     }
 }
 
-TEST(IntersectU32, GallopingPathSkewed) {
+TEST(IntersectU64, HighValuesAcross232Boundary) {
+    std::uint64_t seed = 42;
+    std::vector<std::uint64_t> out;
+    const std::uint64_t bases[] = {0ULL, 0xFFFFFF00ULL, 5'000'000'000ULL,
+                                   0x7FFFFFFFFFFFFF00ULL};
+    const std::size_t sizes[] = {0, 1, 3, 4, 5, 8, 9, 64, 200};
+    for (auto base : bases) {
+        for (auto na : sizes) {
+            for (auto nb : sizes) {
+                auto a = make_sorted_unique(seed, na, 1000, base);
+                auto b = make_sorted_unique(seed, nb, 1000, base);
+                intersect_u64(a, b, out);
+                ASSERT_EQ(out, ref_intersect(a, b))
+                    << "base=" << base << " na=" << na << " nb=" << nb;
+            }
+        }
+    }
+}
+
+TEST(IntersectU64, Low32BitCollision) {
+    std::vector<std::uint64_t> a, b, out;
+    for (std::uint64_t k = 0; k < 64; ++k) a.push_back((1ULL << 32) | (k * 7));
+    for (std::uint64_t k = 0; k < 64; ++k) b.push_back((2ULL << 32) | (k * 7));
+    intersect_u64(a, b, out);
+    EXPECT_TRUE(out.empty());
+    intersect_u64(a, a, out);
+    EXPECT_EQ(out, a);
+}
+
+TEST(IntersectU64, GallopingPathSkewed) {
     std::uint64_t seed = 99;
-    std::vector<std::uint32_t> out;
-    // >32x 悬殊触发 galloping 路径（两个方向）。
+    std::vector<std::uint64_t> out;
     auto small_v = make_sorted_unique(seed, 20, 100000);
     auto large_v = make_sorted_unique(seed, 5000, 100000);
-    intersect_u32(small_v, large_v, out);
+    intersect_u64(small_v, large_v, out);
     EXPECT_EQ(out, ref_intersect(small_v, large_v));
-    intersect_u32(large_v, small_v, out);
+    intersect_u64(large_v, small_v, out);
     EXPECT_EQ(out, ref_intersect(small_v, large_v));
 }
 
-TEST(IntersectU32, FullAndNoOverlap) {
-    std::vector<std::uint32_t> a, out;
-    for (std::uint32_t i = 0; i < 1000; ++i) a.push_back(i * 2);
-    intersect_u32(a, a, out);
-    EXPECT_EQ(out, a);                       // 全重叠
-    std::vector<std::uint32_t> b;
-    for (std::uint32_t i = 0; i < 1000; ++i) b.push_back(i * 2 + 1);
-    intersect_u32(a, b, out);
-    EXPECT_TRUE(out.empty());                // 零重叠（交错）
-}
-
-// 纵深防御回归（review #1）：违反「严格升序无重复」前置的脏输入不得写穿堆。
-// 复刻崩溃恢复后 PostingList 含重复 ord 的形态。构造让 AVX2 块推进「钉住」
-// b 指针、a 反复以小值块匹配同一 b 块——cnt 每块 +7 持续增长，远超
-// out.resize(min(na,nb)+8) 的上界 → 修复前 _mm256_storeu 越界写（ASan 报
-// heap-buffer-overflow / 非 ASan 报 malloc abort）。守卫扩容后不崩。
-// 脏输入下只要求无 UB；结果正确性不在契约内。
-TEST(IntersectU32, DirtyDuplicateInputDoesNotOverflow) {
-    // 走 AVX2 路径需 na ≤ 32×nb（否则路由到 galloping，无此 bug）。
-    // b：严格升序，块 0 = [0..6, 1e6]，其后全是大值 → 每个 b 块 max 都很大，
-    // 块推进时 b 指针钉死在 j=0（bmax > amax 恒成立），同一 b 块被反复比较。
-    constexpr std::size_t kNb = 10000;
-    std::vector<std::uint32_t> b(kNb);
-    for (std::uint32_t v = 0; v < 7; ++v) b[v] = v;
-    for (std::size_t x = 7; x < kNb; ++x) b[x] = 1000000u + static_cast<std::uint32_t>(x);
-    // a：[0..6, 99] 块重复 40000 次（非升序、大量重复，模拟崩溃恢复的多段
-    // 形态）。每块与 b 块 0 命中 7 个、b 钉死 → cnt 累加 7×40000 ≈ 280000
-    // ≫ cap=min(na,nb)+8=10008。无守卫时 _mm256_storeu 从该上界起持续越界
-    // 写 ~1MB，必然走出映射页 → 确定性 SIGSEGV（ASan 不插桩 SIMD intrinsic
-    // store，小越界会漏过，故刻意放大到段错误量级）。守卫扩容后全程合法。
-    constexpr std::size_t kReps = 40000;  // na = 320000 = 32×nb → 仍走 AVX2
-    std::vector<std::uint32_t> a;
-    a.reserve(kReps * 8);
-    for (std::size_t rep = 0; rep < kReps; ++rep) {
-        for (std::uint32_t v = 0; v < 7; ++v) a.push_back(v);
-        a.push_back(99);
-    }
-    std::vector<std::uint32_t> out;
-    intersect_u32(a, b, out);   // 修复前在此越界写崩
-    SUCCEED();
+TEST(IntersectU64, FullAndNoOverlap) {
+    std::vector<std::uint64_t> a, out;
+    for (std::uint64_t i = 0; i < 1000; ++i) a.push_back(i * 2);
+    intersect_u64(a, a, out);
+    EXPECT_EQ(out, a);
+    std::vector<std::uint64_t> b;
+    for (std::uint64_t i = 0; i < 1000; ++i) b.push_back(i * 2 + 1);
+    intersect_u64(a, b, out);
+    EXPECT_TRUE(out.empty());
 }

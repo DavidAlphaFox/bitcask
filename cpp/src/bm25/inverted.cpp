@@ -897,65 +897,30 @@ auto InvertedIndex::bool_search(
                              must_tps[b].fp.size();
                   });
 
-        // P2.2：u32 窄化快路径。fp.ords 升序 → back() 即最大值，全部
-        // ≤ 0xFFFFFFFF 才可安全窄化（ord 单调分配，理论上可超 2^32——
-        // 超界走下方 u64 标量路径，语义不变）。窄化后用 intersect_u32
-        // （galloping / AVX2 块交集 / 标量归并三路自适应）。
-        bool narrow_ok = true;
-        for (auto& tp : must_tps) {
-            if (!tp.fp.ords.empty() && tp.fp.ords.back() > 0xFFFFFFFFULL) {
-                narrow_ok = false;
-                break;
-            }
-        }
-
-        // MUST 交集骨架（u32 窄化快路径 / u64 回退共用单一实现）：按 must_order
-        // 升序逐词求交、live 过滤、空交集提前 break——骨架只此一份，避免改
-        // 语义时漏同步某条路径（u64 回退由 BoolSearchMustU64Fallback 测试覆盖）。
-        // 只有元素类型 T 与单次求交实现不同：u32→intersect_u32（三路 SIMD），
-        // u64→set_intersection（标量）。fp.ords 升序无重复、live 过滤保序，
-        // 满足两者前置（u32 免 sort/unique、u64 归并有序）。
-        auto run_must_intersect = [&]<typename T>(auto pair_intersect) {
-            std::vector<T> acc;
+        auto run_must_intersect = [&] {
+            std::vector<std::uint64_t> acc;
             bool first_must = true;
             for (auto mi : must_order) {
                 auto& tp = must_tps[mi];
                 if (!first_must && acc.empty()) break;
-                std::vector<T> ords;
+                std::vector<std::uint64_t> ords;
                 ords.reserve(tp.fp.size());
                 for (std::size_t i = 0; i < tp.fp.size(); ++i) {
-                    if (tp.live[i]) ords.push_back(static_cast<T>(tp.fp.ords[i]));
+                    if (tp.live[i]) ords.push_back(tp.fp.ords[i]);
                 }
                 if (first_must) {
                     acc = std::move(ords);
                     first_must = false;
                 } else {
-                    acc = pair_intersect(acc, ords);
+                    std::vector<std::uint64_t> out;
+                    intersect_u64(acc, ords, out);
+                    acc = std::move(out);
                 }
             }
             return acc;
         };
 
-        if (narrow_ok) {
-            auto inter = run_must_intersect.operator()<std::uint32_t>(
-                [](const std::vector<std::uint32_t>& a,
-                   const std::vector<std::uint32_t>& b) {
-                    std::vector<std::uint32_t> out;
-                    intersect_u32(a, b, out);
-                    return out;
-                });
-            candidates.assign(inter.begin(), inter.end());  // u32 → u64 候选
-        } else {
-            candidates = run_must_intersect.operator()<std::uint64_t>(
-                [](const std::vector<std::uint64_t>& a,
-                   const std::vector<std::uint64_t>& b) {
-                    std::vector<std::uint64_t> out;
-                    out.reserve(std::min(a.size(), b.size()));
-                    std::set_intersection(a.begin(), a.end(), b.begin(), b.end(),
-                                          std::back_inserter(out));
-                    return out;
-                });
-        }
+        candidates = run_must_intersect();
     } else if (!should_tps.empty()) {
         for (auto& tp : should_tps) {
             for (std::size_t i = 0; i < tp.fp.size(); ++i) {

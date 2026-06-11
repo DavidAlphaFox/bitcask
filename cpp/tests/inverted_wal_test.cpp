@@ -216,7 +216,7 @@ TEST(AddDocIdempotent, DuplicateOrdDropped) {
 
 // 崩溃恢复端到端（review #1）：save 后不 truncate（模拟 save/truncate_wal
 // 之间崩溃）→ 重启 load + replay_wal 重放快照已含条目 → 水位幂等保证
-// items 严格升序无重复 → bool_search 的 intersect_u32 不崩、结果正确。
+// items 严格升序无重复 → bool_search 的 intersect_u64 不崩、结果正确。
 TEST(CrashRecovery, ReplayDuplicateKeepsItemsSortedUnique) {
     auto snap = std::filesystem::temp_directory_path() / "inv_crash_snap.inv";
     auto wal  = std::filesystem::temp_directory_path() / "inv_crash_snap.inv.wal";
@@ -248,7 +248,7 @@ TEST(CrashRecovery, ReplayDuplicateKeepsItemsSortedUnique) {
     EXPECT_EQ(idx2.df("beta"), 50u);
     EXPECT_EQ(idx2.live_doc_count(), 50u);
 
-    // bool_search 两个 MUST：触发 intersect_u32；修复前重复 ord 会让 AVX2
+    // bool_search 两个 MUST：触发 intersect_u64；修复前重复 ord 会让 AVX2
     // 越界写崩溃，且交集结果错。
     auto q = QueryNode::must_all(
         {QueryNode::must_term("alpha"), QueryNode::must_term("beta")});
