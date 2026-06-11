@@ -11,6 +11,14 @@ TEST(PorterStemmer, Basic) {
     EXPECT_EQ(porter_stem("addresses"), "address");
 }
 
+// 回归（O6 时发现）：step1a 的 ies 规则此前写成 erase(size-2) 再 += 'i'，
+// 净效果是 "ies → ii"（"ponies" → "ponii"），偏离标准 Porter 与自身注释。
+// 修正为标准 "ies → i"。
+TEST(PorterStemmer, Step1aIes) {
+    EXPECT_EQ(porter_stem("ponies"), "poni");
+    EXPECT_EQ(porter_stem("ties"), "ti");
+}
+
 TEST(PorterStemmer, Short) {
     EXPECT_EQ(porter_stem("a"), "a");
     EXPECT_EQ(porter_stem("be"), "be");
