@@ -162,6 +162,24 @@ std::vector<SearchResult> score_bow_topk(
     return results;
 }
 
+// 安全收集一个 shard 满足 pred 的 term key 快照（去重升序）。
+// 这是遍历 tbb::concurrent_hash_map 的唯一安全原语，把一条实测复现过的
+// 并发不变量集中到一处：遍历期间**不可** find（懒 rehash 节点搬迁致迭代器
+// 重访/漏访）也**不可**裸读/改 slot 值（shared_ptr 可能被写者 CoW 替换、
+// 裸读撕裂）——只读 key（节点 key 稳定）。调用方随后逐 key 经 accessor
+// 取值/改值。sort+unique 兜住与单写者并发时 rehash 可能造成的重访去重。
+template <typename Pred>
+std::vector<std::string> collect_term_keys(
+    const InvertedIndex::PostingMap& map, Pred pred) {
+    std::vector<std::string> keys;
+    for (auto it = map.begin(); it != map.end(); ++it) {
+        if (pred(it->first)) keys.push_back(it->first);
+    }
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    return keys;
+}
+
 // P2-min CoW：返回可安全原地修改的 PostingList。调用方必须持有该桶的写
 // accessor。读者只能在桶读锁下取得 shared_ptr 引用（与写 accessor 互斥），
 // 因此 use_count()==1 ⟺ 当前无 phrase/near 读者持引用 → 原地改安全；
@@ -742,22 +760,15 @@ auto InvertedIndex::search_wildcard(
         std::vector<TermPostings>{},
         [&](const tbb::blocked_range<std::size_t>& range, std::vector<TermPostings> local) {
             for (std::size_t s = range.begin(); s < range.end(); ++s) {
-                // P2-min 两阶段：遍历只收集匹配的 key——遍历中调 find 会触发
-                // concurrent_hash_map 的懒 rehash 节点搬迁，迭代器会重复访问
-                // 同一节点（实测复现）。值统一在遍历结束后经 const_accessor 读
-                //（slot 上的 shared_ptr 可能被写者 CoW 替换，裸读会撕裂）。
-                std::vector<std::string> matched;
-                for (auto it = shards_[s].inverted.begin();
-                     it != shards_[s].inverted.end(); ++it) {
-                    if (!lit.empty() && it->first.find(lit) == std::string::npos) {
-                        continue;  // P2.5：字面量预过滤
-                    }
-                    if (wildcard_match(pattern, it->first)) {
-                        matched.push_back(it->first);
-                    }
-                }
-                std::sort(matched.begin(), matched.end());
-                matched.erase(std::unique(matched.begin(), matched.end()), matched.end());
+                // 两阶段：安全收集匹配 key（含 P2.5 字面量预过滤），再逐 key
+                // 经 const_accessor 取值（并发不变量见 collect_term_keys）。
+                auto matched = collect_term_keys(
+                    shards_[s].inverted, [&](const std::string& t) {
+                        if (!lit.empty() && t.find(lit) == std::string::npos) {
+                            return false;
+                        }
+                        return wildcard_match(pattern, t);
+                    });
                 for (auto& term : matched) {
                     PostingMap::const_accessor acc;
                     if (!shards_[s].inverted.find(acc, term)) continue;
@@ -1086,27 +1097,21 @@ auto InvertedIndex::search_fuzzy(
     for (auto& q : query_terms) matchers.emplace_back(q);
 
     for (auto& shard : shards_) {
-        // P2-min 两阶段：遍历只做匹配收集 key——遍历中调 find 会触发懒 rehash
-        // 节点搬迁，迭代器重复访问同一节点（破坏 S10.2 的去重，实测复现）。
-        std::vector<std::string> matched;
-        for (auto it = shard.inverted.begin(); it != shard.inverted.end(); ++it) {
-            const auto& term = it->first;
-            for (std::size_t qi = 0; qi < query_terms.size(); ++qi) {
-                auto& query_term = query_terms[qi];
-                auto len_diff = term.size() > query_term.size()
-                                    ? term.size() - query_term.size()
-                                    : query_term.size() - term.size();
-                if (len_diff > max_edit_distance) continue;
-                if (matchers[qi].within(term, max_edit_distance)) {
-                    matched.push_back(term);
-                    break;
+        // 两阶段：安全收集模糊命中的 key（任一 query 词编辑距离 ≤ k，含 S10.3
+        // 长度差剪枝），再逐 key 经 const_accessor 取值（不变量见 collect_term_keys）。
+        auto matched = collect_term_keys(
+            shard.inverted, [&](const std::string& term) {
+                for (std::size_t qi = 0; qi < query_terms.size(); ++qi) {
+                    auto& query_term = query_terms[qi];
+                    auto len_diff = term.size() > query_term.size()
+                                        ? term.size() - query_term.size()
+                                        : query_term.size() - term.size();
+                    if (len_diff > max_edit_distance) continue;
+                    if (matchers[qi].within(term, max_edit_distance)) return true;
                 }
-            }
-        }
-        std::sort(matched.begin(), matched.end());
-        matched.erase(std::unique(matched.begin(), matched.end()), matched.end());
+                return false;
+            });
         for (auto& term : matched) {
-            // 值经 const_accessor 读（slot 的 shared_ptr 可能被 CoW 替换）。
             PostingMap::const_accessor acc;
             if (!shard.inverted.find(acc, term)) continue;
             TermPostings tp;
@@ -1160,13 +1165,11 @@ auto InvertedIndex::df_live(std::string_view term, const LiveChecker& live_check
 }
 
 void InvertedIndex::finalize_all_postings() {
-    // P2-min：与 compact 同模式——先快照 key，再逐 key 持写 accessor 经
-    // mutable_pl 修改（迭代器裸改在共享模型下会绕过 CoW 协议）。
+    // 先快照全部 key，再逐 key 持写 accessor 经 mutable_pl 修改（迭代器裸改
+    // 会绕过 CoW 协议；并发不变量见 collect_term_keys）。
     for (auto& shard : shards_) {
-        std::vector<std::string> keys;
-        for (auto it = shard.inverted.begin(); it != shard.inverted.end(); ++it) {
-            keys.push_back(it->first);
-        }
+        auto keys = collect_term_keys(shard.inverted,
+                                      [](const std::string&) { return true; });
         for (auto& key : keys) {
             PostingMap::accessor acc;
             if (!shard.inverted.find(acc, key)) continue;
@@ -1179,12 +1182,11 @@ auto InvertedIndex::compact(const LiveChecker& live_checker, double dead_ratio_t
     -> std::size_t {
     std::size_t compacted = 0;
     for (auto& shard : shards_) {
-        // 先快照 key 列表（迭代不改 map 结构），再逐 key 持写 accessor 压实：
-        // 写锁与并发查询的 const_accessor 互斥，保证查询不读到半压实状态。
-        std::vector<std::string> keys;
-        for (auto it = shard.inverted.begin(); it != shard.inverted.end(); ++it) {
-            keys.push_back(it->first);
-        }
+        // 先快照 key 列表，再逐 key 持写 accessor 压实：写锁与并发查询的
+        // const_accessor 互斥，保证查询不读到半压实状态（不变量见
+        // collect_term_keys）。
+        auto keys = collect_term_keys(shard.inverted,
+                                      [](const std::string&) { return true; });
         std::vector<std::uint64_t> ords_buf;
         std::vector<char> live_buf;
         for (auto& key : keys) {
