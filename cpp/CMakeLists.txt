@@ -121,6 +121,7 @@ target_link_libraries(bitcask_index
 # bitcask_bm25 — BM25 倒排索引（InvertedIndex + DAAT 评分）。
 # ---------------------------------------------------------------------------
 add_library(bitcask_bm25 STATIC
+    src/bm25/intersect.cpp
     src/bm25/inverted.cpp
     src/bm25/inverted_wal.cpp
     src/bm25/query_parser.cpp

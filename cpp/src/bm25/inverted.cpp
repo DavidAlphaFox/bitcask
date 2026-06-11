@@ -1,3 +1,4 @@
+#include "bitcask/intersect.hpp"
 #include "bitcask/inverted.hpp"
 #include "bitcask/inverted_wal.hpp"
 #include "bitcask/myers.hpp"
@@ -901,10 +902,9 @@ auto InvertedIndex::bool_search(
             return {};
         }
 
-        std::vector<std::uint64_t> intersection;
         // O4：按 posting 数升序处理 MUST——最短 list 先进交集，accumulator 尽早
-        // 缩小，后续 set_intersection 都在小集合上做；交集一旦为空提前退出。
-        // 交集与处理顺序无关，结果集语义不变（must_tps 本体不重排，评分用）。
+        // 缩小；交集一旦为空提前退出。交集与处理顺序无关，结果集语义不变
+        // （must_tps 本体不重排，评分用）。
         std::vector<std::size_t> must_order(must_tps.size());
         for (std::size_t i = 0; i < must_order.size(); ++i) must_order[i] = i;
         std::sort(must_order.begin(), must_order.end(),
@@ -912,32 +912,71 @@ auto InvertedIndex::bool_search(
                       return must_tps[a].fp.size() <
                              must_tps[b].fp.size();
                   });
-        bool first_must = true;
-        for (auto mi : must_order) {
-            auto& tp = must_tps[mi];
-            if (!first_must && intersection.empty()) break;
-            std::vector<std::uint64_t> ords;
-            for (std::size_t i = 0; i < tp.fp.size(); ++i) {
-                if (tp.live[i]) {
-                    ords.push_back(tp.fp.ords[i]);
-                }
-            }
-            std::sort(ords.begin(), ords.end());
-            ords.erase(std::unique(ords.begin(), ords.end()), ords.end());
 
-            if (first_must) {
-                intersection = std::move(ords);
-                first_must = false;
-            } else {
-                std::vector<std::uint64_t> tmp;
-                tmp.reserve(std::min(intersection.size(), ords.size()));
-                std::set_intersection(intersection.begin(), intersection.end(),
-                                      ords.begin(), ords.end(),
-                                      std::back_inserter(tmp));
-                intersection = std::move(tmp);
+        // P2.2：u32 窄化快路径。fp.ords 升序 → back() 即最大值，全部
+        // ≤ 0xFFFFFFFF 才可安全窄化（ord 单调分配，理论上可超 2^32——
+        // 超界走下方 u64 标量路径，语义不变）。窄化后用 intersect_u32
+        // （galloping / AVX2 块交集 / 标量归并三路自适应）。
+        bool narrow_ok = true;
+        for (auto& tp : must_tps) {
+            if (!tp.fp.ords.empty() && tp.fp.ords.back() > 0xFFFFFFFFULL) {
+                narrow_ok = false;
+                break;
             }
         }
-        candidates = std::move(intersection);
+
+        if (narrow_ok) {
+            // fp.ords 升序无重复、live 过滤保序 → 无需 sort/unique。
+            std::vector<std::uint32_t> inter32;
+            std::vector<std::uint32_t> ords32;
+            std::vector<std::uint32_t> tmp32;
+            bool first_must = true;
+            for (auto mi : must_order) {
+                auto& tp = must_tps[mi];
+                if (!first_must && inter32.empty()) break;
+                ords32.clear();
+                ords32.reserve(tp.fp.size());
+                for (std::size_t i = 0; i < tp.fp.size(); ++i) {
+                    if (tp.live[i]) {
+                        ords32.push_back(static_cast<std::uint32_t>(tp.fp.ords[i]));
+                    }
+                }
+                if (first_must) {
+                    inter32.swap(ords32);
+                    first_must = false;
+                } else {
+                    intersect_u32(inter32, ords32, tmp32);
+                    inter32.swap(tmp32);
+                }
+            }
+            candidates.reserve(inter32.size());
+            for (auto v : inter32) candidates.push_back(v);
+        } else {
+            std::vector<std::uint64_t> intersection;
+            bool first_must = true;
+            for (auto mi : must_order) {
+                auto& tp = must_tps[mi];
+                if (!first_must && intersection.empty()) break;
+                std::vector<std::uint64_t> ords;
+                for (std::size_t i = 0; i < tp.fp.size(); ++i) {
+                    if (tp.live[i]) {
+                        ords.push_back(tp.fp.ords[i]);
+                    }
+                }
+                if (first_must) {
+                    intersection = std::move(ords);
+                    first_must = false;
+                } else {
+                    std::vector<std::uint64_t> tmp;
+                    tmp.reserve(std::min(intersection.size(), ords.size()));
+                    std::set_intersection(intersection.begin(), intersection.end(),
+                                          ords.begin(), ords.end(),
+                                          std::back_inserter(tmp));
+                    intersection = std::move(tmp);
+                }
+            }
+            candidates = std::move(intersection);
+        }
     } else if (!should_tps.empty()) {
         for (auto& tp : should_tps) {
             for (std::size_t i = 0; i < tp.fp.size(); ++i) {
