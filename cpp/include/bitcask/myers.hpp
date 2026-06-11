@@ -13,6 +13,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 #include <string_view>
 
 #include "bitcask/fuzzy_matcher.hpp"
@@ -22,7 +23,11 @@ namespace bitcask::bm25 {
 class MyersMatcher {
 public:
     explicit MyersMatcher(std::string_view pattern)
-        : m_(pattern.size()), pattern_(pattern) {
+        : m_(pattern.size()),
+          // 仅 m>64 回退路径需要原串；持 owned string 而非 string_view，
+          // 避免 caller 用临时串构造（如 MyersMatcher(make_token())）时
+          // 在那条最冷、最难复现的路径上悬垂读。≤64 路径不碰它。
+          pattern_(m_ > 64 ? std::string(pattern) : std::string()) {
         if (m_ == 0 || m_ > 64) return;  // 空串/超长走特判与回退
         for (std::size_t i = 0; i < m_; ++i) {
             peq_[static_cast<unsigned char>(pattern[i])] |= 1ULL << i;
@@ -72,7 +77,7 @@ public:
 private:
     std::array<std::uint64_t, 256> peq_{};
     std::size_t m_ = 0;
-    std::string_view pattern_;  // 仅 >64 回退路径使用；caller 保证生命周期
+    std::string pattern_;  // 仅 m>64 回退路径用（owned，无生命周期前提）
 };
 
 }  // namespace bitcask::bm25
