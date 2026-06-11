@@ -68,6 +68,10 @@ struct Atoms {
     ERL_NIF_TERM min_token_length;
     ERL_NIF_TERM enable_stemming;
 
+    // 索引模式 get/put 的 doc map 键（O2：热路径避免每次重建 atom）
+    ERL_NIF_TERM text;
+    ERL_NIF_TERM meta;
+
     // 线程安全: 否（写入静态状态）；仅 on_load 调用一次。
     void init(ErlNifEnv* env) noexcept;
 };

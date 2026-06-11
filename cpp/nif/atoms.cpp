@@ -59,6 +59,9 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     max_n              = a("max_n");
     min_token_length   = a("min_token_length");
     enable_stemming    = a("enable_stemming");
+
+    text               = a("text");
+    meta               = a("meta");
 }
 
 Atoms& atoms() noexcept { return g_atoms; }

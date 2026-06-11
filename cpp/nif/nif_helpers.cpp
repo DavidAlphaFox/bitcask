@@ -51,14 +51,14 @@ CaskIterHandle* cask_iter_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept {
 
 bool parse_doc_map(ErlNifEnv* env, ERL_NIF_TERM map_term, DocInput& doc) {
     ERL_NIF_TERM text_val;
-    if (enif_get_map_value(env, map_term, enif_make_atom(env, "text"), &text_val)) {
+    if (enif_get_map_value(env, map_term, atoms().text, &text_val)) {
         ErlNifBinary tb{};
         if (enif_inspect_binary(env, text_val, &tb)) {
             doc.text = as_bytes(tb);
         }
     }
     ERL_NIF_TERM meta_val;
-    if (enif_get_map_value(env, map_term, enif_make_atom(env, "meta"), &meta_val)) {
+    if (enif_get_map_value(env, map_term, atoms().meta, &meta_val)) {
         ErlNifBinary mb{};
         if (enif_inspect_binary(env, meta_val, &mb)) {
             doc.meta = as_bytes(mb);
