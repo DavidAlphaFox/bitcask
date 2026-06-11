@@ -71,6 +71,97 @@ float upper_bound_from(std::uint32_t global_max_tf, float idf,
     return idf * (tf_norm + params.delta);
 }
 
+// search / search_wildcard / search_fuzzy 共用的查询词条目：term + 扁平快照。
+// （wand/bool 的词条目更富——带 live/dls/cursor/idf——仍各自局部定义。）
+struct ScoredTerm {
+    std::string  term;
+    FlatPostings fp;
+};
+
+// bag-of-words 评分 + top-k：三条路径（search 标量 / wildcard / fuzzy）此前
+// 各自内联一份逐字相同的「批量 live/doc_len + 两阶段评分 parallel_reduce +
+// 小顶堆 top-k」。提取单一实现，BM25 公式与「分数位级不变 / 无分支可向量化」
+// 两条不变量只此一处（避免改公式时漏改某条低频路径致评分不一致）。
+std::vector<SearchResult> score_bow_topk(
+    const std::vector<ScoredTerm>& tps, std::size_t k,
+    std::uint64_t N, std::uint64_t sum_dl,
+    const Bm25Params& params, const LiveChecker& live_checker) {
+    const double avgdl =
+        N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
+
+    // 并行 BM25 评分：parallel_reduce 按查询词分片，线程本地 map 无锁累加。
+    using ScoreMap = std::unordered_map<std::uint64_t, float>;
+    ScoreMap scores = tbb::parallel_reduce(
+        tbb::blocked_range<std::size_t>(0, tps.size()),
+        ScoreMap{},
+        [&](const tbb::blocked_range<std::size_t>& range, ScoreMap local) {
+            for (std::size_t ti = range.begin(); ti < range.end(); ++ti) {
+                const auto& fp = tps[ti].fp;
+                const std::size_t n = fp.size();
+
+                // P2.1：live/doc_len 批量取——一次虚调用（Index 侧一次锁）完成
+                // 整列，评分浮点循环不再含虚调用，编译器可自动向量化。
+                std::vector<char> live(n);
+                live_checker.fill_is_live(fp.ords, live);
+                std::size_t live_df = 0;
+                for (std::size_t i = 0; i < n; ++i) {
+                    live_df += static_cast<std::size_t>(live[i]);
+                }
+                if (live_df == 0) continue;
+
+                auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
+
+                std::vector<std::uint32_t> dls(n);
+                live_checker.fill_doc_lens(fp.ords, dls);
+
+                // 两阶段评分：① 纯数组浮点（可向量化；死点也算、结果不用，
+                // 保持无分支），公式与逐 posting 版逐运算一致（分数位级不变）；
+                // ② 标量 scatter 进线程本地 map（hash 写无法向量化）。
+                std::vector<float> contrib(n);
+                const float fidf = static_cast<float>(idf);
+                for (std::size_t i = 0; i < n; ++i) {
+                    auto tf_norm = static_cast<float>(fp.tfs[i]) *
+                                   (params.k1 + 1.0F) /
+                                   (static_cast<float>(fp.tfs[i]) + params.k1 *
+                                    (1.0F - params.b + params.b *
+                                     static_cast<float>(dls[i]) / static_cast<float>(avgdl)));
+                    contrib[i] = fidf * (tf_norm + params.delta);
+                }
+                for (std::size_t i = 0; i < n; ++i) {
+                    if (live[i]) local[fp.ords[i]] += contrib[i];
+                }
+            }
+            return local;
+        },
+        [](ScoreMap a, const ScoreMap& b) {
+            for (auto& [doc, score] : b) {
+                a[doc] += score;
+            }
+            return a;
+        });
+
+    // top-k 小顶堆（score, ord）。
+    using Entry = std::pair<float, std::uint64_t>;
+    std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
+    for (auto& [ord, score] : scores) {
+        if (heap.size() < k) {
+            heap.push({score, ord});
+        } else if (score > heap.top().first) {
+            heap.pop();
+            heap.push({score, ord});
+        }
+    }
+    std::vector<SearchResult> results;
+    results.reserve(heap.size());
+    while (!heap.empty()) {
+        auto& [score, ord] = heap.top();
+        results.push_back({ord, score});
+        heap.pop();
+    }
+    std::reverse(results.begin(), results.end());  // 分数降序
+    return results;
+}
+
 // P2-min CoW：返回可安全原地修改的 PostingList。调用方必须持有该桶的写
 // accessor。读者只能在桶读锁下取得 shared_ptr 引用（与写 accessor 互斥），
 // 因此 use_count()==1 ⟺ 当前无 phrase/near 读者持引用 → 原地改安全；
@@ -220,10 +311,7 @@ auto InvertedIndex::search(
     }
 
     // 标量路径：现在才快照。
-    struct TermPostings {
-        std::string term;
-        FlatPostings fp;
-    };
+    using TermPostings = ScoredTerm;  // 共用条目（term + 扁平快照）
     std::vector<TermPostings> tps;
     tps.reserve(query_terms.size());
     for (auto& term : query_terms) {
@@ -238,87 +326,11 @@ auto InvertedIndex::search(
     }
     if (tps.empty()) return {};
 
-    // 读取全局统计（atomic load，S10.1 去锁）。
-    auto N = live_doc_count_.load(std::memory_order_relaxed);
-    auto sum_dl = sum_doc_len_.load(std::memory_order_relaxed);
-    auto avgdl = N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
-
-    // 并行 BM25 评分：parallel_reduce 按查询词分片，线程本地 map 无锁累加。
-    using ScoreMap = std::unordered_map<std::uint64_t, float>;
-
-    ScoreMap scores = tbb::parallel_reduce(
-        tbb::blocked_range<std::size_t>(0, tps.size()),
-        ScoreMap{},
-        [&](const tbb::blocked_range<std::size_t>& range, ScoreMap local) {
-            for (std::size_t ti = range.begin(); ti < range.end(); ++ti) {
-                auto& fp = tps[ti].fp;
-                const std::size_t n = fp.size();
-
-                // P2.1：live/doc_len 批量取——一次虚调用（Index 侧一次锁）完成
-                // 整列，评分浮点循环不再含虚调用，编译器可自动向量化。
-                std::vector<char> live(n);
-                live_checker.fill_is_live(fp.ords, live);
-                std::size_t live_df = 0;
-                for (std::size_t i = 0; i < n; ++i) {
-                    live_df += static_cast<std::size_t>(live[i]);
-                }
-                if (live_df == 0) continue;
-
-                auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
-
-                std::vector<std::uint32_t> dls(n);
-                live_checker.fill_doc_lens(fp.ords, dls);
-
-                // 两阶段评分：① 纯数组浮点（可向量化；死点也算、结果不用，
-                // 保持无分支），公式与原逐 posting 版逐运算一致（分数位级不变）；
-                // ② 标量 scatter 进线程本地 map（hash 写无法向量化）。
-                std::vector<float> contrib(n);
-                const float fidf = static_cast<float>(idf);
-                for (std::size_t i = 0; i < n; ++i) {
-                    auto tf_norm = static_cast<float>(fp.tfs[i]) *
-                                   (params.k1 + 1.0F) /
-                                   (static_cast<float>(fp.tfs[i]) + params.k1 *
-                                    (1.0F - params.b + params.b *
-                                     static_cast<float>(dls[i]) / static_cast<float>(avgdl)));
-                    contrib[i] = fidf * (tf_norm + params.delta);
-                }
-                for (std::size_t i = 0; i < n; ++i) {
-                    if (live[i]) local[fp.ords[i]] += contrib[i];
-                }
-            }
-            return local;
-        },
-        [](ScoreMap a, const ScoreMap& b) {
-            for (auto& [doc, score] : b) {
-                a[doc] += score;
-            }
-            return a;
-        }
-    );
-
-    // top-k 堆。
-    using Entry = std::pair<float, std::uint64_t>;  // (score, ord)，按 score 小顶
-    std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
-
-    for (auto& [ord, score] : scores) {
-        if (heap.size() < k) {
-            heap.push({score, ord});
-        } else if (score > heap.top().first) {
-            heap.pop();
-            heap.push({score, ord});
-        }
-    }
-
-    std::vector<SearchResult> results;
-    results.reserve(heap.size());
-    while (!heap.empty()) {
-        auto& [score, ord] = heap.top();
-        results.push_back({ord, score});
-        heap.pop();
-    }
-    // 按分数降序。
-    std::reverse(results.begin(), results.end());
-    return results;
+    // bag-of-words 评分 + top-k（共享 kernel score_bow_topk）。
+    return score_bow_topk(tps, k,
+                          live_doc_count_.load(std::memory_order_relaxed),
+                          sum_doc_len_.load(std::memory_order_relaxed),
+                          params, live_checker);
 }
 
 // ===========================================================================
@@ -717,10 +729,7 @@ auto InvertedIndex::search_wildcard(
     const Bm25Params* params_override) const -> std::vector<SearchResult> {
     const Bm25Params& params = params_override ? *params_override : params_;
 
-    struct TermPostings {
-        std::string term;
-        FlatPostings fp;  // P1：扁平快照
-    };
+    using TermPostings = ScoredTerm;  // 共用条目（term + 扁平快照）
 
     // P2.5：最长字面量预过滤——不含该子串的词必不匹配，免跑回溯匹配器
     // （string_view::find 底层是 SIMD 化的 memchr/memcmp）。
@@ -767,80 +776,11 @@ auto InvertedIndex::search_wildcard(
 
     if (tps.empty()) return {};
 
-    auto N = live_doc_count_.load(std::memory_order_relaxed);
-    auto sum_dl = sum_doc_len_.load(std::memory_order_relaxed);
-    auto avgdl = N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
-
-    using ScoreMap = std::unordered_map<std::uint64_t, float>;
-
-    ScoreMap scores = tbb::parallel_reduce(
-        tbb::blocked_range<std::size_t>(0, tps.size()),
-        ScoreMap{},
-        [&](const tbb::blocked_range<std::size_t>& range, ScoreMap local) {
-            for (std::size_t ti = range.begin(); ti < range.end(); ++ti) {
-                auto& fp = tps[ti].fp;
-                const std::size_t n = fp.size();
-
-                // P2.1：批量取 live/doc_len + 两阶段评分（同 search()，
-                // ①纯浮点可向量化 ②标量 scatter；公式逐运算一致）。
-                std::vector<char> live(n);
-                live_checker.fill_is_live(fp.ords, live);
-                std::size_t live_df = 0;
-                for (std::size_t i = 0; i < n; ++i) {
-                    live_df += static_cast<std::size_t>(live[i]);
-                }
-                if (live_df == 0) continue;
-
-                auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
-
-                std::vector<std::uint32_t> dls(n);
-                live_checker.fill_doc_lens(fp.ords, dls);
-
-                std::vector<float> contrib(n);
-                const float fidf = static_cast<float>(idf);
-                for (std::size_t i = 0; i < n; ++i) {
-                    auto tf_norm = static_cast<float>(fp.tfs[i]) *
-                                   (params.k1 + 1.0F) /
-                                   (static_cast<float>(fp.tfs[i]) + params.k1 *
-                                    (1.0F - params.b + params.b *
-                                     static_cast<float>(dls[i]) / static_cast<float>(avgdl)));
-                    contrib[i] = fidf * (tf_norm + params.delta);
-                }
-                for (std::size_t i = 0; i < n; ++i) {
-                    if (live[i]) local[fp.ords[i]] += contrib[i];
-                }
-            }
-            return local;
-        },
-        [](ScoreMap a, const ScoreMap& b) {
-            for (auto& [doc, score] : b) {
-                a[doc] += score;
-            }
-            return a;
-        }
-    );
-
-    using Entry = std::pair<float, std::uint64_t>;
-    std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
-
-    for (auto& [ord, score] : scores) {
-        if (heap.size() < k) {
-            heap.push({score, ord});
-        } else if (score > heap.top().first) {
-            heap.pop();
-            heap.push({score, ord});
-        }
-    }
-
-    std::vector<SearchResult> results;
-    results.reserve(heap.size());
-    while (!heap.empty()) {
-        auto& [score, ord] = heap.top();
-        results.push_back({ord, score});
-        heap.pop();
-    }
-    std::reverse(results.begin(), results.end());
-    return results;
+    // bag-of-words 评分 + top-k（共享 kernel score_bow_topk）。
+    return score_bow_topk(tps, k,
+                          live_doc_count_.load(std::memory_order_relaxed),
+                          sum_doc_len_.load(std::memory_order_relaxed),
+                          params, live_checker);
 }
 
 auto InvertedIndex::bool_search(
@@ -1130,10 +1070,7 @@ auto InvertedIndex::search_fuzzy(
     if (query_terms.empty()) return {};
     const Bm25Params& params = params_override ? *params_override : params_;
 
-    struct TermPostings {
-        std::string term;
-        FlatPostings fp;  // P1：扁平快照
-    };
+    using TermPostings = ScoredTerm;  // 共用条目（term + 扁平快照）
     std::vector<TermPostings> tps;
 
     // 翻转循环：vocab term 放外层、query term 放内层 + break。
@@ -1181,80 +1118,11 @@ auto InvertedIndex::search_fuzzy(
 
     if (tps.empty()) return {};
 
-    auto N = live_doc_count_.load(std::memory_order_relaxed);
-    auto sum_dl = sum_doc_len_.load(std::memory_order_relaxed);
-    auto avgdl = N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
-
-    using ScoreMap = std::unordered_map<std::uint64_t, float>;
-
-    ScoreMap scores = tbb::parallel_reduce(
-        tbb::blocked_range<std::size_t>(0, tps.size()),
-        ScoreMap{},
-        [&](const tbb::blocked_range<std::size_t>& range, ScoreMap local) {
-            for (std::size_t ti = range.begin(); ti < range.end(); ++ti) {
-                auto& fp = tps[ti].fp;
-                const std::size_t n = fp.size();
-
-                // P2.1：批量取 live/doc_len + 两阶段评分（同 search()，
-                // ①纯浮点可向量化 ②标量 scatter；公式逐运算一致）。
-                std::vector<char> live(n);
-                live_checker.fill_is_live(fp.ords, live);
-                std::size_t live_df = 0;
-                for (std::size_t i = 0; i < n; ++i) {
-                    live_df += static_cast<std::size_t>(live[i]);
-                }
-                if (live_df == 0) continue;
-
-                auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
-
-                std::vector<std::uint32_t> dls(n);
-                live_checker.fill_doc_lens(fp.ords, dls);
-
-                std::vector<float> contrib(n);
-                const float fidf = static_cast<float>(idf);
-                for (std::size_t i = 0; i < n; ++i) {
-                    auto tf_norm = static_cast<float>(fp.tfs[i]) *
-                                   (params.k1 + 1.0F) /
-                                   (static_cast<float>(fp.tfs[i]) + params.k1 *
-                                    (1.0F - params.b + params.b *
-                                     static_cast<float>(dls[i]) / static_cast<float>(avgdl)));
-                    contrib[i] = fidf * (tf_norm + params.delta);
-                }
-                for (std::size_t i = 0; i < n; ++i) {
-                    if (live[i]) local[fp.ords[i]] += contrib[i];
-                }
-            }
-            return local;
-        },
-        [](ScoreMap a, const ScoreMap& b) {
-            for (auto& [doc, score] : b) {
-                a[doc] += score;
-            }
-            return a;
-        }
-    );
-
-    using Entry = std::pair<float, std::uint64_t>;
-    std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
-
-    for (auto& [ord, score] : scores) {
-        if (heap.size() < k) {
-            heap.push({score, ord});
-        } else if (score > heap.top().first) {
-            heap.pop();
-            heap.push({score, ord});
-        }
-    }
-
-    std::vector<SearchResult> results;
-    results.reserve(heap.size());
-    while (!heap.empty()) {
-        auto& [score, ord] = heap.top();
-        results.push_back({ord, score});
-        heap.pop();
-    }
-    std::reverse(results.begin(), results.end());
-    return results;
+    // bag-of-words 评分 + top-k（共享 kernel score_bow_topk）。
+    return score_bow_topk(tps, k,
+                          live_doc_count_.load(std::memory_order_relaxed),
+                          sum_doc_len_.load(std::memory_order_relaxed),
+                          params, live_checker);
 }
 
 // ---- 统计 ----
