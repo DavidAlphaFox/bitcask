@@ -17,8 +17,12 @@
 
 #include <benchmark/benchmark.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <mutex>
+#include <shared_mutex>
+#include <span>
 #include <memory>
 #include <string>
 #include <thread>
@@ -39,6 +43,56 @@ class AllLiveChecker : public LiveChecker {
 public:
     [[nodiscard]] bool is_live(std::uint64_t) const override { return true; }
     [[nodiscard]] std::uint32_t doc_len(std::uint64_t) const override { return 8; }
+    // P2.1：批量覆写（生产 Index 实现为持锁数组直读，这里等价的平价填充）。
+    void fill_is_live(std::span<const std::uint64_t>,
+                      std::span<char> out) const override {
+        std::fill(out.begin(), out.end(), char{1});
+    }
+    void fill_doc_lens(std::span<const std::uint64_t>,
+                       std::span<std::uint32_t> out) const override {
+        std::fill(out.begin(), out.end(), 8U);
+    }
+};
+
+// 模拟生产 Index 形态：is_live/doc_len 每次调用拿一次 shared_lock（与
+// index.cpp 实现同构）。不覆写批量接口 → 默认回退逐条调用 = P2.1 之前的
+// 生产成本形态。
+class LockedScalarChecker : public LiveChecker {
+public:
+    explicit LockedScalarChecker(std::size_t n) : live_(n, 1), lens_(n, 8) {}
+    [[nodiscard]] bool is_live(std::uint64_t o) const override {
+        std::shared_lock lk(mu_);
+        return o < live_.size() && live_[o];
+    }
+    [[nodiscard]] std::uint32_t doc_len(std::uint64_t o) const override {
+        std::shared_lock lk(mu_);
+        return o < lens_.size() ? lens_[o] : 0;
+    }
+
+protected:
+    mutable std::shared_mutex mu_;
+    std::vector<char> live_;
+    std::vector<std::uint32_t> lens_;
+};
+
+// 覆写批量接口：一次锁扫整列 = P2.1 之后的生产成本形态。
+class LockedBatchChecker : public LockedScalarChecker {
+public:
+    using LockedScalarChecker::LockedScalarChecker;
+    void fill_is_live(std::span<const std::uint64_t> ords,
+                      std::span<char> out) const override {
+        std::shared_lock lk(mu_);
+        for (std::size_t i = 0; i < ords.size(); ++i) {
+            out[i] = static_cast<char>(ords[i] < live_.size() && live_[ords[i]]);
+        }
+    }
+    void fill_doc_lens(std::span<const std::uint64_t> ords,
+                       std::span<std::uint32_t> out) const override {
+        std::shared_lock lk(mu_);
+        for (std::size_t i = 0; i < ords.size(); ++i) {
+            out[i] = ords[i] < lens_.size() ? lens_[ords[i]] : 0;
+        }
+    }
 };
 
 TermPositions doc_with(const std::string& term) {
@@ -162,3 +216,39 @@ void BM_Inverted_PhraseHotTerm(benchmark::State& state) {
 }
 BENCHMARK(BM_Inverted_PhraseHotTerm)->Arg(4096)->Arg(100000)
     ->Unit(benchmark::kMicrosecond);
+
+// P2.1 生产形态 A/B：同一查询代码，checker 决定 live/doc_len 是逐 posting
+// 锁+虚调用（LockedScalar = P2.1 前形态）还是一次锁批量（LockedBatch）。
+template <typename Checker>
+void run_search_locked(benchmark::State& state) {
+    auto idx = build_index(100000);
+    Checker checker(200000);
+    for (auto _ : state) {
+        auto results = idx->search({"hot"}, 10, checker);
+        benchmark::DoNotOptimize(results);
+    }
+}
+void BM_Inverted_SearchLockedScalar(benchmark::State& state) {
+    run_search_locked<LockedScalarChecker>(state);
+}
+void BM_Inverted_SearchLockedBatch(benchmark::State& state) {
+    run_search_locked<LockedBatchChecker>(state);
+}
+BENCHMARK(BM_Inverted_SearchLockedScalar)->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_Inverted_SearchLockedBatch)->Unit(benchmark::kMicrosecond);
+
+// fuzzy 热词：命中 10 万 posting 的 vocab term + 1024 个冷词（走 P2.1
+// 向量化的两阶段评分块 + levenshtein 词典扫描）。
+void BM_Inverted_FuzzyHot(benchmark::State& state) {
+    auto idx = build_index(100000);
+    for (std::uint64_t i = 0; i < 1024; ++i) {
+        idx->add_doc(500000 + i, doc_with("cold" + std::to_string(i)));
+    }
+    AllLiveChecker live;
+    for (auto _ : state) {
+        auto results = idx->search_fuzzy({"hoot"}, 10, 1, live);
+        benchmark::DoNotOptimize(results);
+    }
+    state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations()) * 100000);
+}
+BENCHMARK(BM_Inverted_FuzzyHot)->Unit(benchmark::kMicrosecond);
