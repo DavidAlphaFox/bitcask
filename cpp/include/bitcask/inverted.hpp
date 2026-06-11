@@ -357,8 +357,12 @@ public:
     int replay_wal();
 
     // 内部分片结构（公开用于测试）。
+    // P2-min：map 值为 shared_ptr<PostingList>（CoW 发布，见 inverted.cpp
+    // mutable_pl）。phrase/near 读者持引用零拷贝读；写者 use_count==1 时
+    // 原地改（常态），>1（有 phrase 读者在持）才克隆替换。
+    using PostingMap = tbb::concurrent_hash_map<std::string, std::shared_ptr<PostingList>>;
     struct Shard {
-        tbb::concurrent_hash_map<std::string, PostingList> inverted;
+        PostingMap inverted;
     };
 
     // 获取内部 shard（用于测试）。

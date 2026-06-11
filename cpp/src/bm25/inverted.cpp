@@ -6,9 +6,11 @@
 #include <oneapi/tbb/parallel_reduce.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <queue>
 #include <string>
 #include <string_view>
@@ -65,6 +67,24 @@ float upper_bound_from(std::uint32_t global_max_tf, float idf,
                      (1.0f - params.b + params.b * 1.0f / static_cast<float>(avgdl)));
     // BM25+：上界含 δ 下界项，与实际评分一致，避免 WAND 剪枝漏结果（S8.10）。
     return idf * (tf_norm + params.delta);
+}
+
+// P2-min CoW：返回可安全原地修改的 PostingList。调用方必须持有该桶的写
+// accessor。读者只能在桶读锁下取得 shared_ptr 引用（与写 accessor 互斥），
+// 因此 use_count()==1 ⟺ 当前无 phrase/near 读者持引用 → 原地改安全；
+// >1 则克隆替换，旧版本由读者的引用计数续命（对读者 immutable）。
+// use_count() 是 relaxed load：观察到 1 后补 acquire fence，与读者析构
+// shared_ptr 的 release 递减配对，确保读者的最后一次数据读 happens-before
+// 写者的后续原地修改。
+PostingList& mutable_pl(std::shared_ptr<PostingList>& sp) {
+    if (!sp) {
+        sp = std::make_shared<PostingList>();
+    } else if (sp.use_count() > 1) {
+        sp = std::make_shared<PostingList>(*sp);
+    } else {
+        std::atomic_thread_fence(std::memory_order_acquire);
+    }
+    return *sp;
 }
 
 }  // namespace
@@ -128,15 +148,16 @@ void InvertedIndex::add_doc(
     for (auto& [term, data] : term_data) {
         auto& [tf, positions] = data;
         auto& shard = shard_for(term);
-        tbb::concurrent_hash_map<std::string, PostingList>::accessor acc;
+        PostingMap::accessor acc;
         shard.inverted.insert(acc, term);
+        PostingList& pl = mutable_pl(acc->second);  // P2-min：有 phrase 读者持引用时 CoW
         // S10.10：index_positions_=false 时不存 positions（省内存，短语/近邻失效）。
         if (index_positions_) {
-            acc->second.items.push_back({ord, tf, positions});
+            pl.items.push_back({ord, tf, positions});
         } else {
-            acc->second.items.push_back({ord, tf, {}});
+            pl.items.push_back({ord, tf, {}});
         }
-        acc->second.note_appended();  // S10.6：增量封块，在线索引也吃 WAND 块跳跃
+        pl.note_appended();  // S10.6：增量封块，在线索引也吃 WAND 块跳跃
         doc_len += tf;
     }
 
@@ -178,11 +199,11 @@ auto InvertedIndex::search(
 
     for (auto& term : query_terms) {
         auto& shard = shard_for(term);
-        tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+        PostingMap::const_accessor acc;
         if (shard.inverted.find(acc, term)) {
             TermPostings tp;
             tp.term = term;
-            acc->second.snapshot_flat(tp.fp);
+            acc->second->snapshot_flat(tp.fp);
             tps.push_back(std::move(tp));
         }
     }
@@ -298,13 +319,13 @@ auto InvertedIndex::explain(
         ts.term = term;
 
         auto& shard = shard_for(term);
-        tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+        PostingMap::const_accessor acc;
         if (!shard.inverted.find(acc, term)) {
             // term 不在索引：df=0、各项 0，仍记录以示「未命中」。
             out.terms.push_back(std::move(ts));
             continue;
         }
-        const PostingList& pl = acc->second;
+        const PostingList& pl = *acc->second;
 
         // 与 search() 一致地算 live df（O3：直接读 items[].ord，免物化 ords）。
         std::size_t live_df = 0;
@@ -354,11 +375,11 @@ auto InvertedIndex::search_wand(
 
     for (auto& term : query_terms) {
         auto& shard = shard_for(term);
-        tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+        PostingMap::const_accessor acc;
         if (shard.inverted.find(acc, term)) {
             TermPostings tp;
             tp.term = term;
-            acc->second.snapshot_flat(tp.fp);
+            acc->second->snapshot_flat(tp.fp);
             tps.push_back(std::move(tp));
         }
     }
@@ -528,16 +549,19 @@ auto InvertedIndex::search_phrase_impl(
     if (query_terms.empty()) return {};
     const Bm25Params& params = params_override ? *params_override : params_;
 
+    // P2-min：持 shared_ptr 引用零拷贝读（原先深拷贝整列表含全部 positions）。
+    // 安全性：写者对同 term 追加时经 mutable_pl 做 CoW（见 use_count 协议），
+    // 本读者持有的对象自取得引用起不再被修改。
     struct TermPostings {
         std::string term;
-        PostingList pl_copy;
+        std::shared_ptr<const PostingList> pl;
     };
     std::vector<TermPostings> tps;
     tps.reserve(query_terms.size());
 
     for (auto& term : query_terms) {
         auto& shard = shard_for(term);
-        tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+        PostingMap::const_accessor acc;
         if (!shard.inverted.find(acc, term)) return {};
         tps.push_back({term, acc->second});
     }
@@ -548,7 +572,7 @@ auto InvertedIndex::search_phrase_impl(
 
     std::unordered_map<std::uint64_t, float> scores;
 
-    auto& first_pl = tps[0].pl_copy;
+    auto& first_pl = *tps[0].pl;
 
     // live_df 只依赖 first term 的 posting list（与具体候选 doc 无关），
     // 提到循环外算一次，避免每个匹配 doc 重算 O(D)（S9.7）。
@@ -570,7 +594,7 @@ auto InvertedIndex::search_phrase_impl(
         bool doc_has_all_terms = true;
         std::vector<const std::vector<std::uint32_t>*> other_pos(tps.size(), nullptr);
         for (std::size_t t = 1; t < tps.size(); ++t) {
-            auto& other_pl = tps[t].pl_copy;
+            auto& other_pl = *tps[t].pl;
             auto idx = other_pl.find(posting_ord);
             if (idx >= other_pl.items.size()) { doc_has_all_terms = false; break; }
             other_pos[t] = &other_pl.items[idx].positions;
@@ -663,13 +687,26 @@ auto InvertedIndex::search_wildcard(
         std::vector<TermPostings>{},
         [&](const tbb::blocked_range<std::size_t>& range, std::vector<TermPostings> local) {
             for (std::size_t s = range.begin(); s < range.end(); ++s) {
-                for (auto& [term, plist] : shards_[s].inverted) {
-                    if (wildcard_match(pattern, term)) {
-                        TermPostings tp;
-                        tp.term = term;
-                        plist.snapshot_flat(tp.fp);
-                        local.push_back(std::move(tp));
+                // P2-min 两阶段：遍历只收集匹配的 key——遍历中调 find 会触发
+                // concurrent_hash_map 的懒 rehash 节点搬迁，迭代器会重复访问
+                // 同一节点（实测复现）。值统一在遍历结束后经 const_accessor 读
+                //（slot 上的 shared_ptr 可能被写者 CoW 替换，裸读会撕裂）。
+                std::vector<std::string> matched;
+                for (auto it = shards_[s].inverted.begin();
+                     it != shards_[s].inverted.end(); ++it) {
+                    if (wildcard_match(pattern, it->first)) {
+                        matched.push_back(it->first);
                     }
+                }
+                std::sort(matched.begin(), matched.end());
+                matched.erase(std::unique(matched.begin(), matched.end()), matched.end());
+                for (auto& term : matched) {
+                    PostingMap::const_accessor acc;
+                    if (!shards_[s].inverted.find(acc, term)) continue;
+                    TermPostings tp;
+                    tp.term = term;
+                    acc->second->snapshot_flat(tp.fp);
+                    local.push_back(std::move(tp));
                 }
             }
             return local;
@@ -773,11 +810,11 @@ auto InvertedIndex::bool_search(
     auto collect = [&](const std::string& term, bool is_must,
                        std::vector<TermPostings>& dst) {
         auto& shard = shard_for(term);
-        tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+        PostingMap::const_accessor acc;
         if (shard.inverted.find(acc, term)) {
             TermPostings tp;
             tp.term = term;
-            acc->second.snapshot_flat(tp.fp);
+            acc->second->snapshot_flat(tp.fp);
             tp.is_must = is_must;
             dst.push_back(std::move(tp));
         }
@@ -814,7 +851,7 @@ auto InvertedIndex::bool_search(
         bool all_terms_found = true;
         for (auto& term : must_terms) {
             auto& shard = shard_for(term);
-            tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+            PostingMap::const_accessor acc;
             if (!shard.inverted.find(acc, term)) {
                 all_terms_found = false;
                 break;
@@ -992,20 +1029,32 @@ auto InvertedIndex::search_fuzzy(
     // ② S10.3：跑 O(n·m) levenshtein 前先按字节长度差剪枝——编辑距离 ≥ |长度差|，
     //    故长度差 > max_edit 时必不匹配，省掉绝大多数 DP（levenshtein 按字节算，用字节长度）。
     for (auto& shard : shards_) {
-        for (auto& [term, plist] : shard.inverted) {
+        // P2-min 两阶段：遍历只做匹配收集 key——遍历中调 find 会触发懒 rehash
+        // 节点搬迁，迭代器重复访问同一节点（破坏 S10.2 的去重，实测复现）。
+        std::vector<std::string> matched;
+        for (auto it = shard.inverted.begin(); it != shard.inverted.end(); ++it) {
+            const auto& term = it->first;
             for (auto& query_term : query_terms) {
                 auto len_diff = term.size() > query_term.size()
                                     ? term.size() - query_term.size()
                                     : query_term.size() - term.size();
                 if (len_diff > max_edit_distance) continue;
                 if (levenshtein_distance(query_term, term) <= max_edit_distance) {
-                    TermPostings tp;
-                    tp.term = term;
-                    plist.snapshot_flat(tp.fp);
-                    tps.push_back(std::move(tp));
+                    matched.push_back(term);
                     break;
                 }
             }
+        }
+        std::sort(matched.begin(), matched.end());
+        matched.erase(std::unique(matched.begin(), matched.end()), matched.end());
+        for (auto& term : matched) {
+            // 值经 const_accessor 读（slot 的 shared_ptr 可能被 CoW 替换）。
+            PostingMap::const_accessor acc;
+            if (!shard.inverted.find(acc, term)) continue;
+            TermPostings tp;
+            tp.term = term;
+            acc->second->snapshot_flat(tp.fp);
+            tps.push_back(std::move(tp));
         }
     }
 
@@ -1101,26 +1150,34 @@ auto InvertedIndex::avg_doc_len() const -> double {
 
 auto InvertedIndex::df(std::string_view term) const -> std::size_t {
     auto& shard = shard_for(term);
-    tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+    PostingMap::const_accessor acc;
     if (!shard.inverted.find(acc, std::string(term))) return 0;
-    return acc->second.items.size();
+    return acc->second->items.size();
 }
 
 auto InvertedIndex::df_live(std::string_view term, const LiveChecker& live_checker) const -> std::size_t {
     auto& shard = shard_for(term);
-    tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+    PostingMap::const_accessor acc;
     if (!shard.inverted.find(acc, std::string(term))) return 0;
     std::size_t count = 0;
-    for (auto& posting : acc->second.items) {
+    for (auto& posting : acc->second->items) {
         if (live_checker.is_live(posting.ord)) ++count;
     }
     return count;
 }
 
 void InvertedIndex::finalize_all_postings() {
+    // P2-min：与 compact 同模式——先快照 key，再逐 key 持写 accessor 经
+    // mutable_pl 修改（迭代器裸改在共享模型下会绕过 CoW 协议）。
     for (auto& shard : shards_) {
+        std::vector<std::string> keys;
         for (auto it = shard.inverted.begin(); it != shard.inverted.end(); ++it) {
-            it->second.finalize();
+            keys.push_back(it->first);
+        }
+        for (auto& key : keys) {
+            PostingMap::accessor acc;
+            if (!shard.inverted.find(acc, key)) continue;
+            mutable_pl(acc->second).finalize();
         }
     }
 }
@@ -1136,9 +1193,9 @@ auto InvertedIndex::compact(const LiveChecker& live_checker, double dead_ratio_t
             keys.push_back(it->first);
         }
         for (auto& key : keys) {
-            tbb::concurrent_hash_map<std::string, PostingList>::accessor acc;
+            PostingMap::accessor acc;
             if (!shard.inverted.find(acc, key)) continue;
-            auto& pl = acc->second;
+            const PostingList& pl = *acc->second;
             if (pl.items.empty()) continue;
 
             std::size_t dead = 0;
@@ -1149,7 +1206,8 @@ auto InvertedIndex::compact(const LiveChecker& live_checker, double dead_ratio_t
             double ratio = static_cast<double>(dead) / static_cast<double>(pl.items.size());
             if (ratio < dead_ratio_threshold) continue;
 
-            if (pl.compact([&](std::uint64_t ord) { return live_checker.is_live(ord); })) {
+            if (mutable_pl(acc->second).compact(
+                    [&](std::uint64_t ord) { return live_checker.is_live(ord); })) {
                 ++compacted;
             }
         }
@@ -1196,7 +1254,8 @@ auto InvertedIndex::save(std::string_view path) const -> bool {
         ok = write_u32(term_count);
         if (!ok) { std::fclose(f); return false; }
 
-        for (auto& [term, pl] : shard.inverted) {
+        for (auto& [term, plsp] : shard.inverted) {
+            const PostingList& pl = *plsp;
             auto tlen = static_cast<std::uint32_t>(term.size());
             ok = write_u32(tlen);
             if (!ok) { std::fclose(f); return false; }
@@ -1392,7 +1451,7 @@ auto InvertedIndex::load(std::string_view path) -> bool {
             for (auto& p : pl.items) {
                 if (p.tf > pl.max_tf) pl.max_tf = p.tf;
             }
-            shard.inverted.emplace(std::move(term), std::move(pl));
+            shard.inverted.emplace(std::move(term), std::make_shared<PostingList>(std::move(pl)));
         }
     }
 
