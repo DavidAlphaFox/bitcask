@@ -1123,3 +1123,72 @@ TEST(InvertedIndex, PhraseSearchConcurrentWithSingleWriter) {
     auto final_res = idx.search_phrase({"p0", "p1"}, 5, checker);
     EXPECT_EQ(final_res.size(), 5u);
 }
+
+// =========================================================================
+// P2.2：intersect_u32 三路实现（标量/galloping/AVX2）黑盒对拍
+// =========================================================================
+
+#include "bitcask/intersect.hpp"
+
+namespace {
+std::vector<std::uint32_t> ref_intersect(const std::vector<std::uint32_t>& a,
+                                         const std::vector<std::uint32_t>& b) {
+    std::vector<std::uint32_t> r;
+    std::set_intersection(a.begin(), a.end(), b.begin(), b.end(),
+                          std::back_inserter(r));
+    return r;
+}
+std::vector<std::uint32_t> make_sorted_unique(std::uint64_t& seed, std::size_t n,
+                                              std::uint32_t value_range) {
+    auto next = [&seed] {
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        return static_cast<std::uint32_t>(seed >> 33);
+    };
+    std::vector<std::uint32_t> v(n);
+    for (auto& x : v) x = next() % value_range;
+    std::sort(v.begin(), v.end());
+    v.erase(std::unique(v.begin(), v.end()), v.end());
+    return v;
+}
+}  // namespace
+
+TEST(IntersectU32, AgreesWithSetIntersectionRandomized) {
+    std::uint64_t seed = 7;
+    std::vector<std::uint32_t> out;
+    // 覆盖：块边界附近的大小、密集/稀疏重叠、空输入。
+    const std::size_t sizes[] = {0, 1, 7, 8, 9, 15, 16, 17, 63, 64, 200, 777};
+    for (auto na : sizes) {
+        for (auto nb : sizes) {
+            for (std::uint32_t range : {50U, 1000U, 1000000U}) {
+                auto a = make_sorted_unique(seed, na, range);
+                auto b = make_sorted_unique(seed, nb, range);
+                intersect_u32(a, b, out);
+                ASSERT_EQ(out, ref_intersect(a, b))
+                    << "na=" << na << " nb=" << nb << " range=" << range;
+            }
+        }
+    }
+}
+
+TEST(IntersectU32, GallopingPathSkewed) {
+    std::uint64_t seed = 99;
+    std::vector<std::uint32_t> out;
+    // >32x 悬殊触发 galloping 路径（两个方向）。
+    auto small_v = make_sorted_unique(seed, 20, 100000);
+    auto large_v = make_sorted_unique(seed, 5000, 100000);
+    intersect_u32(small_v, large_v, out);
+    EXPECT_EQ(out, ref_intersect(small_v, large_v));
+    intersect_u32(large_v, small_v, out);
+    EXPECT_EQ(out, ref_intersect(small_v, large_v));
+}
+
+TEST(IntersectU32, FullAndNoOverlap) {
+    std::vector<std::uint32_t> a, out;
+    for (std::uint32_t i = 0; i < 1000; ++i) a.push_back(i * 2);
+    intersect_u32(a, a, out);
+    EXPECT_EQ(out, a);                       // 全重叠
+    std::vector<std::uint32_t> b;
+    for (std::uint32_t i = 0; i < 1000; ++i) b.push_back(i * 2 + 1);
+    intersect_u32(a, b, out);
+    EXPECT_TRUE(out.empty());                // 零重叠（交错）
+}
