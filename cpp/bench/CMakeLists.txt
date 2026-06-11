@@ -22,6 +22,7 @@ add_executable(bitcask_bench
     keydir_bench.cpp
     cask_bench.cpp
     inverted_bench.cpp
+    analyzer_bench.cpp
     bench_main.cpp
 )
 target_link_libraries(bitcask_bench
@@ -31,5 +32,6 @@ target_link_libraries(bitcask_bench
         bitcask_cask
         bitcask_bm25
         bitcask_index
+        bitcask_text
         bitcask_warnings
 )
