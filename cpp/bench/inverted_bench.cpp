@@ -140,3 +140,25 @@ BENCHMARK(BM_Inverted_SearchWhileIndexing)->Threads(4)
     ->Unit(benchmark::kMicrosecond)->UseRealTime();
 
 }  // namespace
+
+// P2-min 基准：phrase 路径（唯一仍深拷贝 PostingList 的查询路径）。
+// 每文档 "p0 p1" 相邻 → 短语全命中，posting 含 positions，深拷贝成本最大化。
+void BM_Inverted_PhraseHotTerm(benchmark::State& state) {
+    const auto n = static_cast<std::size_t>(state.range(0));
+    auto idx = std::make_unique<InvertedIndex>();
+    for (std::size_t i = 0; i < n; ++i) {
+        idx->add_doc(static_cast<std::uint64_t>(i),
+                     {{"p0", {1, {0}}}, {"p1", {1, {1}}},
+                      {"filler", {6, {2, 3, 4, 5, 6, 7}}}});
+    }
+    AllLiveChecker live;
+
+    for (auto _ : state) {
+        auto results = idx->search_phrase({"p0", "p1"}, 10, live);
+        benchmark::DoNotOptimize(results);
+    }
+    state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations()) *
+                            static_cast<std::int64_t>(n));
+}
+BENCHMARK(BM_Inverted_PhraseHotTerm)->Arg(4096)->Arg(100000)
+    ->Unit(benchmark::kMicrosecond);
