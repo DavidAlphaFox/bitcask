@@ -242,3 +242,40 @@ TEST(SearchLayerWildcard, DeletedDocSkipped) {
     ASSERT_EQ(result->size(), 1u);
     EXPECT_EQ(result->at(0).key, "doc2");
 }
+
+// =========================================================================
+// P2.5：最长字面量预过滤的必要性对拍——预过滤绝不能拒绝真命中
+// =========================================================================
+
+TEST(WildcardPrefilter, NeverRejectsRealMatch) {
+    using bitcask::bm25::longest_literal;
+    using bitcask::bm25::wildcard_match;
+    // 确定性 LCG 生成随机 pattern（含 */?）与 text，验证必要性：
+    // wildcard_match(p, t) == true ⟹ t 包含 longest_literal(p)。
+    std::uint64_t seed = 11;
+    auto next = [&seed] {
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        return seed >> 33;
+    };
+    const char syms[] = "ab*?";
+    for (int iter = 0; iter < 20000; ++iter) {
+        std::string pat, text;
+        auto lp = next() % 8, lt = next() % 8;
+        for (std::uint64_t i = 0; i < lp; ++i) pat.push_back(syms[next() % 4]);
+        for (std::uint64_t i = 0; i < lt; ++i) text.push_back(syms[next() % 2]);
+        if (!wildcard_match(pat, text)) continue;
+        auto lit = longest_literal(pat);
+        ASSERT_TRUE(lit.empty() || text.find(lit) != std::string::npos)
+            << "pat=" << pat << " text=" << text << " lit=" << lit;
+    }
+}
+
+TEST(WildcardPrefilter, LongestLiteralExtraction) {
+    using bitcask::bm25::longest_literal;
+    EXPECT_EQ(longest_literal("term1234*"), "term1234");
+    EXPECT_EQ(longest_literal("*ing"), "ing");
+    EXPECT_EQ(longest_literal("a?bcd*ef"), "bcd");
+    EXPECT_EQ(longest_literal("***"), "");
+    EXPECT_EQ(longest_literal("???"), "");
+    EXPECT_EQ(longest_literal("plain"), "plain");
+}

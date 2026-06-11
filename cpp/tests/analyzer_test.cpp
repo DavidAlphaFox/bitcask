@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "bitcask/analyzer.hpp"
+#include "bitcask/text_utils.hpp"
 #include "bitcask/cjk_detect.hpp"
 #include "bitcask/ngram_analyzer.hpp"
 #include "bitcask/whitespace_analyzer.hpp"
@@ -294,4 +295,51 @@ TEST(NgramAnalyzer, MinTokenLengthDoesNotAffectCjkNgrams) {
     EXPECT_NE(tfs.find("北京"), tfs.end());  // CJK bi-gram（2 codepoint）必须保留
     EXPECT_EQ(tfs.find("a"), tfs.end());     // 拉丁短词过滤
     EXPECT_EQ(tfs.find("of"), tfs.end());
+}
+
+// =========================================================================
+// P2.5：nfkc_fold ASCII 快路径语义对拍
+// =========================================================================
+
+TEST(NfkcFold, AsciiFastPathEqualsLowercase) {
+    using bitcask::text::detail::nfkc_fold;
+    EXPECT_EQ(nfkc_fold("Hello, World! 123"), "hello, world! 123");
+    EXPECT_EQ(nfkc_fold("ABCxyz"), "abcxyz");
+    EXPECT_EQ(nfkc_fold("already lower"), "already lower");
+    EXPECT_EQ(nfkc_fold(""), "");
+    // 全部 ASCII 可打印字符：除 A-Z 外不变。
+    std::string all;
+    for (char c = 0x20; c < 0x7F; ++c) all.push_back(c);
+    auto folded = nfkc_fold(all);
+    ASSERT_EQ(folded.size(), all.size());
+    for (std::size_t i = 0; i < all.size(); ++i) {
+        char expect = (all[i] >= 'A' && all[i] <= 'Z')
+                          ? static_cast<char>(all[i] - 'A' + 'a') : all[i];
+        EXPECT_EQ(folded[i], expect) << "i=" << i;
+    }
+}
+
+TEST(NfkcFold, NonAsciiPathUnchanged) {
+    using bitcask::text::detail::nfkc_fold;
+    // 全角 → 半角 + casefold（NFKC_Casefold 经典行为，走 utf8proc 路径）。
+    EXPECT_EQ(nfkc_fold("ＨＥＬＬＯ"), "hello");
+    EXPECT_EQ(nfkc_fold("Ｃａｆé"), "café");
+    EXPECT_EQ(nfkc_fold("北京"), "北京");
+    // 混合（含非 ASCII → 整串走 utf8proc，ASCII 部分行为一致）。
+    EXPECT_EQ(nfkc_fold("Hello北京World"), "hello北京world");
+}
+
+TEST(ToCodepoints, AsciiFastPathOffsets) {
+    using bitcask::text::detail::to_codepoints;
+    auto cps = to_codepoints("a北b");
+    ASSERT_EQ(cps.size(), 3u);
+    EXPECT_EQ(cps[0].cp, U'a');
+    EXPECT_EQ(cps[0].byte_off, 0u);
+    EXPECT_EQ(cps[0].byte_len, 1u);
+    EXPECT_EQ(cps[1].cp, U'北');
+    EXPECT_EQ(cps[1].byte_off, 1u);
+    EXPECT_EQ(cps[1].byte_len, 3u);
+    EXPECT_EQ(cps[2].cp, U'b');
+    EXPECT_EQ(cps[2].byte_off, 4u);
+    EXPECT_EQ(cps[2].byte_len, 1u);
 }
