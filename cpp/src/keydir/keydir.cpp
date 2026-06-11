@@ -194,7 +194,7 @@ std::optional<EntryProxy> KeyDir::get(std::string_view key,
     std::shared_lock lock(mutex_);
 
     if (pending_.has_value()) {
-        auto p = pending_->find(std::string(key));
+        auto p = pending_->find(key);
         if (p != pending_->end() && target_epoch >= p->second.epoch) {
             const SingleEntry& s = p->second;
             const bool tomb = is_pending_tombstone(s);
@@ -203,7 +203,7 @@ std::optional<EntryProxy> KeyDir::get(std::string_view key,
         }
     }
 
-    auto it = entries_.find(std::string(key));
+    auto it = entries_.find(key);
     if (it == entries_.end()) return std::nullopt;
 
     auto found = entry_at_epoch(it->second, target_epoch);
@@ -261,7 +261,7 @@ PutResult KeyDir::put(std::string_view key,
     bool current_is_tombstone = false;
 
     if (pending_.has_value()) {
-        auto p = pending_->find(std::string(key));
+        auto p = pending_->find(key);
         if (p != pending_->end() && kMaxEpoch >= p->second.epoch) {
             pending_entry = &p->second;
             current_is_tombstone = is_pending_tombstone(*pending_entry);
@@ -270,7 +270,7 @@ PutResult KeyDir::put(std::string_view key,
         }
     }
     if (!found) {
-        auto it = entries_.find(std::string(key));
+        auto it = entries_.find(key);
         if (it != entries_.end()) {
             auto at = entry_at_epoch(it->second, kMaxEpoch);
             if (at.found) {
@@ -445,7 +445,7 @@ bool KeyDir::remove(std::string_view key, std::uint32_t remove_time) {
     // entries 里的「旧 live revision」会被 remove 当成「活的」再减一次
     // key_count_，造成 double-decrement bug。
     if (pending_.has_value()) {
-        auto p = pending_->find(std::string(key));
+        auto p = pending_->find(key);
         if (p != pending_->end()) {
             if (is_pending_tombstone(p->second)) {
                 return false;  // shadowed by pending tomb
@@ -456,7 +456,7 @@ bool KeyDir::remove(std::string_view key, std::uint32_t remove_time) {
         }
     }
     if (!found) {
-        auto it = entries_.find(std::string(key));
+        auto it = entries_.find(key);
         if (it != entries_.end()) {
             auto at = entry_at_epoch(it->second, kMaxEpoch);
             if (at.found && !at.is_tombstone) {
@@ -488,7 +488,7 @@ bool KeyDir::remove(std::string_view key, std::uint32_t remove_time) {
         pending_updated_ += 1;
     } else if (keyfolders_ == 0) {
         // 没 fold 干扰——直接从 entries_ 抹掉。
-        auto it = entries_.find(std::string(key));
+        auto it = entries_.find(key);
         if (it != entries_.end()) entries_.erase(it);
     } else {
         // 有 fold 但还没建 pending——往 entries 里插一条 sibling 墓碑
@@ -528,7 +528,7 @@ PutResult KeyDir::conditional_remove(std::string_view key,
         SingleEntry cur{};
         bool found = false;
         if (pending_.has_value()) {
-            auto p = pending_->find(std::string(key));
+            auto p = pending_->find(key);
             if (p != pending_->end()) {
                 if (is_pending_tombstone(p->second)) {
                     return PutResult::kOk;  // shadowed; not-found is success
@@ -537,7 +537,7 @@ PutResult KeyDir::conditional_remove(std::string_view key,
             }
         }
         if (!found) {
-            auto it = entries_.find(std::string(key));
+            auto it = entries_.find(key);
             if (it != entries_.end()) {
                 auto at = entry_at_epoch(it->second, kMaxEpoch);
                 if (at.found && !at.is_tombstone) {

@@ -27,6 +27,8 @@
 
 #pragma once
 
+#include "bitcask/string_hash.hpp"
+
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -311,12 +313,14 @@ private:
     mutable std::shared_mutex mutex_;
 
     // 主 hash。值是 variant；判别用 std::get_if<SingleEntry|MultiEntry>。
-    std::unordered_map<std::string, Entry> entries_;
+    // 透明 hash：get/put/remove 热路径用 string_view 直接查，零临时拷贝（O1）。
+    std::unordered_map<std::string, Entry, StringHash, std::equal_to<>> entries_;
 
     // fold 期间「pending 表」：写时复制规则触发后，新 key 和「不在
     // entries_ 里的 key 之 tombstone」会落到这里。最后一个 release 时
     // merge 回 entries_。
-    std::optional<std::unordered_map<std::string, SingleEntry>> pending_;
+    std::optional<std::unordered_map<std::string, SingleEntry,
+                                     StringHash, std::equal_to<>>> pending_;
     std::uint64_t pending_start_epoch_ = 0;  // 第一个 fold 启动时的 epoch
     std::uint64_t pending_start_time_  = 0;  // 第一个 fold 启动时的 wall-clock
     std::uint64_t pending_updated_     = 0;  // pending 中累积的写入次数

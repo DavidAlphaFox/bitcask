@@ -15,6 +15,7 @@
 #pragma once
 
 #include "bitcask/inverted.hpp"
+#include "bitcask/string_hash.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -28,13 +29,8 @@
 
 namespace bitcask::index {
 
-// 透明 hash/equal：让 ext2ord_ 支持用 string_view 直接查找，免去临时 string 拷贝。
-struct StringHash {
-    using is_transparent = void;
-    std::size_t operator()(std::string_view s) const noexcept {
-        return std::hash<std::string_view>{}(s);
-    }
-};
+// 透明 hash 已提到 bitcask/string_hash.hpp 与 KeyDir 共用。
+using bitcask::StringHash;
 
 // 一条文档在磁盘上的定位（pread 整条 kDoc 用）。
 struct DocLoc {
