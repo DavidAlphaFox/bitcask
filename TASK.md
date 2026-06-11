@@ -765,7 +765,9 @@ WAND 路径无此问题。建议顺序：P2.1 → 基准 → P2.2 → P2.3。
 
 | **P4.3** | 两阶段 tbb 词表扫描提取 `collect_term_keys`：「遍历 concurrent_hash_map 只收集 key（不可 find/裸读，懒 rehash 会致迭代器重访/CoW 撕裂）+ sort/unique 去重」这条**实测复现过的并发不变量**此前在 wildcard/fuzzy/finalize_all_postings/compact 4 处各带一段警告注释复制——收敛到单一 helper（谓词过滤版），调用方只剩「逐 key 经 accessor 取值/改值」。价值在不变量集中（下个加词表扫描功能的人照抄 helper 而非重踩 rehash bug），非行数。ctest 338/338 + ASan(inverted/fuzzy/wildcard) 干净 + TSan 并发用例干净 + bench 无回归 + eunit 44/44 | ✅ |
 
-**本批未做（记录，留后续独立 commit）**：`compressed_ords`/`finalized` 内存死状态删除（touches save/load 落盘格式，有 fixture 风险，单独评审）；bool_search 的 u64 回退影子路径（ord>2^32 不可达、无测试，与 u32 路径需人工同步）；测试侧 LCG/LiveChecker 桩重复（建共享测试头）；nfkc_casefold_inert 表改离线 Unicode 数据生成（altitude）。
+| **P4.4** | 删 `compressed_ords`/`finalized` 内存死状态：O3 后查询路径从不读压缩副本（items[].ord 恒为事实来源），二字段只服务 save 的格式决定却让维护者误以为是读路径事实来源。删两字段——`save()` 改为现场 `gap_encode(items.ords)`（与旧 finalize 写出的字节逐字节一致，磁盘格式不变）、`load()` 解码进局部缓冲回填 items[].ord 后丢弃、`finalize`/`note_appended`/`compact_flags` 去掉压缩维护。`note_appended` 的尾块弹出逻辑独立于 finalized 标志（已确认），不受影响。净 −23 行 + 永久省 1-2 字节/posting 内存。两个误导命名测试（FinalizeCompressesOrds/ReducesMemory，实际只断言 search/df 不变）改名为 FinalizePreservesSearchResults/KeepsDfStable。**验证**：SaveLoadRoundtrip（非 finalized→现在 comp=1 路径）+ SaveLoadWithFinalizedPostings + LoadV3SnapshotBackwardCompat（新 load 读旧 finalize 的 comp=1 字节，证字节一致）+ LoadFinalizedThenAddDocKeepsOldOrds（回填路径）全过；ctest 338/338（×3 稳定）+ ASan 干净 + eunit 44/44 | ✅ |
+
+**本批未做（记录，留后续独立 commit）**：bool_search 的 u64 回退影子路径——P3.1 刚硬化过该求交核心（水位幂等 + intersect 守卫），且 u64 路径不可达（需 >2^32 文档），**有意不动**以免扰动刚修的崩溃路径；测试侧 LCG/LiveChecker 桩重复（建共享测试头，纯测试维护性）；nfkc_casefold_inert 表改离线 Unicode 数据生成（引入构建期工具，altitude）。
 
 ### V3 — HNSW 单图 + search_vector（暂缓）
 
