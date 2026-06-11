@@ -1,24 +1,23 @@
-// 升序去重 u32 数组求交的三路实现。接口语义见 intersect.hpp。
+// 升序去重 u64 数组求交（Inoue 块过滤 + SIMD 精确匹配）。
+// 接口语义见 intersect.hpp。
 
 #include "bitcask/intersect.hpp"
 
 #include <algorithm>
-#include <array>
 #include <bit>
 #include <cstddef>
 
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-#define BITCASK_INTERSECT_AVX2 1
+#define BITCASK_INTERSECT_SIMD 1
 #include <immintrin.h>
 #endif
 
 namespace bitcask::bm25 {
 namespace {
 
-// 标量双指针归并。
-void intersect_scalar(const std::uint32_t* a, std::size_t na,
-                      const std::uint32_t* b, std::size_t nb,
-                      std::vector<std::uint32_t>& out) {
+void intersect_scalar(const std::uint64_t* a, std::size_t na,
+                      const std::uint64_t* b, std::size_t nb,
+                      std::vector<std::uint64_t>& out) {
     std::size_t i = 0;
     std::size_t j = 0;
     while (i < na && j < nb) {
@@ -34,14 +33,12 @@ void intersect_scalar(const std::uint32_t* a, std::size_t na,
     }
 }
 
-// galloping：s（小）驱动，l（大）上指数探查 + 二分。
-void intersect_galloping(const std::uint32_t* s, std::size_t ns,
-                         const std::uint32_t* l, std::size_t nl,
-                         std::vector<std::uint32_t>& out) {
+void intersect_galloping(const std::uint64_t* s, std::size_t ns,
+                         const std::uint64_t* l, std::size_t nl,
+                         std::vector<std::uint64_t>& out) {
     std::size_t lo = 0;
     for (std::size_t i = 0; i < ns && lo < nl; ++i) {
-        const std::uint32_t v = s[i];
-        // 指数探查找到包含 v 的窗口，再二分。
+        const std::uint64_t v = s[i];
         std::size_t step = 1;
         std::size_t hi = lo;
         while (hi < nl && l[hi] < v) {
@@ -50,7 +47,7 @@ void intersect_galloping(const std::uint32_t* s, std::size_t ns,
             step <<= 1;
         }
         if (hi >= nl) hi = nl - 1;
-        if (l[hi] < v) break;  // 大数组耗尽
+        if (l[hi] < v) break;
         const auto* it = std::lower_bound(l + lo, l + hi + 1, v);
         lo = static_cast<std::size_t>(it - l);
         if (lo < nl && l[lo] == v) {
@@ -60,98 +57,128 @@ void intersect_galloping(const std::uint32_t* s, std::size_t ns,
     }
 }
 
-#ifdef BITCASK_INTERSECT_AVX2
+#ifdef BITCASK_INTERSECT_SIMD
 
-// mask（8 bit）→ 压缩置换索引：把被置位 lane 的下标紧凑排到前部。
-// 8KB，进程内一次性构造。
-struct CompressLut {
-    alignas(32) std::array<std::array<std::uint32_t, 8>, 256> idx{};
-    CompressLut() {
-        for (unsigned mask = 0; mask < 256; ++mask) {
-            unsigned dst = 0;
-            for (unsigned bit = 0; bit < 8; ++bit) {
-                if (mask & (1U << bit)) idx[mask][dst++] = bit;
-            }
-        }
-    }
-};
+// ── AVX2 内核（block=4，permute4x64 立即数旋转 + 条件 push_back）─────────
 
 __attribute__((target("avx2")))
-void intersect_avx2(const std::uint32_t* a, std::size_t na,
-                    const std::uint32_t* b, std::size_t nb,
-                    std::vector<std::uint32_t>& out) {
-    static const CompressLut lut;
+void exact_match_u64_avx2(const std::uint64_t* a, const std::uint64_t* b,
+                           std::vector<std::uint64_t>& out) {
+    const __m256i va =
+        _mm256_loadu_si256(reinterpret_cast<const __m256i_u*>(a));
+    const __m256i vb =
+        _mm256_loadu_si256(reinterpret_cast<const __m256i_u*>(b));
 
-    // 输出上限 min(na,nb)；末尾留 8 lane 余量给整组 storeu。
-    const std::size_t cap = std::min(na, nb);
-    out.resize(cap + 8);
-    std::uint32_t* dst = out.data();
-    std::size_t cnt = 0;
+    const __m256i cmp01 = _mm256_or_si256(
+        _mm256_cmpeq_epi64(va, vb),
+        _mm256_cmpeq_epi64(va,
+                           _mm256_permute4x64_epi64(vb, 0x39)));
+    const __m256i cmp23 = _mm256_or_si256(
+        _mm256_cmpeq_epi64(
+            va, _mm256_permute4x64_epi64(vb, 0x4E)),
+        _mm256_cmpeq_epi64(
+            va, _mm256_permute4x64_epi64(vb, 0x93)));
+    const __m256i cmp = _mm256_or_si256(cmp01, cmp23);
 
-    // b 块的 8 个循环旋转索引（permutevar8x32 跨 128-bit lane 旋转）。
-    alignas(32) static constexpr std::uint32_t kRot[8][8] = {
-        {0, 1, 2, 3, 4, 5, 6, 7}, {1, 2, 3, 4, 5, 6, 7, 0},
-        {2, 3, 4, 5, 6, 7, 0, 1}, {3, 4, 5, 6, 7, 0, 1, 2},
-        {4, 5, 6, 7, 0, 1, 2, 3}, {5, 6, 7, 0, 1, 2, 3, 4},
-        {6, 7, 0, 1, 2, 3, 4, 5}, {7, 0, 1, 2, 3, 4, 5, 6}};
+    const unsigned mask = static_cast<unsigned>(
+        _mm256_movemask_pd(_mm256_castsi256_pd(cmp)));
 
+    if (mask & 1u) out.push_back(a[0]);
+    if (mask & 2u) out.push_back(a[1]);
+    if (mask & 4u) out.push_back(a[2]);
+    if (mask & 8u) out.push_back(a[3]);
+}
+
+__attribute__((target("avx2")))
+void intersect_inoue_avx2(const std::uint64_t* a, std::size_t na,
+                          const std::uint64_t* b, std::size_t nb,
+                          std::vector<std::uint64_t>& out) {
+    constexpr std::size_t B = 4;
     std::size_t i = 0;
     std::size_t j = 0;
-    while (i + 8 <= na && j + 8 <= nb) {
-        const __m256i va =
-            _mm256_loadu_si256(reinterpret_cast<const __m256i_u*>(a + i));
-        const __m256i vb =
-            _mm256_loadu_si256(reinterpret_cast<const __m256i_u*>(b + j));
 
-        // va 各 lane 与 vb 的 8 个旋转逐一全比较，命中掩码落在 va 的 lane 位。
-        __m256i cmp = _mm256_cmpeq_epi32(va, vb);
-        for (int r = 1; r < 8; ++r) {
-            const __m256i ridx = _mm256_load_si256(
-                reinterpret_cast<const __m256i*>(kRot[r]));
-            const __m256i vbr = _mm256_permutevar8x32_epi32(vb, ridx);
-            cmp = _mm256_or_si256(cmp, _mm256_cmpeq_epi32(va, vbr));
-        }
-        const unsigned mask = static_cast<unsigned>(
-            _mm256_movemask_ps(_mm256_castsi256_ps(cmp)));
+    while (i + B <= na && j + B <= nb) {
+        if (a[i + B - 1] < b[j]) { i += B; continue; }
+        if (b[j + B - 1] < a[i]) { j += B; continue; }
 
-        const __m256i perm = _mm256_load_si256(
-            reinterpret_cast<const __m256i*>(lut.idx[mask].data()));
-        const __m256i packed = _mm256_permutevar8x32_epi32(va, perm);
-        // 纵深防御：每轮整组 storeu 8 lane，需 cnt+8 ≤ capacity。无重复输入
-        // 下 cnt ≤ min(na,nb)=cap 恒成立、守卫永不触发（零开销）；若调用方
-        // 违反「严格升序无重复」前置（如崩溃恢复的重复 ord），输出可超 cap，
-        // 此处扩容避免写穿堆（不保证结果正确，只保证不 UB）。
-        if (cnt + 8 > out.size()) {
-            out.resize(out.size() * 2 + 8);
-            dst = out.data();
-        }
-        _mm256_storeu_si256(reinterpret_cast<__m256i_u*>(dst + cnt), packed);
-        cnt += static_cast<std::size_t>(std::popcount(mask));
+        exact_match_u64_avx2(a + i, b + j, out);
 
-        // 块推进：最大值较小的一侧整组前进（相等则双进）。
-        // 正确性：a 块内任何 ≤ max(b 块) 的元素已与全部可能相等者比较过。
-        const std::uint32_t amax = a[i + 7];
-        const std::uint32_t bmax = b[j + 7];
-        if (amax <= bmax) i += 8;
-        if (bmax <= amax) j += 8;
+        const std::uint64_t amax = a[i + B - 1];
+        const std::uint64_t bmax = b[j + B - 1];
+        if (amax <= bmax) i += B;
+        if (bmax <= amax) j += B;
     }
 
-    out.resize(cnt);
-    // 尾部（不足一块）标量归并。
     intersect_scalar(a + i, na - i, b + j, nb - j, out);
 }
 
-#endif  // BITCASK_INTERSECT_AVX2
+// ── AVX-512 内核（block=8，permutexvar + cmpeq_mask + compressstoreu）─────
+
+alignas(64) static constexpr std::uint64_t kRot512[8][8] = {
+    {0, 1, 2, 3, 4, 5, 6, 7},
+    {1, 2, 3, 4, 5, 6, 7, 0},
+    {2, 3, 4, 5, 6, 7, 0, 1},
+    {3, 4, 5, 6, 7, 0, 1, 2},
+    {4, 5, 6, 7, 0, 1, 2, 3},
+    {5, 6, 7, 0, 1, 2, 3, 4},
+    {6, 7, 0, 1, 2, 3, 4, 5},
+    {7, 0, 1, 2, 3, 4, 5, 6},
+};
+
+__attribute__((target("avx512f")))
+void exact_match_u64_avx512(const std::uint64_t* a, const std::uint64_t* b,
+                              std::vector<std::uint64_t>& out) {
+    const __m512i va = _mm512_loadu_si512(a);
+    const __m512i vb = _mm512_loadu_si512(b);
+
+    __mmask8 cmp = _mm512_cmpeq_epi64_mask(va, vb);
+    for (int r = 1; r < 8; ++r) {
+        const __m512i ridx = _mm512_load_si512(kRot512[r]);
+        const __m512i vbr = _mm512_permutexvar_epi64(ridx, vb);
+        cmp |= _mm512_cmpeq_epi64_mask(va, vbr);
+    }
+
+    if (cmp == 0) return;
+    const std::size_t cnt =
+        static_cast<std::size_t>(std::popcount(static_cast<unsigned>(cmp)));
+    const std::size_t old = out.size();
+    out.resize(old + cnt);
+    _mm512_mask_compressstoreu_epi64(out.data() + old, cmp, va);
+}
+
+__attribute__((target("avx512f")))
+void intersect_inoue_avx512(const std::uint64_t* a, std::size_t na,
+                             const std::uint64_t* b, std::size_t nb,
+                             std::vector<std::uint64_t>& out) {
+    constexpr std::size_t B = 8;
+    std::size_t i = 0;
+    std::size_t j = 0;
+
+    while (i + B <= na && j + B <= nb) {
+        if (a[i + B - 1] < b[j]) { i += B; continue; }
+        if (b[j + B - 1] < a[i]) { j += B; continue; }
+
+        exact_match_u64_avx512(a + i, b + j, out);
+
+        const std::uint64_t amax = a[i + B - 1];
+        const std::uint64_t bmax = b[j + B - 1];
+        if (amax <= bmax) i += B;
+        if (bmax <= amax) j += B;
+    }
+
+    intersect_scalar(a + i, na - i, b + j, nb - j, out);
+}
+
+#endif  // BITCASK_INTERSECT_SIMD
 
 }  // namespace
 
-void intersect_u32(std::span<const std::uint32_t> a,
-                   std::span<const std::uint32_t> b,
-                   std::vector<std::uint32_t>& out) {
+void intersect_u64(std::span<const std::uint64_t> a,
+                   std::span<const std::uint64_t> b,
+                   std::vector<std::uint64_t>& out) {
     out.clear();
     if (a.empty() || b.empty()) return;
 
-    // 悬殊形态：galloping（SIMD 块交集对此无益）。
     if (a.size() * 32 < b.size()) {
         intersect_galloping(a.data(), a.size(), b.data(), b.size(), out);
         return;
@@ -161,10 +188,15 @@ void intersect_u32(std::span<const std::uint32_t> a,
         return;
     }
 
-#ifdef BITCASK_INTERSECT_AVX2
+#ifdef BITCASK_INTERSECT_SIMD
+    static const bool kHasAvx512f = __builtin_cpu_supports("avx512f");
+    if (kHasAvx512f) {
+        intersect_inoue_avx512(a.data(), a.size(), b.data(), b.size(), out);
+        return;
+    }
     static const bool kHasAvx2 = __builtin_cpu_supports("avx2");
     if (kHasAvx2) {
-        intersect_avx2(a.data(), a.size(), b.data(), b.size(), out);
+        intersect_inoue_avx2(a.data(), a.size(), b.data(), b.size(), out);
         return;
     }
 #endif
