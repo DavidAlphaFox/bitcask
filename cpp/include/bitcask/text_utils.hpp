@@ -17,21 +17,70 @@ struct Utf8ProcDeleter {
 };
 using Utf8ProcBuf = std::unique_ptr<uint8_t[], Utf8ProcDeleter>;
 
+[[nodiscard]] inline std::pair<char32_t, std::size_t> decode_one(
+    std::string_view sv) noexcept {
+    if (sv.empty()) return {0, 0};
+
+    auto* ptr = reinterpret_cast<const utf8proc_uint8_t*>(sv.data());
+    auto len = static_cast<utf8proc_ssize_t>(sv.size());
+
+    utf8proc_int32_t cp = 0;
+    auto consumed = utf8proc_iterate(ptr, len, &cp);
+    if (consumed < 0 || cp < 0) return {0xFFFD, 1};
+    return {static_cast<char32_t>(cp), static_cast<std::size_t>(consumed)};
+}
+
+// P2.5b：NFKC_Casefold 惰性区段表——cp 满足「NFKC_Casefold(cp) == cp 且
+// 组合类为 0 且不参与任何规范组合」（后两条保证整串成员间不存在跨码点
+// 重组，逐码点判定即整串判定）。表的每个成员都由 analyzer_test 的
+// NfkcInertTableOracle 用 utf8proc 逐码点穷举验证（表错即测试红）。
+// 注意刻意排除：全角标点/字母数字（U+FF00 块，NFKC 折叠）、
+// …（U+2026，分解为 ...）、兼容表意文字（U+F900 块）、拉丁带附标区。
+[[nodiscard]] inline bool nfkc_casefold_inert(char32_t cp) noexcept {
+    if (cp >= 0x4E00 && cp <= 0x9FFF) return true;   // CJK 基本区
+    if (cp >= 0x3400 && cp <= 0x4DBF) return true;   // CJK 扩展 A
+    if (cp >= 0x3001 && cp <= 0x3002) return true;   // 、。
+    if (cp >= 0x3008 && cp <= 0x3011) return true;   // 〈〉《》「」『』【】
+    if (cp == 0x2014) return true;                   // ——
+    if (cp >= 0x2018 && cp <= 0x2019) return true;   // ‘ ’
+    if (cp >= 0x201C && cp <= 0x201D) return true;   // “ ”
+    return false;
+}
+
 [[nodiscard]] inline std::string nfkc_fold(std::string_view input) {
     if (input.empty()) return {};
 
-    // P2.5 ASCII 快路径：纯 ASCII 输入的 NFKC_Casefold 数学上等价于逐字节
-    // tolower——ASCII 区是 NFKC 稳定的（无分解/组合）、casefold 即小写化、
-    // 无 default-ignorable 字符。实测 1KB 拉丁文本 utf8proc 路径 ~12us，
-    // 本路径亚微秒（且循环可被自动向量化）。语义对拍见 analyzer_test。
-    bool ascii = true;
-    for (unsigned char c : input) {
-        if (c >= 0x80) {
-            ascii = false;
-            break;
+    // P2.5/P2.5b 统一快路径：全部码点 ∈（NFKC_Casefold 恒等区段 ∪ ASCII）
+    // 时，整个变换等价于「原串 + ASCII 字节 tolower」——纯 ASCII 文本与
+    // 「中文 + 半角英文/标点」文本都命中，跳过整条 utf8proc 流水线。
+    // ASCII 的 tolower 可安全按字节做：UTF-8 多字节序列的所有字节 ≥ 0x80，
+    // 不会误伤。含全角标点（，：！？等会被 NFKC 折叠）即整串回退。
+    // 语义对拍见 analyzer_test（穷举表成员 + 随机串黑盒 vs utf8proc）。
+    bool fast = true;
+    {
+        std::size_t off = 0;
+        while (off < input.size()) {
+            const auto b = static_cast<unsigned char>(input[off]);
+            if (b < 0x80) {
+                // 可打印 ASCII + 常见空白恒等（A-Z 由下方 tolower 处理）。
+                // 常见可打印区先判（绝大多数字节两次比较即过）。
+                if (!((b >= 0x20 && b <= 0x7E) ||
+                      b == 0x09 || b == 0x0A || b == 0x0D)) {
+                    fast = false;
+                    break;
+                }
+                ++off;
+                continue;
+            }
+            auto [cp, consumed] = decode_one(input.substr(off));
+            if (consumed == 0 || !nfkc_casefold_inert(cp)) {
+                fast = false;
+                break;
+            }
+            off += consumed;
         }
     }
-    if (ascii) {
+    if (fast) {
         std::string out(input);
         for (auto& c : out) {
             if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
@@ -54,19 +103,6 @@ using Utf8ProcBuf = std::unique_ptr<uint8_t[], Utf8ProcDeleter>;
     Utf8ProcBuf guard(out);
     return std::string(reinterpret_cast<const char*>(out),
                        static_cast<std::size_t>(n));
-}
-
-[[nodiscard]] inline std::pair<char32_t, std::size_t> decode_one(
-    std::string_view sv) noexcept {
-    if (sv.empty()) return {0, 0};
-
-    auto* ptr = reinterpret_cast<const utf8proc_uint8_t*>(sv.data());
-    auto len = static_cast<utf8proc_ssize_t>(sv.size());
-
-    utf8proc_int32_t cp = 0;
-    auto consumed = utf8proc_iterate(ptr, len, &cp);
-    if (consumed < 0 || cp < 0) return {0xFFFD, 1};
-    return {static_cast<char32_t>(cp), static_cast<std::size_t>(consumed)};
 }
 
 struct CpInfo {
