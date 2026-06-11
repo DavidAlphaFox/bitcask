@@ -171,15 +171,14 @@ struct PostingList {
         return true;
     }
 
-    // 解压返回 ord 数组。
+    // 返回 ord 数组。items[].ord 恒为事实来源（load 已回填，见 inverted.cpp
+    // load 的 comp==1 分支），直接复制即可，不必走 VByte 解码（O3：原 finalized
+    // 路径每次查询都全量 gap_decode，纯浪费）。compressed_ords 只服务落盘格式。
     [[nodiscard]] std::vector<std::uint64_t> decompress_ords() const {
-        if (!finalized || compressed_ords.empty()) {
-            std::vector<std::uint64_t> ords;
-            ords.reserve(items.size());
-            for (auto& p : items) ords.push_back(p.ord);
-            return ords;
-        }
-        return codec::gap_decode(compressed_ords);
+        std::vector<std::uint64_t> ords;
+        ords.reserve(items.size());
+        for (auto& p : items) ords.push_back(p.ord);
+        return ords;
     }
 
     // 按 ord 查找（二分，用于 add_doc 去重 / remove_doc 定位）。

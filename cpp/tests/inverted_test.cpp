@@ -657,6 +657,48 @@ TEST(InvertedIndex, SaveLoadWithFinalizedPostings) {
     cleanup();
 }
 
+// 回归（O3 时发现的 load 回填缺失）：load 的 comp==1 分支此前只读入
+// compressed_ords，不回填 items[].ord（resize 后全 0）。而 find()/
+// note_appended()/compact()/df 等内存路径都以 items[].ord 为事实来源——
+// 快照重载后对既有 term 增量 add_doc 会触发 note_appended 使压缩失效，
+// 旧 posting 的 ord 全部读成 0，搜索结果损坏。覆盖「load → explain →
+// 增量写 → 搜索」链路。
+TEST(InvertedIndex, LoadFinalizedThenAddDocKeepsOldOrds) {
+    auto tmp = std::filesystem::temp_directory_path() / "inv_finalized_add.inv";
+    auto cleanup = [&]() { std::filesystem::remove(tmp); };
+    cleanup();
+
+    InvertedIndex idx;
+    idx.add_doc(10, {{"hello", tp(1, {0})}});
+    idx.add_doc(20, {{"hello", tp(2, {0, 1})}});
+    idx.finalize_all_postings();
+    ASSERT_TRUE(idx.save(tmp.string()));
+
+    InvertedIndex idx2;
+    ASSERT_TRUE(idx2.load(tmp.string()));
+
+    // explain 走 pl.find(ord)（二分 items[].ord）——load 后必须能命中。
+    FakeLiveChecker checker;
+    checker.doc_lens[10] = 1;
+    checker.doc_lens[20] = 2;
+    auto ex = idx2.explain({"hello"}, 20, checker);
+    ASSERT_EQ(ex.terms.size(), 1u);
+    EXPECT_EQ(ex.terms[0].tf, 2u);
+
+    // 对既有 term 增量写一条新 posting（note_appended 使压缩失效，
+    // 此后 ord 完全依赖 items[].ord）。
+    idx2.add_doc(30, {{"hello", tp(1, {0})}});
+    checker.doc_lens[30] = 1;
+
+    auto results = idx2.search({"hello"}, 10, checker);
+    std::vector<std::uint64_t> ords;
+    for (auto& r : results) ords.push_back(r.ord);
+    std::sort(ords.begin(), ords.end());
+    EXPECT_EQ(ords, (std::vector<std::uint64_t>{10, 20, 30}));
+
+    cleanup();
+}
+
 // 回归 S9.4 验证缺口：手工构造 v3 格式快照（positions 为原始 u32 数组，
 // 非 v4 的 gap 压缩），确认 v4 代码能向后兼容读入。
 // 此前 load 版本检查 `ver != kInvVersion && ver != 2 && ver != 1` 漏了 v3，

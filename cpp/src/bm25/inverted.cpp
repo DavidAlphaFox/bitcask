@@ -171,14 +171,14 @@ auto InvertedIndex::search(
         [&](const tbb::blocked_range<std::size_t>& range, ScoreMap local) {
             for (std::size_t ti = range.begin(); ti < range.end(); ++ti) {
                 auto& pl_copy = tps[ti].pl_copy;
-                auto ords = pl_copy.decompress_ords();
 
                 // 计算该词的 live df。S10.7：一遍 is_live 缓存到 live[]，
                 // 评分循环复用，避免每 posting 第二次虚调用 is_live。
-                std::vector<char> live(ords.size());
+                // O3：ord 直接读 items[i].ord，免每查询物化一份 ords 数组。
+                std::vector<char> live(pl_copy.items.size());
                 std::size_t live_df = 0;
                 for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
-                    live[i] = static_cast<char>(live_checker.is_live(ords[i]));
+                    live[i] = static_cast<char>(live_checker.is_live(pl_copy.items[i].ord));
                     if (live[i]) ++live_df;
                 }
                 if (live_df == 0) continue;
@@ -189,7 +189,7 @@ auto InvertedIndex::search(
                 for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
                     if (!live[i]) continue;
                     auto& posting = pl_copy.items[i];
-                    auto ord = ords[i];
+                    auto ord = posting.ord;
 
                     auto dl = live_checker.doc_len(ord);
                     auto tf_norm = static_cast<float>(posting.tf) *
@@ -266,12 +266,11 @@ auto InvertedIndex::explain(
             continue;
         }
         const PostingList& pl = acc->second;
-        auto ords = pl.decompress_ords();
 
-        // 与 search() 一致地算 live df。
+        // 与 search() 一致地算 live df（O3：直接读 items[].ord，免物化 ords）。
         std::size_t live_df = 0;
         for (std::size_t i = 0; i < pl.items.size(); ++i) {
-            if (live_checker.is_live(ords[i])) ++live_df;
+            if (live_checker.is_live(pl.items[i].ord)) ++live_df;
         }
         ts.df = live_df;
         if (live_df == 0) { out.terms.push_back(std::move(ts)); continue; }
@@ -513,19 +512,19 @@ auto InvertedIndex::search_phrase_impl(
     std::unordered_map<std::uint64_t, float> scores;
 
     auto& first_pl = tps[0].pl_copy;
-    auto first_ords = first_pl.decompress_ords();
 
     // live_df 只依赖 first term 的 posting list（与具体候选 doc 无关），
     // 提到循环外算一次，避免每个匹配 doc 重算 O(D)（S9.7）。
+    // O3：ord 直接读 items[].ord，免物化 ords 数组。
     std::size_t live_df = 0;
     for (std::size_t j = 0; j < first_pl.items.size(); ++j) {
-        if (live_checker.is_live(first_ords[j])) ++live_df;
+        if (live_checker.is_live(first_pl.items[j].ord)) ++live_df;
     }
     auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
 
     for (std::size_t i = 0; i < first_pl.items.size(); ++i) {
         auto& posting = first_pl.items[i];
-        auto posting_ord = first_ords[i];
+        auto posting_ord = posting.ord;
         if (!live_checker.is_live(posting_ord)) continue;
 
         // 把「在其余 term 的 posting list 里定位本 doc」提到 start_pos 循环外：
@@ -654,13 +653,13 @@ auto InvertedIndex::search_wildcard(
         [&](const tbb::blocked_range<std::size_t>& range, ScoreMap local) {
             for (std::size_t ti = range.begin(); ti < range.end(); ++ti) {
                 auto& pl_copy = tps[ti].pl_copy;
-                auto ords = pl_copy.decompress_ords();
 
                 // S10.7：一遍 is_live 缓存到 live[]，评分循环复用，避免每 posting 二次虚调用。
-                std::vector<char> live(ords.size());
+                // O3：ord 直接读 items[i].ord，免每查询物化一份 ords 数组。
+                std::vector<char> live(pl_copy.items.size());
                 std::size_t live_df = 0;
                 for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
-                    live[i] = static_cast<char>(live_checker.is_live(ords[i]));
+                    live[i] = static_cast<char>(live_checker.is_live(pl_copy.items[i].ord));
                     if (live[i]) ++live_df;
                 }
                 if (live_df == 0) continue;
@@ -670,7 +669,7 @@ auto InvertedIndex::search_wildcard(
                 for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
                     if (!live[i]) continue;
                     auto& posting = pl_copy.items[i];
-                    auto ord = ords[i];
+                    auto ord = posting.ord;
 
                     auto dl = live_checker.doc_len(ord);
                     auto tf_norm = static_cast<float>(posting.tf) *
@@ -789,8 +788,20 @@ auto InvertedIndex::bool_search(
         }
 
         std::vector<std::uint64_t> intersection;
+        // O4：按 posting 数升序处理 MUST——最短 list 先进交集，accumulator 尽早
+        // 缩小，后续 set_intersection 都在小集合上做；交集一旦为空提前退出。
+        // 交集与处理顺序无关，结果集语义不变（must_tps 本体不重排，评分用）。
+        std::vector<std::size_t> must_order(must_tps.size());
+        for (std::size_t i = 0; i < must_order.size(); ++i) must_order[i] = i;
+        std::sort(must_order.begin(), must_order.end(),
+                  [&](std::size_t a, std::size_t b) {
+                      return must_tps[a].pl_copy.items.size() <
+                             must_tps[b].pl_copy.items.size();
+                  });
         bool first_must = true;
-        for (auto& tp : must_tps) {
+        for (auto mi : must_order) {
+            auto& tp = must_tps[mi];
+            if (!first_must && intersection.empty()) break;
             std::vector<std::uint64_t> ords;
             for (std::size_t i = 0; i < tp.pl_copy.items.size(); ++i) {
                 if (live_checker.is_live(tp.ords[i])) {
@@ -971,13 +982,13 @@ auto InvertedIndex::search_fuzzy(
         [&](const tbb::blocked_range<std::size_t>& range, ScoreMap local) {
             for (std::size_t ti = range.begin(); ti < range.end(); ++ti) {
                 auto& pl_copy = tps[ti].pl_copy;
-                auto ords = pl_copy.decompress_ords();
 
                 // S10.7：一遍 is_live 缓存到 live[]，评分循环复用，避免每 posting 二次虚调用。
-                std::vector<char> live(ords.size());
+                // O3：ord 直接读 items[i].ord，免每查询物化一份 ords 数组。
+                std::vector<char> live(pl_copy.items.size());
                 std::size_t live_df = 0;
                 for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
-                    live[i] = static_cast<char>(live_checker.is_live(ords[i]));
+                    live[i] = static_cast<char>(live_checker.is_live(pl_copy.items[i].ord));
                     if (live[i]) ++live_df;
                 }
                 if (live_df == 0) continue;
@@ -987,7 +998,7 @@ auto InvertedIndex::search_fuzzy(
                 for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
                     if (!live[i]) continue;
                     auto& posting = pl_copy.items[i];
-                    auto ord = ords[i];
+                    auto ord = posting.ord;
 
                     auto dl = live_checker.doc_len(ord);
                     auto tf_norm = static_cast<float>(posting.tf) *
@@ -1286,6 +1297,18 @@ auto InvertedIndex::load(std::string_view path) -> bool {
                     if (csize > 0) {
                         if (std::fread(pl.compressed_ords.data(), 1, csize, f) != csize) {
                             std::fclose(f); return false;
+                        }
+                    }
+                    // 回填 items[].ord：内存路径（find/note_appended/compact/
+                    // live_doc_count 及查询热循环）都以 items[].ord 为事实来源，
+                    // compressed_ords 只是落盘副本。漏回填会让 load 后的 ord 全 0，
+                    // 后续对既有 term 的 add_doc（note_appended 使压缩失效）即丢失
+                    // 全部旧 posting 的 ord。
+                    {
+                        auto ords = codec::gap_decode(pl.compressed_ords);
+                        if (ords.size() != pc) { std::fclose(f); return false; }
+                        for (std::uint32_t p = 0; p < pc; ++p) {
+                            pl.items[p].ord = ords[p];
                         }
                     }
                     for (std::uint32_t p = 0; p < pc; ++p) {
