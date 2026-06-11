@@ -767,7 +767,9 @@ WAND 路径无此问题。建议顺序：P2.1 → 基准 → P2.2 → P2.3。
 
 | **P4.4** | 删 `compressed_ords`/`finalized` 内存死状态：O3 后查询路径从不读压缩副本（items[].ord 恒为事实来源），二字段只服务 save 的格式决定却让维护者误以为是读路径事实来源。删两字段——`save()` 改为现场 `gap_encode(items.ords)`（与旧 finalize 写出的字节逐字节一致，磁盘格式不变）、`load()` 解码进局部缓冲回填 items[].ord 后丢弃、`finalize`/`note_appended`/`compact_flags` 去掉压缩维护。`note_appended` 的尾块弹出逻辑独立于 finalized 标志（已确认），不受影响。净 −23 行 + 永久省 1-2 字节/posting 内存。两个误导命名测试（FinalizeCompressesOrds/ReducesMemory，实际只断言 search/df 不变）改名为 FinalizePreservesSearchResults/KeepsDfStable。**验证**：SaveLoadRoundtrip（非 finalized→现在 comp=1 路径）+ SaveLoadWithFinalizedPostings + LoadV3SnapshotBackwardCompat（新 load 读旧 finalize 的 comp=1 字节，证字节一致）+ LoadFinalizedThenAddDocKeepsOldOrds（回填路径）全过；ctest 338/338（×3 稳定）+ ASan 干净 + eunit 44/44 | ✅ |
 
-**本批未做（记录，留后续独立 commit）**：bool_search 的 u64 回退影子路径——P3.1 刚硬化过该求交核心（水位幂等 + intersect 守卫），且 u64 路径不可达（需 >2^32 文档），**有意不动**以免扰动刚修的崩溃路径；测试侧 LCG/LiveChecker 桩重复（建共享测试头，纯测试维护性）；nfkc_casefold_inert 表改离线 Unicode 数据生成（引入构建期工具，altitude）。
+| **P4.5** | bool_search MUST 交集的 u64 影子路径——加测试 + 合并骨架。① **加测试** `BoolSearchMustU64Fallback`：用 ord>2^32 的大值（非 43 亿文档）强制窄化闸门拒绝、走 set_intersection 回退；**有牙验证**：临时清空 u64 交集结果，仅此测试 fail（其余 bool 测试走 u32 路径全过），证明它精确覆盖此前无测试的回退分支。② **合并骨架**：u32 窄化 / u64 回退两条逐字相同的「must_order 升序遍历 + live 过滤 + 空交集 break」循环用 C++23 模板 lambda（`run_must_intersect<T>`）合一,只在「intersect_u32 三路 SIMD vs set_intersection 标量」处分叉——改 MUST 语义不再需人工同步两份。u32 仍全程 u32（T=uint32_t），LTO 下模板内联,**bench 无回归**（BoolMustHot/4096 150us、/100k 4400us 持平 P2.2）。净 −5 行。ctest 339/339 + ASan(bool/intersect/concurrent/CrashRecovery) 干净 + eunit 44/44 | ✅ |
+
+**本批未做（记录，留后续独立 commit）**：测试侧 LCG/LiveChecker 桩重复（建共享测试头，纯测试维护性）；nfkc_casefold_inert 表改离线 Unicode 数据生成（引入构建期工具，altitude）。
 
 ### V3 — HNSW 单图 + search_vector（暂缓）
 
