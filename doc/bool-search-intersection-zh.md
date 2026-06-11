@@ -98,3 +98,70 @@ AVX2 经 `__builtin_cpu_supports("avx2")` **运行时分发**——不改
 「交集/求交」（intersection）指本文的集合运算；项目讨论中偶尔出现的
 「正交」（orthogonal）是另一概念——指两个优化互不干扰可叠加（如
 「长度差剪枝与 Myers 算法正交」），二者无关。
+
+## 7. 备选实现路径（已评审、按需启动）
+
+> 现状（P4.5 后）：u32 窄化快路径（AVX2/galloping/标量三路）+ u64
+> `set_intersection` 标量回退，两者共用单一骨架（`run_must_intersect<T>`
+> 模板 lambda），u64 回退由 `BoolSearchMustU64Fallback` 测试覆盖（用
+> ord>2^32 的大值强制走回退，非 43 亿文档）。以下是评审过但**有意未做**
+> 的扩展路径，各自记录触发条件——条件不满足前不实现。
+
+### 7.1 u64 AVX2 内核（成对 permutevar8x32 模拟 64 位变量 shuffle）
+
+**触发条件**：单索引累计写入超 2^32（ord 突破 32 位），u64 回退从
+「影子路径」变成热路径时。
+
+AVX2 做 u64 shuffle 交集的障碍只有一个：`_mm256_permutevar8x32_epi32`
+是 32 位 lane 的变量索引 shuffle，64 位变量版（`permutexvar_epi64`）
+是 AVX-512 才有。**解法：把每个 u64 视为两个相邻 u32 lane（lo,hi），
+用成对索引的 permutevar8x32 模拟 64 位 lane 移动**：
+
+- 256-bit 寄存器 = 4 个 u64 = 8 个 u32 lane（成对）；
+- 旋转 4 个 u64 lane 一位 ⟺ permutevar8x32 索引 `{2,3,4,5,6,7,0,1}`
+  （每对 u32 整体平移），4 个旋转变体即覆盖全对全；
+- 相等比较直接用 `_mm256_cmpeq_epi64`（AVX2 原生有），
+  `movemask_pd` 取 4-bit 命中掩码；
+- 压缩存储同样用成对索引 LUT（16 项 × 8 个 u32 索引）+
+  permutevar8x32。
+
+成本评估：4 lane × 4 旋转（对比 u32 路径 8 lane × 8 旋转），内存流量
+2 倍——交集内核预期 ~2x 于标量（u32 路径约 3-4x）。块推进、守卫
+（cnt+8 越界防护的 u64 版为 cnt+4）与 §4③ 完全同构。
+
+### 7.2 AVX-512 后端
+
+**触发条件**：部署目标明确为带 AVX-512 的服务器（Xeon/EPYC）。
+
+u32 16 lane；u64 有原生 `permutexvar_epi64`（§7.1 的模拟不再需要）+
+`_mm512_cmpeq_epu64_mask` 直接出 mask + `compressstoreu` 免 LUT——
+实现反而比 AVX2 简洁。注意：消费级 Intel（12 代后）无 AVX-512，本机
+（i9-13900H）**无法验证**；部分微架构有降频代价，需实测。
+
+### 7.3 NEON 后端（aarch64）
+
+**触发条件**：ARM 成为真实部署目标（Apple Silicon / Graviton /
+移动端）——当前 ARM 上交集走纯标量。
+
+128-bit = 4 个 u32 lane（AVX2 一半），shuffle 用 `vqtbl1q_u8` 字节表
+查重写内核；mask 提取无 movemask 等价物，用 `vshrn` 窄移位惯用法。
+**前置**：必须先有 ARM 验证环境（真机 CI 或 qemu + ASan）——SIMD
+边界错误（参见 P3.1 的 AVX2 越界写教训）没有 sanitizer 实测兜底
+不可合入。
+
+### 7.4 SSE4.1 中间档
+
+**评审结论：不做**。「有 SSE4.1 但无 AVX2」的机器（2013 年前）在
+现实部署面占比可忽略，标量回退已保证正确性。
+
+### 分发扩展点
+
+`intersect_u32`（intersect.cpp）的运行时分发即扩展点：新后端 =
+新增一个 `__attribute__((target(...)))` 内核 + 一个
+`__builtin_cpu_supports` 分支（ARM 侧改用编译期 `#ifdef __aarch64__`）。
+悬殊形态的 galloping 路由对所有后端共用，不随 ISA 变。
+
+另注：BM25 **评分循环**的向量化是另一套机制（编译器自动向量化，受
+`-march` 基线限制在 SSE2 宽度）——若要让评分吃上 AVX2，用
+`target_clones` 函数多版本而非动 `-march`，见 TASK.md P2 节的 ISA
+分发策略。评分是全查询热路径，其收益面大于本文的 bool-only 交集。
