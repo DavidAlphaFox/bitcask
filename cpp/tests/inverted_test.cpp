@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
-#include <cstdint>
+#include <thread>
 
 #include "bitcask/analyzer.hpp"
 #include "bitcask/inverted.hpp"
@@ -984,4 +986,53 @@ TEST(InvertedIndex, CompactSkipsBelowThreshold) {
     auto n = idx.compact(checker, 0.5);
     EXPECT_EQ(n, 0u);
     EXPECT_EQ(idx.df("term"), 100u);  // 未压实
+}
+
+// P1 回归：多读者 search × 单写者对同一 term 持续 add_doc 并发。
+// 对齐生产线程模型（IndexPool 单写 worker + NIF dirty 线程多读）。
+// snapshot_flat 在桶读锁（const_accessor）下拷贝、写者持写 accessor 追加，
+// 互斥成立——TSan 构建下本测试验证无 data race。写者只追加已存在的 term
+//（不插新 key），与 add_doc 既有桶级锁语义一致。
+TEST(InvertedIndex, SearchConcurrentWithSingleWriter) {
+    class AllLive : public LiveChecker {
+    public:
+        [[nodiscard]] bool is_live(std::uint64_t) const override { return true; }
+        [[nodiscard]] std::uint32_t doc_len(std::uint64_t) const override { return 4; }
+    };
+
+    InvertedIndex idx;
+    // 预热超过 kWandThreshold，让读者既走 WAND 也走标量路径（k 小走 WAND）。
+    for (std::uint64_t i = 0; i < 2000; ++i) {
+        idx.add_doc(i, {{"hot", tp(2, {0, 1})}, {"warm", tp(2, {2, 3})}});
+    }
+
+    AllLive checker;
+    std::atomic<bool> stop{false};
+    std::atomic<bool> bad{false};
+
+    std::vector<std::thread> readers;
+    readers.reserve(4);
+    for (int r = 0; r < 4; ++r) {
+        readers.emplace_back([&] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                auto res = idx.search({"hot", "warm"}, 10, checker);
+                if (res.size() > 10) { bad.store(true); return; }
+                for (auto& h : res) {
+                    // 写者只发布 ord < 4000；任何越界 ord 都是撕裂读。
+                    if (h.ord >= 4000) { bad.store(true); return; }
+                }
+            }
+        });
+    }
+
+    // 单写者（当前线程）：对既有 term 持续追加。
+    for (std::uint64_t i = 2000; i < 4000; ++i) {
+        idx.add_doc(i, {{"hot", tp(1, {0})}});
+    }
+    stop.store(true);
+    for (auto& t : readers) t.join();
+
+    EXPECT_FALSE(bad.load());
+    auto final_res = idx.search({"hot"}, 10, checker);
+    EXPECT_EQ(final_res.size(), 10u);
 }
