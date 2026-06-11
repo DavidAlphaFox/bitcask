@@ -753,6 +753,18 @@ WAND 路径无此问题。建议顺序：P2.1 → 基准 → P2.2 → P2.3。
 
 **复审驳回**：`save()` 裸读 shared_ptr 的并发指控——验证确认 save 仅在 merge 路径调用，前置 `rebuild_index` 已在调用线程同步换上线程私有新 index，save 遍历的对象从未被 worker 触碰；单 handle 所有权契约保证无并发写者。**未修（记录）**：wand 可见性窗口扩大（PLAUSIBLE，与系统既有最终一致语义同级，上层对 stale ord 安全）；cleanup 类（死状态 compressed_ords/finalized、三份重复评分块、u64 回退影子路径）攒独立 commit。**全量**：ctest 338/338（+3 回归）+ eunit 44/44 + ASan inverted/wal/fuzzy 干净 + TSan 并发用例干净。
 
+### P4 — review cleanup 类（✅ 本批已落地）
+
+> P3 修完崩溃级/遗留后，做 review 记录的 cleanup（reuse/simplification/altitude）。
+> 本批挑收益高、风险可控的做，每项独立验证；format-risk 项留后续。
+
+| # | 内容 | 状态 |
+|---|------|------|
+| **P4.1** | 删死代码：`PostingList::decompress_ords()`（O3 后零调用方）+ `compact(IsLive)` 模板（P2.4 后被 `compact_flags` 取代、零 lambda 调用方） | ✅ |
+| **P4.2** | 三份逐字相同的「批量 live/doc_len + 两阶段评分 parallel_reduce + 小顶堆 top-k」（search 标量/wildcard/fuzzy 各一份 ~75 行）提取为单一 `score_bow_topk` kernel；三处简单 `TermPostings{term,fp}` 合并为共享 `ScoredTerm`。BM25 公式与「分数位级不变/无分支可向量化」不变量从此只一处——消除「改公式漏改低频路径致评分不一致」的抄写漂移风险（O3/O6 回归即此类事故）。inverted 核心净 **−132 行**（109+/241−）。ctest 338/338（评分各路径有分数断言护着）+ bench 无回归 + eunit 44/44 | ✅ |
+
+**本批未做（记录，留后续独立 commit）**：`compressed_ords`/`finalized` 内存死状态删除（touches save/load 落盘格式，有 fixture 风险，单独评审）；bool_search 的 u64 回退影子路径（ord>2^32 不可达、无测试，与 u32 路径需人工同步）；两阶段 tbb 词表扫描 helper（wildcard/fuzzy/finalize/compact 4 处重复并发不变量）；测试侧 LCG/LiveChecker 桩重复（建共享测试头）；nfkc_casefold_inert 表改离线 Unicode 数据生成（altitude）。
+
 ### V3 — HNSW 单图 + search_vector（暂缓）
 
 ### V4 — 单域 merge
