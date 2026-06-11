@@ -20,7 +20,7 @@ SearchLayer::SearchLayer(const SearchLayerConfig& config)
 }
 
 bm25::InvertedIndex& SearchLayer::field_index(std::string_view field) {
-    auto it = fields_.find(std::string(field));
+    auto it = fields_.find(field);
     if (it == fields_.end()) {
         it = fields_.emplace(std::string(field),
                              std::make_unique<bm25::InvertedIndex>(config_.bm25_params, config_.index_positions)).first;
@@ -29,7 +29,7 @@ bm25::InvertedIndex& SearchLayer::field_index(std::string_view field) {
 }
 
 const bm25::InvertedIndex* SearchLayer::field_index(std::string_view field) const {
-    auto it = fields_.find(std::string(field));
+    auto it = fields_.find(field);
     return it == fields_.end() ? nullptr : it->second.get();
 }
 
@@ -71,8 +71,17 @@ void SearchLayer::on_write_fields(
     field_lens.reserve(fields.size() + 1);
 
     const std::string default_field(kDefaultField);
-    std::string catchall;          // 非默认字段文本拼接，作 catch-all 默认字段内容
     bool wrote_default = false;    // 是否已有字段直接写入默认字段
+
+    // catch-all（S8.6 修复 + O5 合并优化）：把非默认字段词项合并进默认字段，
+    // 使 search_text/phrase/near（只查默认字段）也能命中多字段文档。
+    // O5：此前是拼接原文后整体重新分词（NFKC + 分词全部重跑一遍）；改为直接
+    // 合并各字段的分词结果，position 按字段顺序平移 ca_pos_base。字段内
+    // 相对位置不变（phrase/near 字段内语义不变）；跨字段间隔取「字段最大
+    // position + 1」，与拼接版仅在字段尾部存在被丢短词时差极小的 slop。
+    text::TermPositionsMap ca_data;
+    std::uint32_t ca_pos_base = 0;
+    std::uint32_t ca_len = 0;
 
     for (auto& [fname, ftext] : fields) {
         const std::string field = fname.empty() ? default_field : fname;
@@ -87,23 +96,26 @@ void SearchLayer::on_write_fields(
 
         if (field == default_field) {
             wrote_default = true;
-        } else {
-            if (!catchall.empty()) catchall.push_back(' ');
-            catchall += ftext;
+        } else if (!term_data.empty()) {
+            std::uint32_t field_max_pos = 0;
+            for (auto& [term, data] : term_data) {
+                auto& [tf, positions] = data;
+                auto& [ca_tf, ca_positions] = ca_data[term];
+                ca_tf += tf;
+                for (auto p : positions) {
+                    ca_positions.push_back(p + ca_pos_base);
+                    if (p > field_max_pos) field_max_pos = p;
+                }
+            }
+            ca_len += flen;
+            ca_pos_base += field_max_pos + 1;
         }
     }
 
-    // catch-all（S8.6 修复）：把非默认字段文本合并进默认字段，使
-    // search_text/phrase/near（只查默认字段）也能命中多字段文档。
     // 若已有字段直接写默认字段，则不重复合并（避免双写）。
-    if (!wrote_default && !catchall.empty()) {
-        auto ca_data = analyzer_->analyze_with_positions(catchall);
-        if (!ca_data.empty()) {
-            field_index(default_field).add_doc(ord, ca_data);
-            std::uint32_t ca_len = 0;
-            for (auto& [_, data] : ca_data) ca_len += data.first;
-            field_lens.push_back({default_field, ca_len});
-        }
+    if (!wrote_default && !ca_data.empty()) {
+        field_index(default_field).add_doc(ord, ca_data);
+        field_lens.push_back({default_field, ca_len});
     }
 
     index_.put_doc(key, ord,

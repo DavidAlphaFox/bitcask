@@ -243,7 +243,9 @@ private:
     index::Index      index_;
     // S8.6：每字段一个 InvertedIndex（字段间 avgdl/idf 隔离）。
     // 旧单 text 文档与无字段限定查询都走 kDefaultField。
-    std::unordered_map<std::string, std::unique_ptr<bm25::InvertedIndex>> fields_;
+    // O8：透明 hash——field_index 查找直接吃 string_view，免临时 string。
+    std::unordered_map<std::string, std::unique_ptr<bm25::InvertedIndex>,
+                       StringHash, std::equal_to<>> fields_;
     // R3：ord → (字段名 → 该字段 doc_len)，供 on_delete 按字段精确扣减统计。
     // 仅多字段路径填充；单 text 路径用 index_ 的 doc_len 即可（默认字段）。
     std::unordered_map<std::uint64_t,
