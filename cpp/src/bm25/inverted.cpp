@@ -703,6 +703,10 @@ auto InvertedIndex::search_wildcard(
         FlatPostings fp;  // P1：扁平快照
     };
 
+    // P2.5：最长字面量预过滤——不含该子串的词必不匹配，免跑回溯匹配器
+    // （string_view::find 底层是 SIMD 化的 memchr/memcmp）。
+    const std::string_view lit = longest_literal(pattern);
+
     // S10.4：并行扫词表匹配 pattern。按 shard 下标分区，每个 shard 至多被一个任务
     // 遍历（互不重叠），与既有「查询无锁读」模型一致（拷贝 plist 不持桶锁）。
     std::vector<TermPostings> tps = tbb::parallel_reduce(
@@ -717,6 +721,9 @@ auto InvertedIndex::search_wildcard(
                 std::vector<std::string> matched;
                 for (auto it = shards_[s].inverted.begin();
                      it != shards_[s].inverted.end(); ++it) {
+                    if (!lit.empty() && it->first.find(lit) == std::string::npos) {
+                        continue;  // P2.5：字面量预过滤
+                    }
                     if (wildcard_match(pattern, it->first)) {
                         matched.push_back(it->first);
                     }
