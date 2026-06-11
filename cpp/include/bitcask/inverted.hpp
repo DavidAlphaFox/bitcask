@@ -176,26 +176,6 @@ struct PostingList {
         return true;
     }
 
-    // 谓词版本（兼容旧调用方/测试）：构建 flags 后转调，单一实现体。
-    template <typename IsLive>
-    bool compact(const IsLive& is_live) {
-        std::vector<char> live(items.size());
-        for (std::size_t i = 0; i < items.size(); ++i) {
-            live[i] = static_cast<char>(is_live(items[i].ord));
-        }
-        return compact_flags(live);
-    }
-
-    // 返回 ord 数组。items[].ord 恒为事实来源（load 已回填，见 inverted.cpp
-    // load 的 comp==1 分支），直接复制即可，不必走 VByte 解码（O3：原 finalized
-    // 路径每次查询都全量 gap_decode，纯浪费）。compressed_ords 只服务落盘格式。
-    [[nodiscard]] std::vector<std::uint64_t> decompress_ords() const {
-        std::vector<std::uint64_t> ords;
-        ords.reserve(items.size());
-        for (auto& p : items) ords.push_back(p.ord);
-        return ords;
-    }
-
     // 按 ord 查找（二分，用于 add_doc 去重 / remove_doc 定位）。
     [[nodiscard]] auto find(std::uint64_t ord) const -> std::size_t;
     [[nodiscard]] bool has(std::uint64_t ord) const;
