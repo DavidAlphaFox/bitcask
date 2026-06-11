@@ -1,5 +1,6 @@
 #include "bitcask/inverted.hpp"
 #include "bitcask/inverted_wal.hpp"
+#include "bitcask/myers.hpp"
 #include "bitcask/wildcard_matcher.hpp"
 
 #include <oneapi/tbb/blocked_range.h>
@@ -1066,18 +1067,26 @@ auto InvertedIndex::search_fuzzy(
     //    会重复 push，导致该 posting list 被评分两遍、IDF 贡献翻倍。
     // ② S10.3：跑 O(n·m) levenshtein 前先按字节长度差剪枝——编辑距离 ≥ |长度差|，
     //    故长度差 > max_edit 时必不匹配，省掉绝大多数 DP（levenshtein 按字节算，用字节长度）。
+    // P2.3：每个查询词建一次 Myers matcher（Peq 表摊销于全词典扫描）。
+    // 经典 DP O(n·m) + 每次调用两个 vector 堆分配 → 位并行 O(n)、零分配，
+    // 原理见 doc/myers-bitparallel-zh.md，对拍见 fuzzy_test.cpp。
+    std::vector<MyersMatcher> matchers;
+    matchers.reserve(query_terms.size());
+    for (auto& q : query_terms) matchers.emplace_back(q);
+
     for (auto& shard : shards_) {
         // P2-min 两阶段：遍历只做匹配收集 key——遍历中调 find 会触发懒 rehash
         // 节点搬迁，迭代器重复访问同一节点（破坏 S10.2 的去重，实测复现）。
         std::vector<std::string> matched;
         for (auto it = shard.inverted.begin(); it != shard.inverted.end(); ++it) {
             const auto& term = it->first;
-            for (auto& query_term : query_terms) {
+            for (std::size_t qi = 0; qi < query_terms.size(); ++qi) {
+                auto& query_term = query_terms[qi];
                 auto len_diff = term.size() > query_term.size()
                                     ? term.size() - query_term.size()
                                     : query_term.size() - term.size();
                 if (len_diff > max_edit_distance) continue;
-                if (levenshtein_distance(query_term, term) <= max_edit_distance) {
+                if (matchers[qi].within(term, max_edit_distance)) {
                     matched.push_back(term);
                     break;
                 }
