@@ -30,5 +30,6 @@ target_link_libraries(bitcask_bench
         bitcask_keydir
         bitcask_cask
         bitcask_bm25
+        bitcask_index
         bitcask_warnings
 )

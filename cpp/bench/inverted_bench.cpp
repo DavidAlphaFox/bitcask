@@ -28,6 +28,7 @@
 #include <thread>
 #include <vector>
 
+#include "bitcask/index.hpp"
 #include "bitcask/inverted.hpp"
 #include "bitcask/query.hpp"
 
@@ -268,3 +269,25 @@ void BM_Inverted_FuzzyVocabScan(benchmark::State& state) {
     state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations()) * 200000);
 }
 BENCHMARK(BM_Inverted_FuzzyVocabScan)->Unit(benchmark::kMicrosecond);
+
+// P2.4 基准：用真实 index::Index 做 LiveChecker。1M 文档登记侧表，
+// 热词 posting 以步长 10 散布（10 万 posting 横跨 1M ord 空间）——
+// fill_doc_lens 对 slots_（32B/项）做稀疏 gather，暴露 AoS 布局的
+// cache line 浪费（每 64B 行只用 4B）。
+void BM_Inverted_SearchIndexChecker(benchmark::State& state) {
+    auto idx = std::make_unique<InvertedIndex>();
+    bitcask::index::Index side;
+    for (std::uint64_t ord = 0; ord < 1000000; ++ord) {
+        side.put_doc("k" + std::to_string(ord), ord,
+                     bitcask::index::DocSlot{{}, 0, 8, 0});
+        if (ord % 10 == 0) {
+            idx->add_doc(ord, doc_with("hot"));
+        }
+    }
+    for (auto _ : state) {
+        auto results = idx->search({"hot"}, 10, side);
+        benchmark::DoNotOptimize(results);
+    }
+    state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations()) * 100000);
+}
+BENCHMARK(BM_Inverted_SearchIndexChecker)->Unit(benchmark::kMicrosecond);
