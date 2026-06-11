@@ -485,6 +485,35 @@ TEST(InvertedIndex, BoolSearchMust) {
     EXPECT_EQ(results[0].ord, 0u);
 }
 
+// review cleanup：覆盖 bool_search MUST 交集的 u64 回退路径。ord > 2^32 时
+// 窄化闸门（back() > 0xFFFFFFFF）拒绝转 u32 → 走 set_intersection 标量回退。
+// 此前该分支无测试（造不出 43 亿文档），靠大 ord 值即可强制进入——守住
+// 「u32 快路径 / u64 回退」骨架合并的正确性。
+TEST(InvertedIndex, BoolSearchMustU64Fallback) {
+    InvertedIndex idx;
+    const std::uint64_t base = 5'000'000'000ULL;  // > 2^32，强制 narrow_ok=false
+    idx.add_doc(base + 0, {{"hello", tp(1, {0})}, {"world", tp(1, {1})}});
+    idx.add_doc(base + 1, {{"hello", tp(1, {0})}});
+    idx.add_doc(base + 2, {{"world", tp(1, {0})}});
+    idx.add_doc(base + 3, {{"hello", tp(1, {0})}, {"world", tp(1, {1})}});
+
+    FakeLiveChecker checker;
+    checker.doc_lens[base + 0] = 2;
+    checker.doc_lens[base + 1] = 1;
+    checker.doc_lens[base + 2] = 1;
+    checker.doc_lens[base + 3] = 2;
+
+    auto node = parse_query("+hello +world");
+    auto results = idx.bool_search(node, 10, checker);
+    ASSERT_EQ(results.size(), 2u);  // hello AND world → base+0, base+3
+    std::set<std::uint64_t> ords;
+    for (auto& r : results) ords.insert(r.ord);
+    EXPECT_TRUE(ords.count(base + 0));
+    EXPECT_TRUE(ords.count(base + 3));
+    EXPECT_FALSE(ords.count(base + 1));  // 只含 hello
+    EXPECT_FALSE(ords.count(base + 2));  // 只含 world
+}
+
 TEST(InvertedIndex, BoolSearchMustNot) {
     InvertedIndex idx;
     idx.add_doc(0, {{"hello", tp(1, {0})}});

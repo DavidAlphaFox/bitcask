@@ -909,57 +909,52 @@ auto InvertedIndex::bool_search(
             }
         }
 
+        // MUST 交集骨架（u32 窄化快路径 / u64 回退共用单一实现）：按 must_order
+        // 升序逐词求交、live 过滤、空交集提前 break——骨架只此一份，避免改
+        // 语义时漏同步某条路径（u64 回退由 BoolSearchMustU64Fallback 测试覆盖）。
+        // 只有元素类型 T 与单次求交实现不同：u32→intersect_u32（三路 SIMD），
+        // u64→set_intersection（标量）。fp.ords 升序无重复、live 过滤保序，
+        // 满足两者前置（u32 免 sort/unique、u64 归并有序）。
+        auto run_must_intersect = [&]<typename T>(auto pair_intersect) {
+            std::vector<T> acc;
+            bool first_must = true;
+            for (auto mi : must_order) {
+                auto& tp = must_tps[mi];
+                if (!first_must && acc.empty()) break;
+                std::vector<T> ords;
+                ords.reserve(tp.fp.size());
+                for (std::size_t i = 0; i < tp.fp.size(); ++i) {
+                    if (tp.live[i]) ords.push_back(static_cast<T>(tp.fp.ords[i]));
+                }
+                if (first_must) {
+                    acc = std::move(ords);
+                    first_must = false;
+                } else {
+                    acc = pair_intersect(acc, ords);
+                }
+            }
+            return acc;
+        };
+
         if (narrow_ok) {
-            // fp.ords 升序无重复、live 过滤保序 → 无需 sort/unique。
-            std::vector<std::uint32_t> inter32;
-            std::vector<std::uint32_t> ords32;
-            std::vector<std::uint32_t> tmp32;
-            bool first_must = true;
-            for (auto mi : must_order) {
-                auto& tp = must_tps[mi];
-                if (!first_must && inter32.empty()) break;
-                ords32.clear();
-                ords32.reserve(tp.fp.size());
-                for (std::size_t i = 0; i < tp.fp.size(); ++i) {
-                    if (tp.live[i]) {
-                        ords32.push_back(static_cast<std::uint32_t>(tp.fp.ords[i]));
-                    }
-                }
-                if (first_must) {
-                    inter32.swap(ords32);
-                    first_must = false;
-                } else {
-                    intersect_u32(inter32, ords32, tmp32);
-                    inter32.swap(tmp32);
-                }
-            }
-            candidates.reserve(inter32.size());
-            for (auto v : inter32) candidates.push_back(v);
+            auto inter = run_must_intersect.operator()<std::uint32_t>(
+                [](const std::vector<std::uint32_t>& a,
+                   const std::vector<std::uint32_t>& b) {
+                    std::vector<std::uint32_t> out;
+                    intersect_u32(a, b, out);
+                    return out;
+                });
+            candidates.assign(inter.begin(), inter.end());  // u32 → u64 候选
         } else {
-            std::vector<std::uint64_t> intersection;
-            bool first_must = true;
-            for (auto mi : must_order) {
-                auto& tp = must_tps[mi];
-                if (!first_must && intersection.empty()) break;
-                std::vector<std::uint64_t> ords;
-                for (std::size_t i = 0; i < tp.fp.size(); ++i) {
-                    if (tp.live[i]) {
-                        ords.push_back(tp.fp.ords[i]);
-                    }
-                }
-                if (first_must) {
-                    intersection = std::move(ords);
-                    first_must = false;
-                } else {
-                    std::vector<std::uint64_t> tmp;
-                    tmp.reserve(std::min(intersection.size(), ords.size()));
-                    std::set_intersection(intersection.begin(), intersection.end(),
-                                          ords.begin(), ords.end(),
-                                          std::back_inserter(tmp));
-                    intersection = std::move(tmp);
-                }
-            }
-            candidates = std::move(intersection);
+            candidates = run_must_intersect.operator()<std::uint64_t>(
+                [](const std::vector<std::uint64_t>& a,
+                   const std::vector<std::uint64_t>& b) {
+                    std::vector<std::uint64_t> out;
+                    out.reserve(std::min(a.size(), b.size()));
+                    std::set_intersection(a.begin(), a.end(), b.begin(), b.end(),
+                                          std::back_inserter(out));
+                    return out;
+                });
         }
     } else if (!should_tps.empty()) {
         for (auto& tp : should_tps) {
