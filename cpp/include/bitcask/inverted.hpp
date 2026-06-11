@@ -77,25 +77,18 @@ struct PostingList {
 
     std::vector<Posting> items;
 
-    // VByte 压缩 ord 存储（finalize 后使用）。
-    std::vector<std::uint8_t> compressed_ords;
-    bool finalized = false;
-
-    // Block-Max WAND 跳跃索引（finalize 后计算）。
+    // Block-Max WAND 跳跃索引（增量 seal_full_blocks + finalize 补尾块）。
+    // 注：O3 后 items[].ord 恒为 ord 的唯一事实来源；VByte 压缩只在落盘格式
+    // 里现场编码（save），内存不再常驻压缩副本。
     std::vector<PostingBlock> blocks;
 
     // 全局最大 tf 缓存（S10.9）：block_upper_bound 此前每次重扫全 items 求最大 tf；
     // 改为增量维护（note_appended 追加时更新，load 后重算），查询直接读。
     std::uint32_t max_tf = 0;
 
-    // 压缩所有 ord 为 VByte gap 编码，并计算块元数据。
+    // 计算块元数据（含部分尾块）。幂等：重复调用重算同一结果。
     void finalize() {
-        if (items.empty() || finalized) return;
-        std::vector<std::uint64_t> ords;
-        ords.reserve(items.size());
-        for (auto& p : items) ords.push_back(p.ord);
-        compressed_ords = codec::gap_encode(ords);
-        finalized = true;
+        if (items.empty()) return;
 
         // 计算 Block-Max WAND 元数据。S10.6：先 clear——增量封块（seal_full_blocks）
         // 可能已建若干满块，这里重建为含「部分尾块」的规范集（覆盖之），避免重复追加。
@@ -139,11 +132,6 @@ struct PostingList {
     void note_appended() {
         // S10.9：增量维护全局 max_tf（新 posting 必在末尾）。
         if (!items.empty() && items.back().tf > max_tf) max_tf = items.back().tf;
-        // 之前 finalize 过：压缩 ord 失效，decompress_ords 退回 items 源（保证正确）。
-        if (finalized) {
-            finalized = false;
-            compressed_ords.clear();
-        }
         // finalize 可能留下不满的尾块；增量封块要求 blocks 仅含满块，先弹掉它。
         if (!blocks.empty() && blocks.back().count < kBlockSize) {
             blocks.pop_back();
@@ -164,9 +152,7 @@ struct PostingList {
         }
         if (kept.size() == items.size()) return false;  // 无死点，不动
         items = std::move(kept);
-        // 重建派生态（compressed_ords/finalized/blocks/max_tf）。
-        compressed_ords.clear();
-        finalized = false;
+        // 重建派生态（blocks/max_tf）。
         blocks.clear();
         max_tf = 0;
         for (auto& p : items) {
@@ -187,9 +173,8 @@ struct PostingList {
     [[nodiscard]] auto block_upper_bound(float idf, const Bm25Params& params, double avgdl) const -> float;
 
     // P1：在 caller 持桶锁（accessor）期间拷出查询评分所需的扁平快照。
-    // 只拷 (ord, tf) 双数组 + WAND 元数据——positions / compressed_ords
-    // 评分用不到，不拷。相比整列表深拷贝：分配 N+1 次 → 2 次，
-    // 拷贝 ~40B+positions 堆块 → 12B/posting。
+    // 只拷 (ord, tf) 双数组 + WAND 元数据——positions 评分用不到，不拷。
+    // 相比整列表深拷贝：分配 N+1 次 → 2 次，拷贝 ~40B+positions 堆块 → 12B/posting。
     void snapshot_flat(FlatPostings& out) const;
 };
 

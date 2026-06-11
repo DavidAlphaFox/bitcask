@@ -586,7 +586,8 @@ TEST(InvertedIndex, VByteEncodeDecode) {
     EXPECT_EQ(val128, 300u);
 }
 
-TEST(InvertedIndex, FinalizeCompressesOrds) {
+// finalize_all_postings 不改变 search 结果（幂等、不损坏 items）。
+TEST(InvertedIndex, FinalizePreservesSearchResults) {
     InvertedIndex idx;
     idx.add_doc(0, {{"hello", tp(1, {0})}});
     idx.add_doc(100, {{"hello", tp(2, {0, 1})}});
@@ -617,7 +618,8 @@ TEST(InvertedIndex, FinalizeCompressesOrds) {
     EXPECT_EQ(before_ords, after_ords);
 }
 
-TEST(InvertedIndex, FinalizeReducesMemory) {
+// finalize_all_postings 后 df 不变（不丢/不增 posting）。
+TEST(InvertedIndex, FinalizeKeepsDfStable) {
     InvertedIndex idx;
     for (std::uint64_t i = 0; i < 100; ++i) {
         idx.add_doc(i * 1000, {{"term", tp(1, {0})}});

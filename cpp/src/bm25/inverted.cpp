@@ -1274,46 +1274,40 @@ auto InvertedIndex::save(std::string_view path) const -> bool {
             ok = write_u32(pc);
             if (!ok) { std::fclose(f); return false; }
 
-            if (pl.finalized && !pl.compressed_ords.empty()) {
-                // VByte gap 编码格式（version=2/3）
-                std::uint8_t comp = 1;
-                ok = write_u32(comp);
-                if (!ok) { std::fclose(f); return false; }
-                auto csize = static_cast<std::uint32_t>(pl.compressed_ords.size());
+            // v4 comp=1：ord 现场 VByte gap 编码落盘（内存不再常驻压缩副本）。
+            // items[].ord 升序 → gap_encode 与此前 finalize 写出的 compressed_ords
+            // 逐字节一致；load 回填 items[].ord（comp==1 分支）。
+            std::uint8_t comp = 1;
+            ok = write_u32(comp);
+            if (!ok) { std::fclose(f); return false; }
+            {
+                std::vector<std::uint64_t> ords;
+                ords.reserve(pl.items.size());
+                for (auto& p : pl.items) ords.push_back(p.ord);
+                auto enc = codec::gap_encode(ords);
+                auto csize = static_cast<std::uint32_t>(enc.size());
                 ok = write_u32(csize);
                 if (!ok) { std::fclose(f); return false; }
-                if (std::fwrite(pl.compressed_ords.data(), 1, csize, f) != csize) {
+                if (csize > 0 && std::fwrite(enc.data(), 1, csize, f) != csize) {
                     std::fclose(f); return false;
                 }
-                for (auto& posting : pl.items) {
-                    ok = write_u32(posting.tf);
-                    if (!ok) { std::fclose(f); return false; }
-                    if (!write_positions(posting.positions)) {
-                        std::fclose(f); return false;
-                    }
-                }
-                // Block-Max WAND 元数据（version=3）
-                std::uint32_t block_count = static_cast<std::uint32_t>(pl.blocks.size());
-                ok = write_u32(block_count);
+            }
+            for (auto& posting : pl.items) {
+                ok = write_u32(posting.tf);
                 if (!ok) { std::fclose(f); return false; }
-                for (auto& blk : pl.blocks) {
-                    ok = write_u64(blk.base_ord) && write_u64(blk.end_ord)
-                         && write_u32(blk.max_tf) && write_u32(static_cast<std::uint32_t>(blk.start_idx))
-                         && write_u32(static_cast<std::uint32_t>(blk.count));
-                    if (!ok) { std::fclose(f); return false; }
+                if (!write_positions(posting.positions)) {
+                    std::fclose(f); return false;
                 }
-            } else {
-                // 原始格式（version=1 或未压缩）
-                std::uint8_t comp = 0;
-                ok = write_u32(comp);
+            }
+            // Block-Max WAND 元数据（version=3）
+            std::uint32_t block_count = static_cast<std::uint32_t>(pl.blocks.size());
+            ok = write_u32(block_count);
+            if (!ok) { std::fclose(f); return false; }
+            for (auto& blk : pl.blocks) {
+                ok = write_u64(blk.base_ord) && write_u64(blk.end_ord)
+                     && write_u32(blk.max_tf) && write_u32(static_cast<std::uint32_t>(blk.start_idx))
+                     && write_u32(static_cast<std::uint32_t>(blk.count));
                 if (!ok) { std::fclose(f); return false; }
-                for (auto& posting : pl.items) {
-                    ok = write_u64(posting.ord) && write_u32(posting.tf);
-                    if (!ok) { std::fclose(f); return false; }
-                    if (!write_positions(posting.positions)) {
-                        std::fclose(f); return false;
-                    }
-                }
             }
         }
     }
@@ -1397,22 +1391,20 @@ auto InvertedIndex::load(std::string_view path) -> bool {
                 auto comp = read_u32();
                 if (comp == 0xFFFFFFFF) { std::fclose(f); return false; }
                 if (comp == 1) {
-                    pl.finalized = true;
                     auto csize = read_u32();
                     if (csize == 0xFFFFFFFF) { std::fclose(f); return false; }
-                    pl.compressed_ords.resize(csize);
+                    std::vector<std::uint8_t> comp_ords(csize);
                     if (csize > 0) {
-                        if (std::fread(pl.compressed_ords.data(), 1, csize, f) != csize) {
+                        if (std::fread(comp_ords.data(), 1, csize, f) != csize) {
                             std::fclose(f); return false;
                         }
                     }
                     // 回填 items[].ord：内存路径（find/note_appended/compact/
                     // live_doc_count 及查询热循环）都以 items[].ord 为事实来源，
-                    // compressed_ords 只是落盘副本。漏回填会让 load 后的 ord 全 0，
-                    // 后续对既有 term 的 add_doc（note_appended 使压缩失效）即丢失
-                    // 全部旧 posting 的 ord。
+                    // 压缩字节只是落盘副本（解码后即丢弃，不常驻）。漏回填会让
+                    // load 后 ord 全 0，后续对既有 term 的 add_doc 即丢失旧 ord。
                     {
-                        auto ords = codec::gap_decode(pl.compressed_ords);
+                        auto ords = codec::gap_decode(comp_ords);
                         if (ords.size() != pc) { std::fclose(f); return false; }
                         for (std::uint32_t p = 0; p < pc; ++p) {
                             pl.items[p].ord = ords[p];
