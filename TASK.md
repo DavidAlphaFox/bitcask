@@ -515,6 +515,123 @@ race）。点 get 本就基本无害（unlink 是 merge 最后一步、单次 NI
 
 ---
 
+## 性能优化（O1-O9）✅
+
+> 基于全库代码审计（存储核心 / 倒排索引 / 搜索文本层 / NIF+Erlang 层四路并行分析，
+> 高影响发现已逐一对照源码核实）。原则：只做已确认真实存在、收益明确的优化；
+> 不改对外语义；每项独立可验证。基线：ctest 317/317 + eunit 44/44。
+> **结果**：ctest 317→**319/319**（+2 回归测试）+ eunit 44/44。过程中发现并修复
+> 2 个正确性 bug（O3 的 load 回填缺失、O6 的 ies 规则偏差，见各节）；O7 与 O9
+> 的队列部分经核实为审计误报，未改动（理由见各节）。
+
+### O1 — KeyDir 透明 hash（消除热路径 string 临时构造）
+
+**目标**：`keydir.cpp` 中 `entries_`/`pending_` 的每次 `find`/`insert_or_assign` 都做
+`std::string(key)` 临时构造（13 处），每个 put/get/remove 至少一次多余堆分配。
+`index.hpp` 已有支持异构查找的 `StringHash`，复用之。
+
+| # | 目标 | 改动范围 | 关键内容 | 状态 |
+|---|------|---------|---------|------|
+| **O1.1** | entries_/pending_ 改透明 hash | `keydir.hpp` / `keydir.cpp` | `StringHash` 提到共享头 `string_hash.hpp`（index.hpp 同步复用）；9 处 `find(std::string(key))` 改零拷贝；4 处 insert_or_assign 保留（key 须 owned） | ✅ |
+| **O1.2** | 回归 | 全量 | ctest 317/317 | ✅ |
+
+### O2 — NIF get 热路径 atom 缓存
+
+**目标**：`nif_cask.cpp` 索引模式 get 每次调用 `enif_make_atom(env, "text"/"meta")`，
+走 BEAM 原子表查询。挪进 `atoms()` on_load 一次性初始化。
+
+| # | 目标 | 改动范围 | 关键内容 | 状态 |
+|---|------|---------|---------|------|
+| **O2.1** | atoms 加 text/meta | `atoms.hpp/.cpp` / `nif_cask.cpp` / `nif_helpers.cpp` | `atoms().text/.meta`；get 构造 map 与 parse_doc_map 解析共 4 处改引用 | ✅ |
+| **O2.2** | 回归 | eunit | 44/44 | ✅ |
+
+### O3 — 倒排查询 ords 解压缓存统一
+
+**目标（实施中升级）**：原计划做查询内解压缓存；实施时发现 `items[].ord` 在内存中
+恒存在（finalize 不清 items），`compressed_ords` 只服务落盘格式——查询路径的
+`decompress_ords()`（VByte 全量解码 + 物化 vector）是纯浪费，可直接读 `items[i].ord`。
+
+**顺手发现并修复正确性 bug**：load 的 comp==1 分支只读入 compressed_ords，
+不回填 `items[].ord`（resize 后全 0）。而 `find()`/`note_appended()`/`compact()`/
+`df` 等内存路径都以 `items[].ord` 为事实来源——快照重载后对既有 term 增量
+add_doc 触发 note_appended 使压缩失效，旧 posting 的 ord 全部读成 0，索引损坏。
+触发链路：merge → rebuild（finalize+save）→ 重启 load → 写既有 term。
+
+| # | 目标 | 改动范围 | 关键内容 | 状态 |
+|---|------|---------|---------|------|
+| **O3.0** | **load 回填 items[].ord（bug 修复）** | `inverted.cpp` load | comp==1 分支 gap_decode 后回填，个数自洽校验 | ✅ |
+| **O3.1** | 查询路径免解压 | `inverted.cpp` / `inverted.hpp` | search/explain/phrase/wildcard/fuzzy 5 处热循环直接读 `items[i].ord`（免物化）；wand/bool_search 的游标 `tp.ords` 保留但 `decompress_ords()` 改为从 items 直拷（免 VByte 解码） | ✅ |
+| **O3.2** | 回归 | `inverted_test` | 新增 `LoadFinalizedThenAddDocKeepsOldOrds`（load→explain→增量写→搜索）；**测试有牙**：临时禁用回填确认 FAILED，还原后通过。ctest 318/318 | ✅ |
+
+### O4 — bool_search MUST 求交按 df 升序
+
+**目标**：`inverted.cpp` bool_search 多 MUST term 逐个 `set_intersection`，未按
+posting list 长度排序。先按 df 升序排，最短 list 优先求交，早期大幅剪枝。
+
+| # | 目标 | 改动范围 | 关键内容 | 状态 |
+|---|------|---------|---------|------|
+| **O4.1** | MUST terms 按 df 升序 | `inverted.cpp` | 用索引数组 must_order 按 items.size() 升序处理（must_tps 本体不重排，评分用）；交集为空提前 break | ✅ |
+| **O4.2** | 回归 | `inverted_test` | bool 全用例通过，ctest 318/318 | ✅ |
+
+### O5 — 多字段写入 catch-all 合并分词（去重复分词）
+
+**目标**：`search_layer.cpp` on_write_fields 各字段已逐个 `analyze_with_positions`，
+catch-all 又把拼接文本完整重新分词一遍（NFKC + jieba 重跑）。改为直接合并各字段
+term_data（position 按字段偏移平移），多字段写入分词开销约减半。
+
+| # | 目标 | 改动范围 | 关键内容 | 状态 |
+|---|------|---------|---------|------|
+| **O5.1** | catch-all 由各字段结果合并 | `search_layer.cpp` | 各字段 term_data 平移 ca_pos_base（字段最大 position+1）并入；字段内相对位置不变；跨字段间隔仅在「字段尾部有被丢短词」时与拼接版差极小 slop（边角语义，已注释记录） | ✅ |
+| **O5.2** | 回归 | `search_layer_test` | 多字段 phrase/near/highlight 全用例通过 | ✅ |
+
+### O6 — Porter stemmer 去临时分配
+
+**目标**：`porter_stemmer.hpp` 规则匹配大量 `std::string(r.first)` / `w.substr()` /
+`stem + suffix` 临时串，每词十几次分配。改 `string_view` 后缀 + offset 版 measure +
+原地修改。
+
+| # | 目标 | 改动范围 | 关键内容 | 状态 |
+|---|------|---------|---------|------|
+| **O6.1** | 规则表 string_view 化 | `porter_stemmer.hpp` | 谓词/measure 全部 string_view；前缀用 stem_of 视图；规则表 constexpr string_view；替换 resize+append，逐词零临时分配 | ✅ |
+| **O6.0** | **ies 规则修正（bug 修复）** | `porter_stemmer.hpp` | 原 step1a `erase(size-2)+='i'` 净效果 "ies→ii"（"ponies"→"ponii"），偏离标准 Porter 与自身注释；修正为 "ies→i"。注意：已建索引中受影响词干会变（项目不考虑向后兼容） | ✅ |
+| **O6.2** | 回归 | `porter_stemmer_test` | 黄金词表不变 + 新增 `Step1aIes` 锁定修正行为。ctest 319/319 | ✅ |
+
+### O7 — search_cache 失效判定 O(1) 化
+
+**核实后不做（审计误报）**：现实现已把 changed_terms 建成 `unordered_set`，
+每个缓存条目只做 O(查询词数) 次哈希查找——并非嵌套线性扫描。条目的 terms
+是查询词（通常 1~5 个），总成本 O(m + cache×查询词数)，已接近最优；剩余
+可省的只有每次调用重建 changed set，收益可忽略，不值得为此维护反向索引。
+
+| # | 目标 | 状态 |
+|---|------|------|
+| **O7** | 核实为误报，不改动 | ❌（有意不做） |
+
+### O8 — SearchLayer::field_index 透明 hash
+
+**目标**：`search_layer.cpp:23,32` 每次字段名查找 `std::string(field)` 拷贝。
+同 O1 方案，map 加透明 hash。
+
+| # | 目标 | 改动范围 | 关键内容 | 状态 |
+|---|------|---------|---------|------|
+| **O8.1** | 字段 map 透明 hash | `search_layer.hpp/.cpp` | fields_ 复用共享头 `StringHash`，两个 field_index 重载查找零拷贝 | ✅ |
+
+### O9 — Erlang 层低垂果实（merge_worker 队列）
+
+**目标**：`bitcask_merge_worker.erl` 队列与列表差的低效写法。
+
+| # | 目标 | 改动范围 | 关键内容 | 状态 |
+|---|------|---------|---------|------|
+| **O9.1** | 有序列表差 | `bitcask_merge_worker.erl` | `Files0 -- Expired`（O(n·m)）改 `ordsets:subtract`（O(n+m)，两边已 usort） | ✅ |
+| **O9.2** | `Q ++ [Args]` 不改 | — | 核实后不做：入队前必经 `lists:keyfind`（按 Dir 去重）本身就 O(n)，换 queue 模块无法保留 keyfind/keyreplace 语义且不改渐近复杂度 | ❌（有意不做） |
+| **O9.3** | 回归 | eunit | 44/44 | ✅ |
+
+**暂不做（记录在案）**：GetResult 零拷贝（API 变更牵动 NIF，归入 V6）；fold/stream 批量
+拉接口（接口设计问题，归入 V6）；WAL 批量 flush（动崩溃恢复窗口语义，需单独评审）；
+wildcard 词典剪枝（trie/后缀索引工程量大，归入 V6）；LTO（构建配置，单独评审）。
+
+---
+
 ## 未来任务
 
 ### V3 — HNSW 单图 + search_vector（暂缓）
