@@ -30,6 +30,14 @@ std::string cjk_text() {
     }
     return t;
 }
+// P2.5b 目标语料：中文 + 半角英文/数字/标点（无全角标点）。
+std::string cjk_halfwidth_text() {
+    std::string t;
+    while (t.size() < 1024) {
+        t += "北京市朝阳区的搜索引擎对bitcask引擎进行GPU加速测试, 性能提升明显. ";
+    }
+    return t;
+}
 std::string mixed_text() {
     std::string t;
     while (t.size() < 1024) {
@@ -73,6 +81,18 @@ void BM_Text_NfkcFoldLatin(benchmark::State& s) {
     s.SetBytesProcessed(static_cast<std::int64_t>(s.iterations()) *
                         static_cast<std::int64_t>(t.size()));
 }
+void BM_Text_NfkcFoldCjkHalfwidth(benchmark::State& s) {
+    auto t = cjk_halfwidth_text();
+    for (auto _ : s) {
+        auto r = detail::nfkc_fold(t);
+        benchmark::DoNotOptimize(r);
+    }
+    s.SetBytesProcessed(static_cast<std::int64_t>(s.iterations()) *
+                        static_cast<std::int64_t>(t.size()));
+}
+void BM_Text_AnalyzeNgramCjkHalfwidth(benchmark::State& s) {
+    bench_analyze(s, AnalyzerType::Ngram, cjk_halfwidth_text());
+}
 void BM_Text_NfkcFoldCjk(benchmark::State& s) {
     auto t = cjk_text();
     for (auto _ : s) {
@@ -100,6 +120,8 @@ void BM_Text_ToCodepointsCjk(benchmark::State& s) {
     s.SetBytesProcessed(static_cast<std::int64_t>(s.iterations()) *
                         static_cast<std::int64_t>(t.size()));
 }
+BENCHMARK(BM_Text_NfkcFoldCjkHalfwidth)->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_Text_AnalyzeNgramCjkHalfwidth)->Unit(benchmark::kMicrosecond);
 BENCHMARK(BM_Text_NfkcFoldLatin)->Unit(benchmark::kMicrosecond);
 BENCHMARK(BM_Text_NfkcFoldCjk)->Unit(benchmark::kMicrosecond);
 BENCHMARK(BM_Text_ToCodepointsLatin)->Unit(benchmark::kMicrosecond);
