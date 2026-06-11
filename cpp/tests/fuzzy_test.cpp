@@ -181,3 +181,65 @@ TEST(SearchLayerFuzzy, DeletedDocSkipped) {
     ASSERT_EQ(result->size(), 1u);
     EXPECT_EQ(result->at(0).key, "doc2");
 }
+
+// =========================================================================
+// P2.3：Myers 位并行 vs 经典 levenshtein 黑盒对拍
+// =========================================================================
+
+#include "bitcask/myers.hpp"
+
+// 确定性 LCG（不用 std::random_device，保证可复现）。
+namespace {
+struct Lcg {
+    std::uint64_t s;
+    std::uint64_t next() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return s >> 33; }
+};
+}  // namespace
+
+TEST(MyersMatcher, AgreesWithLevenshteinRandomized) {
+    Lcg rng{42};
+    const char alphabet[] = "abc";  // 小字母表逼出高碰撞/重复字符场景
+    for (int iter = 0; iter < 5000; ++iter) {
+        std::string a, b;
+        auto la = rng.next() % 9, lb = rng.next() % 9;
+        for (std::uint64_t i = 0; i < la; ++i) a.push_back(alphabet[rng.next() % 3]);
+        for (std::uint64_t i = 0; i < lb; ++i) b.push_back(alphabet[rng.next() % 3]);
+        MyersMatcher m(a);
+        auto d = levenshtein_distance(a, b);
+        for (std::uint32_t k = 0; k <= 3; ++k) {
+            ASSERT_EQ(m.within(b, k), d <= k)
+                << "a=" << a << " b=" << b << " d=" << d << " k=" << k;
+        }
+    }
+}
+
+TEST(MyersMatcher, BoundaryAndFallback) {
+    // m=64 边界（位并行的满字宽路径）。
+    std::string p64(64, 'x');
+    MyersMatcher m64(p64);
+    EXPECT_TRUE(m64.within(p64, 0));
+    std::string q = p64; q[10] = 'y';
+    EXPECT_FALSE(m64.within(q, 0));
+    EXPECT_TRUE(m64.within(q, 1));
+
+    // m=65 → 退回经典 DP。
+    std::string p65(65, 'x');
+    MyersMatcher m65(p65);
+    EXPECT_TRUE(m65.within(p65, 0));
+    std::string q65 = p65; q65.pop_back();
+    EXPECT_TRUE(m65.within(q65, 1));
+    EXPECT_FALSE(m65.within(q65, 0));
+
+    // 空模式串。
+    MyersMatcher me("");
+    EXPECT_TRUE(me.within("", 0));
+    EXPECT_TRUE(me.within("ab", 2));
+    EXPECT_FALSE(me.within("ab", 1));
+
+    // UTF-8 多字节：按字节语义，与 levenshtein_distance 一致。
+    MyersMatcher mc("北京");
+    EXPECT_TRUE(mc.within("北京", 0));
+    auto d = levenshtein_distance("北京", "北亰");
+    EXPECT_EQ(mc.within("北亰", d), true);
+    EXPECT_EQ(mc.within("北亰", d - 1), false);
+}
