@@ -1,7 +1,16 @@
 # 查询路径 PostingList 零拷贝设计（P1）
 
-> 状态：Phase 1（方案 D）已实施并验证——基准 -60~72%，详见 TASK.md P1 节。
-> Phase 2 按 §6 判据暂不启动。前置事实基于 2026-06 的代码审计（O1-O9 之后）。
+> 状态：Phase 1（方案 D）已实施——基准 -60~72%；Phase 2-min（phrase/near
+> 持 shared_ptr + use_count CoW 协议）已实施——phrase -25~32%，详见 TASK.md
+> P1 节。完整 Phase 2（published_count 前缀只读 + deque）按 §6 判据暂不启动。
+>
+> 实施备注（Phase 2-min 与 §4.2 的差异）：未做 deque/published_count，
+> 而是用「写者持写 accessor 时 use_count()==1 → 原地改，>1 → 克隆替换」
+> 的 CoW 协议保证读者持引用期间对象不被修改（裸 shared_ptr + 原地追加
+> 是不安全的——vector 扩容搬迁会让读者悬空）。代价：仅当 phrase 查询与
+> 同 term 写入重叠时发生整列表克隆，常态写零开销。另：实施中发现并修复
+> 「遍历 concurrent_hash_map 期间调 find 触发懒 rehash 致迭代器重复访问
+> 节点」的坑（wildcard/fuzzy 改两阶段收集，详见 TASK.md P2.3）。
 
 ## 1. 问题
 

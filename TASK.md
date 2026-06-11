@@ -634,7 +634,7 @@ wildcard 词典剪枝（trie/后缀索引工程量大，归入 V6）；LTO（构
 
 ## 未来任务
 
-### P1 — 查询路径 PostingList 零拷贝（Phase 1 ✅）
+### P1 — 查询路径 PostingList 零拷贝（Phase 1 ✅ + Phase 2-min ✅）
 
 > 设计文档：`doc/posting-zero-copy-design-zh.md`。原状：6 个查询路径每词
 > 深拷贝整个 PostingList（含逐 posting 的 positions 堆分配），查询侧最大单项开销。
@@ -666,9 +666,23 @@ wildcard 词典剪枝（trie/后缀索引工程量大，归入 V6）；LTO（构
 warning——已验证 **HEAD（P1 之前）同测试报同签名 race**：系统 libtbb 无
 TSan 插桩，parallel_reduce 任务派发的 happens-before 边对 TSan 不可见的
 既有假阳性类（修复方向：TSan 构建链接插桩版 TBB 或加 suppression，归
-工程化任务）。**Phase 2**（shared_ptr 发布 + published_count 前缀只读，
-真零拷贝）按设计文档判据：Phase 1 后 profile 中 snapshot memcpy 仍占查询
->30% 才启动；当前收益已 -60~72%，暂不启动。
+工程化任务）。完整 Phase 2 按设计文档判据暂不启动。
+
+**Phase 2-min（phrase/near 零拷贝子集）已落地**：
+
+| # | 内容 | 状态 |
+|---|------|------|
+| P2.1 | map 值改 `shared_ptr<PostingList>`（`PostingMap` 别名）；新增 `mutable_pl()` CoW 协议：写者持写 accessor 时 `use_count()==1` → 原地改（常态零开销，observe 后补 acquire fence 与读者 release 递减配对）；`>1`（有 phrase 读者持引用）→ 克隆替换，旧版本靠引用计数续命 | ✅ |
+| P2.2 | phrase/near 改持 `shared_ptr<const PostingList>` 零拷贝读（原先深拷整列表含全部 positions）；add_doc/compact/finalize 全部经 `mutable_pl`（finalize 从迭代器裸改改为 key 快照 + 写 accessor 模式） | ✅ |
+| P2.3 | **顺手发现并修复**：wildcard/fuzzy 在遍历 concurrent_hash_map 期间取值不安全——遍历中调 `find()` 触发懒 rehash 节点搬迁致迭代器**重复访问同一节点**（实测复现，曾使 S10.2 去重失效）。改为两阶段：遍历只收集 key，遍历结束后逐 key 经 const_accessor 取值（顺带消除了既有的「遍历中裸读 slot 值」hazard） | ✅ |
+| P2.4 | 回归：`CowClonesWhenReaderHoldsReference`（CoW 协议确定性验证：持引用→克隆、释放后→原地）+ `PhraseSearchConcurrentWithSingleWriter`（4 phrase 读者 × 单写者同 term 追加），TSan 下两者干净（全量仍只有已知 TBB 假阳性类）。ctest 322/322 + eunit 44/44 | ✅ |
+
+**Phase 2-min 基准**（同会话 before/after，5 次重复取中位）：
+PhraseHotTerm/100k **12448us → 8459us（-32%）**、/4096 424us → 319us（-25%）。
+非 phrase 路径同会话复测 2030~2090us vs P1 时段单次测量 1816us（+10%上下）——
+每查询代码差异仅一次指针解引用，解释不了该量级；P1 数字为数小时前单次运行，
+倾向跨时段环境漂移，但未能当场 A/B 定论（P1/P2 在同一未提交差异中，拆分
+成本高），如实记录。相对 P1 前基线（6091us）当前为 -66%。
 
 ### V3 — HNSW 单图 + search_vector（暂缓）
 
