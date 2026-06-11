@@ -634,6 +634,42 @@ wildcard 词典剪枝（trie/后缀索引工程量大，归入 V6）；LTO（构
 
 ## 未来任务
 
+### P1 — 查询路径 PostingList 零拷贝（Phase 1 ✅）
+
+> 设计文档：`doc/posting-zero-copy-design-zh.md`。原状：6 个查询路径每词
+> 深拷贝整个 PostingList（含逐 posting 的 positions 堆分配），查询侧最大单项开销。
+
+**基准先行**：新增 `cpp/bench/inverted_bench.cpp`（bitcask_bench 目标，
+`--benchmark_filter=Inverted`）：SearchHotTerm/{512,4096,100k}（标量 + WAND
+两路径）、BoolMustHot、SearchWhileIndexing（4 reader × 1 writer）。
+
+**Phase 1（方案 D：扁平快照）已落地**：
+
+| # | 内容 | 状态 |
+|---|------|------|
+| P1.1 | `FlatPostings`（ords/tfs/blocks/max_tf）+ `PostingList::snapshot_flat()`；block_for_ord/block_upper_bound 提取共享实现 | ✅ |
+| P1.2 | search/wand/bool/wildcard/fuzzy 5 路径改扁平快照（分配 N+1→2 次、拷贝 ~40B+positions→12B/posting）；phrase/near 保留深拷（需 positions，Phase 2 处理）；explain 本就持 accessor 短读不拷 | ✅ |
+| P1.3 | 并发回归 `SearchConcurrentWithSingleWriter`（4 reader × 单写者同 term 追加，对齐 IndexPool 线程模型），TSan 下单测干净 | ✅ |
+| P1.4 | 回归：ctest 320/320 + eunit 44/44 | ✅ |
+
+**基准结果**（同机同配置 before/after）：
+
+| benchmark | before | after | Δ |
+|---|---|---|---|
+| SearchHotTerm/512（标量） | 25.1us | 15.7us | **-38%** |
+| SearchHotTerm/4096（WAND） | 208.5us | 57.6us | **-72%** |
+| SearchHotTerm/100k（WAND） | 6090.6us | 1816.5us | **-70%** |
+| BoolMustHot/100k | 14682.5us | 5730.1us | **-61%** |
+| SearchWhileIndexing 4r×1w | 8761.4us | 2459.2us | **-72%** |
+
+**已知事项**：TSan 全量跑 inverted_test 时 `BlockMaxWandBasic` 报 4 条
+warning——已验证 **HEAD（P1 之前）同测试报同签名 race**：系统 libtbb 无
+TSan 插桩，parallel_reduce 任务派发的 happens-before 边对 TSan 不可见的
+既有假阳性类（修复方向：TSan 构建链接插桩版 TBB 或加 suppression，归
+工程化任务）。**Phase 2**（shared_ptr 发布 + published_count 前缀只读，
+真零拷贝）按设计文档判据：Phase 1 后 profile 中 snapshot memcpy 仍占查询
+>30% 才启动；当前收益已 -60~72%，暂不启动。
+
 ### V3 — HNSW 单图 + search_vector（暂缓）
 
 ### V4 — 单域 merge
