@@ -21,6 +21,32 @@ target_compile_options(bitcask_warnings INTERFACE
 find_package(ZLIB REQUIRED)
 find_package(TBB REQUIRED)
 
+# ---------------------------------------------------------------------------
+# Release 性能选项（评审记录见 TASK.md「P1 — Phase 2-min」节）：
+# - -falign-functions=64：search_wand 等热循环对代码布局敏感——A/B 实测
+#   无关代码增删可造成 ±10% 的 icache 对齐伪影；固定对齐让基准可复现、
+#   性能对无关改动免疫。
+# - LTO/IPO：nif → cask → keydir/bm25 调用链大量小函数跨 TU 调用，LTO
+#   允许跨库内联。sanitizer 构建不启用（与运行时插桩叠加无意义，且易
+#   触发编译器边角问题）；通过 _RELEASE 后缀只作用于 Release 配置，
+#   Debug/sanitizer 构建目录不受影响。
+# 注意：两者都需在所有 add_library 之前设置（目录属性在 target 创建时固化）。
+# ---------------------------------------------------------------------------
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options($<$<CONFIG:Release>:-falign-functions=64>)
+endif()
+
+option(BITCASK_LTO "Release 构建启用 LTO/IPO（sanitizer 构建自动关闭）" ON)
+if(BITCASK_LTO AND "${BITCASK_SANITIZE}" STREQUAL "")
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT _bitcask_ipo_ok OUTPUT _bitcask_ipo_msg)
+    if(_bitcask_ipo_ok)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+    else()
+        message(STATUS "bitcask: LTO unavailable (${_bitcask_ipo_msg}), proceeding without")
+    endif()
+endif()
+
 # 当从 cpp/ 子目录独立构建时（不经过顶层 CMake），提供 bitcask_sanitizers
 # 的空壳 target，使测试 target 能正常链接。
 if(NOT TARGET bitcask_sanitizers)
