@@ -753,9 +753,9 @@ TEST(PostingList, BlockMetadata) {
     idx.finalize_all_postings();
 
     auto& shard = idx.shard_for("term");
-    tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+    InvertedIndex::PostingMap::const_accessor acc;
     ASSERT_TRUE(shard.inverted.find(acc, "term"));
-    auto& pl = acc->second;
+    auto& pl = *acc->second;
 
     EXPECT_GE(pl.blocks.size(), 2u);
     std::size_t expected_blocks = (300 + PostingList::kBlockSize - 1) / PostingList::kBlockSize;
@@ -870,10 +870,10 @@ TEST(InvertedIndex, IncrementalBlocksOnLiveIndex) {
     // ① 在线索引（未 finalize）：blocks 已增量封满块，仅含整块。
     {
         auto& shard = idx.shard_for("common");
-        tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+        InvertedIndex::PostingMap::const_accessor acc;
         ASSERT_TRUE(shard.inverted.find(acc, "common"));
-        ASSERT_EQ(acc->second.blocks.size(), kDocs / PostingList::kBlockSize);  // 600/128=4 满块
-        for (auto& blk : acc->second.blocks) {
+        ASSERT_EQ(acc->second->blocks.size(), kDocs / PostingList::kBlockSize);  // 600/128=4 满块
+        for (auto& blk : acc->second->blocks) {
             EXPECT_EQ(blk.count, PostingList::kBlockSize);
         }
     }
@@ -893,9 +893,9 @@ TEST(InvertedIndex, IncrementalBlocksOnLiveIndex) {
     // ③ finalize 后块数为含部分尾块的规范数 ceil(600/128)=5。
     {
         auto& shard = idx.shard_for("common");
-        tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+        InvertedIndex::PostingMap::const_accessor acc;
         ASSERT_TRUE(shard.inverted.find(acc, "common"));
-        EXPECT_EQ(acc->second.blocks.size(),
+        EXPECT_EQ(acc->second->blocks.size(),
                   (kDocs + PostingList::kBlockSize - 1) / PostingList::kBlockSize);
     }
 }
@@ -920,9 +920,9 @@ TEST(InvertedIndex, IndexPositionsDisabled) {
     // positions 未存：posting 的 positions 为空。
     {
         auto& shard = idx.shard_for("quick");
-        tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
+        InvertedIndex::PostingMap::const_accessor acc;
         ASSERT_TRUE(shard.inverted.find(acc, "quick"));
-        for (auto& p : acc->second.items) {
+        for (auto& p : acc->second->items) {
             EXPECT_TRUE(p.positions.empty());
         }
     }
@@ -1035,4 +1035,91 @@ TEST(InvertedIndex, SearchConcurrentWithSingleWriter) {
     EXPECT_FALSE(bad.load());
     auto final_res = idx.search({"hot"}, 10, checker);
     EXPECT_EQ(final_res.size(), 10u);
+}
+
+// P2-min：CoW 协议确定性验证。读者持 shared_ptr 引用期间（use_count>1），
+// 写者对同 term 的 add_doc 必须克隆替换而非原地改——读者持有的对象冻结，
+// 索引侧换上含新 posting 的新对象。无读者持引用时（use_count==1）原地改。
+TEST(InvertedIndex, CowClonesWhenReaderHoldsReference) {
+    InvertedIndex idx;
+    idx.add_doc(0, {{"hot", tp(1, {0})}});
+
+    // 模拟 phrase 读者：取引用后释放桶锁。
+    std::shared_ptr<const PostingList> held;
+    {
+        InvertedIndex::PostingMap::const_accessor acc;
+        ASSERT_TRUE(idx.shard_for("hot").inverted.find(acc, "hot"));
+        held = acc->second;
+    }
+    ASSERT_EQ(held->items.size(), 1u);
+
+    // 写者追加同 term → CoW：held 冻结，索引换新对象。
+    idx.add_doc(1, {{"hot", tp(1, {0})}});
+    EXPECT_EQ(held->items.size(), 1u);  // 读者视图不变
+    {
+        InvertedIndex::PostingMap::const_accessor acc;
+        ASSERT_TRUE(idx.shard_for("hot").inverted.find(acc, "hot"));
+        EXPECT_EQ(acc->second->items.size(), 2u);   // 索引侧已更新
+        EXPECT_NE(acc->second.get(), held.get());   // 确实是克隆出的新对象
+    }
+
+    // 读者释放后（use_count 回到 1）→ 原地改，不再克隆。
+    held.reset();
+    const PostingList* before;
+    {
+        InvertedIndex::PostingMap::const_accessor acc;
+        ASSERT_TRUE(idx.shard_for("hot").inverted.find(acc, "hot"));
+        before = acc->second.get();
+    }
+    idx.add_doc(2, {{"hot", tp(1, {0})}});
+    {
+        InvertedIndex::PostingMap::const_accessor acc;
+        ASSERT_TRUE(idx.shard_for("hot").inverted.find(acc, "hot"));
+        EXPECT_EQ(acc->second.get(), before);       // 同一对象（原地追加）
+        EXPECT_EQ(acc->second->items.size(), 3u);
+    }
+}
+
+// P2-min 回归：phrase 读者（零拷贝持引用）× 单写者同 term 追加并发。
+// 读者持引用期间写者每次 add_doc 都触发 CoW；读者的快照自洽（短语命中数
+// 不超过其取引用时刻的发布量）。TSan 构建下验证无 data race。
+TEST(InvertedIndex, PhraseSearchConcurrentWithSingleWriter) {
+    class AllLive : public LiveChecker {
+    public:
+        [[nodiscard]] bool is_live(std::uint64_t) const override { return true; }
+        [[nodiscard]] std::uint32_t doc_len(std::uint64_t) const override { return 2; }
+    };
+
+    InvertedIndex idx;
+    for (std::uint64_t i = 0; i < 1000; ++i) {
+        idx.add_doc(i, {{"p0", tp(1, {0})}, {"p1", tp(1, {1})}});
+    }
+
+    AllLive checker;
+    std::atomic<bool> stop{false};
+    std::atomic<bool> bad{false};
+
+    std::vector<std::thread> readers;
+    readers.reserve(4);
+    for (int r = 0; r < 4; ++r) {
+        readers.emplace_back([&] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                auto res = idx.search_phrase({"p0", "p1"}, 5, checker);
+                if (res.size() > 5) { bad.store(true); return; }
+                for (auto& h : res) {
+                    if (h.ord >= 3000) { bad.store(true); return; }
+                }
+            }
+        });
+    }
+
+    for (std::uint64_t i = 1000; i < 3000; ++i) {
+        idx.add_doc(i, {{"p0", tp(1, {0})}, {"p1", tp(1, {1})}});
+    }
+    stop.store(true);
+    for (auto& t : readers) t.join();
+
+    EXPECT_FALSE(bad.load());
+    auto final_res = idx.search_phrase({"p0", "p1"}, 5, checker);
+    EXPECT_EQ(final_res.size(), 5u);
 }
