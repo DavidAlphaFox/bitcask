@@ -252,3 +252,19 @@ void BM_Inverted_FuzzyHot(benchmark::State& state) {
     state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations()) * 100000);
 }
 BENCHMARK(BM_Inverted_FuzzyHot)->Unit(benchmark::kMicrosecond);
+
+// P2.3 基准：大词典 fuzzy 扫描（20 万词表，d=2 → 长度剪枝放过大部分词，
+// 编辑距离计算本体成为主导）。与 FuzzyHot（评分主导）互补。
+void BM_Inverted_FuzzyVocabScan(benchmark::State& state) {
+    auto idx = std::make_unique<InvertedIndex>();
+    for (std::uint64_t i = 0; i < 200000; ++i) {
+        idx->add_doc(i, {{"term" + std::to_string(i), {1, {0}}}});
+    }
+    AllLiveChecker live;
+    for (auto _ : state) {
+        auto results = idx->search_fuzzy({"term12345"}, 10, 2, live);
+        benchmark::DoNotOptimize(results);
+    }
+    state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations()) * 200000);
+}
+BENCHMARK(BM_Inverted_FuzzyVocabScan)->Unit(benchmark::kMicrosecond);
