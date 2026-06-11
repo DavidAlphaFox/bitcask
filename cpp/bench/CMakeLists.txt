@@ -22,6 +22,7 @@ add_executable(bitcask_bench
     keydir_bench.cpp
     cask_bench.cpp
     inverted_bench.cpp
+    intersect_u64_proto_bench.cpp
     analyzer_bench.cpp
     bench_main.cpp
 )
