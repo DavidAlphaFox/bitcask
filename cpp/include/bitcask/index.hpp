@@ -121,6 +121,12 @@ private:
     std::vector<DocSlot>     slots_;                          // 下标 = ord
     std::vector<std::string> ord2ext_;                        // 下标 = ord
     std::vector<bool>        live_;                           // 下标 = ord（Roaring 留待优化）
+    // P2.4：doc_len 的 SoA 读优化副本（下标 = ord）。slots_[ord].doc_len 仍是
+    // API 返回值的来源（get/for_each_live 语义不变），但 BM25 评分的
+    // fill_doc_lens 稀疏 gather 改读本数组：DocSlot 32B/项 → 每条 cache line
+    // 只有 4B 有用；u32 紧凑数组 = 16 项/line。与 slots_ 同一 unique_lock
+    // 下写入，不会发散。
+    std::vector<std::uint32_t> doc_lens_;
     std::uint64_t next_ord_  = 0;
     std::uint64_t live_docs_ = 0;
 

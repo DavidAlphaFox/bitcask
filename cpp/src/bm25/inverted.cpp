@@ -1282,22 +1282,34 @@ auto InvertedIndex::compact(const LiveChecker& live_checker, double dead_ratio_t
         for (auto it = shard.inverted.begin(); it != shard.inverted.end(); ++it) {
             keys.push_back(it->first);
         }
+        std::vector<std::uint64_t> ords_buf;
+        std::vector<char> live_buf;
         for (auto& key : keys) {
             PostingMap::accessor acc;
             if (!shard.inverted.find(acc, key)) continue;
             const PostingList& pl = *acc->second;
             if (pl.items.empty()) continue;
 
+            // P2.4：live 批量取一次——此前死点统计与压实各自逐 posting
+            // 一次带锁虚调用（大列表 = 数十万次锁）。
+            ords_buf.resize(pl.items.size());
+            for (std::size_t i = 0; i < pl.items.size(); ++i) {
+                ords_buf[i] = pl.items[i].ord;
+            }
+            live_buf.resize(ords_buf.size());
+            live_checker.fill_is_live(ords_buf, live_buf);
+
             std::size_t dead = 0;
-            for (auto& p : pl.items) {
-                if (!live_checker.is_live(p.ord)) ++dead;
+            for (std::size_t i = 0; i < live_buf.size(); ++i) {
+                dead += static_cast<std::size_t>(!live_buf[i]);
             }
             if (dead == 0) continue;
             double ratio = static_cast<double>(dead) / static_cast<double>(pl.items.size());
             if (ratio < dead_ratio_threshold) continue;
 
-            if (mutable_pl(acc->second).compact(
-                    [&](std::uint64_t ord) { return live_checker.is_live(ord); })) {
+            // mutable_pl 可能因 phrase 读者持引用而克隆——克隆保序保内容，
+            // live_buf 与 items 的下标对齐不受影响。
+            if (mutable_pl(acc->second).compact_flags(live_buf)) {
                 ++compacted;
             }
         }

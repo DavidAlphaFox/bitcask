@@ -150,15 +150,16 @@ struct PostingList {
         seal_full_blocks();
     }
 
-    // 死点压实（S10.11）：删除 is_live(ord)==false 的 posting，重建派生态。
+    // 死点压实（S10.11）：删除 live 标志为 0 的 posting，重建派生态。
     // items 原本按 ord 升序，过滤保序 → 压实后仍有序。返回是否实际删了。
     // 分数无关：live_df/idf/avgdl 都只数 live，压实只是不再扫死点。
-    template <typename IsLive>
-    bool compact(const IsLive& is_live) {
+    // P2.4：flags 版本——live 与 items 按下标对齐（批量 fill_is_live 产物，
+    // 免每 posting 一次带锁虚调用）。
+    bool compact_flags(std::span<const char> live) {
         std::vector<Posting> kept;
         kept.reserve(items.size());
-        for (auto& p : items) {
-            if (is_live(p.ord)) kept.push_back(std::move(p));
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            if (live[i]) kept.push_back(std::move(items[i]));
         }
         if (kept.size() == items.size()) return false;  // 无死点，不动
         items = std::move(kept);
@@ -172,6 +173,16 @@ struct PostingList {
         }
         seal_full_blocks();  // 仅封满块（与增量一致，尾部留给后续 finalize）
         return true;
+    }
+
+    // 谓词版本（兼容旧调用方/测试）：构建 flags 后转调，单一实现体。
+    template <typename IsLive>
+    bool compact(const IsLive& is_live) {
+        std::vector<char> live(items.size());
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            live[i] = static_cast<char>(is_live(items[i].ord));
+        }
+        return compact_flags(live);
     }
 
     // 返回 ord 数组。items[].ord 恒为事实来源（load 已回填，见 inverted.cpp

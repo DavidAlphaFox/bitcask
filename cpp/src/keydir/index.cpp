@@ -11,6 +11,7 @@ void Index::ensure_capacity_locked(std::uint64_t ord) {
         slots_.resize(want);
         ord2ext_.resize(want);
         live_.resize(want, false);
+        doc_lens_.resize(want, 0);
     }
 }
 
@@ -39,9 +40,10 @@ void Index::put_doc(std::string_view ext_id, std::uint64_t ord,
         ++live_docs_;
     }
 
-    slots_[ord]   = slot;
+    slots_[ord]    = slot;
+    doc_lens_[ord] = slot.doc_len;  // P2.4：SoA 副本同步写
     ord2ext_[ord].assign(ext_id);
-    live_[ord]    = true;
+    live_[ord]     = true;
 }
 
 bool Index::remove(std::string_view ext_id, std::uint64_t tomb_ord) {
@@ -90,8 +92,8 @@ bool Index::is_live(std::uint64_t ord) const {
 
 std::uint32_t Index::doc_len(std::uint64_t ord) const {
     std::shared_lock lk(mutex_);
-    if (ord >= slots_.size()) return 0;
-    return slots_[ord].doc_len;
+    if (ord >= doc_lens_.size()) return 0;
+    return doc_lens_[ord];
 }
 
 void Index::fill_is_live(std::span<const std::uint64_t> ords,
@@ -106,9 +108,10 @@ void Index::fill_is_live(std::span<const std::uint64_t> ords,
 void Index::fill_doc_lens(std::span<const std::uint64_t> ords,
                           std::span<std::uint32_t> out) const {
     std::shared_lock lk(mutex_);
-    const std::size_t bound = slots_.size();
+    // P2.4：读 SoA 紧凑数组（gather 的 cache 流量 ↓8x，见 index.hpp 注释）。
+    const std::size_t bound = doc_lens_.size();
     for (std::size_t i = 0; i < ords.size(); ++i) {
-        out[i] = ords[i] < bound ? slots_[ords[i]].doc_len : 0;
+        out[i] = ords[i] < bound ? doc_lens_[ords[i]] : 0;
     }
 }
 
