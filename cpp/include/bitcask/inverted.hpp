@@ -66,6 +66,8 @@ struct Posting {
     std::vector<std::uint32_t> positions;
 };
 
+struct FlatPostings;  // 前向声明（定义在 PostingList 之后）
+
 // 一个 term 对应的 posting 列表，按 ord 升序排列。
 // 同一个 ord 不会出现两次（add_doc 保证）。
 struct PostingList {
@@ -189,6 +191,29 @@ struct PostingList {
     [[nodiscard]] auto block_for_ord(std::uint64_t ord) const -> const PostingBlock*;
 
     // 计算该 posting list 的全局上界分数（用于 WAND剪枝）。
+    [[nodiscard]] auto block_upper_bound(float idf, const Bm25Params& params, double avgdl) const -> float;
+
+    // P1：在 caller 持桶锁（accessor）期间拷出查询评分所需的扁平快照。
+    // 只拷 (ord, tf) 双数组 + WAND 元数据——positions / compressed_ords
+    // 评分用不到，不拷。相比整列表深拷贝：分配 N+1 次 → 2 次，
+    // 拷贝 ~40B+positions 堆块 → 12B/posting。
+    void snapshot_flat(FlatPostings& out) const;
+};
+
+// P1：查询路径的 PostingList 扁平快照（见 doc/posting-zero-copy-design-zh.md）。
+// 6 条查询路径中 5 条只需要 (ord, tf)（search/wand/bool/fuzzy/wildcard），
+// 由本结构承载；phrase/near 需要 positions，仍走 PostingList 深拷贝。
+struct FlatPostings {
+    std::vector<std::uint64_t> ords;    // 与 tfs 平行，按 ord 升序
+    std::vector<std::uint32_t> tfs;
+    std::vector<PostingBlock>  blocks;  // WAND 跳跃索引（量 = N/128，浅拷）
+    std::uint32_t              max_tf = 0;
+
+    [[nodiscard]] std::size_t size() const noexcept { return ords.size(); }
+    [[nodiscard]] bool empty() const noexcept { return ords.empty(); }
+
+    // 与 PostingList 同名方法语义一致（共享实现，见 inverted.cpp）。
+    [[nodiscard]] auto block_for_ord(std::uint64_t ord) const -> const PostingBlock*;
     [[nodiscard]] auto block_upper_bound(float idf, const Bm25Params& params, double avgdl) const -> float;
 };
 

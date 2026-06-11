@@ -35,7 +35,12 @@ bool PostingList::has(std::uint64_t ord) const {
     return find(ord) != items.size();
 }
 
-auto PostingList::block_for_ord(std::uint64_t ord) const -> const PostingBlock* {
+namespace {
+
+// block_for_ord / block_upper_bound 的共享实现——PostingList 与
+// FlatPostings（P1 查询快照）语义必须一致，逻辑只写一份。
+const PostingBlock* block_for_ord_in(const std::vector<PostingBlock>& blocks,
+                                     std::uint64_t ord) {
     if (blocks.empty()) return nullptr;
     auto it = std::lower_bound(blocks.begin(), blocks.end(), ord,
                                [](const PostingBlock& block, std::uint64_t o) {
@@ -53,16 +58,46 @@ auto PostingList::block_for_ord(std::uint64_t ord) const -> const PostingBlock* 
     return nullptr;
 }
 
-auto PostingList::block_upper_bound(float idf, const Bm25Params& params, double avgdl) const -> float {
-    if (items.empty()) return 0.0f;
-    // S10.9：直接读缓存的 global max_tf（note_appended 增量维护 / load 后重算），
-    // 不再每次重扫全 items。
-    std::uint32_t global_max_tf = max_tf;
+float upper_bound_from(std::uint32_t global_max_tf, float idf,
+                       const Bm25Params& params, double avgdl) {
     float tf_norm = static_cast<float>(global_max_tf) * (params.k1 + 1.0f) /
                     (static_cast<float>(global_max_tf) + params.k1 *
                      (1.0f - params.b + params.b * 1.0f / static_cast<float>(avgdl)));
     // BM25+：上界含 δ 下界项，与实际评分一致，避免 WAND 剪枝漏结果（S8.10）。
     return idf * (tf_norm + params.delta);
+}
+
+}  // namespace
+
+auto PostingList::block_for_ord(std::uint64_t ord) const -> const PostingBlock* {
+    return block_for_ord_in(blocks, ord);
+}
+
+auto PostingList::block_upper_bound(float idf, const Bm25Params& params, double avgdl) const -> float {
+    if (items.empty()) return 0.0f;
+    // S10.9：直接读缓存的 global max_tf（note_appended 增量维护 / load 后重算），
+    // 不再每次重扫全 items。
+    return upper_bound_from(max_tf, idf, params, avgdl);
+}
+
+void PostingList::snapshot_flat(FlatPostings& out) const {
+    out.ords.resize(items.size());
+    out.tfs.resize(items.size());
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        out.ords[i] = items[i].ord;
+        out.tfs[i]  = items[i].tf;
+    }
+    out.blocks = blocks;
+    out.max_tf = max_tf;
+}
+
+auto FlatPostings::block_for_ord(std::uint64_t ord) const -> const PostingBlock* {
+    return block_for_ord_in(blocks, ord);
+}
+
+auto FlatPostings::block_upper_bound(float idf, const Bm25Params& params, double avgdl) const -> float {
+    if (ords.empty()) return 0.0f;
+    return upper_bound_from(max_tf, idf, params, avgdl);
 }
 
 // ===========================================================================
@@ -133,9 +168,10 @@ auto InvertedIndex::search(
     const LiveChecker& live_checker,
     const Bm25Params* params_override) const -> std::vector<SearchResult> {
     const Bm25Params& params = params_override ? *params_override : params_;
+    // P1：accessor 下只拷扁平快照（ords/tfs），不再深拷整个 PostingList。
     struct TermPostings {
         std::string term;
-        PostingList pl_copy;
+        FlatPostings fp;
     };
     std::vector<TermPostings> tps;
     tps.reserve(query_terms.size());
@@ -144,7 +180,10 @@ auto InvertedIndex::search(
         auto& shard = shard_for(term);
         tbb::concurrent_hash_map<std::string, PostingList>::const_accessor acc;
         if (shard.inverted.find(acc, term)) {
-            tps.push_back({term, acc->second});
+            TermPostings tp;
+            tp.term = term;
+            acc->second.snapshot_flat(tp.fp);
+            tps.push_back(std::move(tp));
         }
     }
 
@@ -152,7 +191,7 @@ auto InvertedIndex::search(
 
     // 检查是否启用 WAND 路径（posting 总量足够大时才值得）。
     std::size_t total_postings = 0;
-    for (auto& tp : tps) total_postings += tp.pl_copy.items.size();
+    for (auto& tp : tps) total_postings += tp.fp.size();
     if (total_postings >= kWandThreshold) {
         return search_wand(query_terms, k, live_checker, params);
     }
@@ -170,15 +209,15 @@ auto InvertedIndex::search(
         ScoreMap{},
         [&](const tbb::blocked_range<std::size_t>& range, ScoreMap local) {
             for (std::size_t ti = range.begin(); ti < range.end(); ++ti) {
-                auto& pl_copy = tps[ti].pl_copy;
+                auto& fp = tps[ti].fp;
 
                 // 计算该词的 live df。S10.7：一遍 is_live 缓存到 live[]，
                 // 评分循环复用，避免每 posting 第二次虚调用 is_live。
-                // O3：ord 直接读 items[i].ord，免每查询物化一份 ords 数组。
-                std::vector<char> live(pl_copy.items.size());
+                // P1：在扁平快照（连续数组）上评分，cache 友好。
+                std::vector<char> live(fp.size());
                 std::size_t live_df = 0;
-                for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
-                    live[i] = static_cast<char>(live_checker.is_live(pl_copy.items[i].ord));
+                for (std::size_t i = 0; i < fp.size(); ++i) {
+                    live[i] = static_cast<char>(live_checker.is_live(fp.ords[i]));
                     if (live[i]) ++live_df;
                 }
                 if (live_df == 0) continue;
@@ -186,15 +225,15 @@ auto InvertedIndex::search(
                 auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
 
                 // 逐 posting 累加 BM25 分数到线程本地 map。
-                for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
+                for (std::size_t i = 0; i < fp.size(); ++i) {
                     if (!live[i]) continue;
-                    auto& posting = pl_copy.items[i];
-                    auto ord = posting.ord;
+                    auto tf  = fp.tfs[i];
+                    auto ord = fp.ords[i];
 
                     auto dl = live_checker.doc_len(ord);
-                    auto tf_norm = static_cast<float>(posting.tf) *
+                    auto tf_norm = static_cast<float>(tf) *
                                    (params.k1 + 1.0F) /
-                                   (static_cast<float>(posting.tf) + params.k1 *
+                                   (static_cast<float>(tf) + params.k1 *
                                     (1.0F - params.b + params.b *
                                      static_cast<float>(dl) / static_cast<float>(avgdl)));
                     local[ord] += static_cast<float>(idf) * (tf_norm + params.delta);
@@ -305,8 +344,7 @@ auto InvertedIndex::search_wand(
     const Bm25Params& params) const -> std::vector<SearchResult> {
     struct TermPostings {
         std::string term;
-        PostingList pl_copy;
-        std::vector<std::uint64_t> ords;
+        FlatPostings fp;   // P1：扁平快照，ords/tfs 兼任 DAAT 游标数组
         std::size_t cursor = 0;
         float idf = 0.0f;
         float list_upper_bound = 0.0f;
@@ -320,8 +358,7 @@ auto InvertedIndex::search_wand(
         if (shard.inverted.find(acc, term)) {
             TermPostings tp;
             tp.term = term;
-            tp.pl_copy = acc->second;
-            tp.ords = tp.pl_copy.decompress_ords();
+            acc->second.snapshot_flat(tp.fp);
             tps.push_back(std::move(tp));
         }
     }
@@ -334,8 +371,8 @@ auto InvertedIndex::search_wand(
     // 计算每个 term 的 IDF 和上界分数。
     for (auto& tp : tps) {
         std::size_t live_df = 0;
-        for (std::size_t i = 0; i < tp.pl_copy.items.size(); ++i) {
-            if (live_checker.is_live(tp.ords[i])) ++live_df;
+        for (std::size_t i = 0; i < tp.fp.size(); ++i) {
+            if (live_checker.is_live(tp.fp.ords[i])) ++live_df;
         }
         if (live_df == 0) {
             tp.idf = 0.0f;
@@ -344,15 +381,15 @@ auto InvertedIndex::search_wand(
         }
         tp.idf = static_cast<float>(std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) /
                                              (static_cast<double>(live_df) + 0.5)));
-        tp.list_upper_bound = tp.pl_copy.block_upper_bound(tp.idf, params, avgdl);
+        tp.list_upper_bound = tp.fp.block_upper_bound(tp.idf, params, avgdl);
     }
 
     using Entry = std::pair<float, std::uint64_t>;
     std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
     float threshold = 0.0f;
 
-    // S10.5：每轮只排序索引数组，避免 std::sort 整体搬运含 4 个 vector 的
-    // TermPostings（pl_copy 的 items/compressed_ords/blocks + ords）。
+    // S10.5：每轮只排序索引数组，避免 std::sort 整体搬运含多个 vector 的
+    // TermPostings（P1 后为 fp 的 ords/tfs/blocks）。
     // order[i] 给出按当前 ord 升序的第 i 个 term 在 tps 中的下标。
     std::vector<std::size_t> order(tps.size());
     for (std::size_t i = 0; i < tps.size(); ++i) order[i] = i;
@@ -363,12 +400,12 @@ auto InvertedIndex::search_wand(
                   [&tps](std::size_t a, std::size_t b) {
                       const auto& ta = tps[a];
                       const auto& tb = tps[b];
-                      bool a_ex = ta.cursor >= ta.ords.size();
-                      bool b_ex = tb.cursor >= tb.ords.size();
+                      bool a_ex = ta.cursor >= ta.fp.ords.size();
+                      bool b_ex = tb.cursor >= tb.fp.ords.size();
                       if (a_ex && b_ex) return false;
                       if (a_ex) return true;
                       if (b_ex) return false;
-                      return ta.ords[ta.cursor] < tb.ords[tb.cursor];
+                      return ta.fp.ords[ta.cursor] < tb.fp.ords[tb.cursor];
                   });
 
         std::size_t pivot_pos = 0;  // pivot 在排序序列 order 中的位置
@@ -377,7 +414,7 @@ auto InvertedIndex::search_wand(
 
         for (std::size_t i = 0; i < order.size(); ++i) {
             auto& tp = tps[order[i]];
-            if (tp.cursor >= tp.ords.size()) continue;
+            if (tp.cursor >= tp.fp.ords.size()) continue;
             acc_score += tp.list_upper_bound;
             if (acc_score >= threshold) {
                 pivot_pos = i;
@@ -388,15 +425,15 @@ auto InvertedIndex::search_wand(
         if (!pivot_found) break;
 
         auto& pivot_tp = tps[order[pivot_pos]];
-        auto pivot_ord = pivot_tp.ords[pivot_tp.cursor];
+        auto pivot_ord = pivot_tp.fp.ords[pivot_tp.cursor];
 
         bool any_skipped = false;
         for (std::size_t i = 0; i <= pivot_pos; ++i) {
             auto& tp = tps[order[i]];
-            if (tp.cursor >= tp.ords.size()) continue;
-            if (tp.ords[tp.cursor] != pivot_ord) continue;
+            if (tp.cursor >= tp.fp.ords.size()) continue;
+            if (tp.fp.ords[tp.cursor] != pivot_ord) continue;
 
-            const auto* block = tp.pl_copy.block_for_ord(pivot_ord);
+            const auto* block = tp.fp.block_for_ord(pivot_ord);
             if (block != nullptr) {
                 float block_tf_norm = static_cast<float>(block->max_tf) * (params.k1 + 1.0f) /
                                       (static_cast<float>(block->max_tf) + params.k1 *
@@ -407,8 +444,8 @@ auto InvertedIndex::search_wand(
                 if (block_upper < remaining_needed) {
                     // 跳过到下一个块边界。
                     std::size_t next_start = block->start_idx + block->count;
-                    if (next_start >= tp.ords.size()) {
-                        tp.cursor = tp.ords.size();
+                    if (next_start >= tp.fp.ords.size()) {
+                        tp.cursor = tp.fp.ords.size();
                     } else {
                         tp.cursor = next_start;
                     }
@@ -424,12 +461,12 @@ auto InvertedIndex::search_wand(
             // S10.8：dl 只依赖 pivot_ord，提到 term 循环外取一次（原先每个匹配 term 重取）。
             auto dl = live_checker.doc_len(pivot_ord);
             for (std::size_t i = 0; i < tps.size(); ++i) {
-                if (tps[i].cursor >= tps[i].ords.size()) continue;
-                if (tps[i].ords[tps[i].cursor] != pivot_ord) continue;
+                if (tps[i].cursor >= tps[i].fp.ords.size()) continue;
+                if (tps[i].fp.ords[tps[i].cursor] != pivot_ord) continue;
 
-                auto tf_norm = static_cast<float>(tps[i].pl_copy.items[tps[i].cursor].tf) *
+                auto tf_norm = static_cast<float>(tps[i].fp.tfs[tps[i].cursor]) *
                                (params.k1 + 1.0f) /
-                               (static_cast<float>(tps[i].pl_copy.items[tps[i].cursor].tf) + params.k1 *
+                               (static_cast<float>(tps[i].fp.tfs[tps[i].cursor]) + params.k1 *
                                 (1.0f - params.b + params.b *
                                  static_cast<float>(dl) / static_cast<float>(avgdl)));
                 score += tps[i].idf * (tf_norm + params.delta);
@@ -450,19 +487,19 @@ auto InvertedIndex::search_wand(
 
         // 推进所有 cursor <= pivot_ord 的 term。
         for (std::size_t i = 0; i < tps.size(); ++i) {
-            while (tps[i].cursor < tps[i].ords.size() && tps[i].ords[tps[i].cursor] <= pivot_ord) {
+            while (tps[i].cursor < tps[i].fp.ords.size() && tps[i].fp.ords[tps[i].cursor] <= pivot_ord) {
                 ++tps[i].cursor;
             }
         }
 
         bool any_exhausted = false;
         for (auto& tp : tps) {
-            if (tp.cursor >= tp.ords.size()) any_exhausted = true;
+            if (tp.cursor >= tp.fp.ords.size()) any_exhausted = true;
         }
         if (any_exhausted) {
             bool all_exhausted = true;
             for (auto& tp : tps) {
-                if (tp.cursor < tp.ords.size()) {
+                if (tp.cursor < tp.fp.ords.size()) {
                     all_exhausted = false;
                     break;
                 }
@@ -616,7 +653,7 @@ auto InvertedIndex::search_wildcard(
 
     struct TermPostings {
         std::string term;
-        PostingList pl_copy;
+        FlatPostings fp;  // P1：扁平快照
     };
 
     // S10.4：并行扫词表匹配 pattern。按 shard 下标分区，每个 shard 至多被一个任务
@@ -628,7 +665,10 @@ auto InvertedIndex::search_wildcard(
             for (std::size_t s = range.begin(); s < range.end(); ++s) {
                 for (auto& [term, plist] : shards_[s].inverted) {
                     if (wildcard_match(pattern, term)) {
-                        local.push_back({term, plist});
+                        TermPostings tp;
+                        tp.term = term;
+                        plist.snapshot_flat(tp.fp);
+                        local.push_back(std::move(tp));
                     }
                 }
             }
@@ -652,29 +692,29 @@ auto InvertedIndex::search_wildcard(
         ScoreMap{},
         [&](const tbb::blocked_range<std::size_t>& range, ScoreMap local) {
             for (std::size_t ti = range.begin(); ti < range.end(); ++ti) {
-                auto& pl_copy = tps[ti].pl_copy;
+                auto& fp = tps[ti].fp;
 
                 // S10.7：一遍 is_live 缓存到 live[]，评分循环复用，避免每 posting 二次虚调用。
-                // O3：ord 直接读 items[i].ord，免每查询物化一份 ords 数组。
-                std::vector<char> live(pl_copy.items.size());
+                // P1：在扁平快照（连续数组）上评分。
+                std::vector<char> live(fp.size());
                 std::size_t live_df = 0;
-                for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
-                    live[i] = static_cast<char>(live_checker.is_live(pl_copy.items[i].ord));
+                for (std::size_t i = 0; i < fp.size(); ++i) {
+                    live[i] = static_cast<char>(live_checker.is_live(fp.ords[i]));
                     if (live[i]) ++live_df;
                 }
                 if (live_df == 0) continue;
 
                 auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
 
-                for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
+                for (std::size_t i = 0; i < fp.size(); ++i) {
                     if (!live[i]) continue;
-                    auto& posting = pl_copy.items[i];
-                    auto ord = posting.ord;
+                    auto tf  = fp.tfs[i];
+                    auto ord = fp.ords[i];
 
                     auto dl = live_checker.doc_len(ord);
-                    auto tf_norm = static_cast<float>(posting.tf) *
+                    auto tf_norm = static_cast<float>(tf) *
                                    (params.k1 + 1.0F) /
-                                   (static_cast<float>(posting.tf) + params.k1 *
+                                   (static_cast<float>(tf) + params.k1 *
                                     (1.0F - params.b + params.b *
                                      static_cast<float>(dl) / static_cast<float>(avgdl)));
                     local[ord] += static_cast<float>(idf) * (tf_norm + params.delta);
@@ -726,11 +766,10 @@ auto InvertedIndex::bool_search(
 
     struct TermPostings {
         std::string term;
-        PostingList pl_copy;
+        FlatPostings fp;  // P1：扁平快照（S9.6 的 ords 缓存由 fp.ords 取代）
         bool is_must;
-        std::vector<std::uint64_t> ords;  // decompress_ords 缓存（S9.6：一次解压复用）
     };
-    // 收集一个 term 的 posting 到 dst，顺带解压 ords 一次缓存起来。
+    // 收集一个 term 的 posting 到 dst（accessor 下拷扁平快照）。
     auto collect = [&](const std::string& term, bool is_must,
                        std::vector<TermPostings>& dst) {
         auto& shard = shard_for(term);
@@ -738,9 +777,8 @@ auto InvertedIndex::bool_search(
         if (shard.inverted.find(acc, term)) {
             TermPostings tp;
             tp.term = term;
-            tp.pl_copy = acc->second;
+            acc->second.snapshot_flat(tp.fp);
             tp.is_must = is_must;
-            tp.ords = tp.pl_copy.decompress_ords();
             dst.push_back(std::move(tp));
         }
     };
@@ -759,9 +797,9 @@ auto InvertedIndex::bool_search(
 
     std::vector<std::uint64_t> must_not_ords;
     for (auto& tp : must_not_tps) {
-        for (std::size_t i = 0; i < tp.pl_copy.items.size(); ++i) {
-            if (live_checker.is_live(tp.ords[i])) {
-                must_not_ords.push_back(tp.ords[i]);
+        for (std::size_t i = 0; i < tp.fp.size(); ++i) {
+            if (live_checker.is_live(tp.fp.ords[i])) {
+                must_not_ords.push_back(tp.fp.ords[i]);
             }
         }
     }
@@ -795,17 +833,17 @@ auto InvertedIndex::bool_search(
         for (std::size_t i = 0; i < must_order.size(); ++i) must_order[i] = i;
         std::sort(must_order.begin(), must_order.end(),
                   [&](std::size_t a, std::size_t b) {
-                      return must_tps[a].pl_copy.items.size() <
-                             must_tps[b].pl_copy.items.size();
+                      return must_tps[a].fp.size() <
+                             must_tps[b].fp.size();
                   });
         bool first_must = true;
         for (auto mi : must_order) {
             auto& tp = must_tps[mi];
             if (!first_must && intersection.empty()) break;
             std::vector<std::uint64_t> ords;
-            for (std::size_t i = 0; i < tp.pl_copy.items.size(); ++i) {
-                if (live_checker.is_live(tp.ords[i])) {
-                    ords.push_back(tp.ords[i]);
+            for (std::size_t i = 0; i < tp.fp.size(); ++i) {
+                if (live_checker.is_live(tp.fp.ords[i])) {
+                    ords.push_back(tp.fp.ords[i]);
                 }
             }
             std::sort(ords.begin(), ords.end());
@@ -826,9 +864,9 @@ auto InvertedIndex::bool_search(
         candidates = std::move(intersection);
     } else if (!should_tps.empty()) {
         for (auto& tp : should_tps) {
-            for (std::size_t i = 0; i < tp.pl_copy.items.size(); ++i) {
-                if (live_checker.is_live(tp.ords[i])) {
-                    candidates.push_back(tp.ords[i]);
+            for (std::size_t i = 0; i < tp.fp.size(); ++i) {
+                if (live_checker.is_live(tp.fp.ords[i])) {
+                    candidates.push_back(tp.fp.ords[i]);
                 }
             }
         }
@@ -871,8 +909,8 @@ auto InvertedIndex::bool_search(
     std::unordered_map<std::string, float> term_idf;
     for (auto& tp : all_tps) {
         std::size_t live_df = 0;
-        for (std::size_t i = 0; i < tp.pl_copy.items.size(); ++i) {
-            if (live_checker.is_live(tp.ords[i])) ++live_df;
+        for (std::size_t i = 0; i < tp.fp.size(); ++i) {
+            if (live_checker.is_live(tp.fp.ords[i])) ++live_df;
         }
         if (live_df == 0) continue;
         auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) /
@@ -894,16 +932,16 @@ auto InvertedIndex::bool_search(
         if (idf_it == term_idf.end()) continue;
         auto idf = idf_it->second;
 
-        for (std::size_t i = 0; i < tp.pl_copy.items.size(); ++i) {
-            auto posting_ord = tp.ords[i];
+        for (std::size_t i = 0; i < tp.fp.size(); ++i) {
+            auto posting_ord = tp.fp.ords[i];
             if (!live_checker.is_live(posting_ord)) continue;
             auto it = acc.scores.find(posting_ord);
             if (it == acc.scores.end()) continue;
 
             auto dl = live_checker.doc_len(posting_ord);
-            auto tf_norm = static_cast<float>(tp.pl_copy.items[i].tf) *
+            auto tf_norm = static_cast<float>(tp.fp.tfs[i]) *
                            (params.k1 + 1.0F) /
-                           (static_cast<float>(tp.pl_copy.items[i].tf) + params.k1 *
+                           (static_cast<float>(tp.fp.tfs[i]) + params.k1 *
                             (1.0F - params.b + params.b *
                              static_cast<float>(dl) / static_cast<float>(avgdl)));
             it->second += idf * (tf_norm + params.delta);
@@ -944,7 +982,7 @@ auto InvertedIndex::search_fuzzy(
 
     struct TermPostings {
         std::string term;
-        PostingList pl_copy;
+        FlatPostings fp;  // P1：扁平快照
     };
     std::vector<TermPostings> tps;
 
@@ -961,7 +999,10 @@ auto InvertedIndex::search_fuzzy(
                                     : query_term.size() - term.size();
                 if (len_diff > max_edit_distance) continue;
                 if (levenshtein_distance(query_term, term) <= max_edit_distance) {
-                    tps.push_back({term, plist});
+                    TermPostings tp;
+                    tp.term = term;
+                    plist.snapshot_flat(tp.fp);
+                    tps.push_back(std::move(tp));
                     break;
                 }
             }
@@ -981,29 +1022,29 @@ auto InvertedIndex::search_fuzzy(
         ScoreMap{},
         [&](const tbb::blocked_range<std::size_t>& range, ScoreMap local) {
             for (std::size_t ti = range.begin(); ti < range.end(); ++ti) {
-                auto& pl_copy = tps[ti].pl_copy;
+                auto& fp = tps[ti].fp;
 
                 // S10.7：一遍 is_live 缓存到 live[]，评分循环复用，避免每 posting 二次虚调用。
-                // O3：ord 直接读 items[i].ord，免每查询物化一份 ords 数组。
-                std::vector<char> live(pl_copy.items.size());
+                // P1：在扁平快照（连续数组）上评分。
+                std::vector<char> live(fp.size());
                 std::size_t live_df = 0;
-                for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
-                    live[i] = static_cast<char>(live_checker.is_live(pl_copy.items[i].ord));
+                for (std::size_t i = 0; i < fp.size(); ++i) {
+                    live[i] = static_cast<char>(live_checker.is_live(fp.ords[i]));
                     if (live[i]) ++live_df;
                 }
                 if (live_df == 0) continue;
 
                 auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
 
-                for (std::size_t i = 0; i < pl_copy.items.size(); ++i) {
+                for (std::size_t i = 0; i < fp.size(); ++i) {
                     if (!live[i]) continue;
-                    auto& posting = pl_copy.items[i];
-                    auto ord = posting.ord;
+                    auto tf  = fp.tfs[i];
+                    auto ord = fp.ords[i];
 
                     auto dl = live_checker.doc_len(ord);
-                    auto tf_norm = static_cast<float>(posting.tf) *
+                    auto tf_norm = static_cast<float>(tf) *
                                    (params.k1 + 1.0F) /
-                                   (static_cast<float>(posting.tf) + params.k1 *
+                                   (static_cast<float>(tf) + params.k1 *
                                     (1.0F - params.b + params.b *
                                      static_cast<float>(dl) / static_cast<float>(avgdl)));
                     local[ord] += static_cast<float>(idf) * (tf_norm + params.delta);
