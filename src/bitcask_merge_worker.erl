@@ -206,7 +206,9 @@ merge_files(New, Old) ->
     {OFiles, OExp} = Old,
     Files0 = lists:umerge(lists:usort(NFiles), OFiles),
     Expired = lists:umerge(lists:usort(NExp), OExp),
-    Files = Files0 -- Expired,
+    %% O9：两边都是有序去重列表，ordsets:subtract 是 O(n+m)
+    %% 的归并减法；`--` 是 O(n*m)，大目录（数百文件）下白白平方。
+    Files = ordsets:subtract(Files0, Expired),
     {Files, Expired}.
 
 %% =========================================================================
