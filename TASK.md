@@ -738,6 +738,21 @@ Phase 2 零拷贝会让它整体消失）；phrase 位置匹配 SIMD（分支/�
 scatter）不可向量化，可能成为新瓶颈——profile 后再决定是否改两阶段累加；
 WAND 路径无此问题。建议顺序：P2.1 → 基准 → P2.2 → P2.3。
 
+### P3 — 高强度 code-review 修复（✅ 已落地）
+
+> P1/P2 全系列落地后做了一轮 7 角度 high-effort review（3 correctness +
+> 3 cleanup + 1 altitude），~30 候选去重验证。1 个崩溃级 + 2 个一行级遗留
+> 已修，附带 2 个低风险加固。
+
+| # | 问题 | 修复 | 状态 |
+|---|------|------|------|
+| **P3.1** | **崩溃级**：崩溃恢复时 save/truncate_wal 非原子窗口 → load+replay_wal 重放快照已含的 add_doc → PostingList.items 重复/乱序，违反 bool_search（P2.2 删 sort+unique 后新依赖）的「严格升序无重复」前置 → intersect_avx2 越界写堆（验证 agent fuzz 实复现 SIGSEGV/malloc abort，NIF 形态会带崩 BEAM） | **根因**：InvertedIndex 加 `max_indexed_ord_` 水位，add_doc 幂等丢弃 ord≤水位的整文档（修复被违反的不变量本身、正常路径 O(1) 一次比较、并修正 inverted.hpp 错误注释「同一 ord 不会出现两次」），load 末尾重建水位。**纵深防御**：intersect_avx2 每轮 storeu 前守卫 `cnt+8≤out.size()`，违约输入扩容不写穿堆。**测试有牙**：`AddDocIdempotent`/`CrashRecovery`（去水位即 FAIL）+ `DirtyDuplicateInputDoesNotOverflow`（ASan 下去守卫即确定性 SEGV） | ✅ |
+| **P3.2** | bool_search 最终评分循环漏掉 P2.1 批量化——逐 posting 调 `doc_len`（生产 Index = 每次一把 shared_lock+虚调用），search/wand/wildcard/fuzzy 都已改、唯独此处遗留锁风暴 | TermPostings 加 `dls`，fill_live 对 must/should 同时 `fill_doc_lens`（must_not 只建排除集免取），评分循环读 `tp.dls[i]` | ✅ |
+| **P3.3** | search() 路由 WAND 时双倍快照：入口先对全部 term snapshot_flat 只为数 total_postings、判定后整组丢弃，search_wand 重新 find+快照——浪费恰在 posting 最大（≥阈值）的查询上 | 路由判定改为 accessor 下读 `items.size()`（不快照），仅标量路径才 snapshot_flat | ✅ |
+| **P3.4** | MyersMatcher 持 `string_view pattern_` 仅服务 m>64 回退，临时串构造会在最冷路径悬垂读 | 改持 owned `std::string`（回退路径冷、拷贝无代价，消除生命周期前提） | ✅ |
+
+**复审驳回**：`save()` 裸读 shared_ptr 的并发指控——验证确认 save 仅在 merge 路径调用，前置 `rebuild_index` 已在调用线程同步换上线程私有新 index，save 遍历的对象从未被 worker 触碰；单 handle 所有权契约保证无并发写者。**未修（记录）**：wand 可见性窗口扩大（PLAUSIBLE，与系统既有最终一致语义同级，上层对 stale ord 安全）；cleanup 类（死状态 compressed_ords/finalized、三份重复评分块、u64 回退影子路径）攒独立 commit。**全量**：ctest 338/338（+3 回归）+ eunit 44/44 + ASan inverted/wal/fuzzy 干净 + TSan 并发用例干净。
+
 ### V3 — HNSW 单图 + search_vector（暂缓）
 
 ### V4 — 单域 merge
