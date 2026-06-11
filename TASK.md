@@ -769,6 +769,8 @@ WAND 路径无此问题。建议顺序：P2.1 → 基准 → P2.2 → P2.3。
 
 | **P4.5** | bool_search MUST 交集的 u64 影子路径——加测试 + 合并骨架。① **加测试** `BoolSearchMustU64Fallback`：用 ord>2^32 的大值（非 43 亿文档）强制窄化闸门拒绝、走 set_intersection 回退；**有牙验证**：临时清空 u64 交集结果，仅此测试 fail（其余 bool 测试走 u32 路径全过），证明它精确覆盖此前无测试的回退分支。② **合并骨架**：u32 窄化 / u64 回退两条逐字相同的「must_order 升序遍历 + live 过滤 + 空交集 break」循环用 C++23 模板 lambda（`run_must_intersect<T>`）合一,只在「intersect_u32 三路 SIMD vs set_intersection 标量」处分叉——改 MUST 语义不再需人工同步两份。u32 仍全程 u32（T=uint32_t），LTO 下模板内联,**bench 无回归**（BoolMustHot/4096 150us、/100k 4400us 持平 P2.2）。净 −5 行。ctest 339/339 + ASan(bool/intersect/concurrent/CrashRecovery) 干净 + eunit 44/44 | ✅ |
 
+| **P4.6** | u64 AVX2 交集原型收录为附录：`cpp/bench/intersect_u64_proto_bench.cpp`（opt-in bench，含自检对拍 + 对抗性「低 32 位碰撞」模式，烂掉即 SkipWithError 报红）。成对 permutevar8x32 模拟 64 位变量 shuffle + 原生 cmpeq_epi64，库内实测 **~3.5-3.7x** 于标量归并；设计/触发条件/接线步骤见 `doc/bool-search-intersection-zh.md` §7.1。**未接线生产代码**——触发条件仍是 ord>2^32（u64 回退变热），届时按文件头注释接入即可 | ✅ |
+
 **本批未做（记录，留后续独立 commit）**：测试侧 LCG/LiveChecker 桩重复（建共享测试头，纯测试维护性）；nfkc_casefold_inert 表改离线 Unicode 数据生成（引入构建期工具，altitude）。
 
 ### V3 — HNSW 单图 + search_vector（暂缓）
