@@ -146,6 +146,16 @@ auto InvertedIndex::shard_for(std::string_view term) const -> const Shard& {
 void InvertedIndex::add_doc(
     std::uint64_t ord,
     const TermPositions& term_data) {
+    // 水位幂等：ord ≤ 已索引最大 ord ⟹ 该文档已在索引里（崩溃恢复时
+    // replay_wal 重放快照已含的条目），整文档丢弃，避免 items 重复/乱序。
+    // 正常追加 ord 单调递增 > 水位，一次比较即过（max_indexed_ord_ 初值 -1
+    // 使首个文档 ord=0 也通过）。
+    if (max_indexed_ord_ != static_cast<std::uint64_t>(-1) &&
+        ord <= max_indexed_ord_) {
+        return;
+    }
+    max_indexed_ord_ = ord;
+
     auto doc_len = std::uint32_t{0};
     for (auto& [term, data] : term_data) {
         auto& [tf, positions] = data;
@@ -192,13 +202,30 @@ auto InvertedIndex::search(
     const Bm25Params* params_override) const -> std::vector<SearchResult> {
     const Bm25Params& params = params_override ? *params_override : params_;
     // P1：accessor 下只拷扁平快照（ords/tfs），不再深拷整个 PostingList。
+    // WAND 路由判定只需 posting 总量——在 accessor 下读 items.size() 即可，
+    // 不必先 snapshot_flat（原实现对每 term 拷 ords/tfs/blocks 三个 vector，
+    // 走 WAND 时整组作废、search_wand 再快照一遍，是触发条件最大的查询上的
+    // 双倍拷贝）。标量路径才在确定后快照。
+    std::size_t total_postings = 0;
+    for (auto& term : query_terms) {
+        auto& shard = shard_for(term);
+        PostingMap::const_accessor acc;
+        if (shard.inverted.find(acc, term)) {
+            total_postings += acc->second->items.size();
+        }
+    }
+    if (total_postings == 0) return {};
+    if (total_postings >= kWandThreshold) {
+        return search_wand(query_terms, k, live_checker, params);
+    }
+
+    // 标量路径：现在才快照。
     struct TermPostings {
         std::string term;
         FlatPostings fp;
     };
     std::vector<TermPostings> tps;
     tps.reserve(query_terms.size());
-
     for (auto& term : query_terms) {
         auto& shard = shard_for(term);
         PostingMap::const_accessor acc;
@@ -209,15 +236,7 @@ auto InvertedIndex::search(
             tps.push_back(std::move(tp));
         }
     }
-
     if (tps.empty()) return {};
-
-    // 检查是否启用 WAND 路径（posting 总量足够大时才值得）。
-    std::size_t total_postings = 0;
-    for (auto& tp : tps) total_postings += tp.fp.size();
-    if (total_postings >= kWandThreshold) {
-        return search_wand(query_terms, k, live_checker, params);
-    }
 
     // 读取全局统计（atomic load，S10.1 去锁）。
     auto N = live_doc_count_.load(std::memory_order_relaxed);
@@ -839,7 +858,8 @@ auto InvertedIndex::bool_search(
         std::string term;
         FlatPostings fp;  // P1：扁平快照（S9.6 的 ords 缓存由 fp.ords 取代）
         bool is_must;
-        std::vector<char> live;  // P2.1：live 批量取一次，5 个使用阶段复用
+        std::vector<char> live;          // P2.1：live 批量取一次，多阶段复用
+        std::vector<std::uint32_t> dls;  // P2.1：doc_len 批量取一次，评分循环复用
     };
     // 收集一个 term 的 posting 到 dst（accessor 下拷扁平快照）。
     auto collect = [&](const std::string& term, bool is_must,
@@ -869,15 +889,21 @@ auto InvertedIndex::bool_search(
 
     // P2.1：每个 term 的 live 批量取一次（此前 must_not/交集/should/idf/评分
     // 五个阶段各自逐 posting 重扫 is_live——既重复又每次一锁）。
-    auto fill_live = [&](std::vector<TermPostings>& v) {
+    // must/should 进评分循环，需 doc_len 批量（with_dls）；must_not 只用 live
+    // 建排除集，免去 doc_len 取数。
+    auto fill_live = [&](std::vector<TermPostings>& v, bool with_dls) {
         for (auto& tp : v) {
             tp.live.resize(tp.fp.size());
             live_checker.fill_is_live(tp.fp.ords, tp.live);
+            if (with_dls) {
+                tp.dls.resize(tp.fp.size());
+                live_checker.fill_doc_lens(tp.fp.ords, tp.dls);
+            }
         }
     };
-    fill_live(must_tps);
-    fill_live(should_tps);
-    fill_live(must_not_tps);
+    fill_live(must_tps, /*with_dls=*/true);
+    fill_live(should_tps, /*with_dls=*/true);
+    fill_live(must_not_tps, /*with_dls=*/false);
 
     std::vector<std::uint64_t> must_not_ords;
     for (auto& tp : must_not_tps) {
@@ -1060,7 +1086,9 @@ auto InvertedIndex::bool_search(
             auto it = acc.scores.find(posting_ord);
             if (it == acc.scores.end()) continue;
 
-            auto dl = live_checker.doc_len(posting_ord);
+            // P2.1：doc_len 读批量数组 tp.dls（此前逐 posting 一把 Index
+            // shared_lock + 虚调用，大候选集下锁风暴；与其它路径对齐）。
+            auto dl = tp.dls[i];
             auto tf_norm = static_cast<float>(tp.fp.tfs[i]) *
                            (params.k1 + 1.0F) /
                            (static_cast<float>(tp.fp.tfs[i]) + params.k1 *
@@ -1557,8 +1585,14 @@ auto InvertedIndex::load(std::string_view path) -> bool {
                 }
             }
             // S10.9：load 后重算缓存的 global max_tf（落盘格式不含此字段，派生量）。
+            // 同时重建 add_doc 水位 = 全局最大 ord（落盘亦不含，派生量）；
+            // 用 -1 哨兵区分「未索引任何」与「ord=0」。
             for (auto& p : pl.items) {
                 if (p.tf > pl.max_tf) pl.max_tf = p.tf;
+                if (max_indexed_ord_ == static_cast<std::uint64_t>(-1) ||
+                    p.ord > max_indexed_ord_) {
+                    max_indexed_ord_ = p.ord;
+                }
             }
             shard.inverted.emplace(std::move(term), std::make_shared<PostingList>(std::move(pl)));
         }

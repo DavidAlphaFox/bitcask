@@ -117,6 +117,14 @@ void intersect_avx2(const std::uint32_t* a, std::size_t na,
         const __m256i perm = _mm256_load_si256(
             reinterpret_cast<const __m256i*>(lut.idx[mask].data()));
         const __m256i packed = _mm256_permutevar8x32_epi32(va, perm);
+        // 纵深防御：每轮整组 storeu 8 lane，需 cnt+8 ≤ capacity。无重复输入
+        // 下 cnt ≤ min(na,nb)=cap 恒成立、守卫永不触发（零开销）；若调用方
+        // 违反「严格升序无重复」前置（如崩溃恢复的重复 ord），输出可超 cap，
+        // 此处扩容避免写穿堆（不保证结果正确，只保证不 UB）。
+        if (cnt + 8 > out.size()) {
+            out.resize(out.size() * 2 + 8);
+            dst = out.data();
+        }
         _mm256_storeu_si256(reinterpret_cast<__m256i_u*>(dst + cnt), packed);
         cnt += static_cast<std::size_t>(std::popcount(mask));
 

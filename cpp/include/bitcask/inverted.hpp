@@ -69,8 +69,9 @@ struct Posting {
 
 struct FlatPostings;  // 前向声明（定义在 PostingList 之后）
 
-// 一个 term 对应的 posting 列表，按 ord 升序排列。
-// 同一个 ord 不会出现两次（add_doc 保证）。
+// 一个 term 对应的 posting 列表，按 ord 严格升序排列、同一 ord 不重复。
+// 该不变量由 InvertedIndex::add_doc 的水位幂等保护（max_indexed_ord_）维持，
+// 是 find 二分 / note_appended 封块 / intersect_u32 求交的共同前提。
 struct PostingList {
     static constexpr std::size_t kBlockSize = 128;
 
@@ -416,6 +417,14 @@ private:
     // remove_doc 的 guard 用 load+fetch_sub 即可）。
     std::atomic<std::uint64_t> live_doc_count_{0};
     std::atomic<std::uint64_t> sum_doc_len_{0};
+
+    // 已索引文档的最大 ord 水位（add_doc 幂等保护）。ord 由引擎单调分配、
+    // add_doc 调用序保持单调（IndexPool 单消费者 + 恢复按 ord 序回放），故
+    // 正常追加恒满足 ord > 水位。崩溃恢复时 save/truncate_wal 非原子窗口会让
+    // load 后的 replay_wal 重放已在快照里的 (ord, term)；用水位把 ord ≤ 水位的
+    // 重放整文档丢弃，保证 PostingList::items 严格升序无重复（intersect_u32 /
+    // find 二分 / note_appended 封块都依赖该不变量）。-1 = 尚未索引任何文档。
+    std::uint64_t max_indexed_ord_ = static_cast<std::uint64_t>(-1);
 
     // WAL（S8.9）。
     std::unique_ptr<InvertedWal> wal_;
