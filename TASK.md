@@ -628,7 +628,7 @@ term_data（position 按字段偏移平移），多字段写入分词开销约�
 
 **暂不做（记录在案）**：GetResult 零拷贝（API 变更牵动 NIF，归入 V6）；fold/stream 批量
 拉接口（接口设计问题，归入 V6）；WAL 批量 flush（动崩溃恢复窗口语义，需单独评审）；
-wildcard 词典剪枝（trie/后缀索引工程量大，归入 V6）；LTO（构建配置，单独评审）。
+wildcard 词典剪枝（trie/后缀索引工程量大，归入 V6）；LTO（已随 P1 节的 B1 落地）。
 
 ---
 
@@ -679,10 +679,35 @@ TSan 插桩，parallel_reduce 任务派发的 happens-before 边对 TSan 不可�
 
 **Phase 2-min 基准**（同会话 before/after，5 次重复取中位）：
 PhraseHotTerm/100k **12448us → 8459us（-32%）**、/4096 424us → 319us（-25%）。
-非 phrase 路径同会话复测 2030~2090us vs P1 时段单次测量 1816us（+10%上下）——
-每查询代码差异仅一次指针解引用，解释不了该量级；P1 数字为数小时前单次运行，
-倾向跨时段环境漂移，但未能当场 A/B 定论（P1/P2 在同一未提交差异中，拆分
-成本高），如实记录。相对 P1 前基线（6091us）当前为 -66%。
+
+**+10% 疑点的严格 A/B 归因（已解决）**：P1-only（73009b0）与 P1+P2min（HEAD）
+两个 worktree、同一份 bench 源（消除 bench TU 布局差）、同会话交替 6 轮取中位：
+SearchHotTerm/100k A=1849us / B=2035us（+10.0%，分布不重叠）——回退真实存在但
+**不是算法成本**：① SnapshotOnly 微基准两侧完全相同（~115us，排除 shared_ptr
+间接寻址）；② 两侧加 `-falign-functions=64 -falign-loops=64` 重编后差距塌缩到
++0.4%（A≈1830us / B≈1840us）——根因是 inverted.cpp 新增函数改变了 search_wand
+热循环的**代码对齐/布局**（icache 伪影）；③ 对齐构建下 phrase 收益不变
+（A 12.4ms / B 8.4ms，-32%，算法性收益）。
+**启示**：该热循环对代码布局敏感（±10%），后续任何 inverted.cpp 改动的基准对比
+都应在对齐构建下进行。
+
+### B1 — Release 构建性能选项（✅ 已落地）
+
+`cpp/CMakeLists.txt`：① `-falign-functions=64`（仅 Release，GNU/Clang）——
+消除上述对齐伪影，基准可复现、性能对无关代码改动免疫；② LTO/IPO
+（`BITCASK_LTO` 选项，默认 ON；`CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE`
+只作用于 Release 配置，sanitizer 构建自动关闭——`BITCASK_SANITIZE` 非空即跳过，
+Debug/tsan/asan 构建目录均不受影响，已验证 tsan 构建无 LTO 且测试通过）。
+
+**收益**（对比落地前同会话基准，3 轮中位）：SearchHotTerm/4096
+62us → **51.7us（-17%）**；/100k 2035us → **~1750us（-14%）**；
+BoolMustHot/100k 5977us → **~5460us（-8%）**；PhraseHotTerm/100k
+~8200us → **~7660us（-7%）**。其中对齐贡献约消除 +10% 伪影，LTO 贡献
+额外 -5~12%（跨 TU 内联）。
+
+**代价**：LTO 全量构建 ~55s（链接期代码生成）；rebar3 增量路径不受影响
+（bitcask_cpp 无改动时仍是 no-op）。eunit 验证 BEAM 正常加载 LTO 的
+NIF .so（44/44）；ctest 322/322。
 
 ### V3 — HNSW 单图 + search_vector（暂缓）
 
