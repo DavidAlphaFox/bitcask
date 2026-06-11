@@ -1192,3 +1192,34 @@ TEST(IntersectU32, FullAndNoOverlap) {
     intersect_u32(a, b, out);
     EXPECT_TRUE(out.empty());                // 零重叠（交错）
 }
+
+// 纵深防御回归（review #1）：违反「严格升序无重复」前置的脏输入不得写穿堆。
+// 复刻崩溃恢复后 PostingList 含重复 ord 的形态。构造让 AVX2 块推进「钉住」
+// b 指针、a 反复以小值块匹配同一 b 块——cnt 每块 +7 持续增长，远超
+// out.resize(min(na,nb)+8) 的上界 → 修复前 _mm256_storeu 越界写（ASan 报
+// heap-buffer-overflow / 非 ASan 报 malloc abort）。守卫扩容后不崩。
+// 脏输入下只要求无 UB；结果正确性不在契约内。
+TEST(IntersectU32, DirtyDuplicateInputDoesNotOverflow) {
+    // 走 AVX2 路径需 na ≤ 32×nb（否则路由到 galloping，无此 bug）。
+    // b：严格升序，块 0 = [0..6, 1e6]，其后全是大值 → 每个 b 块 max 都很大，
+    // 块推进时 b 指针钉死在 j=0（bmax > amax 恒成立），同一 b 块被反复比较。
+    constexpr std::size_t kNb = 10000;
+    std::vector<std::uint32_t> b(kNb);
+    for (std::uint32_t v = 0; v < 7; ++v) b[v] = v;
+    for (std::size_t x = 7; x < kNb; ++x) b[x] = 1000000u + static_cast<std::uint32_t>(x);
+    // a：[0..6, 99] 块重复 40000 次（非升序、大量重复，模拟崩溃恢复的多段
+    // 形态）。每块与 b 块 0 命中 7 个、b 钉死 → cnt 累加 7×40000 ≈ 280000
+    // ≫ cap=min(na,nb)+8=10008。无守卫时 _mm256_storeu 从该上界起持续越界
+    // 写 ~1MB，必然走出映射页 → 确定性 SIGSEGV（ASan 不插桩 SIMD intrinsic
+    // store，小越界会漏过，故刻意放大到段错误量级）。守卫扩容后全程合法。
+    constexpr std::size_t kReps = 40000;  // na = 320000 = 32×nb → 仍走 AVX2
+    std::vector<std::uint32_t> a;
+    a.reserve(kReps * 8);
+    for (std::size_t rep = 0; rep < kReps; ++rep) {
+        for (std::uint32_t v = 0; v < 7; ++v) a.push_back(v);
+        a.push_back(99);
+    }
+    std::vector<std::uint32_t> out;
+    intersect_u32(a, b, out);   // 修复前在此越界写崩
+    SUCCEED();
+}

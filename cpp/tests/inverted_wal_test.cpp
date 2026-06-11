@@ -3,6 +3,7 @@
 
 #include "bitcask/inverted.hpp"
 #include "bitcask/inverted_wal.hpp"
+#include "bitcask/query.hpp"
 
 using namespace bitcask::bm25;
 
@@ -188,4 +189,72 @@ TEST(WalMultipleAddDocs, ManyAdds) {
     EXPECT_EQ(idx.df("term"), N);
 
     std::filesystem::remove(tmp);
+}
+// add_doc 水位幂等（review #1 根因）：重复 ord 的整文档被丢弃，items 不重复。
+TEST(AddDocIdempotent, DuplicateOrdDropped) {
+    InvertedIndex idx;
+    idx.add_doc(0, {{"a", tp(1, {0})}, {"b", tp(1, {1})}});
+    idx.add_doc(1, {{"a", tp(1, {0})}});
+    EXPECT_EQ(idx.live_doc_count(), 2u);
+    EXPECT_EQ(idx.df("a"), 2u);
+
+    // 重放 ord 0（≤ 水位）→ 整文档丢弃：df/count 不变。
+    idx.add_doc(0, {{"a", tp(1, {0})}, {"b", tp(1, {1})}});
+    EXPECT_EQ(idx.live_doc_count(), 2u);
+    EXPECT_EQ(idx.df("a"), 2u);
+    EXPECT_EQ(idx.df("b"), 1u);
+
+    // 重放 ord 1（= 水位）→ 同样丢弃。
+    idx.add_doc(1, {{"a", tp(1, {0})}});
+    EXPECT_EQ(idx.df("a"), 2u);
+
+    // 新 ord 2（> 水位）→ 正常追加。
+    idx.add_doc(2, {{"a", tp(1, {0})}});
+    EXPECT_EQ(idx.live_doc_count(), 3u);
+    EXPECT_EQ(idx.df("a"), 3u);
+}
+
+// 崩溃恢复端到端（review #1）：save 后不 truncate（模拟 save/truncate_wal
+// 之间崩溃）→ 重启 load + replay_wal 重放快照已含条目 → 水位幂等保证
+// items 严格升序无重复 → bool_search 的 intersect_u32 不崩、结果正确。
+TEST(CrashRecovery, ReplayDuplicateKeepsItemsSortedUnique) {
+    auto snap = std::filesystem::temp_directory_path() / "inv_crash_snap.inv";
+    auto wal  = std::filesystem::temp_directory_path() / "inv_crash_snap.inv.wal";
+    std::filesystem::remove(snap);
+    std::filesystem::remove(wal);
+
+    FakeLiveChecker checker;
+    {
+        // 原索引：enable_wal 后写若干含两个 MUST 词的文档（同时进内存+WAL），
+        // 然后 save——此时快照与 WAL 含同一批文档。刻意不 truncate_wal。
+        InvertedIndex idx;
+        idx.enable_wal(wal.string());
+        for (std::uint64_t ord = 0; ord < 50; ++ord) {
+            idx.add_doc(ord, {{"alpha", tp(1, {0})}, {"beta", tp(1, {1})}});
+            checker.doc_lens[ord] = 2;
+        }
+        ASSERT_TRUE(idx.save(snap.string()));
+        // 崩溃：save 完成，truncate_wal 未执行。
+    }
+
+    // 重启：load 快照 + replay_wal（重放 0..49，全部 ≤ 水位 → 幂等丢弃）。
+    InvertedIndex idx2;
+    ASSERT_TRUE(idx2.load(snap.string()));
+    idx2.enable_wal(wal.string());
+    idx2.replay_wal();
+
+    // items 严格升序无重复（幂等生效）。
+    EXPECT_EQ(idx2.df("alpha"), 50u);
+    EXPECT_EQ(idx2.df("beta"), 50u);
+    EXPECT_EQ(idx2.live_doc_count(), 50u);
+
+    // bool_search 两个 MUST：触发 intersect_u32；修复前重复 ord 会让 AVX2
+    // 越界写崩溃，且交集结果错。
+    auto q = QueryNode::must_all(
+        {QueryNode::must_term("alpha"), QueryNode::must_term("beta")});
+    auto hits = idx2.bool_search(q, 100, checker);
+    EXPECT_EQ(hits.size(), 50u);  // 全部 50 文档同时含 alpha+beta
+
+    std::filesystem::remove(snap);
+    std::filesystem::remove(wal);
 }
