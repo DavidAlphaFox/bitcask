@@ -721,12 +721,12 @@ NIF .so（44/44）；ctest 322/322。
 
 | # | 目标 | 改动范围 | 关键内容 | 状态 |
 |---|------|---------|---------|------|
-| **P2.1** | LiveChecker 批量/位图接口（最高优先） | `inverted.hpp` / `index.cpp` / `search_layer.cpp` | 加 `fill_doc_lens(span<const uint64_t>, span<uint32_t>)` 与 live 位图视图，评分循环虚调用提出循环外；预期仅去虚调用 + 自动向量化即拿走大部分收益，先测再决定是否手写 SIMD | ⬜ |
+| **P2.1** | LiveChecker 批量接口 | `inverted.hpp` / `index.hpp/.cpp` / `inverted.cpp` / bench | ✅ 已落地：`fill_is_live`/`fill_doc_lens` 批量虚接口（默认回退逐条，外部实现者零改动；Index 覆写为**一次 shared_lock 扫整列**——此前每 posting 一锁，热词查询 ≈20 万次锁）。评分循环改两阶段（①纯数组浮点→自动向量化已确认（objdump 见 packed mulps/divps），公式逐运算一致分数位级不变；②标量 scatter）；wand 的 DAAT 每 pivot is_live/doc_len 改读批量数组（零锁零虚调用）；bool 五阶段 live 重扫合并为一次；phrase first-term live 批量。**生产形态基准**（新增 LockedScalar/LockedBatch 对照，模拟 Index 的每调用一锁）：SearchHotTerm/100k **5570us → 1900us（-66%）**，已逼近无锁 checker 水平（~1830us）。诚实记录：无锁 checker 下 +3~5%（dls 数组的额外内存流量在 checker 本身免费时无补偿；生产 checker 永远带锁，不受此影响）。ctest 322/322 + eunit 44/44 + TSan 并发用例干净 | ✅ |
 | **P2.2** | bool_search 求交 SIMD 化 | `inverted.cpp` | 排序数组交集换 SIMD galloping / shuffle-based（Lemire 系方案）；评估 ord 窄化 uint64→uint32（文档数 <2^32）收益翻倍 | ⬜ |
 | **P2.3** | fuzzy 换 Myers 位并行 | `inverted.cpp` 新 `myers.hpp` | O(n·m) 标量 DP → O(n·⌈m/64⌉) 位并行，原理与适配要点见 `doc/myers-bitparallel-zh.md`；k-bounded 提前终止；保留 S10.3 长度差剪枝；黄金语义对拍现 levenshtein | ⬜ |
 | **P2.4** | live 位图化（与 P2.1 联动） | `index.hpp/.cpp` | `live_` 已是 vector<bool>（注释留有 Roaring 待办）；LiveChecker 直接暴露位图，live 预扫从 10 万次虚调用变位图字节操作 | ⬜ |
 | **P2.5** | 文本侧（索引路径，独立可做） | `text_utils` / `analyzer.cpp` / wildcard | UTF-8 解码/to_codepoints 评估换 simdutf；wildcard_match 加最长字面量 `string_view::find` 预过滤（glibc memchr 已 SIMD） | ⬜ |
-| **P2.6** | 基准扩充 | `inverted_bench.cpp` | 加 fuzzy 热词基准；各项 before/after 进对齐构建 | ⬜ |
+| **P2.6** | 基准扩充 | `inverted_bench.cpp` | ✅ 随 P2.1 落地：FuzzyHot（热词 100k posting + 1024 冷词，基线 ~3000us 供 P2.3 对比）、SearchLockedScalar/Batch 生产形态对照 | ✅ |
 
 **评审后明确不做**：snapshot_flat 的 SIMD AoS→SoA（内存带宽主导，且完整
 Phase 2 零拷贝会让它整体消失）；phrase 位置匹配 SIMD（分支/二分主导，
