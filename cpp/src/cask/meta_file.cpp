@@ -13,6 +13,9 @@ inline constexpr std::size_t kMetaMagicSize = 4;
 inline constexpr std::size_t kMetaVersionOffset = 4;
 inline constexpr std::size_t kMetaModeOffset = 5;
 inline constexpr std::size_t kMetaReservedSize = 12;
+// V3.1:向量配置占用保留区前 3 字节(旧文件全零 → kNone/0,自然兼容)。
+inline constexpr std::size_t kMetaVecMetricOffset = 6;
+inline constexpr std::size_t kMetaVecDimOffset    = 7;  // u16 LE
 inline constexpr std::size_t kMetaFileSize = kMetaMagicSize + 1 + 1 + kMetaReservedSize;  // 18 bytes
 
 inline constexpr std::uint8_t kMetaVersion = 1;
@@ -56,6 +59,16 @@ std::expected<MetaConfig, MetaError> read_meta(std::string_view dirname) {
     } else {
         return std::unexpected(MetaError{0, "unknown mode"});
     }
+    const auto metric_val =
+        static_cast<std::uint8_t>(header[kMetaVecMetricOffset]);
+    if (metric_val > static_cast<std::uint8_t>(VectorMetric::kDot)) {
+        return std::unexpected(MetaError{0, "unknown vector metric"});
+    }
+    cfg.vector_metric = static_cast<VectorMetric>(metric_val);
+    std::memcpy(&cfg.vector_dim, header + kMetaVecDimOffset, 2);
+    if ((cfg.vector_metric == VectorMetric::kNone) != (cfg.vector_dim == 0)) {
+        return std::unexpected(MetaError{0, "inconsistent vector config"});
+    }
     return cfg;
 }
 
@@ -68,6 +81,9 @@ std::expected<void, MetaError> write_meta(std::string_view dirname, const MetaCo
 
     char header[kMetaFileSize] = {0};
     std::memcpy(header, kMetaMagic, kMetaMagicSize);
+    header[kMetaVecMetricOffset] =
+        static_cast<char>(config.vector_metric);
+    std::memcpy(header + kMetaVecDimOffset, &config.vector_dim, 2);
     header[kMetaVersionOffset] = static_cast<char>(kMetaVersion);
     header[kMetaModeOffset] = static_cast<char>(
         config.mode == Mode::kKV ? 0 : 1);

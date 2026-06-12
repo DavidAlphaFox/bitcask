@@ -24,10 +24,22 @@ enum class Mode : std::uint8_t {
     kIndex = 1,    // 索引模式（BM25 搜索）
 };
 
-// bitcask.meta 配置内容（当前仅含模式字段）
+// V3.1:向量距离度量。kNone = 本集合无向量(旧 meta 的保留区全零
+// 自然解码为此值,无需版本升级)。
+enum class VectorMetric : std::uint8_t {
+    kNone = 0,
+    kCosineNormalized = 1,   // 写入时归一化,查询用内积(默认推荐)
+    kL2 = 2,
+    kDot = 3,
+};
+
+// bitcask.meta 配置内容。
+// V3.1:vector 配置占用原保留区 [6]=metric、[7..8]=dim(LE u16)——
+// 库内 dim 恒定、初始化显式配置、重开校验(hnsw-design §1)。
 struct MetaConfig {
     Mode mode = Mode::kKV;
-    // Phase 4 会加入 analyzer_type, bm25_params, dict_path 等
+    VectorMetric vector_metric = VectorMetric::kNone;
+    std::uint16_t vector_dim = 0;   // 0 = 无向量
 };
 
 // meta 文件操作错误
