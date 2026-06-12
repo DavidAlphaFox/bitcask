@@ -3,12 +3,14 @@
 #include <bitcask/codec.hpp>
 #include <bitcask/data_file.hpp>  // parse_data_tstamp（S13 测试枚举 data 文件）
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <map>
 #include <random>
 #include <set>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -1332,5 +1334,374 @@ TEST_F(CaskDocValueTest, V34DeadZoneNavigation) {
     // ef=256 对 300 节点近乎穷举;留 1 个并列容差。
     EXPECT_GE(overlap, kTopK - 1)
         << "活集 top-k 重合 " << overlap << "/" << kTopK;
+    (*c)->close();
+}
+
+// ── V3.5:HNSW 快照(BCVS)并入 A4 covers 门 + merge 重建 ──────────────────
+
+namespace {
+
+// 固定种子归一化高斯向量组(cosine 集合的标准合成形态)。
+std::vector<std::vector<float>> v35_make_vecs(std::size_t n, std::size_t dim,
+                                              std::uint64_t seed) {
+    std::mt19937 rng(static_cast<unsigned>(seed));
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<std::vector<float>> out(n);
+    for (auto& v : out) {
+        v.resize(dim);
+        double sq = 0.0;
+        for (auto& x : v) { x = nd(rng); sq += static_cast<double>(x) * x; }
+        const auto inv = static_cast<float>(1.0 / std::sqrt(sq));
+        for (auto& x : v) x *= inv;
+    }
+    return out;
+}
+
+void v35_put(Cask& c, const std::string& key, const std::vector<float>& v) {
+    bitcask::DocInput doc;
+    const std::string text = "filler " + key;
+    doc.text = sv_bytes(text);
+    doc.vector = std::span<const float>(v.data(), v.size());
+    ASSERT_TRUE(c.put_doc(sv_bytes(key), doc, 1000));
+}
+
+std::vector<std::string> v35_hit_keys(const bitcask::TextSearchResult& r) {
+    std::vector<std::string> keys;
+    keys.reserve(r.hits.size());
+    for (const auto& h : r.hits) keys.push_back(h.key);
+    return keys;
+}
+
+}  // namespace
+
+// 三件套 1:干净 close → reopen 走快路径,search_vector 与 close 前一致。
+// 快路径实证:把目录复制一份并删光 data/hint 文件——没有 data 可 fold,
+// 搜索仍正确 ⟹ 结果只可能来自四块快照(keydir/bm25/sidecar/hnsw)。
+// 再删 hnsw.snap 对比全量 fold 的等价结果(A4 既有断言范式)。
+TEST_F(CaskDocValueTest, V35SnapshotFastReopen) {
+    constexpr std::size_t kDim = 8;
+    auto opts = v31_opts(kDim);
+    auto vecs = v35_make_vecs(50, kDim, 0xB35F);
+    auto q = v35_make_vecs(1, kDim, 0xBEEF)[0];
+    auto key_of = [](std::size_t i) {
+        char k[8];
+        std::snprintf(k, sizeof k, "v%02zu", i);
+        return std::string(k);
+    };
+
+    std::vector<std::string> expect_keys;
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        for (std::size_t i = 0; i < 40; ++i) v35_put(**c, key_of(i), vecs[i]);
+        (*c)->flush_index();
+        // 中部删除(墓碑占 ord 但不收尾——尾部 ord 须是向量文档,
+        // 否则 covers/floor 门保守关闭,快路径无从谈起)。
+        for (std::size_t i = 5; i < 30; i += 6) {
+            ASSERT_TRUE((*c)->remove(sv_bytes(key_of(i))));
+        }
+        for (std::size_t i = 40; i < 50; ++i) v35_put(**c, key_of(i), vecs[i]);
+        (*c)->flush_index();
+        auto r = (*c)->search_vector(std::span<const float>(q.data(), kDim),
+                                     10, /*ef=*/256);
+        ASSERT_TRUE(r);
+        ASSERT_EQ(r->hits.size(), 10u);
+        expect_keys = v35_hit_keys(*r);
+        (*c)->close();
+    }
+    ASSERT_TRUE(std::filesystem::exists(tmpdir_ / "hnsw.snap"));
+
+    auto search_in = [&](const std::string& dir) {
+        std::vector<std::string> keys;
+        auto c = Cask::open(dir, opts);
+        EXPECT_TRUE(c);
+        if (!c) return keys;
+        auto r = (*c)->search_vector(std::span<const float>(q.data(), kDim),
+                                     10, /*ef=*/256);
+        EXPECT_TRUE(r);
+        if (r) keys = v35_hit_keys(*r);
+        (*c)->close();
+        return keys;
+    };
+
+    // (a) 快照齐备的 reopen。
+    EXPECT_EQ(search_in(tmpdir_.string()), expect_keys);
+
+    // (b) 快路径实证:复制目录、删光 data/hint/lock,只剩快照仍可检索。
+    const auto snaponly = tmpdir_.parent_path() /
+                          (tmpdir_.filename().string() + "_snaponly");
+    std::error_code ec;
+    std::filesystem::remove_all(snaponly, ec);
+    std::filesystem::copy(tmpdir_, snaponly, ec);
+    ASSERT_FALSE(ec);
+    for (const auto& e : std::filesystem::directory_iterator(snaponly)) {
+        const auto name = e.path().filename().string();
+        if (name.ends_with(".data") || name.ends_with(".hint") ||
+            name.ends_with(".lock")) {
+            std::filesystem::remove(e.path(), ec);
+        }
+    }
+    EXPECT_EQ(search_in(snaponly.string()), expect_keys);
+    std::filesystem::remove_all(snaponly, ec);
+
+    // (c) 删 hnsw.snap → 全量 fold,结果等价;close 后快照重新落盘。
+    std::filesystem::remove(tmpdir_ / "hnsw.snap");
+    EXPECT_EQ(search_in(tmpdir_.string()), expect_keys);
+    EXPECT_TRUE(std::filesystem::exists(tmpdir_ / "hnsw.snap"));
+}
+
+// 三件套 2:快照旧于 data 尾部(崩溃形态)——回退 keydir+hnsw 快照到
+// 会话 1,会话 2 的向量文档须经尾部回放重插,新旧都可检索。
+TEST_F(CaskDocValueTest, V35StaleTailReplay) {
+    constexpr std::size_t kDim = 8;
+    auto opts = v31_opts(kDim);
+    auto vecs = v35_make_vecs(35, kDim, 0x57A1E);
+    const auto kd_snap = tmpdir_ / "bitcask.keydir.snap";
+    const auto hs_snap = tmpdir_ / "hnsw.snap";
+    const auto kd_old = tmpdir_ / "kd.old";
+    const auto hs_old = tmpdir_ / "hs.old";
+
+    {   // 会话 1:20 个向量文档。
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        for (std::size_t i = 0; i < 20; ++i) {
+            v35_put(**c, "a" + std::to_string(i), vecs[i]);
+        }
+        (*c)->close();
+    }
+    std::filesystem::copy_file(kd_snap, kd_old);
+    std::filesystem::copy_file(hs_snap, hs_old);
+
+    {   // 会话 2:再写 15 个。
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        for (std::size_t i = 20; i < 35; ++i) {
+            v35_put(**c, "b" + std::to_string(i), vecs[i]);
+        }
+        (*c)->close();
+    }
+    // 回退 keydir+hnsw 到会话 1(一致的旧快照对;bm25/sidecar 保持新——
+    // 覆盖更大,门照过)。会话 2 的文件不在旧水位表 → 从 0 回放。
+    std::filesystem::copy_file(kd_old, kd_snap,
+        std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(hs_old, hs_snap,
+        std::filesystem::copy_options::overwrite_existing);
+
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+    auto q = v35_make_vecs(1, kDim, 0xFACE)[0];
+    auto r = (*c)->search_vector(std::span<const float>(q.data(), kDim),
+                                 35, /*ef=*/512);
+    ASSERT_TRUE(r);
+    ASSERT_EQ(r->hits.size(), 35u);   // 旧 20 + 尾部回放重插的 15 全可达
+    std::set<std::string> got;
+    for (const auto& h : r->hits) got.insert(h.key);
+    for (std::size_t i = 0; i < 20; ++i) {
+        EXPECT_EQ(got.count("a" + std::to_string(i)), 1u) << i;
+    }
+    for (std::size_t i = 20; i < 35; ++i) {
+        EXPECT_EQ(got.count("b" + std::to_string(i)), 1u) << i;
+    }
+    (*c)->close();
+}
+
+// 三件套 3:hnsw.snap 损坏(位翻转)→ 整体拒绝 + 回退全量 fold,
+// 不崩、结果正确;再 close 后快照恢复健康。
+TEST_F(CaskDocValueTest, V35CorruptFallsBack) {
+    constexpr std::size_t kDim = 8;
+    auto opts = v31_opts(kDim);
+    auto vecs = v35_make_vecs(30, kDim, 0xC0552);
+    auto q = v35_make_vecs(1, kDim, 0xDeed)[0];
+
+    std::vector<std::string> expect_keys;
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        for (std::size_t i = 0; i < 30; ++i) {
+            v35_put(**c, "k" + std::to_string(i), vecs[i]);
+        }
+        (*c)->flush_index();
+        auto r = (*c)->search_vector(std::span<const float>(q.data(), kDim),
+                                     10, /*ef=*/256);
+        ASSERT_TRUE(r);
+        expect_keys = v35_hit_keys(*r);
+        (*c)->close();
+    }
+    const auto snap = tmpdir_ / "hnsw.snap";
+    ASSERT_TRUE(std::filesystem::exists(snap));
+
+    {   // 位翻转 payload 中部(CRC 必炸 → load 整体拒绝)。
+        std::FILE* f = std::fopen(snap.string().c_str(), "rb+");
+        ASSERT_NE(f, nullptr);
+        std::fseek(f, 0, SEEK_END);
+        const long mid = std::ftell(f) / 2;
+        std::fseek(f, mid, SEEK_SET);
+        int ch = std::fgetc(f);
+        std::fseek(f, mid, SEEK_SET);
+        std::fputc(ch ^ 0xFF, f);
+        std::fclose(f);
+    }
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        auto r = (*c)->search_vector(std::span<const float>(q.data(), kDim),
+                                     10, /*ef=*/256);
+        ASSERT_TRUE(r);
+        EXPECT_EQ(v35_hit_keys(*r), expect_keys);   // 全量 fold 重建等价
+        (*c)->close();                              // 快照重写恢复健康
+    }
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        auto r = (*c)->search_vector(std::span<const float>(q.data(), kDim),
+                                     10, /*ef=*/256);
+        ASSERT_TRUE(r);
+        EXPECT_EQ(v35_hit_keys(*r), expect_keys);
+        (*c)->close();
+    }
+}
+
+// merge 重建:删一半 → merge → RebuildHnsw(IndexPool worker)物理清死,
+// hnsw_size() 收敛到活文档数;结果与删除后一致;close+reopen 仍一致。
+TEST_F(CaskDocValueTest, V35MergeRebuildEvictsDead) {
+    constexpr std::size_t kDim = 8, kN = 50;
+    auto opts = v31_opts(kDim);
+    auto vecs = v35_make_vecs(kN, kDim, 0x4EAD);
+    auto q = v35_make_vecs(1, kDim, 0xF00D)[0];
+    auto key_of = [](std::size_t i) {
+        char k[8];
+        std::snprintf(k, sizeof k, "m%02zu", i);
+        return std::string(k);
+    };
+
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        for (std::size_t i = 0; i < kN; ++i) v35_put(**c, key_of(i), vecs[i]);
+        (*c)->flush_index();
+        for (std::size_t i = 1; i < kN; i += 2) {   // 删奇数位,留 25 活
+            ASSERT_TRUE((*c)->remove(sv_bytes(key_of(i))));
+        }
+        (*c)->close();   // 放掉 active writer,merge 可吃全部文件
+    }
+
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+    (*c)->flush_index();
+    // merge 前:图含全部 50 节点(死节点只是结果侧滤除)。
+    EXPECT_EQ((*c)->search()->hnsw_size(), kN);
+    auto before = (*c)->search_vector(std::span<const float>(q.data(), kDim),
+                                      10, /*ef=*/256);
+    ASSERT_TRUE(before);
+    ASSERT_EQ(before->hits.size(), 10u);
+    for (const auto& h : before->hits) {
+        EXPECT_NE(std::stoul(h.key.substr(1)) % 2, 1u) << h.key;
+    }
+
+    std::vector<std::string> files;
+    for (const auto& e : std::filesystem::directory_iterator(tmpdir_)) {
+        if (e.path().filename().string().ends_with(".bitcask.data")) {
+            files.push_back(e.path().string());
+        }
+    }
+    ASSERT_GE(files.size(), 1u);
+    auto mr = (*c)->merge(files, 3000);
+    ASSERT_TRUE(mr) << mr.error().detail;
+    (*c)->flush_index();   // 等 RebuildHnsw 任务被 worker 消化
+
+    // 物理清死:图节点数 == 活文档数。
+    EXPECT_EQ((*c)->search()->hnsw_size(), kN / 2);
+    auto after = (*c)->search_vector(std::span<const float>(q.data(), kDim),
+                                     10, /*ef=*/256);
+    ASSERT_TRUE(after);
+    EXPECT_EQ(v35_hit_keys(*after), v35_hit_keys(*before));
+    (*c)->close();
+
+    // 重开(merge 后快照/数据均只剩活集)仍一致。
+    auto c2 = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c2);
+    auto r2 = (*c2)->search_vector(std::span<const float>(q.data(), kDim),
+                                   10, /*ef=*/256);
+    ASSERT_TRUE(r2);
+    EXPECT_EQ(v35_hit_keys(*r2), v35_hit_keys(*before));
+    EXPECT_EQ((*c2)->search()->hnsw_size(), kN / 2);
+    (*c2)->close();
+}
+
+// 并发:merge 触发的 RebuildHnsw(worker 换图指针)与多读者 search_vector
+// 并发,期间主线程继续 put(任务排在 Rebuild 之后)。TSan 是裁判;
+// 语义断言:全程查询不出死文档,重建后图 = 活集 + 新增。
+TEST_F(CaskDocValueTest, V35ConcurrentSearchDuringRebuild) {
+    constexpr std::size_t kDim = 16, kN = 400;
+    auto opts = v31_opts(kDim);
+    auto vecs = v35_make_vecs(kN + 40, kDim, 0xCC35);
+    auto key_of = [](std::size_t i) {
+        char k[8];
+        std::snprintf(k, sizeof k, "c%03zu", i);
+        return std::string(k);
+    };
+
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        for (std::size_t i = 0; i < kN; ++i) v35_put(**c, key_of(i), vecs[i]);
+        (*c)->flush_index();
+        for (std::size_t i = 1; i < kN; i += 2) {
+            ASSERT_TRUE((*c)->remove(sv_bytes(key_of(i))));
+        }
+        (*c)->close();
+    }
+
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+
+    std::atomic<bool> done{false};
+    std::atomic<bool> dead_leaked{false};
+    std::atomic<std::uint64_t> queries{0};
+    std::vector<std::thread> readers;
+    readers.reserve(3);
+    for (int t = 0; t < 3; ++t) {
+        readers.emplace_back([&, t]() {
+            std::mt19937 rng(0x5EED0000u + static_cast<unsigned>(t));
+            std::normal_distribution<float> nd(0.0f, 1.0f);
+            std::vector<float> q(kDim);
+            while (!done.load(std::memory_order_acquire)) {
+                for (auto& x : q) x = nd(rng);
+                // 直走 SearchLayer(避开 Cask::search_vector 的 flush 串行
+                // 化)——与 worker 的重建/插入真并发。
+                auto r = (*c)->search()->search_vector(
+                    std::span<const float>(q.data(), kDim), 10, 64);
+                if (!r) continue;
+                for (const auto& h : *r) {
+                    const auto idx = std::stoul(h.key.substr(1));
+                    if (idx < kN && idx % 2 == 1) {
+                        dead_leaked.store(true, std::memory_order_relaxed);
+                    }
+                }
+                queries.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    std::vector<std::string> files;
+    for (const auto& e : std::filesystem::directory_iterator(tmpdir_)) {
+        if (e.path().filename().string().ends_with(".bitcask.data")) {
+            files.push_back(e.path().string());
+        }
+    }
+    auto mr = (*c)->merge(files, 3000);   // 末尾提交 RebuildHnsw(异步)
+    ASSERT_TRUE(mr) << mr.error().detail;
+    // 重建在 worker 排队/执行中,主线程继续写——新任务排在 Rebuild 后。
+    for (std::size_t i = kN; i < kN + 40; ++i) {
+        v35_put(**c, key_of(i), vecs[i]);
+    }
+    (*c)->flush_index();
+    done.store(true, std::memory_order_release);
+    for (auto& th : readers) th.join();
+
+    EXPECT_FALSE(dead_leaked.load());
+    EXPECT_GT(queries.load(), 0u);
+    // 重建清死 + 新增 40:图 = 200 活 + 40。
+    EXPECT_EQ((*c)->search()->hnsw_size(), kN / 2 + 40);
     (*c)->close();
 }
