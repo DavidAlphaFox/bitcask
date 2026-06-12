@@ -866,6 +866,27 @@ search 路径 ord 恒由 keydir 分配,无复用风险)。
 
 ---
 
+## M6 — KeyDir 分片(设计定稿 ◐,实施排程)
+
+> 设计:`doc/keydir-sharding-design-zh.md`(锁序/MVCC 屏障协议/fstats
+> 无锁发布/分阶段 S1-S5 全部定稿)。动机数据(新增护栏基准
+> BM_KeyDir_Mixed_MultiThreaded,90% get + 10% put):
+> **1t 23.6M ops/s → 8t 0.22M ops/s(-100×)**。
+> S1 后复测:多线程持平(写路径仍在 mutex_ 内,符合设计预期);
+> 单线程 put 45→60ns(fstats 改原子 RMW 的代价,S2 摘锁后回收)。
+> 回归:plain/ASan/TSan 357/357 + eunit 44/44。
+
+| # | 内容 | 状态 |
+|---|------|------|
+| M6.0 | 设计文档定稿 + Mixed 多线程护栏基准 + before 基线入档 | ✅ |
+| M6.1 | S1:全局标量原子化(epoch/key_count/key_bytes/biggest_file_id)+ fstats 无锁发布(AtomicFStats deque + grow mutex + size release 发布;CAS-min/max;int64 二补数 wrap 语义保留)| ✅ |
+| M6.2 | S2:entries 16 分片 + 热路径单分片锁(fold 全屏障粗化)。Mixed 8t 0.22M→1.22M(5.4×)、2t 2.66M→11.5M;Get 4t 3.17M→15.2M、8t 2.44M→13.2M;单线程持平(~0.96×)。plain/ASan/TSan 357/357 + eunit 44/44(TSan 全插桩门禁过)。附带:next() 已是单分片锁、A4 save/load 已接分片(S3/S4 主体已随 S2 落地,余验证项) | ✅ |
+| M6.3 | S3:iter next() meta+shard 两段锁细化 | ☐ |
+| M6.4 | S4:A4 快照接分片(save 屏障 / load 分发) | ☐ |
+| M6.5 | S5:基准定稿入 baseline.json;红线 = 8t ≥ 1t,Get/4t 摆脱负扩展;TSan 全插桩全绿 | ☐ |
+
+---
+
 ## 未来任务
 
 ### P1 — 查询路径 PostingList 零拷贝（Phase 1 ✅ + Phase 2-min ✅）

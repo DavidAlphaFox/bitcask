@@ -118,3 +118,31 @@ static void BM_KeyDir_Put_Overwrite(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations());
 }
 BENCHMARK(BM_KeyDir_Put_Overwrite);
+
+// M6 验收护栏:多线程混合负载(每线程 90% get + 10% put 覆写)。
+// 分片前的 before 数字 = 全局 shared_mutex 下写者互斥 + 读写互踩;
+// 分片后预期按 shard 数接近线性,本基准是 M6 的合格线。
+static void BM_KeyDir_Mixed_MultiThreaded(benchmark::State& state) {
+    static KeyDir kd;
+    static std::vector<std::string> keys = make_key_pool();
+    if (state.thread_index() == 0) {
+        populate(kd, keys);
+    }
+    std::mt19937 rng(0xC0FFEE + static_cast<unsigned>(state.thread_index()));
+    std::uniform_int_distribution<int> dist(0, kKeyspace - 1);
+    std::uniform_int_distribution<int> op(0, 9);
+
+    for (auto _ : state) {
+        const auto& k = keys[static_cast<std::size_t>(dist(rng))];
+        if (op(rng) == 0) {
+            kd.put(k, 1, 100, 0, 1, 0, /*newest*/ true, 0, 0);
+        } else {
+            benchmark::DoNotOptimize(kd.get(k));
+        }
+    }
+    state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_KeyDir_Mixed_MultiThreaded)
+    ->Threads(1)->Threads(2)->Threads(4)->Threads(8)
+    ->UseRealTime()
+    ->Unit(benchmark::kNanosecond);

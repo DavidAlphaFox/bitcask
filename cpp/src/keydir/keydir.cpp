@@ -8,10 +8,27 @@
 #include <cassert>
 #include <shared_mutex>
 
+// =============================================================================
+// M6-S2 并发模型速记（详见 keydir.hpp 文件头 / doc/keydir-sharding-design-zh.md）
+//
+// 锁全序（必须严格遵守）：
+//     shards_[0..kShards)（按下标升序）→ meta_mu_ → fstats_grow_mu_
+// 即：可以在持分片锁时嵌套拿 meta_mu_，严禁反向。
+//
+// 核心不变量（探测顺序 entries→pending 的正确性依据）：
+//     key ∈ 某分片 entries  ⟹  pending_ 不会有它的更新版本。
+// 已存在 key 的新版本（put 覆写 / remove 墓碑）一律在分片内走 sibling
+// 链，绝不进 pending；pending 只接「fold 期间出现的全新 key」。
+//
+// keyfolders_ 只在全屏障（全部分片 unique + meta unique）内修改；写者
+// 在持自己分片锁后 relaxed 读即足够新——屏障无法在写者持分片锁期间
+// 完成（unique 等待），所以「读到 0 → 直写」的写一定整体先于屏障。
+// =============================================================================
+
 namespace bitcask::keydir {
 
 // =============================================================================
-// 内部辅助函数（不做锁；caller 必须已持 keydir mutex）
+// 内部辅助函数（不做锁；caller 必须已持对应分片 / meta 锁）
 // =============================================================================
 
 namespace {
@@ -83,6 +100,28 @@ struct EntryAt {
 }  // namespace
 
 // =============================================================================
+// 全屏障辅助：按下标升序锁住全部分片（锁全序第一段）。
+// =============================================================================
+
+std::array<std::unique_lock<std::shared_mutex>, KeyDir::kShards>
+KeyDir::lock_all_shards() const {
+    std::array<std::unique_lock<std::shared_mutex>, kShards> locks;
+    for (std::size_t i = 0; i < kShards; ++i) {
+        locks[i] = std::unique_lock(shards_[i].mu);
+    }
+    return locks;
+}
+
+std::array<std::shared_lock<std::shared_mutex>, KeyDir::kShards>
+KeyDir::lock_all_shards_shared() const {
+    std::array<std::shared_lock<std::shared_mutex>, kShards> locks;
+    for (std::size_t i = 0; i < kShards; ++i) {
+        locks[i] = std::shared_lock(shards_[i].mu);
+    }
+    return locks;
+}
+
+// =============================================================================
 // 文件级统计 (fstats)
 //
 // 每个 file_id 一条 FStatsEntry，记录该 data file 的 live/total key 数和
@@ -99,66 +138,83 @@ struct EntryAt {
 // should_create=false 时如果 file_id 不存在直接 return：set_pending_delete
 // 路径要这个语义——只对已知 file_id 标记 expiration_epoch，不为不存在的
 // file 凭空建一条 fstats。
-void KeyDir::update_fstats_locked(std::uint32_t file_id, std::uint32_t tstamp,
-                                   std::uint64_t expiration_epoch,
-                                   std::int32_t live_inc, std::int32_t total_inc,
-                                   std::int32_t live_bytes_inc,
-                                   std::int32_t total_bytes_inc,
-                                   bool should_create) {
+void KeyDir::update_fstats(std::uint32_t file_id, std::uint32_t tstamp,
+                           std::uint64_t expiration_epoch,
+                           std::int32_t live_inc, std::int32_t total_inc,
+                           std::int32_t live_bytes_inc,
+                           std::int32_t total_bytes_inc,
+                           bool should_create) {
+    // M6-S1 无锁化:槽位发布 + relaxed 原子累加(wrap-around 语义经
+    // int64 二补数保留,与 legacy 字节级对账一致)。锁序:fstats_grow_mu_
+    // 是全序最末一把,caller 持分片锁/meta 时调用均合法。
     const std::size_t idx = file_id;
-    const bool exists = idx < fstats_present_.size() && fstats_present_[idx];
-    if (!exists) {
+    if (idx >= fstats_size_.load(std::memory_order_acquire)) {
         if (!should_create) return;
-        if (idx >= fstats_.size()) {
-            fstats_.resize(idx + 1);
-            fstats_present_.resize(idx + 1, 0);
-        }
-        FStatsEntry e;
-        e.file_id          = file_id;
-        e.expiration_epoch = kMaxEpoch;
-        fstats_[idx]         = e;
-        fstats_present_[idx] = 1;
+        std::lock_guard<std::mutex> g(fstats_grow_mu_);
+        while (fstats_.size() <= idx) fstats_.emplace_back();
+        fstats_size_.store(fstats_.size(), std::memory_order_release);
     }
     auto& f = fstats_[idx];
-    f.live_keys = static_cast<std::uint64_t>(
-        static_cast<std::int64_t>(f.live_keys) + live_inc);
-    f.total_keys = static_cast<std::uint64_t>(
-        static_cast<std::int64_t>(f.total_keys) + total_inc);
-    f.live_bytes = static_cast<std::uint64_t>(
-        static_cast<std::int64_t>(f.live_bytes) + live_bytes_inc);
-    f.total_bytes = static_cast<std::uint64_t>(
-        static_cast<std::int64_t>(f.total_bytes) + total_bytes_inc);
+    if (!f.present.load(std::memory_order_relaxed)) {
+        if (!should_create) return;
+        f.present.store(1, std::memory_order_relaxed);
+    }
+    auto add = [](std::atomic<std::uint64_t>& a, std::int32_t inc) {
+        a.fetch_add(static_cast<std::uint64_t>(static_cast<std::int64_t>(inc)),
+                    std::memory_order_relaxed);
+    };
+    add(f.live_keys, live_inc);
+    add(f.total_keys, total_inc);
+    add(f.live_bytes, live_bytes_inc);
+    add(f.total_bytes, total_bytes_inc);
 
-    if (expiration_epoch < f.expiration_epoch) {
-        f.expiration_epoch = expiration_epoch;
+    // CAS-min:expiration_epoch 只向更早推。
+    std::uint64_t cur = f.expiration_epoch.load(std::memory_order_relaxed);
+    while (expiration_epoch < cur &&
+           !f.expiration_epoch.compare_exchange_weak(
+               cur, expiration_epoch, std::memory_order_relaxed)) {
     }
-    if ((tstamp != 0 && tstamp < f.oldest_tstamp) || f.oldest_tstamp == 0) {
-        f.oldest_tstamp = tstamp;
-    }
-    if ((tstamp != 0 && tstamp > f.newest_tstamp) || f.newest_tstamp == 0) {
-        f.newest_tstamp = tstamp;
+    if (tstamp != 0) {
+        std::uint32_t o = f.oldest_tstamp.load(std::memory_order_relaxed);
+        while ((o == 0 || tstamp < o) &&
+               !f.oldest_tstamp.compare_exchange_weak(
+                   o, tstamp, std::memory_order_relaxed)) {
+        }
+        std::uint32_t n = f.newest_tstamp.load(std::memory_order_relaxed);
+        while ((n == 0 || tstamp > n) &&
+               !f.newest_tstamp.compare_exchange_weak(
+                   n, tstamp, std::memory_order_relaxed)) {
+        }
     }
 }
 
 // 标记某 file_id「等迭代结束就可以删」。把当前 epoch_ 写到该 file 的
 // expiration_epoch；后续 needs_merge 看到 expiration_epoch < newest fold
 // epoch 就把这个文件标记为「safe to delete」。
+// S2:完全无锁（fstats 原子路径 + epoch_ 原子读）。
 void KeyDir::set_pending_delete(std::uint32_t file_id) {
-    std::unique_lock lock(mutex_);
-    update_fstats_locked(file_id, /*tstamp*/ 0,
-                         /*expiration_epoch*/ epoch_,
-                         0, 0, 0, 0, /*should_create*/ false);
+    update_fstats(file_id, /*tstamp*/ 0,
+                  /*expiration_epoch*/ epoch_.load(std::memory_order_relaxed),
+                  0, 0, 0, 0, /*should_create*/ false);
 }
 
 // 一次性删一组 file_id 的 fstats（merge 完成后调用，回收旧统计）。
 // 返回找不到的 id 数——caller 用它做日志 / 测试断言；正常路径下应该是 0。
+// S2:只拿 fstats_grow_mu_（与槽位增长串行;锁全序最末,独立持有合法）。
 std::uint32_t KeyDir::trim_fstats(std::span<const std::uint32_t> ids) {
-    std::unique_lock lock(mutex_);
+    std::lock_guard<std::mutex> lock(fstats_grow_mu_);
     std::uint32_t missing = 0;
+    const std::size_t n = fstats_size_.load(std::memory_order_acquire);
     for (auto id : ids) {
-        if (id < fstats_present_.size() && fstats_present_[id]) {
-            fstats_present_[id] = 0;
-            fstats_[id] = FStatsEntry{};  // 清零槽位,防陈旧数据被误读
+        if (id < n && fstats_[id].present.exchange(0, std::memory_order_relaxed)) {
+            auto& f = fstats_[id];  // 清零槽位,防陈旧数据被误读
+            f.live_keys.store(0, std::memory_order_relaxed);
+            f.total_keys.store(0, std::memory_order_relaxed);
+            f.live_bytes.store(0, std::memory_order_relaxed);
+            f.total_bytes.store(0, std::memory_order_relaxed);
+            f.oldest_tstamp.store(0, std::memory_order_relaxed);
+            f.newest_tstamp.store(0, std::memory_order_relaxed);
+            f.expiration_epoch.store(kMaxEpoch, std::memory_order_relaxed);
         } else {
             ++missing;
         }
@@ -170,11 +226,12 @@ std::uint32_t KeyDir::trim_fstats(std::span<const std::uint32_t> ids) {
 // put / get / remove
 //
 // 这是 keydir 的核心。put 的逻辑分支最多：
-//   - 没在跑 fold (keyfolders_ == 0)：直接覆盖 entries_[key]，最简单
-//   - 在跑 fold，且新 key 还不在 entries_ 里：写到 pending_，迭代器看不到
-//   - 在跑 fold，且 key 已经在 entries_ 里：把旧 SingleEntry 升级成
+//   - 没在跑 fold (keyfolders_ == 0)：直接覆盖本分片 entries[key]，最简单
+//   - 在跑 fold，且新 key 还不在 entries 里：写到 pending_（meta unique），
+//     迭代器看不到
+//   - 在跑 fold，且 key 已经在 entries 里：把旧 SingleEntry 升级成
 //     MultiEntry，把新 revision 插到链头——迭代器仍然看到自己 epoch 的
-//     那个 revision，新写入对它不可见
+//     那个 revision，新写入对它不可见。全程只持本分片锁。
 // merge 路径走 newest_put=false 的「条件 put」：如果当前 entry 的
 // (file_id, offset) 跟 caller 期望的不一致（说明 race 中被覆盖了），
 // 返回 kAlreadyExists 让 merge 跳过。
@@ -182,39 +239,47 @@ std::uint32_t KeyDir::trim_fstats(std::span<const std::uint32_t> ids) {
 
 // 在指定 epoch（默认 kMaxEpoch = 最新）查 key 的可见 revision。
 //
-// 查找顺序：
-//   1. pending_ 表（fold 期间新写入的 key 都在这里）
-//   2. entries_ 主表（可能是 SingleEntry 或 sibling 链 MultiEntry）
-// 任一处找到就返回；墓碑视作「不存在」（kNotFound）。
-//
-// 对应 legacy 的 find_keydir_entry 规则；epoch 比较语义保留：
-// pending entry 的 epoch <= target_epoch 才可见——确保 fold 期间不会
-// 被 fold 启动后才插入的 key 干扰。
+// 查找顺序（S2 起,与旧实现的 pending→entries 相反,这是有意的）：
+//   1. 本分片 entries（权威：已存在 key 的新版本走 sibling 链,不进 pending）
+//   2. miss 且 fold 态时,**保持分片锁不放**,嵌套 meta shared 查 pending_。
+//      保持分片锁是为了堵 release 合并窗口的 TOCTOU：若先放分片锁再查
+//      pending,merge(pending→entries) 可能恰好在两次查找之间完成,两边
+//      都 miss。持分片锁期间全屏障无法完成,合并不可能发生。
+// 正确性依据：key ∈ entries ⟹ pending 不会有它的更新版本（见文件头
+// 不变量）。墓碑视作「不存在」（kNotFound）。
+// epoch 比较语义保留：pending entry 的 epoch <= target_epoch 才可见——
+// 确保 fold 期间不会被 fold 启动后才插入的 key 干扰。
 std::optional<EntryProxy> KeyDir::get(std::string_view key,
                                        std::uint64_t target_epoch) const {
-    std::shared_lock lock(mutex_);
+    const Shard& sh = shards_[shard_for(key)];
+    std::shared_lock slock(sh.mu);
 
-    if (pending_.has_value()) {
-        auto p = pending_->find(key);
-        if (p != pending_->end() && target_epoch >= p->second.epoch) {
-            const SingleEntry& s = p->second;
-            const bool tomb = is_pending_tombstone(s);
-            if (tomb) return std::nullopt;
-            return to_proxy(p->first, s, /*tombstone*/ false);
-        }
+    auto it = sh.entries.find(key);
+    if (it != sh.entries.end()) {
+        auto found = entry_at_epoch(it->second, target_epoch);
+        if (!found.found || found.is_tombstone) return std::nullopt;
+        return to_proxy(it->first, found.rev, /*tombstone*/ false);
     }
 
-    auto it = entries_.find(key);
-    if (it == entries_.end()) return std::nullopt;
-
-    auto found = entry_at_epoch(it->second, target_epoch);
-    if (!found.found || found.is_tombstone) return std::nullopt;
-    return to_proxy(it->first, found.rev, /*tombstone*/ false);
+    // entries miss → 只有 fold 态（或 deep_copy 残留 pending）才需要查
+    // pending。锁序:分片 → meta,嵌套合法。
+    if (keyfolders_.load(std::memory_order_relaxed) > 0 ||
+        has_pending_.load(std::memory_order_relaxed)) {
+        std::shared_lock mlock(meta_mu_);
+        if (pending_.has_value()) {
+            auto p = pending_->find(key);
+            if (p != pending_->end() && target_epoch >= p->second.epoch) {
+                const SingleEntry& s = p->second;
+                if (is_pending_tombstone(s)) return std::nullopt;
+                return to_proxy(p->first, s, /*tombstone*/ false);
+            }
+        }
+    }
+    return std::nullopt;
 }
 
 std::uint64_t KeyDir::get_epoch() const {
-    std::shared_lock lock(mutex_);
-    return epoch_;
+    return epoch_.load(std::memory_order_acquire);
 }
 
 std::uint64_t KeyDir::alloc_ord() {
@@ -233,14 +298,15 @@ void KeyDir::advance_ord(std::uint64_t ord) {
 // keydir 写入主入口。
 //
 // 大致控制流：
-//   1. 先把当前 key 在 pending_ + entries_ 里的「最新可见状态」找出来
+//   1. 先把当前 key 的「最新可见状态」找出来：本分片 entries 优先；
+//      miss 且 fold 态时嵌套 meta unique 查 pending_（锁序分片→meta）
 //   2. 三种情况分支处理：
 //      (A) key 不存在 / 已是墓碑
-//      (B) key 存在，无 fold 在跑：直接覆盖
+//      (B) key 存在，无 fold 在跑：直接覆盖（分片内）
 //      (C) key 存在，fold 在跑（keyfolders_ > 0）：升级 SingleEntry →
-//          MultiEntry，把新 revision 插到链头
-//   3. 在中间合适的位置 +1 epoch；这是 keydir 的全局逻辑时钟，
-//      用于 (a) 给新 entry 标记写入时刻，(b) iter 启动时拍快照
+//          MultiEntry，把新 revision 插到链头（分片内完成,不触 meta）
+//   3. 在中间合适的位置 fetch_add epoch_（分片锁内,保证「entry.epoch <
+//      iter epoch ⟺ 屏障前完成」判据）
 //   4. 最后维护 fstats 计数（live ++、total ++、bytes 变化）
 //
 // 条件 put（old_file_id != 0）来自 merge 路径：只有当前 entry 仍指向
@@ -253,34 +319,41 @@ PutResult KeyDir::put(std::string_view key,
                        bool newest_put,
                        std::uint32_t old_file_id, std::uint64_t old_offset,
                        std::uint64_t ord) {
-    std::unique_lock lock(mutex_);
+    Shard& sh = shards_[shard_for(key)];
+    std::unique_lock slock(sh.mu);
+
+    // keyfolders_ 只在全屏障内变;持分片锁后 relaxed 读即足够新。
+    const bool fold_active = keyfolders_.load(std::memory_order_relaxed) > 0;
 
     // ---- 阶段 1：探测当前状态 ----
-    // pending 优先，entries 次之；epoch 用 kMaxEpoch 拿最新可见 revision。
-    // 跟 legacy find_keydir_entry 的查找顺序保持一致。
+    // entries 优先（S2 不变量:key ∈ entries ⟹ pending 无其更新版本）。
     SingleEntry* pending_entry = nullptr;
     Entry* entries_entry = nullptr;
     EntryProxy current_proxy{};
     bool found = false;
     bool current_is_tombstone = false;
+    // pending 分支才需要的 meta 锁;持有期横跨本函数余下部分。
+    std::unique_lock<std::shared_mutex> mlock;
 
-    if (pending_.has_value()) {
-        auto p = pending_->find(key);
-        if (p != pending_->end() && kMaxEpoch >= p->second.epoch) {
-            pending_entry = &p->second;
-            current_is_tombstone = is_pending_tombstone(*pending_entry);
-            current_proxy = to_proxy(p->first, *pending_entry, current_is_tombstone);
+    auto it = sh.entries.find(key);
+    if (it != sh.entries.end()) {
+        auto at = entry_at_epoch(it->second, kMaxEpoch);
+        if (at.found) {
+            entries_entry = &it->second;
+            current_is_tombstone = at.is_tombstone;
+            current_proxy = to_proxy(it->first, at.rev, at.is_tombstone);
             found = true;
         }
     }
-    if (!found) {
-        auto it = entries_.find(key);
-        if (it != entries_.end()) {
-            auto at = entry_at_epoch(it->second, kMaxEpoch);
-            if (at.found) {
-                entries_entry = &it->second;
-                current_is_tombstone = at.is_tombstone;
-                current_proxy = to_proxy(it->first, at.rev, at.is_tombstone);
+    if (!found && (fold_active ||
+                   has_pending_.load(std::memory_order_relaxed))) {
+        mlock = std::unique_lock(meta_mu_);  // 锁序:分片 → meta
+        if (pending_.has_value()) {
+            auto p = pending_->find(key);
+            if (p != pending_->end() && kMaxEpoch >= p->second.epoch) {
+                pending_entry = &p->second;
+                current_is_tombstone = is_pending_tombstone(*pending_entry);
+                current_proxy = to_proxy(p->first, *pending_entry, current_is_tombstone);
                 found = true;
             }
         }
@@ -291,9 +364,9 @@ PutResult KeyDir::put(std::string_view key,
         return PutResult::kAlreadyExists;
     }
 
-    // 全局 epoch 计数器递增，作为本次写入的时间戳。
-    epoch_ += 1;
-    const std::uint64_t this_epoch = epoch_;
+    // 全局 epoch 计数器递增，作为本次写入的时间戳。分片锁内完成。
+    const std::uint64_t this_epoch =
+        epoch_.fetch_add(1, std::memory_order_relaxed) + 1;
 
     // ---- 分支 (A)：key 不存在或当前是墓碑 ----
     if (!found || current_is_tombstone) {
@@ -301,52 +374,61 @@ PutResult KeyDir::put(std::string_view key,
         // 说明并发 merger 已经把 file_id 推到更大的值，这次 put 是「向后」
         // 写入，必须拒绝（caller 拿到 kAlreadyExists 后会 roll_active 切到
         // 更大的 file_id 重试）。
-        if ((newest_put && file_id < biggest_file_id_) || old_file_id != 0) {
+        if ((newest_put &&
+             file_id < biggest_file_id_.load(std::memory_order_relaxed)) ||
+            old_file_id != 0) {
             return PutResult::kAlreadyExists;
         }
 
         SingleEntry s{file_id, total_sz, offset, this_epoch, tstamp, ord};
 
         if (pending_entry != nullptr) {
-            // 之前在 pending 里是墓碑——直接覆盖成活的 entry。
+            // 之前在 pending 里是墓碑——直接覆盖成活的 entry（mlock 已持）。
             *pending_entry = s;
-        } else if (pending_.has_value()) {
-            // 已经 frozen 但这个 key 哪里都没——插入 pending。
-            pending_->insert_or_assign(std::string(key), s);
-            pending_updated_ += 1;
         } else if (entries_entry != nullptr) {
             // 在 entries_ 里是墓碑（必定是 sibling 链），插一条新 revision
             // 放到链头标记它复活了。
+            // 注:旧实现这里优先查 pending_.has_value() 分流;S2 改为优先
+            // 升链——维持 entries/pending 不相交不变量（entries 已有的 key
+            // 绝不进 pending）。
             if (auto* multi = std::get_if<MultiEntry>(entries_entry)) {
                 multi->revisions.insert(multi->revisions.begin(), s);
             } else {
                 // 理论不可达——SingleEntry 不存墓碑标记。
                 *entries_entry = s;
             }
-        } else if (keyfolders_ > 0) {
-            // fold 期间第一次写入新 key——freeze 并把写入分流到 pending。
+        } else if (mlock.owns_lock()) {
+            // fold 态新 key——分流到 pending（meta unique 已持）。
             // legacy 这里靠 kh_put_will_resize 判断是否真的要分流（rehash
             // 才会破坏迭代器），我们简化为「fold 期间一律分流」——正确性
             // 等价，pending 表略大一点点。
-            pending_.emplace();
-            pending_start_epoch_ = this_epoch;
-            pending_start_time_  = now_sec;
-            pending_updated_     = 0;
+            if (!pending_.has_value()) {
+                pending_.emplace();
+                pending_start_epoch_ = this_epoch;
+                pending_start_time_  = now_sec;
+                pending_updated_     = 0;
+                has_pending_.store(true, std::memory_order_relaxed);
+            }
             pending_->insert_or_assign(std::string(key), s);
             pending_updated_ += 1;
         } else {
-            // 最常见路径：没 fold、key 全新——直接进 entries_。
-            entries_.insert_or_assign(std::string(key), Entry{s});
+            // 最常见路径：没 fold、key 全新——直接进本分片 entries。
+            sh.entries.insert_or_assign(std::string(key), Entry{s});
         }
 
-        key_count_ += 1;
-        key_bytes_ += key.size();
-        if (keyfolders_ > 0) iter_mutation_ = true;
+        key_count_.fetch_add(1, std::memory_order_relaxed);
+        key_bytes_.fetch_add(key.size(), std::memory_order_relaxed);
+        if (fold_active) iter_mutation_.store(true, std::memory_order_relaxed);
 
         const auto sz_i32 = static_cast<std::int32_t>(total_sz);
-        update_fstats_locked(file_id, tstamp, kMaxEpoch,
-                             1, 1, sz_i32, sz_i32, /*should_create*/ true);
-        if (file_id > biggest_file_id_) biggest_file_id_ = file_id;
+        update_fstats(file_id, tstamp, kMaxEpoch,
+                      1, 1, sz_i32, sz_i32, /*should_create*/ true);
+        // CAS-max:并发 put 跨分片推进 biggest_file_id_。
+        std::uint32_t big = biggest_file_id_.load(std::memory_order_relaxed);
+        while (file_id > big &&
+               !biggest_file_id_.compare_exchange_weak(
+                   big, file_id, std::memory_order_relaxed)) {
+        }
         return PutResult::kOk;
     }
 
@@ -370,17 +452,18 @@ PutResult KeyDir::put(std::string_view key,
     //   - 普通模式：tstamp 严格大、file_id 大、或同 file_id 但 offset 大
     // 任一满足就接受新 entry，否则当作 stale 拒绝（CAS race 兜底）。
     const bool accept =
-        (newest_put && file_id >= biggest_file_id_) ||
+        (newest_put &&
+         file_id >= biggest_file_id_.load(std::memory_order_relaxed)) ||
         (!newest_put && cur.tstamp < tstamp) ||
         (!newest_put && (cur.file_id < file_id ||
                           (cur.file_id == file_id && cur.offset < offset)));
 
     if (!accept) {
-        if (!is_ready_) {
-            update_fstats_locked(file_id, tstamp, kMaxEpoch,
-                                 0, 1, 0,
-                                 static_cast<std::int32_t>(total_sz),
-                                 /*should_create*/ true);
+        if (!is_ready_.load(std::memory_order_relaxed)) {
+            update_fstats(file_id, tstamp, kMaxEpoch,
+                          0, 1, 0,
+                          static_cast<std::int32_t>(total_sz),
+                          /*should_create*/ true);
         }
         return PutResult::kAlreadyExists;
     }
@@ -389,27 +472,28 @@ PutResult KeyDir::put(std::string_view key,
     const auto sz_i32     = static_cast<std::int32_t>(total_sz);
     const auto cur_sz_i32 = static_cast<std::int32_t>(cur.total_sz);
     if (cur.file_id != file_id) {
-        update_fstats_locked(cur.file_id, /*tstamp*/ 0, kMaxEpoch,
-                             -1, 0, -cur_sz_i32, 0, /*should_create*/ false);
-        update_fstats_locked(file_id, tstamp, kMaxEpoch,
-                             1, 1, sz_i32, sz_i32, /*should_create*/ true);
+        update_fstats(cur.file_id, /*tstamp*/ 0, kMaxEpoch,
+                      -1, 0, -cur_sz_i32, 0, /*should_create*/ false);
+        update_fstats(file_id, tstamp, kMaxEpoch,
+                      1, 1, sz_i32, sz_i32, /*should_create*/ true);
     } else {
-        update_fstats_locked(file_id, tstamp, kMaxEpoch,
-                             0, 1, sz_i32 - cur_sz_i32, sz_i32,
-                             /*should_create*/ true);
+        update_fstats(file_id, tstamp, kMaxEpoch,
+                      0, 1, sz_i32 - cur_sz_i32, sz_i32,
+                      /*should_create*/ true);
     }
-    if (keyfolders_ > 0) iter_mutation_ = true;
+    if (fold_active) iter_mutation_.store(true, std::memory_order_relaxed);
 
     SingleEntry next{file_id, total_sz, offset, this_epoch, tstamp, ord};
 
     if (pending_entry != nullptr) {
-        // 已经在 pending 里——直接覆盖（pending 自身就是 fold 不可见的）。
+        // 已经在 pending 里——直接覆盖（pending 自身就是 fold 不可见的；
+        // mlock 已持）。
         *pending_entry = next;
     } else {
         assert(entries_entry != nullptr);
-        if (keyfolders_ > 0) {
+        if (fold_active) {
             // fold 在跑——把旧 revision 留在链里给迭代器看，新 revision
-            // 插到链头。SingleEntry 自动升级成 MultiEntry。
+            // 插到链头。SingleEntry 自动升级成 MultiEntry。全程分片内。
             if (auto* multi = std::get_if<MultiEntry>(entries_entry)) {
                 multi->revisions.insert(multi->revisions.begin(), next);
             } else {
@@ -425,127 +509,135 @@ PutResult KeyDir::put(std::string_view key,
         }
     }
 
-    if (file_id > biggest_file_id_) biggest_file_id_ = file_id;
+    std::uint32_t big = biggest_file_id_.load(std::memory_order_relaxed);
+    while (file_id > big &&
+           !biggest_file_id_.compare_exchange_weak(
+               big, file_id, std::memory_order_relaxed)) {
+    }
     return PutResult::kOk;
 }
 
 // 无条件 delete。返回 true 表示原本有这条 key（fstats 已减了一次 live）；
 // false 表示 key 不在 keydir 里，调用方一般也不需要管这个返回值。
 //
-// 跟 put 一样有三种存放路径：直接 erase / 升级 sibling 链 / 写 pending tomb。
+// 存放路径（S2）：
+//   - entries 命中 + 无 fold：直接 erase；
+//   - entries 命中 + fold 态：升级 sibling 链插墓碑（分片内完成）。
+//     注:旧实现在 pending 已冻结时对 entries 命中写 pending 墓碑;S2 改为
+//     统一升链,维持 entries/pending 不相交不变量（get 的 entries 优先
+//     探测顺序依赖它）。语义对迭代器等价（旧 revision 都保留）,且修复了
+//     旧实现「freeze 复用的后启 fold 看不到 remove」的不一致。
+//   - entries miss + pending 命中：pending 内原地改墓碑（meta unique）。
 bool KeyDir::remove(std::string_view key, std::uint32_t remove_time) {
-    std::unique_lock lock(mutex_);
+    Shard& sh = shards_[shard_for(key)];
+    std::unique_lock slock(sh.mu);
 
-    epoch_ += 1;
-    const std::uint64_t this_epoch = epoch_;
+    // 与旧实现一致:无论命中与否都消耗一个 epoch（epoch 洞无害）。
+    const std::uint64_t this_epoch =
+        epoch_.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool fold_active = keyfolders_.load(std::memory_order_relaxed) > 0;
 
-    SingleEntry* pending_entry = nullptr;
-    Entry* entries_entry = nullptr;
-    SingleEntry cur{};
-    bool found = false;
+    auto it = sh.entries.find(key);
+    if (it != sh.entries.end()) {
+        auto at = entry_at_epoch(it->second, kMaxEpoch);
+        if (!at.found || at.is_tombstone) return false;  // 已是墓碑/不可见
+        const SingleEntry cur = at.rev;
 
-    // 跟 legacy find_keydir_entry 完全一致：pending 永远 shadow entries。
-    // 即使 pending 里的是墓碑也不再去查 entries——否则 fold 期间被覆盖到
-    // entries 里的「旧 live revision」会被 remove 当成「活的」再减一次
-    // key_count_，造成 double-decrement bug。
-    if (pending_.has_value()) {
-        auto p = pending_->find(key);
-        if (p != pending_->end()) {
-            if (is_pending_tombstone(p->second)) {
-                return false;  // shadowed by pending tomb
+        update_fstats(cur.file_id, cur.tstamp, kMaxEpoch,
+                      -1, 0, -static_cast<std::int32_t>(cur.total_sz), 0,
+                      /*should_create*/ false);
+        assert(key_count_.load(std::memory_order_relaxed) > 0 &&
+               "remove found a live entry but key_count_ is 0");
+        key_count_.fetch_sub(1, std::memory_order_relaxed);
+        key_bytes_.fetch_sub(key.size(), std::memory_order_relaxed);
+
+        if (fold_active) {
+            iter_mutation_.store(true, std::memory_order_relaxed);
+            // 升 sibling 链插墓碑,旧 revision 留给迭代器。
+            SingleEntry t = make_sibling_tombstone(this_epoch, remove_time);
+            if (auto* multi = std::get_if<MultiEntry>(&it->second)) {
+                multi->revisions.insert(multi->revisions.begin(), t);
+            } else {
+                MultiEntry promoted;
+                promoted.revisions.reserve(2);
+                promoted.revisions.push_back(t);
+                promoted.revisions.push_back(*std::get_if<SingleEntry>(&it->second));
+                it->second = std::move(promoted);
             }
-            pending_entry = &p->second;
-            cur = p->second;
-            found = true;
-        }
-    }
-    if (!found) {
-        auto it = entries_.find(key);
-        if (it != entries_.end()) {
-            auto at = entry_at_epoch(it->second, kMaxEpoch);
-            if (at.found && !at.is_tombstone) {
-                entries_entry = &it->second;
-                cur = at.rev;
-                found = true;
-            }
-        }
-    }
-    if (!found) return false;
-
-    update_fstats_locked(cur.file_id, cur.tstamp, kMaxEpoch,
-                         -1, 0, -static_cast<std::int32_t>(cur.total_sz), 0,
-                         /*should_create*/ false);
-    assert(key_count_ > 0 && "remove found a live entry but key_count_ is 0");
-    key_count_ -= 1;
-    key_bytes_ -= key.size();
-    if (keyfolders_ > 0) iter_mutation_ = true;
-
-    if (pending_entry != nullptr) {
-        // pending 里有 live entry——原地改成 pending 墓碑（offset = MAX）。
-        pending_entry->offset = kMaxOffset;
-        pending_entry->tstamp = remove_time;
-        pending_entry->epoch  = this_epoch;
-    } else if (pending_.has_value()) {
-        // 已 frozen 但 entry 只在 entries_ 里——分流写一条 pending 墓碑。
-        SingleEntry t{cur.file_id, cur.total_sz, kMaxOffset, this_epoch, remove_time, 0};
-        pending_->insert_or_assign(std::string(key), t);
-        pending_updated_ += 1;
-    } else if (keyfolders_ == 0) {
-        // 没 fold 干扰——直接从 entries_ 抹掉。
-        auto it = entries_.find(key);
-        if (it != entries_.end()) entries_.erase(it);
-    } else {
-        // 有 fold 但还没建 pending——往 entries 里插一条 sibling 墓碑
-        // （file_id/total_sz/offset 都是 MAX 的 sentinel revision），
-        // 把 SingleEntry 升级成 MultiEntry。
-        assert(entries_entry != nullptr);
-        SingleEntry t = make_sibling_tombstone(this_epoch, remove_time);
-        if (auto* multi = std::get_if<MultiEntry>(entries_entry)) {
-            multi->revisions.insert(multi->revisions.begin(), t);
         } else {
-            MultiEntry promoted;
-            promoted.revisions.reserve(2);
-            promoted.revisions.push_back(t);
-            promoted.revisions.push_back(*std::get_if<SingleEntry>(entries_entry));
-            *entries_entry = std::move(promoted);
+            // 没 fold 干扰——直接从本分片 entries 抹掉。
+            sh.entries.erase(it);
+        }
+        return true;
+    }
+
+    // entries miss → pending（仅 fold 态/deep_copy 残留）。
+    // 保持分片锁不放,嵌套 meta unique（锁序分片→meta;堵 merge TOCTOU）。
+    if (fold_active || has_pending_.load(std::memory_order_relaxed)) {
+        std::unique_lock mlock(meta_mu_);
+        if (pending_.has_value()) {
+            auto p = pending_->find(key);
+            if (p != pending_->end()) {
+                if (is_pending_tombstone(p->second)) {
+                    return false;  // 已是 pending 墓碑
+                }
+                const SingleEntry cur = p->second;
+                update_fstats(cur.file_id, cur.tstamp, kMaxEpoch,
+                              -1, 0, -static_cast<std::int32_t>(cur.total_sz), 0,
+                              /*should_create*/ false);
+                assert(key_count_.load(std::memory_order_relaxed) > 0 &&
+                       "remove found a live entry but key_count_ is 0");
+                key_count_.fetch_sub(1, std::memory_order_relaxed);
+                key_bytes_.fetch_sub(key.size(), std::memory_order_relaxed);
+                if (fold_active) {
+                    iter_mutation_.store(true, std::memory_order_relaxed);
+                }
+                // pending 里有 live entry——原地改成 pending 墓碑（offset=MAX）。
+                p->second.offset = kMaxOffset;
+                p->second.tstamp = remove_time;
+                p->second.epoch  = this_epoch;
+                return true;
+            }
         }
     }
-    return true;
+    return false;
 }
 
 // CAS-style remove：只有当前 entry 的 (tstamp, file_id, offset) 完全
 // 匹配才真的删；否则返回 kAlreadyExists 让 caller（一般是 merge / 内部
 // 清理）跳过。key 不存在视为「已经删了」——返回 kOk。
 //
-// 实现：先用 shared_lock 快速 peek 比对，匹配再 release shared_lock 升级
-// 成 unique_lock 真正调 remove。这样不匹配的常见路径无需独占锁。
+// 实现：先用分片 shared_lock 快速 peek 比对，匹配再释放并调 remove() 取
+// 分片 unique_lock。这样不匹配的常见路径无需独占锁。
 PutResult KeyDir::conditional_remove(std::string_view key,
                                       std::uint32_t tstamp,
                                       std::uint32_t file_id,
                                       std::uint64_t offset,
                                       std::uint32_t remove_time) {
     {
-        // 探测阶段：只读，避免没必要时占独占锁。
-        // 用跟 remove() 完全一样的 shadow 规则：pending 优先，pending 里有
-        // 墓碑就视为「key 已被 shadow 不存在」直接成功。
-        std::shared_lock lock(mutex_);
+        // 探测阶段：只读。探测顺序与 get/remove 一致:entries 优先,miss
+        // 再嵌套 meta shared 查 pending（锁序分片→meta）。
+        const Shard& sh = shards_[shard_for(key)];
+        std::shared_lock slock(sh.mu);
         SingleEntry cur{};
         bool found = false;
-        if (pending_.has_value()) {
-            auto p = pending_->find(key);
-            if (p != pending_->end()) {
-                if (is_pending_tombstone(p->second)) {
-                    return PutResult::kOk;  // shadowed; not-found is success
-                }
-                cur = p->second; found = true;
+        auto it = sh.entries.find(key);
+        if (it != sh.entries.end()) {
+            auto at = entry_at_epoch(it->second, kMaxEpoch);
+            if (at.found && !at.is_tombstone) {
+                cur = at.rev; found = true;
             }
         }
-        if (!found) {
-            auto it = entries_.find(key);
-            if (it != entries_.end()) {
-                auto at = entry_at_epoch(it->second, kMaxEpoch);
-                if (at.found && !at.is_tombstone) {
-                    cur = at.rev; found = true;
+        if (!found && (keyfolders_.load(std::memory_order_relaxed) > 0 ||
+                       has_pending_.load(std::memory_order_relaxed))) {
+            std::shared_lock mlock(meta_mu_);
+            if (pending_.has_value()) {
+                auto p = pending_->find(key);
+                if (p != pending_->end()) {
+                    if (is_pending_tombstone(p->second)) {
+                        return PutResult::kOk;  // 已删,not-found is success
+                    }
+                    cur = p->second; found = true;
                 }
             }
         }
@@ -561,12 +653,9 @@ PutResult KeyDir::conditional_remove(std::string_view key,
 // =============================================================================
 // 迭代器（IterHandle 实现放在同一个 TU；析构会调 release()）
 //
-// start() 做的关键事：
-//   1. 拿全部 entries_ 的 key 列表（snapshot）；
-//   2. 记录当前 epoch 作为 iter_epoch_，next() 用它过滤 revision；
-//   3. keyfolders_ ++；如果是第一个 folder，建立 pending_ map 接管新写入。
-// release() 做反向：keyfolders_ --；如果归零就把 pending_ merge 回 entries_
-// 并把全部 MultiEntry 折回 SingleEntry。
+// start() / release() 是全屏障（stop-the-world）冷路径：按下标序拿全部
+// 16 个分片 unique 再拿 meta unique，屏障内逐字执行原全局锁下的逻辑——
+// 全独占下原实现语义不变（设计 §4 方案 B）。
 // =============================================================================
 
 IterHandle::~IterHandle() noexcept {
@@ -581,15 +670,15 @@ IterHandle::~IterHandle() noexcept {
 //      freeze（共享同一份 pending），iter_epoch_ 取最新 epoch。
 //   2. pending 太老（age > maxage 或 updated > maxputs）——返回
 //      kOutOfDate，让 caller 等待 pending 排空再重试。
-//   3. 通过的话拍一个 keys snapshot：枚举当前所有 entries_ 的 key，
-//      copy 进 keys_snapshot_。next() 后续从这个 snapshot 走，对
+//   3. 通过的话拍一个 keys snapshot：按分片下标序枚举所有 entries 的
+//      key，copy 进 keys_snapshot_。next() 后续从这个 snapshot 走，对
 //      rehash 完全免疫。
-//
-// 性能优化（key 直接 copy 一份）是 M5 之后的事——M5 阶段先求正确性。
 StartIterResult IterHandle::start(std::uint32_t now_sec,
                                    int maxage, int maxputs) {
     if (iterating_) return StartIterResult::kAlreadyIterating;
-    std::unique_lock lock(parent_->mutex_);
+    // 全屏障:全部分片 unique（下标序）→ meta unique。锁序见 keydir.hpp。
+    auto shard_locks = parent_->lock_all_shards();
+    std::unique_lock mlock(parent_->meta_mu_);
 
     // pending freeze 复用判断：现存 pending 是否仍然「足够新」给本次 fold 用。
     auto can_use_existing_freeze = [&]() -> bool {
@@ -609,32 +698,41 @@ StartIterResult IterHandle::start(std::uint32_t now_sec,
         return StartIterResult::kOutOfDate;
     }
 
-    parent_->epoch_ += 1;
     iterating_ = true;
-    iter_epoch_ = parent_->epoch_;
+    iter_epoch_ = parent_->epoch_.fetch_add(1, std::memory_order_relaxed) + 1;
     parent_->newest_folder_epoch_ = iter_epoch_;
-    parent_->keyfolders_ += 1;
+    // keyfolders_ 只在全屏障内修改（此处与 release）。
+    parent_->keyfolders_.fetch_add(1, std::memory_order_relaxed);
 
-    // 拍 key snapshot——O(n) 一次性开销，之后对 entries_ 的 rehash 免疫。
+    // 拍 key snapshot——O(n) 一次性开销，跨分片归并（按分片下标序拼接），
+    // 之后对 entries 的 rehash 免疫。
     keys_snapshot_.clear();
-    keys_snapshot_.reserve(parent_->entries_.size());
-    for (const auto& [k, _] : parent_->entries_) {
-        keys_snapshot_.push_back(k);
+    std::size_t total = 0;
+    for (const auto& sh : parent_->shards_) total += sh.entries.size();
+    keys_snapshot_.reserve(total);
+    for (const auto& sh : parent_->shards_) {
+        for (const auto& [k, _] : sh.entries) {
+            keys_snapshot_.push_back(k);
+        }
     }
     cursor_ = 0;
     return StartIterResult::kOk;
 }
 
-// 取下一项。读锁就够：cursor_ 是 per-handle 状态（不共享），entries_/
-// pending_ 在这里只读不改。snapshot 期间被 erase 的 key 直接跳过。
+// 取下一项。对 cursor 指向的 key:其分片 shared → 查 entries →
+// entry_at_epoch。cursor_ 是 per-handle 状态（不共享）;keys_snapshot_
+// 全部来自 entries,所以这里不需要触碰 pending_（fold 期间 entries 的
+// key 集只增不减——remove 走 sibling 墓碑,不 erase）。
+// snapshot 期间被折叠 erase 的 key（不可能在 fold 中,防御）直接跳过。
 std::optional<EntryProxy> IterHandle::next(bool include_tombstones) {
     if (!iterating_) return std::nullopt;
-    std::shared_lock lock(parent_->mutex_);
 
     while (cursor_ < keys_snapshot_.size()) {
         const std::string& k = keys_snapshot_[cursor_++];
-        auto it = parent_->entries_.find(k);
-        if (it == parent_->entries_.end()) continue;  // 拍快照后被删了
+        const auto& sh = parent_->shards_[KeyDir::shard_for(k)];
+        std::shared_lock lock(sh.mu);
+        auto it = sh.entries.find(k);
+        if (it == sh.entries.end()) continue;  // 拍快照后被删了
 
         auto at = entry_at_epoch(it->second, iter_epoch_);
         if (!at.found) continue;
@@ -646,72 +744,78 @@ std::optional<EntryProxy> IterHandle::next(bool include_tombstones) {
 
 // 结束迭代。最后一个 folder release 时触发 pending → entries 合并 +
 // MultiEntry 折叠。这两步是 fold 期间「写时复制」的反向收尾。
+// 全屏障下执行——与 start 同样的锁集合。
 void IterHandle::release() {
     if (!iterating_) return;
-    std::unique_lock lock(parent_->mutex_);
+    auto shard_locks = parent_->lock_all_shards();
+    std::unique_lock mlock(parent_->meta_mu_);
     iterating_ = false;
     iter_epoch_ = kMaxEpoch;
     keys_snapshot_.clear();
     cursor_ = 0;
 
-    parent_->keyfolders_ -= 1;
-    if (parent_->keyfolders_ == 0) {
-        parent_->merge_pending_and_collapse_locked();
+    if (parent_->keyfolders_.fetch_sub(1, std::memory_order_relaxed) == 1) {
+        parent_->merge_pending_and_collapse_barrier();
         parent_->iter_generation_ += 1;
-        parent_->iter_mutation_ = false;
+        parent_->iter_mutation_.store(false, std::memory_order_relaxed);
     }
 }
 
-// 把 fold 期间累积的 pending 表 merge 回 entries_，并把所有 sibling 链
-// 折回 SingleEntry。前置条件：caller 持 unique_lock(mutex_)，且 keyfolders_
-// 已经归零（即不会再有迭代器看老 revision）。
-void KeyDir::merge_pending_and_collapse_locked() {
+// 把 fold 期间累积的 pending 表 merge 回各分片 entries，并把所有 sibling
+// 链折回 SingleEntry。前置条件：caller 持全屏障（全部分片 unique + meta
+// unique），且 keyfolders_ 已经归零（即不会再有迭代器看老 revision）。
+void KeyDir::merge_pending_and_collapse_barrier() {
     if (pending_.has_value()) {
-        // 第 1 步：把 pending 里的 entry 合并回 entries_。
+        // 第 1 步：把 pending 里的 entry 按 shard_for 合并回各分片 entries。
         // pending 墓碑的语义：
         //   - entries 里没这个 key：什么都不做（fold 期间出现又消失的临时 key）
         //   - entries 里有：直接 erase，相当于完成最终 delete
+        //     （S2 不变量下 pending∩entries=∅,该分支理论不可达,保留防御）
         // pending 活 entry 直接覆盖进 entries（unconditional——fold 期间
         // 这个 key 在 entries 里的旧 revision 已经没用了）。
         for (auto& [k, p_entry] : *pending_) {
-            auto it = entries_.find(k);
+            auto& sh = shards_[shard_for(k)];
+            auto it = sh.entries.find(k);
             const bool is_tomb = is_pending_tombstone(p_entry);
 
-            if (it == entries_.end()) {
+            if (it == sh.entries.end()) {
                 if (is_tomb) {
                     // 临时墓碑——丢弃即可。
                 } else {
-                    entries_.emplace(k, Entry{p_entry});
+                    sh.entries.emplace(k, Entry{p_entry});
                 }
             } else {
                 if (is_tomb) {
-                    entries_.erase(it);
+                    sh.entries.erase(it);
                 } else {
                     it->second = Entry{p_entry};
                 }
             }
         }
         pending_.reset();
+        has_pending_.store(false, std::memory_order_relaxed);
         pending_start_epoch_ = 0;
         pending_start_time_  = 0;
         pending_updated_     = 0;
     }
 
-    // 第 2 步：把所有 MultiEntry 折回 SingleEntry。
+    // 第 2 步：遍历所有分片,把 MultiEntry 折回 SingleEntry。
     // 链头是最新 revision；如果链头本身是 sibling 墓碑，整个 entry 都消失。
-    for (auto it = entries_.begin(); it != entries_.end(); ) {
-        if (auto* m = std::get_if<MultiEntry>(&it->second)) {
-            if (m->revisions.empty() || is_sibling_tombstone(m->revisions.front())) {
-                it = entries_.erase(it);
-                continue;
+    for (auto& sh : shards_) {
+        for (auto it = sh.entries.begin(); it != sh.entries.end(); ) {
+            if (auto* m = std::get_if<MultiEntry>(&it->second)) {
+                if (m->revisions.empty() || is_sibling_tombstone(m->revisions.front())) {
+                    it = sh.entries.erase(it);
+                    continue;
+                }
+                // 关键：必须先把 front 拷出来再覆盖回 variant！直接
+                // it->second = m->revisions.front() 会在赋值过程中析构 m，
+                // m->revisions.front() 引用的内存就被释放——经典悬垂引用。
+                const SingleEntry winner = m->revisions.front();
+                it->second = winner;
             }
-            // 关键：必须先把 front 拷出来再覆盖回 variant！直接
-            // it->second = m->revisions.front() 会在赋值过程中析构 m，
-            // m->revisions.front() 引用的内存就被释放——经典悬垂引用。
-            const SingleEntry winner = m->revisions.front();
-            it->second = winner;
+            ++it;
         }
-        ++it;
     }
 }
 
@@ -720,26 +824,21 @@ void KeyDir::merge_pending_and_collapse_locked() {
 // =============================================================================
 
 void KeyDir::mark_ready() {
-    std::unique_lock lock(mutex_);
-    is_ready_ = true;
+    is_ready_.store(true, std::memory_order_release);
 }
 
 bool KeyDir::is_ready() const {
-    std::shared_lock lock(mutex_);
-    return is_ready_;
+    return is_ready_.load(std::memory_order_acquire);
 }
 
 std::uint32_t KeyDir::biggest_file_id() const {
-    std::shared_lock lock(mutex_);
-    return biggest_file_id_;
+    return biggest_file_id_.load(std::memory_order_relaxed);
 }
 
 // 给新 active file / 新 merge 输出文件分配下一个 file_id。
 // 单调递增是 keydir 的核心不变量——put 的 staleness 判断依赖它。
 std::uint32_t KeyDir::increment_file_id() {
-    std::unique_lock lock(mutex_);
-    biggest_file_id_ += 1;
-    return biggest_file_id_;
+    return biggest_file_id_.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
 // 把计数器至少推到 conditional_id（不小于）。给两种场景：
@@ -747,26 +846,46 @@ std::uint32_t KeyDir::increment_file_id() {
 //   2. open 扫盘后发现磁盘上 max(file_id) 大于内存计数器（异常恢复），
 //      需要追上来。
 std::uint32_t KeyDir::increment_file_id_at_least(std::uint32_t conditional_id) {
-    std::unique_lock lock(mutex_);
-    if (conditional_id > biggest_file_id_) biggest_file_id_ = conditional_id;
-    return biggest_file_id_;
+    // CAS-max:与并发 put/increment_file_id 兼容。
+    std::uint32_t cur = biggest_file_id_.load(std::memory_order_relaxed);
+    while (conditional_id > cur &&
+           !biggest_file_id_.compare_exchange_weak(
+               cur, conditional_id, std::memory_order_relaxed)) {
+    }
+    return std::max(cur, conditional_id);
 }
 
 KeyDirInfo KeyDir::info() const {
-    std::shared_lock lock(mutex_);
     KeyDirInfo r;
-    r.key_count = key_count_;
-    r.key_bytes = key_bytes_;
-    r.epoch     = epoch_;
-    r.iter_info.iter_generation = iter_generation_;
-    r.iter_info.keyfolders      = keyfolders_;
-    r.iter_info.frozen          = pending_.has_value();
-    r.iter_info.pending_start_epoch =
-        pending_.has_value() ? std::optional<std::uint64_t>(pending_start_epoch_)
-                               : std::nullopt;
-    r.fstats.reserve(fstats_.size());
-    for (std::size_t i = 0; i < fstats_.size(); ++i) {
-        if (fstats_present_[i]) r.fstats.push_back(fstats_[i]);
+    // 计数器都是 atomic,近似一致读即可（设计 §2）。
+    r.key_count = key_count_.load(std::memory_order_relaxed);
+    r.key_bytes = key_bytes_.load(std::memory_order_relaxed);
+    r.epoch     = epoch_.load(std::memory_order_relaxed);
+    {
+        // iter 协调状态归 meta_mu_（独立持有合法,锁序末段）。
+        std::shared_lock mlock(meta_mu_);
+        r.iter_info.iter_generation = iter_generation_;
+        r.iter_info.keyfolders      = keyfolders_.load(std::memory_order_relaxed);
+        r.iter_info.frozen          = pending_.has_value();
+        r.iter_info.pending_start_epoch =
+            pending_.has_value() ? std::optional<std::uint64_t>(pending_start_epoch_)
+                                   : std::nullopt;
+    }
+    const std::size_t fn = fstats_size_.load(std::memory_order_acquire);
+    r.fstats.reserve(fn);
+    for (std::size_t i = 0; i < fn; ++i) {
+        const auto& f = fstats_[i];
+        if (!f.present.load(std::memory_order_relaxed)) continue;
+        FStatsEntry e;
+        e.file_id          = static_cast<std::uint32_t>(i);
+        e.live_keys        = f.live_keys.load(std::memory_order_relaxed);
+        e.total_keys       = f.total_keys.load(std::memory_order_relaxed);
+        e.live_bytes       = f.live_bytes.load(std::memory_order_relaxed);
+        e.total_bytes      = f.total_bytes.load(std::memory_order_relaxed);
+        e.oldest_tstamp    = f.oldest_tstamp.load(std::memory_order_relaxed);
+        e.newest_tstamp    = f.newest_tstamp.load(std::memory_order_relaxed);
+        e.expiration_epoch = f.expiration_epoch.load(std::memory_order_relaxed);
+        r.fstats.push_back(e);
     }
     return r;
 }
@@ -775,24 +894,55 @@ KeyDirInfo KeyDir::info() const {
 // 但 cask 内部某些 merge 路径仍可能用类似的快照）。
 // 拷贝出来的 keydir keyfolders_ 强制清零——副本是「干净的全新 keydir」，
 // 不继承任何活跃 fold 状态，直接可以独立使用。
+// 锁：全部分片 shared（下标序）+ meta shared。
 std::shared_ptr<KeyDir> KeyDir::deep_copy() const {
     auto copy = std::make_shared<KeyDir>();
-    std::shared_lock lock(mutex_);
-    copy->entries_         = entries_;
-    copy->pending_         = pending_;
-    copy->fstats_          = fstats_;
-    copy->fstats_present_  = fstats_present_;
-    copy->key_count_       = key_count_;
-    copy->key_bytes_       = key_bytes_;
-    copy->epoch_           = epoch_;
+    auto shard_locks = lock_all_shards_shared();
+    std::shared_lock mlock(meta_mu_);
+    for (std::size_t i = 0; i < kShards; ++i) {
+        copy->shards_[i].entries = shards_[i].entries;
+    }
+    copy->pending_ = pending_;
+    copy->has_pending_.store(pending_.has_value(), std::memory_order_relaxed);
+    {
+        const std::size_t fn = fstats_size_.load(std::memory_order_acquire);
+        std::lock_guard<std::mutex> g(copy->fstats_grow_mu_);
+        while (copy->fstats_.size() < fn) copy->fstats_.emplace_back();
+        for (std::size_t i = 0; i < fn; ++i) {
+            const auto& a = fstats_[i];
+            auto& b = copy->fstats_[i];
+            b.live_keys.store(a.live_keys.load(std::memory_order_relaxed),
+                              std::memory_order_relaxed);
+            b.total_keys.store(a.total_keys.load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
+            b.live_bytes.store(a.live_bytes.load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
+            b.total_bytes.store(a.total_bytes.load(std::memory_order_relaxed),
+                                std::memory_order_relaxed);
+            b.oldest_tstamp.store(a.oldest_tstamp.load(std::memory_order_relaxed),
+                                  std::memory_order_relaxed);
+            b.newest_tstamp.store(a.newest_tstamp.load(std::memory_order_relaxed),
+                                  std::memory_order_relaxed);
+            b.expiration_epoch.store(
+                a.expiration_epoch.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            b.present.store(a.present.load(std::memory_order_relaxed),
+                            std::memory_order_relaxed);
+        }
+        copy->fstats_size_.store(fn, std::memory_order_release);
+    }
+    copy->key_count_.store(key_count_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    copy->key_bytes_.store(key_bytes_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    copy->epoch_.store(epoch_.load(std::memory_order_relaxed), std::memory_order_relaxed);
     copy->next_ord_.store(next_ord_.load(std::memory_order_relaxed),
                           std::memory_order_relaxed);
-    copy->biggest_file_id_ = biggest_file_id_;
-    copy->is_ready_        = is_ready_;
+    copy->biggest_file_id_.store(biggest_file_id_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    copy->is_ready_.store(is_ready_.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
     copy->iter_generation_ = iter_generation_;
-    copy->keyfolders_      = 0;  // 副本不继承 fold 状态
+    copy->keyfolders_.store(0, std::memory_order_relaxed);  // 副本不继承 fold 状态
     copy->newest_folder_epoch_ = 0;
-    copy->iter_mutation_   = false;
+    copy->iter_mutation_.store(false, std::memory_order_relaxed);
     copy->pending_start_epoch_ = pending_start_epoch_;
     copy->pending_start_time_  = pending_start_time_;
     copy->pending_updated_     = pending_updated_;
@@ -803,6 +953,7 @@ std::shared_ptr<KeyDir> KeyDir::deep_copy() const {
 // ============================================================================
 // A4:keydir 段快照(设计 doc/recovery-snapshot-design-zh.md)
 // 格式:[magic "BCKS"][ver=1][payload][crc32(payload)],LE,tmp+rename。
+// 磁盘格式无分片概念（重分片自由）,S2 只改内存侧的读写路径。
 // ============================================================================
 
 namespace {
@@ -843,37 +994,46 @@ struct SnapCursor {
 bool KeyDir::save_snapshot(
     std::string_view path,
     const std::vector<std::pair<std::uint32_t, std::uint64_t>>& watermarks) const {
-    std::unique_lock lock(mutex_);
-    if (keyfolders_ != 0) return false;  // 活跃 fold:MultiEntry 可能存在,放弃
+    // 全部分片 shared + meta shared:写者静止点;keyfolders_==0 检查保持
+    // 「活跃 fold 拒绝」语义（shared 屏障下 start/release 无法并发进行）。
+    auto shard_locks = lock_all_shards_shared();
+    std::shared_lock mlock(meta_mu_);
+    if (keyfolders_.load(std::memory_order_relaxed) != 0) {
+        return false;  // 活跃 fold:MultiEntry 可能存在,放弃
+    }
+
+    std::size_t entries_total = 0;
+    for (const auto& sh : shards_) entries_total += sh.entries.size();
 
     std::vector<std::uint8_t> buf;
-    buf.reserve(64 + entries_.size() * 56);
+    buf.reserve(64 + entries_total * 56);
     snap_put32(buf, kSnapMagic);
     snap_put32(buf, kSnapVersion);
     const std::size_t payload_begin = buf.size();
 
     snap_put64(buf, next_ord_.load(std::memory_order_relaxed));
-    snap_put64(buf, epoch_);
-    snap_put32(buf, biggest_file_id_);
-    snap_put64(buf, key_count_);
-    snap_put64(buf, key_bytes_);
+    snap_put64(buf, epoch_.load(std::memory_order_relaxed));
+    snap_put32(buf, biggest_file_id_.load(std::memory_order_relaxed));
+    snap_put64(buf, key_count_.load(std::memory_order_relaxed));
+    snap_put64(buf, key_bytes_.load(std::memory_order_relaxed));
 
+    const std::size_t fsz = fstats_size_.load(std::memory_order_acquire);
     std::uint32_t fstats_n = 0;
-    for (std::size_t i = 0; i < fstats_.size(); ++i) {
-        if (fstats_present_[i]) ++fstats_n;
+    for (std::size_t i = 0; i < fsz; ++i) {
+        if (fstats_[i].present.load(std::memory_order_relaxed)) ++fstats_n;
     }
     snap_put32(buf, fstats_n);
-    for (std::size_t i = 0; i < fstats_.size(); ++i) {
-        if (!fstats_present_[i]) continue;
+    for (std::size_t i = 0; i < fsz; ++i) {
         const auto& f = fstats_[i];
-        snap_put32(buf, f.file_id);
-        snap_put64(buf, f.live_keys);
-        snap_put64(buf, f.total_keys);
-        snap_put64(buf, f.live_bytes);
-        snap_put64(buf, f.total_bytes);
-        snap_put32(buf, f.oldest_tstamp);
-        snap_put32(buf, f.newest_tstamp);
-        snap_put64(buf, f.expiration_epoch);
+        if (!f.present.load(std::memory_order_relaxed)) continue;
+        snap_put32(buf, static_cast<std::uint32_t>(i));
+        snap_put64(buf, f.live_keys.load(std::memory_order_relaxed));
+        snap_put64(buf, f.total_keys.load(std::memory_order_relaxed));
+        snap_put64(buf, f.live_bytes.load(std::memory_order_relaxed));
+        snap_put64(buf, f.total_bytes.load(std::memory_order_relaxed));
+        snap_put32(buf, f.oldest_tstamp.load(std::memory_order_relaxed));
+        snap_put32(buf, f.newest_tstamp.load(std::memory_order_relaxed));
+        snap_put64(buf, f.expiration_epoch.load(std::memory_order_relaxed));
     }
 
     snap_put32(buf, static_cast<std::uint32_t>(watermarks.size()));
@@ -882,22 +1042,24 @@ bool KeyDir::save_snapshot(
         snap_put64(buf, off);
     }
 
-    snap_put64(buf, entries_.size());
-    for (auto& [key, entry] : entries_) {
-        const auto* se = std::get_if<SingleEntry>(&entry);
-        if (se == nullptr) return false;  // 防御:不应出现(keyfolders_==0)
-        if (key.size() > 0xFFFF) return false;
-        const auto klen = static_cast<std::uint16_t>(key.size());
-        const auto* kp = reinterpret_cast<const std::uint8_t*>(&klen);
-        buf.insert(buf.end(), kp, kp + 2);
-        const auto* kd = reinterpret_cast<const std::uint8_t*>(key.data());
-        buf.insert(buf.end(), kd, kd + key.size());
-        snap_put32(buf, se->file_id);
-        snap_put32(buf, se->total_sz);
-        snap_put64(buf, se->offset);
-        snap_put64(buf, se->epoch);
-        snap_put32(buf, se->tstamp);
-        snap_put64(buf, se->ord);
+    snap_put64(buf, entries_total);
+    for (const auto& shard : shards_) {
+        for (auto& [key, entry] : shard.entries) {
+            const auto* se = std::get_if<SingleEntry>(&entry);
+            if (se == nullptr) return false;  // 防御:不应出现(keyfolders_==0)
+            if (key.size() > 0xFFFF) return false;
+            const auto klen = static_cast<std::uint16_t>(key.size());
+            const auto* kp = reinterpret_cast<const std::uint8_t*>(&klen);
+            buf.insert(buf.end(), kp, kp + 2);
+            const auto* kd = reinterpret_cast<const std::uint8_t*>(key.data());
+            buf.insert(buf.end(), kd, kd + key.size());
+            snap_put32(buf, se->file_id);
+            snap_put32(buf, se->total_sz);
+            snap_put64(buf, se->offset);
+            snap_put64(buf, se->epoch);
+            snap_put32(buf, se->tstamp);
+            snap_put64(buf, se->ord);
+        }
     }
 
     const std::uint32_t crc = codec::crc32(std::span<const std::byte>(
@@ -946,23 +1108,28 @@ auto KeyDir::load_snapshot(std::string_view path)
     if (crc != stored_crc) return std::nullopt;
     c.end -= 4;  // payload 不含尾部 CRC
 
-    std::unique_lock lock(mutex_);
+    // open 期单线程,但仍按锁序拿全屏障（防御 + TSan 友好）。
+    auto shard_locks = lock_all_shards();
+    std::unique_lock mlock(meta_mu_);
     auto reset_all = [&] {
-        entries_.clear();
-        fstats_.clear();
-        fstats_present_.clear();
-        key_count_ = 0;
-        key_bytes_ = 0;
-        epoch_ = 0;
+        for (auto& sh : shards_) sh.entries.clear();
+        {
+            std::lock_guard<std::mutex> g(fstats_grow_mu_);
+            fstats_.clear();
+            fstats_size_.store(0, std::memory_order_release);
+        }
+        key_count_.store(0, std::memory_order_relaxed);
+        key_bytes_.store(0, std::memory_order_relaxed);
+        epoch_.store(0, std::memory_order_relaxed);
         next_ord_.store(0, std::memory_order_relaxed);
-        biggest_file_id_ = 0;
+        biggest_file_id_.store(0, std::memory_order_relaxed);
     };
 
     next_ord_.store(c.u64(), std::memory_order_relaxed);
-    epoch_ = c.u64();
-    biggest_file_id_ = c.u32();
-    key_count_ = c.u64();
-    key_bytes_ = c.u64();
+    epoch_.store(c.u64(), std::memory_order_relaxed);
+    biggest_file_id_.store(c.u32(), std::memory_order_relaxed);
+    key_count_.store(c.u64(), std::memory_order_relaxed);
+    key_bytes_.store(c.u64(), std::memory_order_relaxed);
 
     const std::uint32_t fstats_n = c.u32();
     if (c.fail || fstats_n > (1u << 24)) { reset_all(); return std::nullopt; }
@@ -977,12 +1144,20 @@ auto KeyDir::load_snapshot(std::string_view path)
         fe.newest_tstamp    = c.u32();
         fe.expiration_epoch = c.u64();
         if (c.fail || fe.file_id > (1u << 24)) { reset_all(); return std::nullopt; }
-        if (fe.file_id >= fstats_.size()) {
-            fstats_.resize(fe.file_id + 1);
-            fstats_present_.resize(fe.file_id + 1, 0);
+        {
+            std::lock_guard<std::mutex> g(fstats_grow_mu_);
+            while (fstats_.size() <= fe.file_id) fstats_.emplace_back();
+            fstats_size_.store(fstats_.size(), std::memory_order_release);
         }
-        fstats_[fe.file_id] = fe;
-        fstats_present_[fe.file_id] = 1;
+        auto& slot = fstats_[fe.file_id];
+        slot.live_keys.store(fe.live_keys, std::memory_order_relaxed);
+        slot.total_keys.store(fe.total_keys, std::memory_order_relaxed);
+        slot.live_bytes.store(fe.live_bytes, std::memory_order_relaxed);
+        slot.total_bytes.store(fe.total_bytes, std::memory_order_relaxed);
+        slot.oldest_tstamp.store(fe.oldest_tstamp, std::memory_order_relaxed);
+        slot.newest_tstamp.store(fe.newest_tstamp, std::memory_order_relaxed);
+        slot.expiration_epoch.store(fe.expiration_epoch, std::memory_order_relaxed);
+        slot.present.store(1, std::memory_order_relaxed);
     }
 
     const std::uint32_t wm_n = c.u32();
@@ -997,7 +1172,9 @@ auto KeyDir::load_snapshot(std::string_view path)
 
     const std::uint64_t entry_n = c.u64();
     if (c.fail || entry_n > (1ull << 40)) { reset_all(); return std::nullopt; }
-    entries_.reserve(static_cast<std::size_t>(entry_n));
+    for (auto& sh : shards_) {
+        sh.entries.reserve(static_cast<std::size_t>(entry_n) / kShards + 1);
+    }
     for (std::uint64_t i = 0; i < entry_n; ++i) {
         const std::uint16_t klen = c.u16();
         std::string key(klen, '\0');
@@ -1010,7 +1187,9 @@ auto KeyDir::load_snapshot(std::string_view path)
         se.tstamp   = c.u32();
         se.ord      = c.u64();
         if (c.fail) { reset_all(); return std::nullopt; }
-        entries_.emplace(std::move(key), se);
+        // entries 按 shard_for 分发（磁盘格式无分片概念）。
+        Shard& sh = shards_[shard_for(key)];
+        sh.entries.emplace(std::move(key), se);
     }
     if (c.fail || c.p != c.end) { reset_all(); return std::nullopt; }
     return wms;

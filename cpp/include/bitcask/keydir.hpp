@@ -4,16 +4,25 @@
 // 是 bitcask 整个架构的核心：put/delete 改 keydir + 追加 data file，
 // get 走 keydir 拿 (file_id, offset) 直接 pread 一次磁盘。
 //
-// === 并发模型（M5.3 phase 1） ===
+// === 并发模型（M6-S2:16 分片）===
 //
-// 一把 std::shared_mutex 罩住所有状态。
-//   - 读：get / get_epoch / info / biggest_file_id / iter::next / deep_copy /
-//          conditional_remove 的探测阶段 / is_ready —— 都是 shared_lock。
-//   - 写：put / remove / update_fstats / pending freeze / iter start+release
-//          —— unique_lock。
-// 实测在 4 reader 并发下相对 std::mutex 有 ~1.9× 吞吐，单线程无开销。
-// 进一步的 per-key sharding（M6 候选）需要把 epoch_/pending_/fstats_ 切开，
-// 暂未做。
+// entries 按 key hash 低 4 位切成 16 个分片，每分片一把 shared_mutex；
+// 全局标量（epoch_/key_count_/key_bytes_/biggest_file_id_/next_ord_/
+// keyfolders_）全部 atomic（M6-S1/S2），fstats 走无锁发布路径（§设计
+// doc/keydir-sharding-design-zh.md）。pending_/iter 协调状态由独立的
+// meta_mu_ 保护（只在 fold 期间触碰，冷路径）。
+//
+// 锁全序（必须严格遵守）：
+//     shards_[0..kShards)（按下标升序）→ meta_mu_ → fstats_grow_mu_
+// 即：允许在持分片锁时嵌套获取 meta_mu_（get/put/remove 的 pending
+// 分支就这么做），严禁反向（持 meta 再拿分片锁）。fold 的
+// start/release/deep_copy/save_snapshot/load_snapshot 是全屏障：按下标
+// 序拿全部 16 个分片锁再拿 meta_mu_。
+//
+//   - 热路径（无 fold）：get 单分片 shared，put/remove 单分片 unique，
+//     至多一把锁 + relaxed 原子。
+//   - fold 期间：写已存在 key 在分片内升 sibling 链；新 key 经
+//     meta_mu_ 进 pending_。
 //
 // === fold（迭代）下的 sibling chain + pending hash ===
 //
@@ -29,8 +38,10 @@
 
 #include "bitcask/string_hash.hpp"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -132,8 +143,9 @@ class KeyDir;
 // parent 必须比 handle 活得久（实际通过 cask 的 owning shared_ptr<KeyDir> 保证）。
 //
 // === 线程模型 ===
-//   - 单 handle 内：start / next / release 自行获取 parent_->mutex_，但
-//     handle 自身字段（iterating_/iter_epoch_/keys_snapshot_/cursor_）
+//   - 单 handle 内：start / release 自行对 parent 做全屏障（全部分片
+//     unique + meta unique），next 只拿目标 key 的分片 shared；handle
+//     自身字段（iterating_/iter_epoch_/keys_snapshot_/cursor_）
 //     不受任何锁保护——caller 必须保证「不要在多线程同时调用同一个
 //     IterHandle 的方法」。
 //   - 多 handle 之间：parent 共享但每个 handle 独立；可并行 fold。
@@ -153,20 +165,21 @@ public:
     //   maxage   — 允许 frozen pending 表的最大年龄（秒），负数禁用该限制
     //   maxputs  — freeze 后允许的最大写入次数，负数禁用
     // 线程安全: 否（修改 handle 自身字段）；同一 handle 不可并发调用。
-    // 锁: 内部对 parent_->mutex_ 取 unique_lock（写）。caller 不要持有 mutex_。
+    // 锁: 内部对 parent_ 做全屏障（全部分片 unique + meta unique）。
+    // caller 不要持有任何 keydir 锁。
     StartIterResult start(std::uint32_t now_sec, int maxage, int maxputs);
 
     // 取下一项。默认跳过墓碑（legacy fold 语义）；include_tombstones=true
     // 时墓碑也作为 EntryProxy 返回（is_tombstone=true 字段）——给 fold/6
     // 的 SeeTombstones 路径用。
     // 线程安全: 否（推进 cursor_）；同一 handle 不可并发调用。
-    // 锁: 内部对 parent_->mutex_ 取 shared_lock（读）。caller 不要持有 mutex_。
+    // 锁: 内部对目标 key 的分片取 shared_lock（读）。caller 不要持锁。
     std::optional<EntryProxy> next(bool include_tombstones = false);
 
     // 释放迭代；幂等。如果是最后一个 folder，触发 parent 把 pending_
     // 合并回 entries_ 并折叠 MultiEntry。
     // 线程安全: 否；幂等但同一 handle 上不可与 start/next 并发。
-    // 锁: 内部对 parent_->mutex_ 取 unique_lock（写）。caller 不要持有 mutex_。
+    // 锁: 内部对 parent_ 做全屏障（全部分片 unique + meta unique）。
     void release();
 
     [[nodiscard]] bool is_iterating() const noexcept { return iterating_; }
@@ -186,14 +199,15 @@ private:
 };
 
 // === KeyDir 类的线程模型（统一）===
-// 所有 public 方法均「线程安全 / 可重入」，内部根据读 / 写自动获取
-// shared_lock 或 unique_lock。caller 永远不应该在外部预先持有 mutex_。
+// 所有 public 方法均「线程安全 / 可重入」，内部按需获取分片锁 /
+// meta_mu_（锁序见文件头：shards 下标升序 → meta_mu_ → fstats_grow_mu_）。
+// caller 永远不应该在外部预先持有 keydir 的任何锁。
 // 把多次调用组合成原子操作不支持——例如「get 再 put」不是原子的，需要
 // 上层自行控制；M5 阶段的 cask 利用「单 Erlang 进程一个 Cask」回避了
 // 这个需求。
 //
-// 私有的 *_locked 后缀方法要求 caller 已持 unique_lock(mutex_)；
-// 详见每个方法附近的注释。
+// 私有的 *_barrier 后缀方法要求 caller 已持全屏障（全部分片 unique +
+// meta unique）；详见每个方法附近的注释。
 class KeyDir {
 public:
     KeyDir() = default;
@@ -209,7 +223,8 @@ public:
     //               false 表示「条件写」（用 old_file_id/old_offset 做 CAS，
     //               值不匹配返回 kAlreadyExists——给 merge 用）。
     //   ord：写入的全局单调递增序号，用于 tie-breaking 和有序遍历。
-    // 线程安全: 是。锁: 内部 unique_lock(mutex_)。可重入: 否（递归会死锁）。
+    // 线程安全: 是。锁: key 分片 unique;fold 态新 key 嵌套 meta unique。
+    // 可重入: 否（递归会死锁）。
     PutResult put(std::string_view key,
                   std::uint32_t file_id, std::uint32_t total_sz,
                   std::uint64_t offset, std::uint32_t tstamp,
@@ -219,13 +234,13 @@ public:
                   std::uint64_t ord = 0);
 
     // 无条件删除。返回 true 表示原本有这条 key。
-    // 线程安全: 是。锁: 内部 unique_lock(mutex_)。
+    // 线程安全: 是。锁: key 分片 unique;fold 态按需嵌套 meta unique。
     bool remove(std::string_view key, std::uint32_t remove_time);
 
     // 条件删除（CAS）：只有 (tstamp, file_id, offset) 匹配当前 entry
     // 才删。给 merge 跟 cask put 路径之间的 race 防护用。
-    // 线程安全: 是。锁: 探测阶段 shared_lock，匹配后 release 并调 remove()
-    // 取 unique_lock；这两阶段之间存在「探测后状态变化」的窗口（caller
+    // 线程安全: 是。锁: 探测阶段分片 shared，匹配后 release 并调 remove()
+    // 取分片 unique；这两阶段之间存在「探测后状态变化」的窗口（caller
     // 拿到 kOk 时不保证当前已不存在），但对 merge 的语义足够。
     PutResult conditional_remove(std::string_view key,
                                  std::uint32_t tstamp,
@@ -237,22 +252,22 @@ public:
 
     // 默认拿最新 revision；epoch != kMaxEpoch 时拿在那个 epoch 之前的
     // 最新 revision（fold 的 snapshot 语义就靠这个）。
-    // 线程安全: 是。锁: 内部 shared_lock(mutex_)（多读者并发）。
-    // 注意: 返回的 EntryProxy.key 是 zero-copy view，仅在 caller 释放
-    // shared_lock 之后无效——本接口返回时锁已释放，所以 key 已不可信赖；
+    // 线程安全: 是。锁: key 分片 shared;miss 且 fold 态时嵌套 meta shared。
+    // 注意: 返回的 EntryProxy.key 是 zero-copy view，仅在持锁期间有效——
+    // 本接口返回时锁已释放，所以 key 已不可信赖；
     // caller 拿到值字段足够（key 字段当前调用方都已自带）。
     std::optional<EntryProxy> get(std::string_view key,
                                    std::uint64_t epoch = kMaxEpoch) const;
 
-    // 线程安全: 是。锁: 内部 shared_lock(mutex_)（多读者并发）。
+    // 线程安全: 是。无锁（atomic 读）。
     [[nodiscard]] std::uint64_t get_epoch() const;
 
     // 分配一个新的全局 ord 值（单调递增）。
-    // 线程安全: 是。锁: 内部 unique_lock(mutex_)。
+    // 线程安全: 是。无锁（atomic fetch_add）。
     [[nodiscard]] std::uint64_t alloc_ord();
 
     // 把 next_ord_ 至少推到 ord + 1（用于 merge 后恢复 ord 状态）。
-    // 线程安全: 是。锁: 内部 unique_lock(mutex_)。
+    // 线程安全: 是。无锁（atomic CAS-max）。
     void advance_ord(std::uint64_t ord);
 
     // ---- 迭代器工厂 ----
@@ -264,17 +279,17 @@ public:
     // ---- 杂项 ----
 
     // 标记 keydir 为「就绪」——之前 acquire 同名 keydir 的线程会被解阻塞。
-    // 线程安全: 是。锁: 内部 unique_lock(mutex_)。
+    // 线程安全: 是。无锁（atomic 写）。
     void mark_ready();
-    // 线程安全: 是。锁: 内部 shared_lock(mutex_)。
+    // 线程安全: 是。无锁（atomic 读）。
     [[nodiscard]] bool is_ready() const;
 
-    // 线程安全: 是。锁: 内部 shared_lock(mutex_)。
+    // 线程安全: 是。无锁（atomic 读）。
     [[nodiscard]] std::uint32_t biggest_file_id() const;
-    // 线程安全: 是。锁: 内部 unique_lock(mutex_)。
+    // 线程安全: 是。无锁（atomic fetch_add）。
     std::uint32_t increment_file_id();
     // 把计数器至少推到 conditional_id；用于 registry 重新 acquire 时的恢复。
-    // 线程安全: 是。锁: 内部 unique_lock(mutex_)。
+    // 线程安全: 是。无锁（atomic CAS-max）。
     std::uint32_t increment_file_id_at_least(std::uint32_t conditional_id);
 
     // A4-P2:当前 next_ord(成对性门比较用;原子读,无锁)。
@@ -285,7 +300,7 @@ public:
     // ---- A4:keydir 段快照(open 加速;设计 doc/recovery-snapshot-design-zh.md)----
     // dump 当前内存态 + 调用方给的 per-file 字节水位。有活跃 fold
     // (MultiEntry 可能存在)时拒绝并返回 false(快照是纯优化)。
-    // 线程安全: 是(内部 unique_lock;只应在写者静止点调用)。
+    // 线程安全: 是(全部分片 shared + meta shared;只应在写者静止点调用)。
     [[nodiscard]] bool save_snapshot(
         std::string_view path,
         const std::vector<std::pair<std::uint32_t, std::uint64_t>>& watermarks) const;
@@ -296,94 +311,144 @@ public:
     load_snapshot(std::string_view path);
 
     // ---- 文件统计 ----
-    // (注:fstats 的增量更新只发生在 put/remove 已持有的 unique_lock 内,
-    //  经私有 update_fstats_locked;曾有的带锁公开版零调用方,O13 核实后删除。)
+    // (注:fstats 的增量更新只发生在 put/remove 内,经私有 update_fstats;
+    //  S1 起内部无锁,曾有的带锁公开版零调用方,O13 核实后删除。)
 
     // 标记某 file_id 为「等迭代结束就可删」。
-    // 线程安全: 是。锁: 内部 unique_lock(mutex_)。
+    // 线程安全: 是。无锁（fstats 原子路径）。
     void set_pending_delete(std::uint32_t file_id);
     // 从 fstats 表里删一组 file_id（merge 完成后调）。返回实际删了几条。
-    // 线程安全: 是。锁: 内部 unique_lock(mutex_)。
+    // 线程安全: 是。锁: fstats_grow_mu_（与槽位增长串行）。
     std::uint32_t trim_fstats(std::span<const std::uint32_t> file_ids);
 
     // ---- 快照 ----
 
-    // 线程安全: 是。锁: 内部 shared_lock(mutex_)。
+    // 线程安全: 是。锁: meta shared（iter 状态）;计数走 atomic,fstats 无锁。
     [[nodiscard]] KeyDirInfo info() const;
     // 全量深拷贝；给 keydir_copy NIF 用（虽然 M6 之后不再 export，但内部
     // 的 merge 有时会用浅快照走类似的路径）。
-    // 线程安全: 是。锁: 内部 shared_lock(mutex_)。
-    // 注意: 大对象，O(n) 拷贝；与并发写者共享 shared_lock 期间，写者会被阻塞。
+    // 线程安全: 是。锁: 全部分片 shared + meta shared。
+    // 注意: 大对象，O(n) 拷贝；持 shared 锁期间写者会被阻塞。
     [[nodiscard]] std::shared_ptr<KeyDir> deep_copy() const;
 
 private:
     friend class IterHandle;
 
-    // 整个 keydir 的并发控制点。读操作 shared_lock、写操作 unique_lock。
-    // 见文件头并发模型说明。
-    mutable std::shared_mutex mutex_;
+    // === M6-S2:16 分片 ===
+    // 锁全序（严格遵守,详见文件头）:
+    //     shards_[0..kShards)（下标升序）→ meta_mu_ → fstats_grow_mu_
+    // 允许持分片锁时嵌套拿 meta_mu_;严禁持 meta_mu_ 时再拿任何分片锁。
+    static constexpr std::size_t kShards = 16;
+    struct alignas(64) Shard {
+        // 分片锁。主 hash 的值是 variant;判别用 std::get_if<Single|Multi>。
+        // 透明 hash:get/put/remove 热路径用 string_view 直接查,零拷贝(O1)。
+        mutable std::shared_mutex mu;
+        // map 头独占缓存行:find 路径读 map 头,别让它与锁字(每次加解锁
+        // RMW)同行。
+        alignas(64) std::unordered_map<std::string, Entry, StringHash, std::equal_to<>> entries;
+    };
+    mutable std::array<Shard, kShards> shards_;
+    // pending_/iter 协调状态专用(仅 fold 期间触碰,冷路径)。
+    mutable std::shared_mutex meta_mu_;
 
-    // 主 hash。值是 variant；判别用 std::get_if<SingleEntry|MultiEntry>。
-    // 透明 hash：get/put/remove 热路径用 string_view 直接查，零临时拷贝（O1）。
-    std::unordered_map<std::string, Entry, StringHash, std::equal_to<>> entries_;
+    // key → 分片下标(hash 低位路由;kShards 是 2^n)。
+    [[nodiscard]] static std::size_t shard_for(std::string_view key) noexcept {
+        return StringHash{}(key) & (kShards - 1);
+    }
 
-    // fold 期间「pending 表」：写时复制规则触发后，新 key 和「不在
-    // entries_ 里的 key 之 tombstone」会落到这里。最后一个 release 时
-    // merge 回 entries_。
+    // 按下标升序锁住全部分片(全屏障第一段;之后通常再拿 meta_mu_)。
+    [[nodiscard]] std::array<std::unique_lock<std::shared_mutex>, kShards>
+    lock_all_shards() const;
+    [[nodiscard]] std::array<std::shared_lock<std::shared_mutex>, kShards>
+    lock_all_shards_shared() const;
+
+    // fold 期间「pending 表」：写时复制规则触发后，新 key 的写入和
+    // 「fold 期间临时 key 的 tombstone」会落到这里。最后一个 release 时
+    // merge 回各分片 entries。
+    // 不变量(S2 起)：key ∈ 某分片 entries ⟹ key ∉ pending_——已存在
+    // key 的新版本一律走分片内 sibling 链,绝不进 pending。get/put/remove
+    // 的「entries 优先、miss 再查 pending」探测顺序依赖该不变量。
+    // 锁要求：meta_mu_。
     std::optional<std::unordered_map<std::string, SingleEntry,
                                      StringHash, std::equal_to<>>> pending_;
-    std::uint64_t pending_start_epoch_ = 0;  // 第一个 fold 启动时的 epoch
-    std::uint64_t pending_start_time_  = 0;  // 第一个 fold 启动时的 wall-clock
-    std::uint64_t pending_updated_     = 0;  // pending 中累积的写入次数
+    std::uint64_t pending_start_epoch_ = 0;  // 第一个 fold 启动时的 epoch(meta_mu_)
+    std::uint64_t pending_start_time_  = 0;  // 第一个 fold 启动时的 wall-clock(meta_mu_)
+    std::uint64_t pending_updated_     = 0;  // pending 中累积的写入次数(meta_mu_)
 
     // file_id 是 keydir_registry 分配的小整数单调计数,直接用 vector 按
     // 下标存(替代 unordered_map:update_fstats 在 put/remove 热路径上)。
     // present 位独立存;trim 后槽位清空但数组不收缩。
-    std::vector<FStatsEntry>  fstats_;
-    std::vector<std::uint8_t> fstats_present_;
+    // M6-S1:fstats 无锁热路径(设计 keydir-sharding-design-zh.md §3)。
+    // deque 元素地址稳定;槽位经 fstats_grow_mu_ 串行构造后,以
+    // fstats_size_ release 发布——读者 idx < size(acquire) 即可直接对
+    // 字段做 relaxed 原子累加,put 热路径零锁字共享(S2 起生效;S1 仍在
+    // mutex_ 内调用,顺序平凡安全)。
+    struct AtomicFStats {
+        std::atomic<std::uint64_t> live_keys{0};
+        std::atomic<std::uint64_t> total_keys{0};
+        std::atomic<std::uint64_t> live_bytes{0};
+        std::atomic<std::uint64_t> total_bytes{0};
+        std::atomic<std::uint32_t> oldest_tstamp{0};
+        std::atomic<std::uint32_t> newest_tstamp{0};
+        std::atomic<std::uint64_t> expiration_epoch{kMaxEpoch};
+        std::atomic<std::uint8_t>  present{0};
+    };
+    mutable std::mutex fstats_grow_mu_;   // 仅新 file_id 槽位构造(罕见)
+    mutable std::deque<AtomicFStats> fstats_;
+    std::atomic<std::size_t> fstats_size_{0};
 
-    std::uint64_t key_count_       = 0;
-    std::uint64_t key_bytes_       = 0;
-    std::uint64_t epoch_           = 0;
-    // ord 分配器独立为 atomic:alloc_ord/advance_ord 不再抢全局
-    // unique_lock(put 热路径上每次写都要分配 ord)。
+    // M6-S1/S2:全局标量原子化。epoch_ 的跨线程可见性判据
+    // (entry.epoch < iter_epoch)由「分片锁内 fetch_add + 屏障内读取」
+    // 保证,见设计 §6.4。
+    //
+    // 缓存行分组（S2 实测关键）:
+    //   写热行——每次 put/remove 都 RMW（epoch_/next_ord_;key_count_/
+    //   key_bytes_ 在插入删除时）。没有热读者(info 是冷路径)。
+    alignas(64) std::atomic<std::uint64_t> epoch_{0};
+    std::atomic<std::uint64_t> key_count_{0};
+    std::atomic<std::uint64_t> key_bytes_{0};
+    // ord 分配器独立为 atomic:alloc_ord/advance_ord 不再抢全局锁
+    // (put 热路径上每次写都要分配 ord)。
     std::atomic<std::uint64_t> next_ord_{0};
-    std::uint32_t biggest_file_id_ = 0;
-    bool is_ready_                 = false;
 
-    // 迭代协调状态。
-    std::uint64_t keyfolders_         = 0;  // 当前活跃 fold 数
-    std::uint64_t iter_generation_    = 0;  // 单调 ++（fold 启动一次 +1）
+    //   读热行——get/put 热路径每次 relaxed 读、写入罕见。与上面的写热
+    //   行隔离,否则每个 put 的 epoch_ RMW 都会把读者需要的行打飞
+    //   (false sharing,Mixed 基准实测主要损耗源)。
+    // keyfolders_:当前活跃 fold 数。只在全屏障(全部分片 unique + meta
+    // unique)内修改;热路径在持自己分片锁后 relaxed 读即足够新——屏障
+    // 无法在写者持分片锁期间完成,见设计 §4 时序论证。
+    alignas(64) std::atomic<std::uint64_t> keyfolders_{0};
+    // biggest_file_id_:put 接受判断每次读;CAS-max 推进仅 roll 时真写。
+    std::atomic<std::uint32_t> biggest_file_id_{0};
+    // pending_.has_value() 的无锁镜像:热路径在持分片锁后 relaxed 读,
+    // 避免每次 get/put 都摸 meta_mu_。仅在持 meta_mu_ unique 时修改。
+    // (单独存在的意义:deep_copy 出的副本可能 keyfolders_==0 但 pending_
+    //  仍在——此时写路径仍须分流到 pending,不能只看 keyfolders_。)
+    std::atomic<bool> has_pending_{false};
+    std::atomic<bool> is_ready_{false};
+
+    // 迭代协调冷状态(meta_mu_;独立行,避免污染上面两条热行)。
+    alignas(64) std::uint64_t iter_generation_ = 0;  // 单调 ++(fold release 归零时 +1)
     std::uint64_t newest_folder_epoch_ = 0;  // 最近启动的 folder 的 iter_epoch
-    bool iter_mutation_               = false;
+    // 写痕迹标志。当前没有读者(纯诊断位);做成 atomic 以免 sibling 升链
+    // 热分支为了它单独去拿 meta_mu_(S2 设计偏差,见 keydir.cpp 注释)。
+    std::atomic<bool> iter_mutation_{false};
 
-    // 持锁版本：caller 必须已经拿了 unique_lock(mutex_)。
-    // 线程安全: 否（依赖外部锁）。锁要求: caller 已持 unique_lock(mutex_)。
-    void update_fstats_locked(std::uint32_t file_id, std::uint32_t tstamp,
-                              std::uint64_t expiration_epoch,
-                              std::int32_t live_inc, std::int32_t total_inc,
-                              std::int32_t live_bytes_inc,
-                              std::int32_t total_bytes_inc,
-                              bool should_create);
+    // fstats 增量更新。S1 起内部即无锁(增长走 fstats_grow_mu_),caller
+    // 无需持有任何锁;锁序上 fstats_grow_mu_ 排最末,持分片锁/meta 时
+    // 调用均合法。
+    void update_fstats(std::uint32_t file_id, std::uint32_t tstamp,
+                       std::uint64_t expiration_epoch,
+                       std::int32_t live_inc, std::int32_t total_inc,
+                       std::int32_t live_bytes_inc,
+                       std::int32_t total_bytes_inc,
+                       bool should_create);
 
-    // 把 pending_ 合并回 entries_、把 MultiEntry 折回 SingleEntry。
-    // 前置条件：caller 持 mutex_ 且 keyfolders_ == 0。
-    // 线程安全: 否（依赖外部锁）。锁要求: caller 已持 unique_lock(mutex_)。
-    void merge_pending_and_collapse_locked();
-
-    // 在指定 epoch 找 key 的可见 revision；填 out 并设 out_is_tombstone。
-    // 返回 true 表示找到（可能是墓碑）。caller 必须持 mutex_。
-    // 线程安全: 否（依赖外部锁）。锁要求: caller 已持 mutex_（shared 或 unique 均可）。
-    bool find_at_epoch_locked(std::string_view key, std::uint64_t target_epoch,
-                              EntryProxy& out, bool& out_is_tombstone) const;
-
-    // 是否有 folder 锁定在 <= 给定 epoch。当前实现是保守的：只要
-    // keyfolders_>0 就视为全部 epoch 都被 pin 住——M5 还没做更细粒度
-    // 的 epoch tracking。M6 候选优化点。
-    // 线程安全: 否（仅读 keyfolders_）。锁要求: caller 已持 mutex_。
-    [[nodiscard]] bool fold_pinned_at_or_below_locked(std::uint64_t /*e*/) const noexcept {
-        return keyfolders_ > 0;
-    }
+    // 把 pending_ 合并回各分片 entries、把 MultiEntry 折回 SingleEntry。
+    // 前置条件：caller 持全屏障(全部分片 unique + meta unique)且
+    // keyfolders_ == 0。
+    // 线程安全: 否（依赖外部锁）。
+    void merge_pending_and_collapse_barrier();
 };
 
 }  // namespace bitcask::keydir
