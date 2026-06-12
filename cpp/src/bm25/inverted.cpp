@@ -89,19 +89,28 @@ std::vector<SearchResult> score_bow_topk(
     const double avgdl =
         N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
 
-    // 并行 BM25 评分：parallel_reduce 按查询词分片，线程本地 map 无锁累加。
-    using ScoreMap = std::unordered_map<std::uint64_t, float>;
-    ScoreMap scores = tbb::parallel_reduce(
+    // 并行 BM25 评分：parallel_reduce 按查询词分片，线程本地扁平
+    // (ord, contrib) 数组累积。替代 unordered_map：每 posting 一次 hash
+    // 节点分配 + reduce 阶段 O(n) hash 合并 → 向量追加 + 拼接,最终
+    // sort + 按 ord 归并累加(同 ord 的浮点累加顺序与 hash 版同为
+    // 分片相关,不引入新的不确定性)。
+    using Hit = std::pair<std::uint64_t, float>;
+    std::vector<Hit> hits = tbb::parallel_reduce(
         tbb::blocked_range<std::size_t>(0, tps.size()),
-        ScoreMap{},
-        [&](const tbb::blocked_range<std::size_t>& range, ScoreMap local) {
+        std::vector<Hit>{},
+        [&](const tbb::blocked_range<std::size_t>& range,
+            std::vector<Hit> local) {
+            // 工作数组提到 term 循环外复用(原实现每 term 3 次分配)。
+            std::vector<char> live;
+            std::vector<std::uint32_t> dls;
+            std::vector<float> contrib;
             for (std::size_t ti = range.begin(); ti < range.end(); ++ti) {
                 const auto& fp = tps[ti].fp;
                 const std::size_t n = fp.size();
 
                 // P2.1：live/doc_len 批量取——一次虚调用（Index 侧一次锁）完成
                 // 整列，评分浮点循环不再含虚调用，编译器可自动向量化。
-                std::vector<char> live(n);
+                live.resize(n);
                 live_checker.fill_is_live(fp.ords, live);
                 std::size_t live_df = 0;
                 for (std::size_t i = 0; i < n; ++i) {
@@ -111,13 +120,13 @@ std::vector<SearchResult> score_bow_topk(
 
                 auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
 
-                std::vector<std::uint32_t> dls(n);
+                dls.resize(n);
                 live_checker.fill_doc_lens(fp.ords, dls);
 
                 // 两阶段评分：① 纯数组浮点（可向量化；死点也算、结果不用，
                 // 保持无分支），公式与逐 posting 版逐运算一致（分数位级不变）；
-                // ② 标量 scatter 进线程本地 map（hash 写无法向量化）。
-                std::vector<float> contrib(n);
+                // ② 标量 append 进线程本地扁平数组。
+                contrib.resize(n);
                 const float fidf = static_cast<float>(idf);
                 for (std::size_t i = 0; i < n; ++i) {
                     auto tf_norm = static_cast<float>(fp.tfs[i]) *
@@ -127,23 +136,32 @@ std::vector<SearchResult> score_bow_topk(
                                      static_cast<float>(dls[i]) / static_cast<float>(avgdl)));
                     contrib[i] = fidf * (tf_norm + params.delta);
                 }
+                local.reserve(local.size() + live_df);
                 for (std::size_t i = 0; i < n; ++i) {
-                    if (live[i]) local[fp.ords[i]] += contrib[i];
+                    if (live[i]) local.emplace_back(fp.ords[i], contrib[i]);
                 }
             }
             return local;
         },
-        [](ScoreMap a, const ScoreMap& b) {
-            for (auto& [doc, score] : b) {
-                a[doc] += score;
-            }
+        [](std::vector<Hit> a, std::vector<Hit> b) {
+            if (a.size() < b.size()) a.swap(b);  // 总把小的拼进大的
+            a.insert(a.end(), b.begin(), b.end());
             return a;
         });
 
-    // top-k 小顶堆（score, ord）。
+    // 按 ord 排序 → 同 ord 连续成段 → 归并累加,边累加边喂 top-k 小顶堆。
+    std::sort(hits.begin(), hits.end(),
+              [](const Hit& x, const Hit& y) { return x.first < y.first; });
+
     using Entry = std::pair<float, std::uint64_t>;
     std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
-    for (auto& [ord, score] : scores) {
+    for (std::size_t i = 0; i < hits.size();) {
+        const std::uint64_t ord = hits[i].first;
+        float score = 0.0F;
+        do {
+            score += hits[i].second;
+            ++i;
+        } while (i < hits.size() && hits[i].first == ord);
         if (heap.size() < k) {
             heap.push({score, ord});
         } else if (score > heap.top().first) {
@@ -285,7 +303,9 @@ void InvertedIndex::add_doc(
     live_doc_count_.fetch_add(1, std::memory_order_relaxed);
     sum_doc_len_.fetch_add(doc_len, std::memory_order_relaxed);
 
-    if (wal_) wal_->append_add_doc(ord, WalTermPositions(term_data.begin(), term_data.end()));
+    // TermPositions 与 WalTermPositions 是同一类型,直接传引用,
+    // 不再为 WAL 深拷贝整个 term map(字符串 + positions 全量)。
+    if (wal_) wal_->append_add_doc(ord, term_data);
 }
 
 void InvertedIndex::remove_doc(
@@ -977,25 +997,28 @@ auto InvertedIndex::bool_search(
         term_idf[tp.term] = static_cast<float>(idf);
     }
 
-    struct ScoreAcc {
-        std::unordered_map<std::uint64_t, float> scores;
-    };
-
-    ScoreAcc acc;
-    for (auto ord : candidates) {
-        acc.scores[ord] = 0.0f;
-    }
+    // 候选集与 posting ords 都是升序去重——评分用「平行分数数组 +
+    // 每词双指针归并」O(|posting| + |candidates|)。替代原先的
+    // unordered_map 播种:per-candidate 一次 hash 节点分配(实测
+    // BoolMust 每查询 ~2 万次 malloc 即来源于此)+ 每 posting 一次
+    // hash find,全部消除。
+    std::vector<float> scores(candidates.size(), 0.0F);
 
     for (auto& tp : all_tps) {
         auto idf_it = term_idf.find(tp.term);
         if (idf_it == term_idf.end()) continue;
         auto idf = idf_it->second;
 
-        for (std::size_t i = 0; i < tp.fp.size(); ++i) {
-            auto posting_ord = tp.fp.ords[i];
+        std::size_t ci = 0;
+        for (std::size_t i = 0;
+             i < tp.fp.size() && ci < candidates.size(); ++i) {
+            const auto posting_ord = tp.fp.ords[i];
+            while (ci < candidates.size() && candidates[ci] < posting_ord) {
+                ++ci;
+            }
+            if (ci == candidates.size()) break;
+            if (candidates[ci] != posting_ord) continue;
             if (!tp.live[i]) continue;
-            auto it = acc.scores.find(posting_ord);
-            if (it == acc.scores.end()) continue;
 
             // P2.1：doc_len 读批量数组 tp.dls（此前逐 posting 一把 Index
             // shared_lock + 虚调用，大候选集下锁风暴；与其它路径对齐）。
@@ -1005,19 +1028,20 @@ auto InvertedIndex::bool_search(
                            (static_cast<float>(tp.fp.tfs[i]) + params.k1 *
                             (1.0F - params.b + params.b *
                              static_cast<float>(dl) / static_cast<float>(avgdl)));
-            it->second += idf * (tf_norm + params.delta);
+            scores[ci] += idf * (tf_norm + params.delta);
         }
     }
 
     using Entry = std::pair<float, std::uint64_t>;
     std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
 
-    for (auto& [ord, score] : acc.scores) {
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+        const float score = scores[i];
         if (heap.size() < k) {
-            heap.push({score, ord});
+            heap.push({score, candidates[i]});
         } else if (score > heap.top().first) {
             heap.pop();
-            heap.push({score, ord});
+            heap.push({score, candidates[i]});
         }
     }
 
