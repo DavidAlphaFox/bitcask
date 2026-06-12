@@ -44,44 +44,95 @@ shard = StringHash{}(key) & (kShards-1)。每 key 操作只触自己分片的锁
 
 put 热路径自此**零锁字共享**(分片锁字 + 纯 relaxed 原子)。
 
-## 4. fold(MVCC)协议:全屏障冷路径
+## 4. fold(MVCC)协议:屏障 v2(写者闸门)
 
-方案 B 定稿——fold 是冷路径,用 stop-the-world 屏障换实现简单与
-逐字保留现有 sibling/pending 语义:
+### 4.0 方案演进
 
-- **iter start**:按下标序拿全部 shard unique + meta unique →
-  置 keyfolders_/iter_generation_、build keys_snapshot_(跨分片归并)、
-  freeze pending_ → 全部释放。屏障期间写者短暂排队(冷路径可接受)。
-- **写路径感知**:put/remove 在**持有自己分片锁后**读
-  `keyfolders_(atomic)`。=0 → 直写;>0 → 沿用现有 sibling 升链
-  (分片锁内)/新 key 走 pending_(meta_mu_ unique)。
-  时序论证:若 put 读到 0 而屏障紧随其后,该写的 epoch < iter epoch,
-  对迭代器可见且一致——等价于"屏障前完成的写";屏障无法在 put 持
-  分片锁期间完成(unique 等待)。
-- **next()**:meta shared(查 pending)→ 该 key 分片 shared。两段不
-  嵌套(先后获取、各自释放),锁序恒 meta→shard,无死锁环。
-  pending→entries 迁移窗口的 TOCTOU:先查 pending 后查分片,release
-  合并方向是 pending→entries,顺序保证不漏(miss pending ⟹ 已并入
-  entries ⟹ 分片查得到)。
-- **release**:同 start 的全屏障,在屏障内逐字复用现有
-  merge_pending_and_collapse 逻辑(全独占下原实现语义不变)——
-  障碍清单里"唯一要认真 MVCC 推演"的第 5 项就此消解。
+初版方案 B(stop-the-world 全屏障)在屏障期间**同时持有全部分片锁 +
+meta**(kShards=256 后即 257 把)。S5 把 kShards 推到 256 后撞上 TSan
+死锁检测器的 **64 持锁硬上限**——compiler-rt
+`sanitizer_deadlock_detector.h:67` 的
+`CHECK_LT(dtls->getNumLocks(), kMaxLT)`,实测
+`KeyDir.DeepCopyPreservesOrd` 在 `TSAN_OPTIONS=detect_deadlocks=1` 下
+必崩(CHECK failed)。该方案废弃,重构为**写者闸门屏障**:任意瞬间至多
+持 1 把分片锁,语义不变,且屏障期间读者照常并发(旧方案的全独占锁顺带
+挡住了读者,是过强的副作用)。
+
+### 4.1 屏障 v2 协议
+
+新增成员:`atomic<bool> barrier_active_`、`barrier_mu_`(屏障间互斥,
+跨整个屏障持有)、`gate_mu_`/`gate_cv_`(写者退避等待)。
+
+- **BarrierGuard(RAII,keydir.cpp 内部)**:
+  - ctor:`barrier_mu_.lock()` → gate_mu_ 内置 `barrier_active_=true`
+    → **排干**:逐分片「加锁-放锁」,任意瞬间只持 1 把——保证在途写者
+    出清(先于排干持分片锁的写者被排干循环等待;晚于排干拿锁的写者经
+    mutex 配对必见 active,退避)。
+  - dtor:gate_mu_ 内置 `barrier_active_=false` → `notify_all` →
+    放 barrier_mu_。
+- **写者侧**(put / remove;conditional_remove 的只读 peek **不**检查
+  闸门,其写阶段调 remove() 自带检查):拿到分片锁后立即查
+  `barrier_active_(acquire)`;active 则**先放分片锁**再到 gate_cv_
+  等待,唤醒后重拿分片锁循环重查。
+- **读者(get/next/conditional_remove peek/info)不受闸门限制**,屏障
+  期间照常并发——这是与旧方案的关键语义差异,逐调用方保证读者视角
+  无缝(见 4.2)。
+- **写路径 fold 感知不变**:闸门检查通过后读 `keyfolders_(relaxed)`。
+  =0 → 直写;>0 → sibling 升链(分片锁内)/新 key 走 pending_
+  (meta unique)。时序论证更新:闸门读到 inactive 的写者要么先于排干
+  循环持有分片锁(排干在该分片等它出清,屏障内的 keyfolders_ 修改
+  整体在其后),要么经排干循环的 mutex 配对必见 active 退避——
+  「读到 0 → 直写」的写仍一定整体先于屏障。
+
+### 4.2 各屏障调用方(读者无缝论证)
+
+1. **deep_copy / save_snapshot / iter start(keys_snapshot 构建)**:
+   屏障内全是**纯读**,写者已出清 → 遍历各分片 entries **不需要任何
+   分片锁**(unordered_map 并发只读安全;与读者的持锁 find 是读-读
+   并发)。meta 状态读取(save 的 keyfolders_ 检查、start 的 freeze
+   判定/keyfolders_++/pending 初始化)在屏障内拿 meta unique 做——
+   此刻不持任何分片锁,锁序 barrier→gate→meta 无环。
+2. **iter release 的合并(写操作!)三阶段**——唯一精细处:
+   - 阶段一[meta unique]:keyfolders_--;非最后一个 folder → 直接
+     返回;是最后一个 → 继续(**不在此清 pending**);
+   - 阶段二[meta **shared** 持有期间]:遍历 pending_ 每条,**嵌套拿该
+     key 分片锁**应用进 entries,放分片锁。这是 meta→shard 方向,与
+     常规锁序相反——**仅屏障内合法**:写者已被闸门出清(meta unique
+     使用者不存在),唯一并发者是读者,读者对 meta 只拿 shared
+     (shared-shared 相容,无 unique 排队者,无法构成环);
+   - 阶段三[meta unique,不持分片锁]:pending_.reset()、
+     has_pending_=false。**先应用后清表** ⟹ 读者在窗口内要么 entries
+     命中(探测顺序 entries 优先)要么 pending 命中,无丢失窗口;
+   - 之后 MultiEntry 折叠:逐分片「lock → 折叠该分片全部链 → unlock」
+     (读者按分片锁协议安全;折叠前后单 key 可见值不变:链头即最新)。
+3. **load_snapshot**:open 期单线程,用 BarrierGuard 统一即可,内部
+   逻辑不变(直填分片)。
 
 ## 5. 其余操作
 
 - get:meta shared(仅当 frozen,先查 pending)→ shard shared。
 - conditional_remove(merge CAS):shard unique,逻辑不变。
-- deep_copy/info/save_snapshot(A4):全屏障(均为冷路径/静止点)。
+- deep_copy/save_snapshot(A4):写者闸门屏障(§4 屏障 v2;冷路径/
+  静止点);info 仅 meta shared。
 - load_snapshot(A4):open 期单线程,entries 按 hash 分发进各分片;
   BCKS 格式不变(磁盘上无分片概念,重分片自由)。
 
-## 6. 锁序与不变量(评审清单)
+## 6. 锁序与不变量(评审清单;屏障 v2 更新)
 
-1. 全序:meta_mu_ → shards_[0..n)(下标升序)→ fstats_grow_mu_;
-   任何路径禁止逆序持有。
-2. 热路径(get/put/remove 非 fold 态)至多 1 把锁(自己分片)。
-3. keyfolders_ 只在全屏障内修改;分片锁内读取即足够新。
-4. epoch 分配(fetch_add)在分片锁内完成,保证"entry.epoch < iter
+1. 全序:**barrier_mu_ → gate_mu_ → meta_mu_ → 单个 shard(任意时刻
+   ≤1 把)→ fstats_grow_mu_**。任何路径任意时刻至多持 1 把分片锁
+   (旧"全部分片锁"屏障因 TSan 64 持锁上限废弃,见 §4.0)。
+2. 与全序相反的两处嵌套(均有无环论证,见 keydir.hpp 文件头):
+   - 热路径 get/put/remove 持单个分片锁后嵌套 meta(shard→meta,
+     S2 起的既有方向,堵 release 合并窗口 TOCTOU);
+   - **屏障内例外**:iter release 阶段二在 meta shared 持有期间嵌套
+     分片锁(meta→shard)。合法性:屏障内写者已出清、无 meta unique
+     持有/等待者,读者与阶段二对 meta 均只拿 shared——无环。
+3. 热路径(get/put/remove 非 fold 态)至多 1 把锁(自己分片)+
+   写者一次 barrier_active_ 原子读(闸门检查)。
+4. keyfolders_ 只在屏障(BarrierGuard + meta unique)内修改;写者
+   闸门检查通过且持分片锁后 relaxed 读即足够新(§4.1 时序论证)。
+5. epoch 分配(fetch_add)在分片锁内完成,保证"entry.epoch < iter
    epoch ⟺ 屏障前完成"的可见性判据不变。
 
 ## 7. 实施阶段(各自可验证)
@@ -177,3 +228,36 @@ fstats 槽位 per-shard 化。
   聚合。进一步收敛(per-shard epoch 域 / fstats 写侧分片聚合)收益
   预估有限且复杂度高,**有意止步**——记录为 M6 关账状态。
 - baseline.json 已刷新(cpp/bench/baseline/,含 Mixed 全档)。
+
+## 11. 屏障 v2(写者闸门)实测(2026-06-12,本机)
+
+动机回顾(§4.0):旧全屏障同时持 257 把锁,TSan 死锁检测器
+(detect_deadlocks=1)64 持锁上限 CHECK 崩溃,KeyDir.DeepCopyPreservesOrd
+必现。重构后任意瞬间 ≤1 把分片锁。
+
+门禁结果(全部通过):
+
+| 门禁 | 结果 |
+|---|---|
+| plain ctest | 371/371 |
+| TSan `bitcask_keydir_test`(detect_deadlocks=1,原崩溃环境) | 8/8 通过,DeepCopyPreservesOrd OK |
+| TSan 全量 ctest(detect_deadlocks=1 已固化进 ENVIRONMENT) | 371/371 |
+| ASan(address,undefined)全量 ctest | 371/371 |
+| eunit(plain .so,ldd 0 tsan) | 44/44 |
+
+基准回归(repetitions=3 median,vs cpp/bench/baseline/baseline.json,
+门槛 ±10%):
+
+| 负载 | baseline M/s | 屏障 v2 M/s | Δ |
+|---|---|---|---|
+| Mixed 1t | 23.71 | 24.30 | +2.5% |
+| Mixed 2t | 17.39 | 17.42 | +0.1% |
+| Mixed 4t | 13.29 | 13.43 | +1.1% |
+| Mixed 8t | 7.68 | 8.19 | +6.6% |
+| Get 1t | 31.76 | 31.79 | +0.1% |
+| Get 8t | 17.04 | 17.21 | +1.0% |
+| Put_Overwrite | 19.31 | 19.21 | -0.5% |
+
+热路径新增成本仅为写者一次 `barrier_active_` relaxed-acquire 读
+(分片锁内),实测在噪声内;Mixed 8t 的 +6.6% 视为运行间波动,不归功
+于本改动。

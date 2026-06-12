@@ -4,25 +4,37 @@
 // 是 bitcask 整个架构的核心：put/delete 改 keydir + 追加 data file，
 // get 走 keydir 拿 (file_id, offset) 直接 pread 一次磁盘。
 //
-// === 并发模型（M6-S2:16 分片）===
+// === 并发模型（M6-S2:分片 + 屏障 v2 写者闸门）===
 //
-// entries 按 key hash 低 4 位切成 16 个分片，每分片一把 shared_mutex；
+// entries 按 key hash 低位切成 kShards 个分片，每分片一把 mutex；
 // 全局标量（epoch_/key_count_/key_bytes_/biggest_file_id_/next_ord_/
 // keyfolders_）全部 atomic（M6-S1/S2），fstats 走无锁发布路径（§设计
 // doc/keydir-sharding-design-zh.md）。pending_/iter 协调状态由独立的
 // meta_mu_ 保护（只在 fold 期间触碰，冷路径）。
 //
-// 锁全序（必须严格遵守）：
-//     shards_[0..kShards)（按下标升序）→ meta_mu_ → fstats_grow_mu_
-// 即：允许在持分片锁时嵌套获取 meta_mu_（get/put/remove 的 pending
-// 分支就这么做），严禁反向（持 meta 再拿分片锁）。fold 的
-// start/release/deep_copy/save_snapshot/load_snapshot 是全屏障：按下标
-// 序拿全部 16 个分片锁再拿 meta_mu_。
+// 锁全序（屏障 v2，必须严格遵守）：
+//     barrier_mu_ → gate_mu_ → meta_mu_ → 单个 shard（任意时刻 ≤1 把）
+//     → fstats_grow_mu_
+// 任何路径任意时刻至多持 1 把分片锁（旧"同时持全部分片锁"方案因 TSan
+// 死锁检测器 64 持锁硬上限废弃，见 keydir.cpp BarrierGuard 注释）。
+// 两处与全序相反的嵌套方向（均有无环论证，详见 keydir.cpp）：
+//   ① 热路径 get/put/remove 持单个分片锁后嵌套 meta（shard→meta，
+//      S2 起的既有方向，堵 release 合并窗口 TOCTOU）；
+//   ② iter release 阶段二在 meta shared 持有期间嵌套分片锁
+//      （meta→shard，"屏障内例外"）。
+// 无环论证：①②构成环要求一方持 shard 等 meta、另一方持 meta 等 shard。
+// 方向②仅存在于屏障内——彼时写者（meta unique 的全部使用者）已被闸门
+// 出清，仅剩读者走方向①且对 meta 只拿 shared；②也只拿 meta shared，
+// shared-shared 相容且无 unique 排队者，meta 获取不可能阻塞——无环。
+// 屏障外只有方向①——同样无环。
 //
-//   - 热路径（无 fold）：get 单分片 shared，put/remove 单分片 unique，
+//   - 热路径（无 fold）：get/put/remove 单分片 mutex，
 //     至多一把锁 + relaxed 原子。
 //   - fold 期间：写已存在 key 在分片内升 sibling 链；新 key 经
 //     meta_mu_ 进 pending_。
+//   - fold 的 start/release/deep_copy/save_snapshot/load_snapshot 走
+//     BarrierGuard 写者闸门屏障：置 barrier_active_ 后逐分片加锁-放锁
+//     排干在途写者；写者拿到分片锁后检查闸门退避，**读者照常并发**。
 //
 // === fold（迭代）下的 sibling chain + pending hash ===
 //
@@ -40,6 +52,7 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <limits>
@@ -143,8 +156,8 @@ class KeyDir;
 // parent 必须比 handle 活得久（实际通过 cask 的 owning shared_ptr<KeyDir> 保证）。
 //
 // === 线程模型 ===
-//   - 单 handle 内：start / release 自行对 parent 做全屏障（全部分片
-//     unique + meta unique），next 只拿目标 key 的分片 shared；handle
+//   - 单 handle 内：start / release 自行对 parent 做写者闸门屏障
+//     （BarrierGuard + meta_mu_），next 只拿目标 key 的分片锁；handle
 //     自身字段（iterating_/iter_epoch_/keys_snapshot_/cursor_）
 //     不受任何锁保护——caller 必须保证「不要在多线程同时调用同一个
 //     IterHandle 的方法」。
@@ -165,7 +178,7 @@ public:
     //   maxage   — 允许 frozen pending 表的最大年龄（秒），负数禁用该限制
     //   maxputs  — freeze 后允许的最大写入次数，负数禁用
     // 线程安全: 否（修改 handle 自身字段）；同一 handle 不可并发调用。
-    // 锁: 内部对 parent_ 做全屏障（全部分片 unique + meta unique）。
+    // 锁: 内部对 parent_ 做写者闸门屏障（BarrierGuard + meta unique）。
     // caller 不要持有任何 keydir 锁。
     StartIterResult start(std::uint32_t now_sec, int maxage, int maxputs);
 
@@ -179,7 +192,8 @@ public:
     // 释放迭代；幂等。如果是最后一个 folder，触发 parent 把 pending_
     // 合并回 entries_ 并折叠 MultiEntry。
     // 线程安全: 否；幂等但同一 handle 上不可与 start/next 并发。
-    // 锁: 内部对 parent_ 做全屏障（全部分片 unique + meta unique）。
+    // 锁: 内部对 parent_ 做写者闸门屏障（BarrierGuard），meta_mu_ 分
+    // 三阶段持有（见 keydir.cpp 实现注释）。
     void release();
 
     [[nodiscard]] bool is_iterating() const noexcept { return iterating_; }
@@ -206,8 +220,8 @@ private:
 // 上层自行控制；M5 阶段的 cask 利用「单 Erlang 进程一个 Cask」回避了
 // 这个需求。
 //
-// 私有的 *_barrier 后缀方法要求 caller 已持全屏障（全部分片 unique +
-// meta unique）；详见每个方法附近的注释。
+// 私有的 *_barrier 后缀方法要求 caller 已持 BarrierGuard 写者闸门屏障；
+// 详见每个方法附近的注释。
 class KeyDir {
 public:
     KeyDir() = default;
@@ -300,7 +314,7 @@ public:
     // ---- A4:keydir 段快照(open 加速;设计 doc/recovery-snapshot-design-zh.md)----
     // dump 当前内存态 + 调用方给的 per-file 字节水位。有活跃 fold
     // (MultiEntry 可能存在)时拒绝并返回 false(快照是纯优化)。
-    // 线程安全: 是(全部分片 shared + meta shared;只应在写者静止点调用)。
+    // 线程安全: 是(写者闸门屏障 + meta unique;屏障期间读者照常并发)。
     [[nodiscard]] bool save_snapshot(
         std::string_view path,
         const std::vector<std::pair<std::uint32_t, std::uint64_t>>& watermarks) const;
@@ -327,17 +341,19 @@ public:
     [[nodiscard]] KeyDirInfo info() const;
     // 全量深拷贝；给 keydir_copy NIF 用（虽然 M6 之后不再 export，但内部
     // 的 merge 有时会用浅快照走类似的路径）。
-    // 线程安全: 是。锁: 全部分片 shared + meta shared。
-    // 注意: 大对象，O(n) 拷贝；持 shared 锁期间写者会被阻塞。
+    // 线程安全: 是。锁: 写者闸门屏障 + meta shared(屏障内纯读)。
+    // 注意: 大对象，O(n) 拷贝；屏障期间写者退避、读者照常并发。
     [[nodiscard]] std::shared_ptr<KeyDir> deep_copy() const;
 
 private:
     friend class IterHandle;
 
-    // === M6-S2:16 分片 ===
-    // 锁全序（严格遵守,详见文件头）:
-    //     shards_[0..kShards)（下标升序）→ meta_mu_ → fstats_grow_mu_
-    // 允许持分片锁时嵌套拿 meta_mu_;严禁持 meta_mu_ 时再拿任何分片锁。
+    // === M6-S2:分片 ===
+    // 锁全序（屏障 v2,严格遵守,详见文件头）:
+    //     barrier_mu_ → gate_mu_ → meta_mu_ → 单个 shard(≤1 把)
+    //     → fstats_grow_mu_
+    // 两处反向嵌套例外（热路径 shard→meta;release 阶段二屏障内
+    // meta_shared→shard）见文件头无环论证。
     static constexpr std::size_t kShards = 256;  // S5:16→64,降低分片碰撞与写者停车传染面
     struct alignas(64) Shard {
         // 分片锁。主 hash 的值是 variant;判别用 std::get_if<Single|Multi>。
@@ -356,11 +372,18 @@ private:
         return StringHash{}(key) & (kShards - 1);
     }
 
-    // 按下标升序锁住全部分片(全屏障第一段;之后通常再拿 meta_mu_)。
-    [[nodiscard]] std::array<std::unique_lock<std::mutex>, kShards>
-    lock_all_shards() const;
-    [[nodiscard]] std::array<std::unique_lock<std::mutex>, kShards>
-    lock_all_shards_shared() const;
+    // === 屏障 v2:写者闸门（替代旧"同时持全部分片锁"方案）===
+    // 旧 lock_all_shards() 同时持 kShards+1=257 把锁,撞 TSan 死锁检测器
+    // 64 持锁硬上限(sanitizer_deadlock_detector.h:67 CHECK,实测
+    // KeyDir.DeepCopyPreservesOrd 在 detect_deadlocks=1 下崩溃),已删除。
+    // BarrierGuard（keydir.cpp 内部）:置 barrier_active_ 后逐分片
+    // 加锁-放锁排干在途写者（任意瞬间只持 1 把分片锁）;写者在拿到
+    // 分片锁后检查闸门,active 则放分片锁到 gate_cv_ 退避;读者不受限。
+    friend class BarrierGuard;
+    std::atomic<bool>       barrier_active_{false};
+    std::mutex              barrier_mu_;   // 屏障间互斥,跨整个屏障持有
+    std::mutex              gate_mu_;      // 写者退避等待的 cv 配套锁
+    std::condition_variable gate_cv_;
 
     // fold 期间「pending 表」：写时复制规则触发后，新 key 的写入和
     // 「fold 期间临时 key 的 tombstone」会落到这里。最后一个 release 时
@@ -414,9 +437,10 @@ private:
     //   读热行——get/put 热路径每次 relaxed 读、写入罕见。与上面的写热
     //   行隔离,否则每个 put 的 epoch_ RMW 都会把读者需要的行打飞
     //   (false sharing,Mixed 基准实测主要损耗源)。
-    // keyfolders_:当前活跃 fold 数。只在全屏障(全部分片 unique + meta
-    // unique)内修改;热路径在持自己分片锁后 relaxed 读即足够新——屏障
-    // 无法在写者持分片锁期间完成,见设计 §4 时序论证。
+    // keyfolders_:当前活跃 fold 数。只在写者闸门屏障(BarrierGuard +
+    // meta unique)内修改;写者在持自己分片锁(且通过闸门检查)后
+    // relaxed 读即足够新——屏障的排干循环无法在写者持分片锁期间越过该
+    // 分片,见设计 §4 时序论证。
     alignas(64) std::atomic<std::uint64_t> keyfolders_{0};
     // biggest_file_id_:put 接受判断每次读;CAS-max 推进仅 roll 时真写。
     std::atomic<std::uint32_t> biggest_file_id_{0};
@@ -444,11 +468,15 @@ private:
                        std::int32_t total_bytes_inc,
                        bool should_create);
 
-    // 把 pending_ 合并回各分片 entries、把 MultiEntry 折回 SingleEntry。
-    // 前置条件：caller 持全屏障(全部分片 unique + meta unique)且
-    // keyfolders_ == 0。
-    // 线程安全: 否（依赖外部锁）。
-    void merge_pending_and_collapse_barrier();
+    // iter release 收尾两步（拆自旧 merge_pending_and_collapse_barrier;
+    // 三阶段协议见 IterHandle::release 实现注释）。
+    // 阶段二:把 pending_ 逐条应用进各分片 entries。内部拿 meta shared,
+    // 持有期间逐 key 嵌套该分片锁（meta→shard,"屏障内例外",无环论证
+    // 见文件头/.cpp）。前置:caller 持 BarrierGuard 且 keyfolders_==0。
+    void apply_pending_to_entries_barrier();
+    // 把 MultiEntry 折回 SingleEntry:逐分片「lock→折叠→unlock」。
+    // 前置:caller 持 BarrierGuard 且 keyfolders_==0、pending_ 已清。
+    void collapse_multi_entries_barrier();
 };
 
 }  // namespace bitcask::keydir

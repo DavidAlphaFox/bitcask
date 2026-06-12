@@ -11,18 +11,24 @@
 // =============================================================================
 // M6-S2 并发模型速记（详见 keydir.hpp 文件头 / doc/keydir-sharding-design-zh.md）
 //
-// 锁全序（必须严格遵守）：
-//     shards_[0..kShards)（按下标升序）→ meta_mu_ → fstats_grow_mu_
-// 即：可以在持分片锁时嵌套拿 meta_mu_，严禁反向。
+// 锁全序（屏障 v2，必须严格遵守）：
+//     barrier_mu_ → gate_mu_ → meta_mu_ → 单个 shard(任意时刻 ≤1 把)
+//     → fstats_grow_mu_
+// 两处反向嵌套例外（无环论证见 keydir.hpp 文件头）：
+//   ① 热路径持单个分片锁后嵌套 meta（shard→meta，S2 起的既有方向）；
+//   ② iter release 阶段二屏障内 meta_shared→shard（见
+//      apply_pending_to_entries_barrier 注释）。
 //
 // 核心不变量（探测顺序 entries→pending 的正确性依据）：
 //     key ∈ 某分片 entries  ⟹  pending_ 不会有它的更新版本。
 // 已存在 key 的新版本（put 覆写 / remove 墓碑）一律在分片内走 sibling
 // 链，绝不进 pending；pending 只接「fold 期间出现的全新 key」。
 //
-// keyfolders_ 只在全屏障（全部分片 unique + meta unique）内修改；写者
-// 在持自己分片锁后 relaxed 读即足够新——屏障无法在写者持分片锁期间
-// 完成（unique 等待），所以「读到 0 → 直写」的写一定整体先于屏障。
+// keyfolders_ 只在写者闸门屏障（BarrierGuard + meta unique）内修改；
+// 写者在持自己分片锁（且闸门检查通过）后 relaxed 读即足够新——闸门
+// 检查读到 inactive 的写者要么先于排干循环持有分片锁（排干在该分片
+// 等它出清，keyfolders_ 修改整体在其后），要么经排干循环的 mutex
+// 配对必见 active 退避；所以「读到 0 → 直写」的写一定整体先于屏障。
 // =============================================================================
 
 namespace bitcask::keydir {
@@ -100,26 +106,64 @@ struct EntryAt {
 }  // namespace
 
 // =============================================================================
-// 全屏障辅助：按下标升序锁住全部分片（锁全序第一段）。
+// 屏障 v2:写者闸门（RAII;替代旧 lock_all_shards/lock_all_shards_shared）。
+//
+// 旧方案在屏障期间同时持有全部 kShards+1=257 把锁,撞 TSan 死锁检测器
+// 的 64 持锁硬上限(compiler-rt sanitizer_deadlock_detector.h:67 CHECK,
+// 实测 KeyDir.DeepCopyPreservesOrd 在 TSAN_OPTIONS=detect_deadlocks=1
+// 下崩溃),故废弃。本方案任意瞬间至多持 1 把分片锁。
+//
+// 协议:
+//   ctor: barrier_mu_(屏障间互斥) → gate_mu_ 内置 barrier_active_=true
+//         → 排干:逐分片「加锁-放锁」。在途写者两种结局:
+//           a) 先于排干持有分片锁(闸门检查读到 inactive)——排干循环在
+//              该分片阻塞,等写者整段临界区(含嵌套 meta unique)出清;
+//           b) 晚于排干拿到分片锁——经该分片 mutex 的 unlock/lock 配对
+//              必见 barrier_active_=true,放分片锁到 gate_cv_ 退避。
+//         排干完成 ⟹ 屏障内不再有写者,也不存在 meta unique 持有/
+//         等待者(其余 unique 使用者 start/release/save/load 被
+//         barrier_mu_ 串行)。
+//   dtor: gate_mu_ 内置 barrier_active_=false → notify_all 唤醒退避
+//         写者 → 放 barrier_mu_。退避写者经 gate_mu_ 的 HB 必见屏障内
+//         的全部修改(keyfolders_/pending_/entries)。
+//
+// 屏障期间**读者(get/next/conditional_remove peek/info)照常并发**:
+//   - 屏障持有者对各分片 entries 的无锁遍历(deep_copy/save/iter start)
+//     与读者的持锁 find 是读-读并发,天然安全;写者出清由排干循环的
+//     mutex 配对保证 happens-before。
+//   - 唯一的屏障内写路径是 iter release 的阶段二/折叠,均按分片锁协议
+//     持锁写,对读者安全(见 apply_pending_to_entries_barrier)。
 // =============================================================================
 
-std::array<std::unique_lock<std::mutex>, KeyDir::kShards>
-KeyDir::lock_all_shards() const {
-    std::array<std::unique_lock<std::mutex>, kShards> locks;
-    for (std::size_t i = 0; i < kShards; ++i) {
-        locks[i] = std::unique_lock(shards_[i].mu);
-    }
-    return locks;
-}
+class BarrierGuard {
+    KeyDir& kd;
 
-std::array<std::unique_lock<std::mutex>, KeyDir::kShards>
-KeyDir::lock_all_shards_shared() const {
-    std::array<std::unique_lock<std::mutex>, kShards> locks;
-    for (std::size_t i = 0; i < kShards; ++i) {
-        locks[i] = std::unique_lock(shards_[i].mu);
+public:
+    explicit BarrierGuard(const KeyDir& k) : kd(const_cast<KeyDir&>(k)) {
+        kd.barrier_mu_.lock();
+        {
+            std::lock_guard<std::mutex> g(kd.gate_mu_);
+            kd.barrier_active_.store(true, std::memory_order_release);
+        }
+        // 排干:逐分片 加锁-放锁,任意瞬间只持 1 把——保证在途写者出清。
+        for (auto& sh : kd.shards_) {
+            sh.mu.lock();
+            sh.mu.unlock();
+        }
     }
-    return locks;
-}
+    ~BarrierGuard() {
+        {
+            std::lock_guard<std::mutex> g(kd.gate_mu_);
+            kd.barrier_active_.store(false, std::memory_order_release);
+        }
+        kd.gate_cv_.notify_all();
+        kd.barrier_mu_.unlock();
+    }
+    BarrierGuard(const BarrierGuard&) = delete;
+    BarrierGuard& operator=(const BarrierGuard&) = delete;
+    BarrierGuard(BarrierGuard&&) = delete;
+    BarrierGuard& operator=(BarrierGuard&&) = delete;
+};
 
 // =============================================================================
 // 文件级统计 (fstats)
@@ -244,7 +288,11 @@ std::uint32_t KeyDir::trim_fstats(std::span<const std::uint32_t> ids) {
 //   2. miss 且 fold 态时,**保持分片锁不放**,嵌套 meta shared 查 pending_。
 //      保持分片锁是为了堵 release 合并窗口的 TOCTOU：若先放分片锁再查
 //      pending,merge(pending→entries) 可能恰好在两次查找之间完成,两边
-//      都 miss。持分片锁期间全屏障无法完成,合并不可能发生。
+//      都 miss。屏障 v2 下论证更新:release 阶段二把某 key 应用进
+//      entries 必须拿该 key 的分片锁(被本读者持有,无法插入两次查找
+//      之间),且清 pending 表(阶段三)排在阶段二全部应用完成之后——
+//      「先应用后清表」⟹ 持本分片锁期间该分片 key 要么已在 entries
+//      命中,要么仍留在 pending 可见,无丢失窗口。
 // 正确性依据：key ∈ entries ⟹ pending 不会有它的更新版本（见文件头
 // 不变量）。墓碑视作「不存在」（kNotFound）。
 // epoch 比较语义保留：pending entry 的 epoch <= target_epoch 才可见——
@@ -322,7 +370,22 @@ PutResult KeyDir::put(std::string_view key,
     Shard& sh = shards_[shard_for(key)];
     std::unique_lock slock(sh.mu);
 
-    // keyfolders_ 只在全屏障内变;持分片锁后 relaxed 读即足够新。
+    // 屏障闸门(v2):屏障期间写者退避。★ 等待前必须放分片锁——否则排干
+    // 循环与我们互等。被唤醒后重新拿分片锁再查(循环兜住虚假唤醒与
+    // 连续屏障)。读路径不检查闸门(屏障期间读者照常并发)。
+    while (barrier_active_.load(std::memory_order_acquire)) {
+        slock.unlock();
+        {
+            std::unique_lock<std::mutex> g(gate_mu_);
+            gate_cv_.wait(g, [&] {
+                return !barrier_active_.load(std::memory_order_acquire);
+            });
+        }
+        slock.lock();
+    }
+
+    // keyfolders_ 只在屏障内变;闸门检查通过且持分片锁后 relaxed 读即
+    // 足够新(论证见文件头)。
     const bool fold_active = keyfolders_.load(std::memory_order_relaxed) > 0;
 
     // ---- 阶段 1：探测当前状态 ----
@@ -532,6 +595,18 @@ bool KeyDir::remove(std::string_view key, std::uint32_t remove_time) {
     Shard& sh = shards_[shard_for(key)];
     std::unique_lock slock(sh.mu);
 
+    // 屏障闸门(v2):同 put——等待前必须放分片锁,唤醒后重拿再查。
+    while (barrier_active_.load(std::memory_order_acquire)) {
+        slock.unlock();
+        {
+            std::unique_lock<std::mutex> g(gate_mu_);
+            gate_cv_.wait(g, [&] {
+                return !barrier_active_.load(std::memory_order_acquire);
+            });
+        }
+        slock.lock();
+    }
+
     // 与旧实现一致:无论命中与否都消耗一个 epoch（epoch 洞无害）。
     const std::uint64_t this_epoch =
         epoch_.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -607,8 +682,9 @@ bool KeyDir::remove(std::string_view key, std::uint32_t remove_time) {
 // 匹配才真的删；否则返回 kAlreadyExists 让 caller（一般是 merge / 内部
 // 清理）跳过。key 不存在视为「已经删了」——返回 kOk。
 //
-// 实现：先用分片 shared_lock 快速 peek 比对，匹配再释放并调 remove() 取
-// 分片 unique_lock。这样不匹配的常见路径无需独占锁。
+// 实现：先用分片锁快速 peek 比对，匹配再释放并调 remove()。
+// 屏障闸门(v2):只读 peek 阶段**不**检查闸门(读不受限,屏障期间照常
+// 并发);写阶段走 remove(),其内部自带闸门检查。
 PutResult KeyDir::conditional_remove(std::string_view key,
                                       std::uint32_t tstamp,
                                       std::uint32_t file_id,
@@ -653,9 +729,9 @@ PutResult KeyDir::conditional_remove(std::string_view key,
 // =============================================================================
 // 迭代器（IterHandle 实现放在同一个 TU；析构会调 release()）
 //
-// start() / release() 是全屏障（stop-the-world）冷路径：按下标序拿全部
-// 16 个分片 unique 再拿 meta unique，屏障内逐字执行原全局锁下的逻辑——
-// 全独占下原实现语义不变（设计 §4 方案 B）。
+// start() / release() 是写者闸门屏障（BarrierGuard）冷路径：写者出清、
+// 读者照常并发。start 屏障内纯读 + meta unique；release 的合并是唯一
+// 屏障内写路径,按三阶段执行（见 release 注释;设计 §4 屏障 v2）。
 // =============================================================================
 
 IterHandle::~IterHandle() noexcept {
@@ -676,8 +752,10 @@ IterHandle::~IterHandle() noexcept {
 StartIterResult IterHandle::start(std::uint32_t now_sec,
                                    int maxage, int maxputs) {
     if (iterating_) return StartIterResult::kAlreadyIterating;
-    // 全屏障:全部分片 unique（下标序）→ meta unique。锁序见 keydir.hpp。
-    auto shard_locks = parent_->lock_all_shards();
+    // 屏障 v2:写者出清,读者照常并发。屏障内全是纯读 + meta 状态修改:
+    // freeze 判定/keyfolders_++/pending 初始化在 meta unique 下做（此刻
+    // 不持任何分片锁,锁序 barrier→gate→meta 无环）。
+    BarrierGuard barrier(*parent_);
     std::unique_lock mlock(parent_->meta_mu_);
 
     // pending freeze 复用判断：现存 pending 是否仍然「足够新」给本次 fold 用。
@@ -701,11 +779,13 @@ StartIterResult IterHandle::start(std::uint32_t now_sec,
     iterating_ = true;
     iter_epoch_ = parent_->epoch_.fetch_add(1, std::memory_order_relaxed) + 1;
     parent_->newest_folder_epoch_ = iter_epoch_;
-    // keyfolders_ 只在全屏障内修改（此处与 release）。
+    // keyfolders_ 只在屏障内修改（此处与 release 阶段一）。
     parent_->keyfolders_.fetch_add(1, std::memory_order_relaxed);
 
     // 拍 key snapshot——O(n) 一次性开销，跨分片归并（按分片下标序拼接），
-    // 之后对 entries 的 rehash 免疫。
+    // 之后对 entries 的 rehash 免疫。屏障内写者已出清,遍历各分片
+    // entries **不需要分片锁**（并发的 get/next 只读,unordered_map
+    // 并发只读安全;写者出清的 HB 由排干循环的 mutex 配对保证）。
     keys_snapshot_.clear();
     std::size_t total = 0;
     for (const auto& sh : parent_->shards_) total += sh.entries.size();
@@ -744,64 +824,111 @@ std::optional<EntryProxy> IterHandle::next(bool include_tombstones) {
 
 // 结束迭代。最后一个 folder release 时触发 pending → entries 合并 +
 // MultiEntry 折叠。这两步是 fold 期间「写时复制」的反向收尾。
-// 全屏障下执行——与 start 同样的锁集合。
+//
+// 屏障 v2 三阶段（写者已出清,唯一并发者是读者,逐阶段保证读者视角
+// 无缝）:
+//   阶段一[meta unique]  keyfolders_--;非最后一个 folder 直接返回;
+//                        是最后一个 → 继续（**不在此清 pending**）。
+//   阶段二[meta shared]  遍历 pending_ 每条,嵌套拿该 key 分片锁应用进
+//                        entries（apply_pending_to_entries_barrier）。
+//   阶段三[meta unique,不持分片锁]  pending_.reset()/has_pending_=false。
+//   「先应用(阶段二)后清表(阶段三)」⟹ 读者在窗口内要么 entries 命中
+//   （探测顺序 entries 优先）要么 pending 命中,无丢失窗口。
+//   之后 MultiEntry 折叠:逐分片「lock → 折叠 → unlock」（读者按分片锁
+//   协议安全;此刻 keyfolders_==0,无迭代器再看老 revision）。
 void IterHandle::release() {
     if (!iterating_) return;
-    auto shard_locks = parent_->lock_all_shards();
-    std::unique_lock mlock(parent_->meta_mu_);
+    BarrierGuard barrier(*parent_);
     iterating_ = false;
     iter_epoch_ = kMaxEpoch;
     keys_snapshot_.clear();
     cursor_ = 0;
 
-    if (parent_->keyfolders_.fetch_sub(1, std::memory_order_relaxed) == 1) {
-        parent_->merge_pending_and_collapse_barrier();
+    // 阶段一[meta unique]:keyfolders_--。
+    {
+        std::unique_lock mlock(parent_->meta_mu_);
+        if (parent_->keyfolders_.fetch_sub(1, std::memory_order_relaxed) != 1) {
+            return;  // 还有别的 folder——屏障由 RAII 释放。
+        }
+    }
+
+    // 阶段二[meta shared]:pending → entries 应用（嵌套分片锁）。
+    parent_->apply_pending_to_entries_barrier();
+
+    // 阶段三[meta unique,不持任何分片锁]:清 pending 表 + iter 协调状态。
+    {
+        std::unique_lock mlock(parent_->meta_mu_);
+        if (parent_->pending_.has_value()) {
+            parent_->pending_.reset();
+            parent_->has_pending_.store(false, std::memory_order_relaxed);
+            parent_->pending_start_epoch_ = 0;
+            parent_->pending_start_time_  = 0;
+            parent_->pending_updated_     = 0;
+        }
         parent_->iter_generation_ += 1;
         parent_->iter_mutation_.store(false, std::memory_order_relaxed);
     }
+
+    // MultiEntry 折叠（逐分片持锁）。
+    parent_->collapse_multi_entries_barrier();
 }
 
-// 把 fold 期间累积的 pending 表 merge 回各分片 entries，并把所有 sibling
-// 链折回 SingleEntry。前置条件：caller 持全屏障（全部分片 unique + meta
-// unique），且 keyfolders_ 已经归零（即不会再有迭代器看老 revision）。
-void KeyDir::merge_pending_and_collapse_barrier() {
-    if (pending_.has_value()) {
-        // 第 1 步：把 pending 里的 entry 按 shard_for 合并回各分片 entries。
-        // pending 墓碑的语义：
-        //   - entries 里没这个 key：什么都不做（fold 期间出现又消失的临时 key）
-        //   - entries 里有：直接 erase，相当于完成最终 delete
-        //     （S2 不变量下 pending∩entries=∅,该分支理论不可达,保留防御）
-        // pending 活 entry 直接覆盖进 entries（unconditional——fold 期间
-        // 这个 key 在 entries 里的旧 revision 已经没用了）。
-        for (auto& [k, p_entry] : *pending_) {
-            auto& sh = shards_[shard_for(k)];
-            auto it = sh.entries.find(k);
-            const bool is_tomb = is_pending_tombstone(p_entry);
+// release 阶段二:把 fold 期间累积的 pending 表逐条应用进各分片 entries。
+// 前置条件:caller 持 BarrierGuard（写者已出清）且 keyfolders_ 已归零。
+//
+// ⚠ 锁序例外（仅屏障内合法）:本函数在 meta **shared** 持有期间逐 key
+// 嵌套该 key 的分片锁——这是 meta→shard 方向,与常规锁序（热路径
+// shard→meta）相反。无环论证:
+//   - 写者(put/remove,meta unique 的全部使用者)已被闸门出清:任何越过
+//     闸门的写者必在排干循环前就持有分片锁,并在排干完成前整体结束
+//     （含其嵌套 meta unique 段）;其余 meta unique 使用者
+//     （start/release 阶段一三/save/load）被 barrier_mu_ 串行,
+//     不与本阶段并发——屏障内不存在 meta unique 持有者或等待者。
+//   - 唯一并发者是读者(get/conditional_remove peek),其 shard→meta
+//     嵌套对 meta 只拿 **shared**;本阶段同样只拿 shared。shared-shared
+//     相容且无 unique 排队者,双方的 meta 获取都不可能阻塞——无法构成
+//     「持 shard 等 meta / 持 meta 等 shard」的环。
+void KeyDir::apply_pending_to_entries_barrier() {
+    std::shared_lock mlock(meta_mu_);
+    if (!pending_.has_value()) return;
 
-            if (it == sh.entries.end()) {
-                if (is_tomb) {
-                    // 临时墓碑——丢弃即可。
-                } else {
-                    sh.entries.emplace(k, Entry{p_entry});
-                }
+    // pending 墓碑的语义（与旧 merge_pending_and_collapse_barrier 逐字
+    // 一致）：
+    //   - entries 里没这个 key：什么都不做（fold 期间出现又消失的临时 key）
+    //   - entries 里有：直接 erase，相当于完成最终 delete
+    //     （S2 不变量下 pending∩entries=∅,该分支理论不可达,保留防御）
+    // pending 活 entry 直接覆盖进 entries（unconditional——fold 期间
+    // 这个 key 在 entries 里的旧 revision 已经没用了）。
+    for (auto& [k, p_entry] : *pending_) {
+        Shard& sh = shards_[shard_for(k)];
+        std::lock_guard<std::mutex> sg(sh.mu);  // 嵌套:meta_shared → shard
+        auto it = sh.entries.find(k);
+        const bool is_tomb = is_pending_tombstone(p_entry);
+
+        if (it == sh.entries.end()) {
+            if (is_tomb) {
+                // 临时墓碑——丢弃即可。
             } else {
-                if (is_tomb) {
-                    sh.entries.erase(it);
-                } else {
-                    it->second = Entry{p_entry};
-                }
+                sh.entries.emplace(k, Entry{p_entry});
+            }
+        } else {
+            if (is_tomb) {
+                sh.entries.erase(it);
+            } else {
+                it->second = Entry{p_entry};
             }
         }
-        pending_.reset();
-        has_pending_.store(false, std::memory_order_relaxed);
-        pending_start_epoch_ = 0;
-        pending_start_time_  = 0;
-        pending_updated_     = 0;
     }
+}
 
-    // 第 2 步：遍历所有分片,把 MultiEntry 折回 SingleEntry。
-    // 链头是最新 revision；如果链头本身是 sibling 墓碑，整个 entry 都消失。
+// release 收尾:遍历所有分片,把 MultiEntry 折回 SingleEntry。
+// 链头是最新 revision；如果链头本身是 sibling 墓碑，整个 entry 都消失。
+// 前置条件:caller 持 BarrierGuard 且 keyfolders_==0、pending_ 已清。
+// 逐分片「lock → 折叠该分片全部链 → unlock」,任意瞬间只持 1 把分片锁;
+// 并发读者按分片锁协议安全（折叠前后单 key 可见值不变:链头即最新）。
+void KeyDir::collapse_multi_entries_barrier() {
     for (auto& sh : shards_) {
+        std::lock_guard<std::mutex> sg(sh.mu);
         for (auto it = sh.entries.begin(); it != sh.entries.end(); ) {
             if (auto* m = std::get_if<MultiEntry>(&it->second)) {
                 if (m->revisions.empty() || is_sibling_tombstone(m->revisions.front())) {
@@ -894,10 +1021,11 @@ KeyDirInfo KeyDir::info() const {
 // 但 cask 内部某些 merge 路径仍可能用类似的快照）。
 // 拷贝出来的 keydir keyfolders_ 强制清零——副本是「干净的全新 keydir」，
 // 不继承任何活跃 fold 状态，直接可以独立使用。
-// 锁：全部分片 shared（下标序）+ meta shared。
+// 锁：写者闸门屏障 + meta shared。屏障内全是纯读,写者已出清——遍历
+// 各分片 entries 不需要分片锁（与并发读者是读-读并发,安全）。
 std::shared_ptr<KeyDir> KeyDir::deep_copy() const {
     auto copy = std::make_shared<KeyDir>();
-    auto shard_locks = lock_all_shards_shared();
+    BarrierGuard barrier(*this);
     std::shared_lock mlock(meta_mu_);
     for (std::size_t i = 0; i < kShards; ++i) {
         copy->shards_[i].entries = shards_[i].entries;
@@ -994,10 +1122,13 @@ struct SnapCursor {
 bool KeyDir::save_snapshot(
     std::string_view path,
     const std::vector<std::pair<std::uint32_t, std::uint64_t>>& watermarks) const {
-    // 全部分片 shared + meta shared:写者静止点;keyfolders_==0 检查保持
-    // 「活跃 fold 拒绝」语义（shared 屏障下 start/release 无法并发进行）。
-    auto shard_locks = lock_all_shards_shared();
-    std::shared_lock mlock(meta_mu_);
+    // 写者闸门屏障:写者静止点;keyfolders_==0 检查保持「活跃 fold 拒绝」
+    // 语义（start/release 同走屏障,被 barrier_mu_ 串行,无法并发进行）。
+    // 屏障内全是纯读,遍历各分片 entries 不需要分片锁;meta 状态读取
+    // （keyfolders_ 检查）在屏障内拿 meta unique 做（此刻不持任何分片
+    // 锁,锁序 barrier→gate→meta 无环）。
+    BarrierGuard barrier(*this);
+    std::unique_lock mlock(meta_mu_);
     if (keyfolders_.load(std::memory_order_relaxed) != 0) {
         return false;  // 活跃 fold:MultiEntry 可能存在,放弃
     }
@@ -1108,8 +1239,10 @@ auto KeyDir::load_snapshot(std::string_view path)
     if (crc != stored_crc) return std::nullopt;
     c.end -= 4;  // payload 不含尾部 CRC
 
-    // open 期单线程,但仍按锁序拿全屏障（防御 + TSan 友好）。
-    auto shard_locks = lock_all_shards();
+    // open 期单线程,但仍走写者闸门屏障统一（防御 + TSan 友好）。
+    // 内部逻辑不变:直填各分片 entries——写者已出清且 open 期无并发
+    // 读者,无需分片锁。
+    BarrierGuard barrier(*this);
     std::unique_lock mlock(meta_mu_);
     auto reset_all = [&] {
         for (auto& sh : shards_) sh.entries.clear();
