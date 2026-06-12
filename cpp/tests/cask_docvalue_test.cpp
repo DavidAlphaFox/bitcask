@@ -922,3 +922,106 @@ TEST_F(CaskDocValueTest, KeydirSnapshotCorruptFallsBackToFullFold) {
         (*c)->close();
     }
 }
+
+// ── A4-P3:search 模式快照快路径(Index sidecar 齐备后开门)──────────────
+
+namespace {
+CaskOptions p3_search_opts() {
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.enable_search = true;
+    SearchLayerConfig cfg;
+    cfg.analyzer_config.type = AnalyzerType::Whitespace;
+    opts.search_config = cfg;
+    return opts;
+}
+}  // namespace
+
+// 干净 close → reopen:三块快照齐备走快路径,搜索/读取完整。
+TEST_F(CaskDocValueTest, SearchSnapshotFastReopen) {
+    auto opts = p3_search_opts();
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        for (int i = 0; i < 200; ++i) {
+            const std::string k = "k" + std::to_string(i);
+            const std::string v = "apple banana doc" + std::to_string(i);
+            ASSERT_TRUE((*c)->put(sv_bytes(k), sv_bytes(v)));
+        }
+        (*c)->flush_index();
+        ASSERT_TRUE((*c)->remove(sv_bytes(std::string("k7"))));
+        (*c)->close();
+    }
+    ASSERT_TRUE(std::filesystem::exists(tmpdir_ / "bitcask.index.snap"));
+
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+    auto sr = (*c)->search_text("banana", 300);
+    ASSERT_TRUE(sr);
+    EXPECT_EQ(sr->hits.size(), 199u);  // k7 已删,live 经 sidecar 恢复
+    auto g = (*c)->get(sv_bytes(std::string("k42")));
+    ASSERT_TRUE(g);
+    EXPECT_FALSE((*c)->get(sv_bytes(std::string("k7"))));
+    (*c)->close();
+}
+
+// 陈旧 keydir 快照:尾部回放在 search 模式下同样生效(门按覆盖判定放行)。
+TEST_F(CaskDocValueTest, SearchSnapshotStaleKeydirTailReplay) {
+    auto opts = p3_search_opts();
+    const auto snap = tmpdir_ / "bitcask.keydir.snap";
+    const auto snap_old = tmpdir_ / "kd.old";
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        for (int i = 0; i < 100; ++i) {
+            ASSERT_TRUE((*c)->put(sv_bytes("a" + std::to_string(i)),
+                                  sv_bytes(std::string("alpha text"))));
+        }
+        (*c)->close();
+    }
+    std::filesystem::copy_file(snap, snap_old);
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        for (int i = 0; i < 50; ++i) {
+            ASSERT_TRUE((*c)->put(sv_bytes("b" + std::to_string(i)),
+                                  sv_bytes(std::string("beta text"))));
+        }
+        (*c)->close();
+    }
+    // keydir 快照回退到会话 1;bm25/sidecar 保持会话 2(覆盖更大 → 门过)。
+    std::filesystem::copy_file(snap_old, snap,
+        std::filesystem::copy_options::overwrite_existing);
+
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+    EXPECT_TRUE((*c)->get(sv_bytes(std::string("b25"))));   // 尾部回放
+    auto sr = (*c)->search_text("beta", 100);
+    ASSERT_TRUE(sr);
+    EXPECT_EQ(sr->hits.size(), 50u);
+    (*c)->close();
+}
+
+// sidecar 损坏 → 门关,全量 fold 兜底,数据与搜索完好。
+TEST_F(CaskDocValueTest, SearchSnapshotCorruptSidecarFallsBack) {
+    auto opts = p3_search_opts();
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        for (int i = 0; i < 120; ++i) {
+            ASSERT_TRUE((*c)->put(sv_bytes("k" + std::to_string(i)),
+                                  sv_bytes(std::string("gamma text"))));
+        }
+        (*c)->close();
+    }
+    const auto sc = tmpdir_ / "bitcask.index.snap";
+    std::filesystem::resize_file(sc, std::filesystem::file_size(sc) / 2);
+
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+    auto sr = (*c)->search_text("gamma", 200);
+    ASSERT_TRUE(sr);
+    EXPECT_EQ(sr->hits.size(), 120u);
+    EXPECT_TRUE((*c)->get(sv_bytes(std::string("k99"))));
+    (*c)->close();
+}

@@ -174,6 +174,18 @@ public:
     // 覆盖 keydir 快照的跳过区(成对性门,recovery 设计 §4)。
     [[nodiscard]] std::uint64_t indexed_ord_floor() const;
 
+    // ---- A4-P3:Index sidecar 快照(BCIS v1)----
+    // 持久化 Index 侧表(ext2ord/slots/doc_lens/live,经 for_each_live
+    // 公开 API dump;put_doc 重建)。covers_next_ord 为覆盖标记:
+    // 调用时刻所有 ord < 该值的文档已进 Index(调用方保证 IndexPool 已
+    // flush)。这是 Phase 2 成对性门缺失的第三块状态,见 recovery 设计 §4。
+    [[nodiscard]] bool save_index_sidecar(std::string_view path,
+                                          std::uint64_t covers_next_ord) const;
+    // 校验失败返回 nullopt(Index 态可能已部分写入——调用方届时走全量
+    // fold,recover_doc 的 put_doc 覆盖语义保证收敛)。成功返回标记。
+    [[nodiscard]] std::optional<std::uint64_t>
+    load_index_sidecar(std::string_view path);
+
     // ---- 快照持久化 ----
     [[nodiscard]] std::expected<void, std::string> save_snapshot(std::string_view path) const;
 

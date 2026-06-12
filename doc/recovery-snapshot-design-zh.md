@@ -54,10 +54,18 @@ O11 同款防御:长度/CRC 校验失败、截断、版本不识 → load 返回
   (SearchSurvivesMerge)暴露缺口——search 状态还含 **Index 侧表**
   (ext2ord/live/doc_lens),bm25 快照不含;且 doc_len 无持久化来源
   (倒排快照不存 per-posting dl),跳过前缀 ⟹ live 全空 + v5 dl
-  不变量失守。**解锁条件(Phase 3)**:Index sidecar 快照
-  (ext2ord/slots/doc_lens/live,可并入 keydir 快照扩展节,doc_len
-  由 SearchLayer 在 put 路径回填)。落地的基建(成对保存/加载链/门)
-  在 sidecar 就位后翻开 `covered` 即生效。
+  不变量失守。~~解锁条件(Phase 3)~~ **Phase 3 已落地(同日)**:独立 sidecar
+  `bitcask.index.snap`(BCIS v1,CRC+tmp/rename),经 Index 公开 API
+  实现——`for_each_live` dump(ord/ext/loc/tstamp/doc_len 每行)、
+  `put_doc` 重建(顺带恢复 live/doc_lens/水位),零 Index 内部耦合。
+  门 = bm25 floor 覆盖 ∧ sidecar.covers_next_ord ≥ keydir.next_ord
+  ∧ 三块快照均校验通过。merge 端保存顺序:keydir 快照(较早
+  next_ord)→ flush IndexPool → bm25 → sidecar——并发写下覆盖标记
+  天然 ≥ keydir 快照,门可判。close 端顺序:停池 → search 双保存
+  (keydir 仍在手)→ keydir 快照 → 释放(初版把 sidecar 放在
+  keydir_.reset() 之后恒被跳过,P3 测试当场抓出)。
+  ord_field_lens_(R3 多字段精确扣减表)不持久化:重启后 on_delete
+  降级为按 slot.doc_len 全字段扣减的既有近似路径,记录在案。
 
 ## 5. 写入点与触发
 

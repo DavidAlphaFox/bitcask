@@ -1,8 +1,11 @@
 #include "bitcask/search_layer.hpp"
 #include "bitcask/text_utils.hpp"
+#include "bitcask/codec.hpp"
 #include "bitcask/highlighter.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <limits>
@@ -503,6 +506,118 @@ std::uint64_t SearchLayer::indexed_ord_floor() const {
         floor = std::min(floor, wm);
     }
     return floor;
+}
+
+
+namespace {
+constexpr std::uint32_t kSidecarMagic   = 0x42434953;  // "BCIS"
+constexpr std::uint32_t kSidecarVersion = 1;
+void sc_put32(std::vector<std::uint8_t>& b, std::uint32_t v) {
+    const auto* p = reinterpret_cast<const std::uint8_t*>(&v);
+    b.insert(b.end(), p, p + 4);
+}
+void sc_put64(std::vector<std::uint8_t>& b, std::uint64_t v) {
+    const auto* p = reinterpret_cast<const std::uint8_t*>(&v);
+    b.insert(b.end(), p, p + 8);
+}
+}  // namespace
+
+bool SearchLayer::save_index_sidecar(std::string_view path,
+                                     std::uint64_t covers_next_ord) const {
+    std::vector<std::uint8_t> buf;
+    sc_put32(buf, kSidecarMagic);
+    sc_put32(buf, kSidecarVersion);
+    sc_put64(buf, covers_next_ord);
+    // 行数占位,回填。
+    const std::size_t cnt_pos = buf.size();
+    sc_put64(buf, 0);
+    std::uint64_t rows = 0;
+    bool ok = true;
+    index_.for_each_live([&](std::uint64_t ord, const std::string& ext,
+                             const index::DocSlot& slot) {
+        if (ext.size() > 0xFFFF) { ok = false; return; }
+        sc_put64(buf, ord);
+        const auto klen = static_cast<std::uint16_t>(ext.size());
+        const auto* kp = reinterpret_cast<const std::uint8_t*>(&klen);
+        buf.insert(buf.end(), kp, kp + 2);
+        const auto* kd = reinterpret_cast<const std::uint8_t*>(ext.data());
+        buf.insert(buf.end(), kd, kd + ext.size());
+        sc_put32(buf, slot.loc.file_id);
+        sc_put64(buf, slot.loc.offset);
+        sc_put32(buf, slot.loc.total_sz);
+        sc_put32(buf, slot.tstamp);
+        sc_put32(buf, slot.doc_len);
+        ++rows;
+    });
+    if (!ok) return false;
+    std::memcpy(buf.data() + cnt_pos, &rows, 8);
+    const std::uint32_t crc = bitcask::codec::crc32(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(buf.data() + 8), buf.size() - 8));
+    sc_put32(buf, crc);
+
+    const std::string fp(path);
+    const std::string tmp = fp + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+    const bool wrote = std::fwrite(buf.data(), 1, buf.size(), f) == buf.size();
+    std::fclose(f);
+    if (!wrote || std::rename(tmp.c_str(), fp.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+std::optional<std::uint64_t>
+SearchLayer::load_index_sidecar(std::string_view path) {
+    std::FILE* f = std::fopen(std::string(path).c_str(), "rb");
+    if (!f) return std::nullopt;
+    std::fseek(f, 0, SEEK_END);
+    const long fsz = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (fsz < 28) { std::fclose(f); return std::nullopt; }
+    std::vector<std::uint8_t> buf(static_cast<std::size_t>(fsz));
+    const bool rd = std::fread(buf.data(), 1, buf.size(), f) == buf.size();
+    std::fclose(f);
+    if (!rd) return std::nullopt;
+
+    auto rd32 = [&](std::size_t off) {
+        std::uint32_t v; std::memcpy(&v, buf.data() + off, 4); return v;
+    };
+    if (rd32(0) != kSidecarMagic || rd32(4) != kSidecarVersion) {
+        return std::nullopt;
+    }
+    std::uint32_t stored_crc = 0;
+    std::memcpy(&stored_crc, buf.data() + buf.size() - 4, 4);
+    const std::uint32_t crc = bitcask::codec::crc32(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(buf.data() + 8), buf.size() - 12));
+    if (crc != stored_crc) return std::nullopt;
+
+    const std::uint8_t* p = buf.data() + 8;
+    const std::uint8_t* end = buf.data() + buf.size() - 4;
+    auto need = [&](std::size_t n) {
+        return static_cast<std::size_t>(end - p) >= n;
+    };
+    std::uint64_t covers = 0, rows = 0;
+    std::memcpy(&covers, p, 8); p += 8;
+    std::memcpy(&rows, p, 8); p += 8;
+    if (rows > (1ull << 40)) return std::nullopt;
+    for (std::uint64_t i = 0; i < rows; ++i) {
+        if (!need(10)) return std::nullopt;
+        std::uint64_t ord; std::memcpy(&ord, p, 8); p += 8;
+        std::uint16_t klen; std::memcpy(&klen, p, 2); p += 2;
+        if (!need(static_cast<std::size_t>(klen) + 20)) return std::nullopt;
+        std::string ext(reinterpret_cast<const char*>(p), klen); p += klen;
+        index::DocSlot slot;
+        std::memcpy(&slot.loc.file_id, p, 4); p += 4;
+        std::memcpy(&slot.loc.offset, p, 8); p += 8;
+        std::memcpy(&slot.loc.total_sz, p, 4); p += 4;
+        std::memcpy(&slot.tstamp, p, 4); p += 4;
+        std::memcpy(&slot.doc_len, p, 4); p += 4;
+        index_.put_doc(ext, ord, slot);  // 重建 ext2ord/live/doc_lens/水位
+    }
+    if (p != end) return std::nullopt;
+    return covers;
 }
 
 std::expected<void, std::string> SearchLayer::save_snapshot(std::string_view path) const {

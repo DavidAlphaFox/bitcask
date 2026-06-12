@@ -16,6 +16,8 @@ namespace bitcask {
 
 // A4:keydir 段快照文件名(目录级,与 bitcask.meta 同级)。
 inline constexpr const char* kKeydirSnapName = "bitcask.keydir.snap";
+// A4-P3:Index 侧表 sidecar(search 模式成对快照的第三块)。
+inline constexpr const char* kIndexSidecarName = "bitcask.index.snap";
 
 namespace {
 namespace fs = std::filesystem;
@@ -543,7 +545,19 @@ void Cask::close() noexcept {
         active_data_.reset();
         read_files_.clear();
     }
-    // A4:写者已静止,落 keydir 段快照(失败无害——open 回退全量 fold)。
+    // A4-P2/P3 顺序要点:先停 IndexPool(排干 → Index 覆盖全部已分配
+    // ord),再在 keydir 仍在手时做 search 双保存(bm25 + sidecar,
+    // 覆盖标记取 peek_next_ord),最后落 keydir 快照并释放——
+    // 旧版在 keydir_.reset() 之后才存 sidecar,恒被跳过(P3 测试抓出)。
+    if (index_pool_) {
+        index_pool_->stop();
+        index_pool_.reset();
+    }
+    if (search_ && opts_.read_write && keydir_) {
+        (void)search_->save_snapshot(dirname_ + "/bm25_snapshot.inv");
+        (void)search_->save_index_sidecar(
+            dirname_ + "/" + kIndexSidecarName, keydir_->peek_next_ord());
+    }
     if (opts_.read_write) write_keydir_snapshot();
     if (registry_ && !keydir_name_.empty()) {
         registry_->release(keydir_name_);
@@ -551,15 +565,6 @@ void Cask::close() noexcept {
         keydir_name_.clear();
     }
     keydir_.reset();
-    if (index_pool_) {
-        index_pool_->stop();
-        index_pool_.reset();
-    }
-    // A4-P2:写者静止,bm25 快照与 keydir 快照在同一静止点成对落盘
-    // (per-field WAL 随 save 截断;成对性门见 recovery 设计 §4)。
-    if (search_ && opts_.read_write) {
-        (void)search_->save_snapshot(dirname_ + "/bm25_snapshot.inv");
-    }
     search_.reset();
     if (write_lock_) {
         write_lock_->release_quiet();
@@ -607,9 +612,14 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
     std::vector<std::pair<std::uint32_t, std::uint64_t>> snap_wms;
     bool snap_loaded = false;
     bool search_snap_ok = false;
+    std::optional<std::uint64_t> sidecar_covers;
     if (search_layer) {
         auto sl = search_layer->load_snapshot(dirname_ + "/bm25_snapshot.inv");
         search_snap_ok = sl.has_value() && *sl;
+        if (search_snap_ok) {
+            sidecar_covers = search_layer->load_index_sidecar(
+                dirname_ + "/" + kIndexSidecarName);
+        }
     }
     if (auto w = keydir_->load_snapshot(dirname_ + "/" + kKeydirSnapName)) {
         snap_wms = std::move(*w);
@@ -620,17 +630,13 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
         // ⟹ 跳过区每个文档在每个字段索引中都已存在(设计 §4 论证)。
         const auto floor = search_layer->indexed_ord_floor();
         const auto need = keydir_->peek_next_ord();
-        bool covered =
-            search_snap_ok &&
+        // P3:三块状态齐备才放行——inverted(bm25 快照+WAL,floor 门)
+        // + Index 侧表(sidecar,covers 标记)+ keydir(快照本体)。
+        const bool covered =
+            search_snap_ok && sidecar_covers.has_value() &&
             (need == 0 ||
-             (floor != static_cast<std::uint64_t>(-1) && floor + 1 >= need));
-        // ⚠️ P2 已知缺口(实测 SearchSurvivesMerge 抓出):search 状态还
-        // 包含 Index 侧表(ext2ord/live/doc_lens),bm25 快照不含它,且
-        // doc_len 暂无持久化来源(倒排快照不存 per-posting dl)——跳过
-        // 前缀会让 live 全空、v5 dl 不变量失守。在 Index sidecar 快照
-        // 落地前,search 模式强制全量 fold(快照态保留无害,
-        // recover_doc 经 add_doc 水位幂等去重)。
-        covered = false;
+             ((floor != static_cast<std::uint64_t>(-1) && floor + 1 >= need) &&
+              *sidecar_covers >= need));
         if (!covered) snap_loaded = false;
     }
     auto wm_of = [&](std::uint32_t fid) -> std::uint64_t {
@@ -1369,6 +1375,10 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
     }
 
     if (search_) {
+        // P3 顺序约定:先落 keydir 快照(取较早的 next_ord),再 flush
+        // IndexPool,之后保存的 bm25/sidecar 覆盖必然 ≥ keydir 快照——
+        // 并发写入下成对性门依然可判。
+        write_keydir_snapshot();
         if (index_pool_) index_pool_->flush();
 
         search_->rebuild_index(
@@ -1386,6 +1396,8 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
 
         auto snap = dirname_ + "/bm25_snapshot.inv";
         search_->save_snapshot(snap);
+        (void)search_->save_index_sidecar(
+            dirname_ + "/" + kIndexSidecarName, keydir_->peek_next_ord());
     }
 
     // After run_merge, every live record from `files` has been CAS-rewritten

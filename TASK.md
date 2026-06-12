@@ -849,6 +849,23 @@ sanitizer 构建只插桩了测试 TU,库代码的数据竞争仅靠 memcpy/new
 
 ---
 
+## A4-P3 — Index sidecar:search 快照快路径开门 ✅
+
+| # | 内容 | 状态 |
+|---|------|------|
+| P3.1 | SearchLayer::save/load_index_sidecar(BCIS v1;for_each_live dump / put_doc 重建,零 Index 内部耦合;covers_next_ord 覆盖标记) | ✅ |
+| P3.2 | close 顺序重排:停池 → bm25+sidecar(keydir 在手取 peek)→ keydir 快照 → 释放(初版 sidecar 在 keydir_.reset() 后恒跳过,测试当场抓出) | ✅ |
+| P3.3 | merge 端顺序:keydir 快照先行 → flush → bm25+sidecar——并发写下 covers ≥ keydir.next_ord,门可判 | ✅ |
+| P3.4 | 门开启:search_snap_ok ∧ sidecar ∧ floor+1≥need ∧ covers≥need;SearchSurvivesMerge 转为门禁回归 | ✅ |
+| P3.5 | 测试 +3:快路径 reopen(被删 key 的 live 经 sidecar 恢复)/ 陈旧 keydir 快照尾部回放 / sidecar 截断回退全量 fold | ✅ |
+| P3.6 | 回归:plain/ASan/TSan 357/357 + eunit 44/44 | ✅ |
+
+**记录在案**:ord_field_lens_ 不持久化——重启后多字段删除统计走既有
+近似路径;Index::next_ord 经 put_doc 水位重建(死尾 ord 不回灌;
+search 路径 ord 恒由 keydir 分配,无复用风险)。
+
+---
+
 ## 未来任务
 
 ### P1 — 查询路径 PostingList 零拷贝（Phase 1 ✅ + Phase 2-min ✅）
