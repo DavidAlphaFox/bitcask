@@ -741,6 +741,76 @@ BoolMustSkewed 是 v5 的验收标尺。详见 kway 文档 §6.1。
 
 ---
 
+## V2 检索加速:B2 — v5 块级 impacts(max_tf + min_dl)✅
+
+> 设计修正与实测:`doc/kway-blockmax-bmw-zh.md` §6.2。比 §6.1 预想的
+> "量化块最高分"更简且统计无关:块存 (max_tf, min_dl) 对,查询期按
+> 当前 idf/avgdl 算上界,天然 admissible(预存分数会随统计漂移失效)。
+
+| # | 内容 | 状态 |
+|---|------|------|
+| B2.1 | Posting 增 dl(索引时 Σtf,落原 4B padding 零内存增量);add_doc 先求和再追加 | ✅ |
+| B2.2 | PostingBlock 增 min_dl;seal/finalize 精确重算(compact 后 dl 随 Posting 保留) | ✅ |
+| B2.3 | 快照 InvVersion=5(块 +4B);v4 载入 min_dl=1 回退;load→save 幂等测试 | ✅ |
+| B2.4 | upper_bound_from 增 min_dl 参(默认 1 = 旧行为);B1 block_ub 接入 | ✅ |
+| B2.5 | LiveChecker 新不变量落档:doc_len == add_doc Σtf(测试 checker 全部对齐) | ✅ |
+| B2.6 | 基准:**Hot/4096 49.1→7.63μs;Hot/100k 1431→324μs(vs K1 前累计 4.6×);Skewed -58%** | ✅ |
+| B2.7 | 回归:ctest 350/350 + ASan + TSan 零新增 + eunit 44/44 | ✅ |
+
+**剩余(解耦另排)**:TF 量化 + FOR 块压缩(纯体积收益,InvVersion=6
+候选);WAND(bag-of-words)路径接入 min_dl 上界(当前仅 bool MUST 路径)。
+
+---
+
+## V2 检索加速:A1 — WAND 块跳跃修复 + C1 — TSan 体系修缮 ✅
+
+### A1:WAND 块跳跃死代码修复 + v5 min_dl 接入
+
+**根因**:原跳跃条件 `block_upper < threshold - heap.top() + 1e-6` 在
+threshold == heap.top()(θ 更新同源)时恒 ≈1e-6——**块跳跃从未触发过**
+(死代码)。修复:本词块上界 + 其余词列表上界之和 ≤ θ → 整块跳;
+块上界接 v5 (max_tf, min_dl)。**不能加绝对 epsilon**:df≈N 时 idf~1e-4,
+分数量级 ~1e-4,绝对容差 1e-6 = 巨大相对容差,会把真 top-k 块当
+"平分"误跳(开发中实测踩中)——只认 <=(位级平分才跳,严格优于语义)。
+
+| 基准(中位) | 修复前 | 修复后 |
+|---|---|---|
+| SearchHotTerm/4096 | 51.5μs | **4.66μs(11×)** |
+| SearchHotTerm/100k | 1716μs | **177μs(9.7×)** |
+| SearchWhileIndexing 4r×1w | (P1 时代 2459μs) | **167μs** |
+
+安全网测试:WandSkipTopKEqualsUnprunedPrefix(小 k 剪枝结果 ==
+大 k 无剪枝前缀;(tf,dl) 与 d 双射构造唯一分数 + 同分位放宽断言——
+首版随机 tf 大量同分曾误报"丢结果",实为并列层合法自由度)。
+
+### C1:TSan 体系修缮(三层)+ 两个真竞态修复
+
+**最大发现:所有库目标从未链接 bitcask_sanitizers——历来的
+sanitizer 构建只插桩了测试 TU,库代码的数据竞争仅靠 memcpy/new
+拦截器间接可见**(每条报告 #0 都是拦截器即此故)。修缮后 TSan
+**首次 351/351 全绿**,且是全插桩条件下:
+
+1. 全部 10 个库 target 链接 bitcask_sanitizers(普通构建空 INTERFACE 零影响);
+2. TSan 构建 FetchContent 源码编译插桩版 oneTBB v2022(系统 libtbb 的
+   fence 同步 TSan 不可见);TBB 调度器仍有 fence 残余 →
+   cmake/tsan.supp(race:*tbb*)经测试 ENVIRONMENT 属性注入
+   (动态 libtsan 不回调二进制内 __tsan_default_suppressions,实测零匹配);
+3. IndexTaskQueue push/pop 加 __tsan_release/acquire 标注
+   (任务 payload 经 tbb 队列移交的 HB 显式化,非 TSan 构建空操作)。
+
+**降噪后立刻捕获两个生产真竞态(并修复)**:
+- SearchLayer::fields_:IndexPool worker 首写新字段 emplace vs 查询
+  线程 find——加 fields_mu_(shared_mutex,双检升级);
+- DocTextLru:worker put vs 高亮查询 get——内置 mutex,get 改返回
+  拷贝(顺带封掉返回内部指针的 UAF 窗口)。
+- SearchLayer 头注释的线程模型声明("非线程安全")与生产形态不符,
+  已修订为「单写者 + 多读者」并注明各成员的保护方式。
+
+回归:plain/ASan/TSan 三树 351/351 + eunit 44/44;基准无回归
+(SearchHotTerm/BoolMust 与 A1 后持平)。
+
+---
+
 ## 未来任务
 
 ### P1 — 查询路径 PostingList 零拷贝（Phase 1 ✅ + Phase 2-min ✅）

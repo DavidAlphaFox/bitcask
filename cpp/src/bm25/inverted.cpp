@@ -62,11 +62,15 @@ const PostingBlock* block_for_ord_in(const std::vector<PostingBlock>& blocks,
     return nullptr;
 }
 
+// min_dl:分母的 doc_len 下界。默认 1 = 最松 admissible(旧行为);
+// v5 块级 impacts 传块内真实最小 dl,上界收紧 ~25%/词(§6.1)。
 float upper_bound_from(std::uint32_t global_max_tf, float idf,
-                       const Bm25Params& params, double avgdl) {
+                       const Bm25Params& params, double avgdl,
+                       std::uint32_t min_dl = 1) {
     float tf_norm = static_cast<float>(global_max_tf) * (params.k1 + 1.0f) /
                     (static_cast<float>(global_max_tf) + params.k1 *
-                     (1.0f - params.b + params.b * 1.0f / static_cast<float>(avgdl)));
+                     (1.0f - params.b + params.b * static_cast<float>(min_dl) /
+                      static_cast<float>(avgdl)));
     // BM25+：上界含 δ 下界项，与实际评分一致，避免 WAND 剪枝漏结果（S8.10）。
     return idf * (tf_norm + params.delta);
 }
@@ -283,7 +287,10 @@ void InvertedIndex::add_doc(
     }
     max_indexed_ord_ = ord;
 
+    // v5 impacts:doc_len 先求和——posting 携带索引时 dl,封块算 min_dl。
     auto doc_len = std::uint32_t{0};
+    for (auto& [term, data] : term_data) doc_len += data.first;
+
     for (auto& [term, data] : term_data) {
         auto& [tf, positions] = data;
         auto& shard = shard_for(term);
@@ -292,12 +299,11 @@ void InvertedIndex::add_doc(
         PostingList& pl = mutable_pl(acc->second);  // P2-min：有 phrase 读者持引用时 CoW
         // S10.10：index_positions_=false 时不存 positions（省内存，短语/近邻失效）。
         if (index_positions_) {
-            pl.items.push_back({ord, tf, positions});
+            pl.items.push_back({ord, tf, doc_len, positions});
         } else {
-            pl.items.push_back({ord, tf, {}});
+            pl.items.push_back({ord, tf, doc_len, {}});
         }
         pl.note_appended();  // S10.6：增量封块，在线索引也吃 WAND 块跳跃
-        doc_len += tf;
     }
 
     live_doc_count_.fetch_add(1, std::memory_order_relaxed);
@@ -532,6 +538,13 @@ auto InvertedIndex::search_wand(
         auto& pivot_tp = tps[order[pivot_pos]];
         auto pivot_ord = pivot_tp.fp.ords[pivot_tp.cursor];
 
+        // A1:非耗尽词的列表上界总和——块跳跃判定的保守"其余词"上界
+        // (含 pivot 之后 cursor 恰为 pivot_ord 的词,admissible)。
+        float total_ub = 0.0f;
+        for (auto& t : tps) {
+            if (t.cursor < t.fp.ords.size()) total_ub += t.list_upper_bound;
+        }
+
         bool any_skipped = false;
         for (std::size_t i = 0; i <= pivot_pos; ++i) {
             auto& tp = tps[order[i]];
@@ -540,13 +553,28 @@ auto InvertedIndex::search_wand(
 
             const auto* block = tp.fp.block_for_ord(pivot_ord);
             if (block != nullptr) {
-                float block_tf_norm = static_cast<float>(block->max_tf) * (params.k1 + 1.0f) /
-                                      (static_cast<float>(block->max_tf) + params.k1 *
-                                       (1.0f - params.b + params.b * 1.0f / static_cast<float>(avgdl)));
+                // A1:块上界接 v5 impacts(max_tf + min_dl),替代 dl=1
+                // 假设——与 bool MUST 路径同源收紧 ~25%/词(§6.2)。
+                // (保持内联表达式,与原代码逐运算一致;此循环每 pivot
+                // 每词执行一次,在热路径上。)
+                float block_tf_norm =
+                    static_cast<float>(block->max_tf) * (params.k1 + 1.0f) /
+                    (static_cast<float>(block->max_tf) + params.k1 *
+                     (1.0f - params.b +
+                      params.b * static_cast<float>(block->min_dl) /
+                          static_cast<float>(avgdl)));
                 float block_upper = tp.idf * (block_tf_norm + params.delta);
-                float remaining_needed = threshold;
-                if (!heap.empty()) remaining_needed = threshold - heap.top().first + 1e-6f;
-                if (block_upper < remaining_needed) {
+                // A1 修复:原公式 threshold - heap.top() 在 threshold ==
+                // heap.top()(下方 θ 更新同源)时恒 ≈1e-6,块跳跃从未
+                // 触发过(死代码)。正确判定:本词块上界 + 其余词列表
+                // 上界之和 ≤ θ ⟹ pivot 不可能严格超过 θ,整块跳过。
+                // 注意不能加绝对 epsilon(如 1e-6):idf 极小时(df≈N)
+                // 分数量级 ~1e-4,绝对容差变成巨大相对容差,会把
+                // 真 top-k 所在块当"平分"误跳——只认 <=(位级平分才跳,
+                // top-k 是严格优于语义,平分块挤不掉现有结果)。
+                if (heap.size() >= k &&
+                    block_upper <=
+                        threshold - (total_ub - tp.list_upper_bound)) {
                     // 跳过到下一个块边界。
                     std::size_t next_start = block->start_idx + block->count;
                     if (next_start >= tp.fp.ords.size()) {
@@ -945,10 +973,13 @@ auto InvertedIndex::bool_search(
             const std::size_t b = c.i / B;
             if (!c.ub_done[b]) {
                 const auto& fp = c.tp->fp;
-                // 尾块未 seal 无块元数据 → 列表级 max_tf 退化(admissible)。
-                const std::uint32_t mtf =
-                    b < fp.blocks.size() ? fp.blocks[b].max_tf : fp.max_tf;
-                c.block_ub[b] = upper_bound_from(mtf, c.idf, params, avgdl);
+                // 尾块未 seal 无块元数据 → 列表级 max_tf + dl=1 退化(admissible)。
+                const bool sealed = b < fp.blocks.size();
+                const std::uint32_t mtf = sealed ? fp.blocks[b].max_tf
+                                                 : fp.max_tf;
+                const std::uint32_t mdl = sealed ? fp.blocks[b].min_dl : 1;
+                c.block_ub[b] =
+                    upper_bound_from(mtf, c.idf, params, avgdl, mdl);
                 c.ub_done[b] = 1;
             }
             return c.block_ub[b];
@@ -1475,7 +1506,7 @@ auto InvertedIndex::compact(const LiveChecker& live_checker, double dead_ratio_t
 static constexpr std::uint32_t kInvMagic   = 0x494E5632;
 // v4：positions 落盘改用 gap+VByte 压缩（内存仍是 vector<uint32_t>，短语查询不变）。
 //     v1/2/3 旧快照按原始 uint32 数组读，向后兼容。
-static constexpr std::uint32_t kInvVersion = 4;
+static constexpr std::uint32_t kInvVersion = 5;  // v5:块元数据 +min_dl(impacts)
 
 auto InvertedIndex::save(std::string_view path) const -> bool {
     auto* f = std::fopen(std::string(path).c_str(), "wb");
@@ -1553,7 +1584,9 @@ auto InvertedIndex::save(std::string_view path) const -> bool {
             if (!ok) { std::fclose(f); return false; }
             for (auto& blk : pl.blocks) {
                 ok = write_u64(blk.base_ord) && write_u64(blk.end_ord)
-                     && write_u32(blk.max_tf) && write_u32(static_cast<std::uint32_t>(blk.start_idx))
+                     && write_u32(blk.max_tf)
+                     && write_u32(blk.min_dl)  // v5 impacts
+                     && write_u32(static_cast<std::uint32_t>(blk.start_idx))
                      && write_u32(static_cast<std::uint32_t>(blk.count));
                 if (!ok) { std::fclose(f); return false; }
             }
@@ -1672,6 +1705,8 @@ auto InvertedIndex::load(std::string_view path) -> bool {
                             pl.blocks[b].base_ord = read_u64();
                             pl.blocks[b].end_ord = read_u64();
                             pl.blocks[b].max_tf = read_u32();
+                            // v4 及更早无 min_dl,默认成员初始化 =1(回退)。
+                            if (ver >= 5) pl.blocks[b].min_dl = read_u32();
                             pl.blocks[b].start_idx = read_u32();
                             pl.blocks[b].count = read_u32();
                         }

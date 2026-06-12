@@ -222,6 +222,30 @@ k>0 → 合取 BMW 路径;否则维持原路径(eager fill + 完整交集 + 全�
 quantize 到 u8/u16),上界零松弛(仅量化误差)。BoolMustSkewed 基准
 是该改动的验收标尺。B1 的剪枝骨架无需改动,只换 block_ub 的来源。
 
+### 6.2 v5 落地结果(impacts:max_tf + min_dl,2026-06-12)
+
+实际选型比 6.1 预想的"量化块最高分"更简:**块存 (max_tf, min_dl) 对**
+(Lucene impacts 的单对简化)。块最高分依赖 idf/avgdl/params 等查询期
+统计,预存会随统计漂移失去 admissibility;(max_tf, min_dl) 与统计
+无关,查询期用当前统计算上界,天然 admissible。实现:`Posting` 增
+`dl` 字段(索引时 Σtf,**恰落原 4B padding,内存零增量**),封块/
+finalize/compact 都能精确重算 min_dl;快照 InvVersion=5(块 +4B),
+v4 载入 min_dl=1 回退(等价旧行为)。
+
+**新不变量**(已写入 LiveChecker 文档):查询期 doc_len(ord) 必须
+== add_doc 时 Σtf(SearchLayer 同源天然成立)——若查询期 dl 更小,
+上界不再 admissible。
+
+| 基准(7 次中位) | B1 后(dl=1 上界) | v5(min_dl 上界) | 累计 vs K1 前 |
+|---|---|---|---|
+| BoolMustHot/4096 | 49.1μs | **7.63μs** | 44.3 → 7.63,**5.8×** |
+| BoolMustHot/100k | 1431μs | **324μs** | 1481 → 324,**4.6×** |
+| BoolMustSkewed/100k | 1451μs | **603μs** | -58% |
+| BoolMustHot3/100k | 695μs | 674μs | 1011 → 674(基准 checker dl 与 Σtf 不一致,上界留有余隙——良性,admissible 方向) |
+
+剪枝如预期触发:均匀形态 min_dl==实际 dl ⇒ ub==θ ⇒ 堆满后整块跳过。
+压缩类改动(TF 量化、FOR)与本次解耦,另行排期(纯体积收益)。
+
 ## 7. 参考
 
 - Broder et al.: "Efficient Query Evaluation using a Two-Level

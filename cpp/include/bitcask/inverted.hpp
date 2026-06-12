@@ -56,6 +56,11 @@ struct PostingBlock {
     std::uint64_t base_ord;
     std::uint64_t end_ord;
     std::uint32_t max_tf;
+    // v5 impacts:块内最小 doc_len(索引时值;文档 dl 不可变)。
+    // 分数上界用 min_dl 替代 dl=1 假设,消除 ~25%/词 的固有松弛
+    // (B1 实测剪枝不触发的根因,doc/kway-blockmax-bmw-zh.md §6.1)。
+    // 1 = 旧快照/dl 未知时的 admissible 回退(等价旧行为)。
+    std::uint32_t min_dl = 1;
     std::size_t   start_idx;
     std::size_t   count;
 };
@@ -64,6 +69,9 @@ struct PostingBlock {
 struct Posting {
     std::uint64_t ord;
     std::uint32_t tf;
+    // 索引时 doc_len(v5 impacts;落在原 4B padding 槽,内存零增量)。
+    // 0 = 未知(旧快照载入)——封块求 min 时跳过,全 0 回退 min_dl=1。
+    std::uint32_t dl = 0;
     std::vector<std::uint32_t> positions;
 };
 
@@ -103,10 +111,15 @@ struct PostingList {
                 std::uint64_t base = items[start].ord;
                 std::uint64_t last = items[end - 1].ord;
                 std::uint32_t max_tf = 0;
+                std::uint32_t min_dl = 0xFFFFFFFF;
                 for (std::size_t i = start; i < end; ++i) {
                     if (items[i].tf > max_tf) max_tf = items[i].tf;
+                    if (items[i].dl > 0 && items[i].dl < min_dl) {
+                        min_dl = items[i].dl;
+                    }
                 }
-                blocks.push_back({base, last, max_tf, start, end - start});
+                if (min_dl == 0xFFFFFFFF) min_dl = 1;  // dl 全未知 → 回退
+                blocks.push_back({base, last, max_tf, min_dl, start, end - start});
             }
         }
     }
@@ -120,10 +133,16 @@ struct PostingList {
             std::size_t start = sealed;
             std::size_t end = start + kBlockSize;
             std::uint32_t max_tf = 0;
+            std::uint32_t min_dl = 0xFFFFFFFF;
             for (std::size_t i = start; i < end; ++i) {
                 if (items[i].tf > max_tf) max_tf = items[i].tf;
+                if (items[i].dl > 0 && items[i].dl < min_dl) {
+                    min_dl = items[i].dl;
+                }
             }
-            blocks.push_back({items[start].ord, items[end - 1].ord, max_tf, start, kBlockSize});
+            if (min_dl == 0xFFFFFFFF) min_dl = 1;
+            blocks.push_back({items[start].ord, items[end - 1].ord, max_tf,
+                              min_dl, start, kBlockSize});
             sealed += kBlockSize;
         }
     }
@@ -221,6 +240,12 @@ struct ScoreExplanation {
 
 // live 文档检查器接口（由 Index 侧表提供）。
 // search() 调用它跳过已删除的 ord。
+//
+// ⚠️ v5 不变量:doc_len(ord) 必须等于该文档 add_doc 时的 Σtf
+// (SearchLayer 两者同源自同一次分词,天然成立)。块级分数上界用
+// 索引时 min_dl 收紧——若自定义实现返回比索引时更小的 doc_len,
+// 上界不再 admissible,BMW 剪枝可能漏掉真 top-k(测试用 checker
+// 必须按此约定构造)。
 class LiveChecker {
 public:
     virtual ~LiveChecker() = default;

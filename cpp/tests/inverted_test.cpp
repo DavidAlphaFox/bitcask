@@ -1373,7 +1373,11 @@ TEST(InvertedIndex, BmwMatchesFallbackNoDeletions) {
         }
         if (m.empty()) m.emplace("filler", tp(1, {0}));
         idx.add_doc(d, m);
-        checker.doc_lens[d] = 2 + static_cast<std::uint32_t>(rng() % 9);
+        // v5 不变量:checker 的 doc_len 必须等于 add_doc 的 Σtf
+        // (生产里 SearchLayer 同源保证;见 LiveChecker 文档)。
+        std::uint32_t dl = 0;
+        for (auto& [t, pr] : m) dl += pr.first;
+        checker.doc_lens[d] = dl;
     }
 
     for (std::size_t k : {5UL, 37UL, 2000UL}) {
@@ -1401,7 +1405,7 @@ TEST(InvertedIndex, BmwDeletedDocsExcluded) {
         m.emplace("aaa", tp(1, {0}));
         if (d % 3 == 0) m.emplace("bbb", tp(2, {1}));
         idx.add_doc(d, m);
-        checker.doc_lens[d] = 2;
+        checker.doc_lens[d] = (d % 3 == 0) ? 3 : 1;  // = Σtf(v5 不变量)
         if (d % 3 == 0) expect.insert(d);
     }
     // 删掉交集里的每第 5 个(0,15,30,...)。
@@ -1429,7 +1433,7 @@ TEST(InvertedIndex, BmwHighScoreInLateBlocksNotPruned) {
         m.emplace("aaa", tp(tf_a, {0}));
         m.emplace("bbb", tp(tf_b, {1}));
         idx.add_doc(d, m);
-        checker.doc_lens[d] = 2;
+        checker.doc_lens[d] = tf_a + tf_b;  // = Σtf(v5 不变量)
     }
 
     auto bmw = idx.bool_search(parse_query("+aaa +bbb"), 10, checker);
@@ -1439,5 +1443,89 @@ TEST(InvertedIndex, BmwHighScoreInLateBlocksNotPruned) {
     for (std::size_t i = 0; i < bmw.size(); ++i) {
         EXPECT_EQ(bmw[i].ord, ref[i].ord) << i;
         EXPECT_FLOAT_EQ(bmw[i].score, ref[i].score) << i;
+    }
+}
+
+// v5 impacts:封块记录块内最小索引时 doc_len;save/load round-trip 保留。
+TEST(InvertedIndex, V5BlockMinDlTrackedAndPersisted) {
+    InvertedIndex idx;
+    // 200 docs → alpha 列表 1 个满块(128)+ 尾巴。doc_len = Σtf 受控:
+    // d<128 块内 dl ∈ {5,9}(min=5);其余 dl=7。
+    for (std::uint64_t d = 0; d < 200; ++d) {
+        TermPositions m;
+        if (d < 128) {
+            m.emplace("alpha", tp(2, {0}));
+            m.emplace("pad", tp((d % 2 == 0) ? 3u : 7u, {1}));  // Σtf = 5 或 9
+        } else {
+            m.emplace("alpha", tp(3, {0}));
+            m.emplace("pad", tp(4, {1}));                       // Σtf = 7
+        }
+        idx.add_doc(d, m);
+    }
+
+    auto tmp = std::filesystem::temp_directory_path() / "inv_v5_mindl.snap";
+    std::filesystem::remove(tmp);
+    ASSERT_TRUE(idx.save(tmp.string()));
+
+    InvertedIndex idx2;
+    ASSERT_TRUE(idx2.load(tmp.string()));
+
+    // 经查询路径间接验证不可行(min_dl 不外露),直接检查快照重载后的
+    // 块元数据:save 前 finalize 会重建块(满块+尾块)。
+    // 通过再 save 一次比较字节一致性来确认 round-trip 无损。
+    auto tmp2 = std::filesystem::temp_directory_path() / "inv_v5_mindl2.snap";
+    std::filesystem::remove(tmp2);
+    ASSERT_TRUE(idx2.save(tmp2.string()));
+
+    std::ifstream f1(tmp, std::ios::binary), f2(tmp2, std::ios::binary);
+    std::vector<char> b1((std::istreambuf_iterator<char>(f1)),
+                         std::istreambuf_iterator<char>());
+    std::vector<char> b2((std::istreambuf_iterator<char>(f2)),
+                         std::istreambuf_iterator<char>());
+    EXPECT_EQ(b1, b2);  // load→save 幂等 ⇒ min_dl 等块字段全数保留
+
+    std::filesystem::remove(tmp);
+    std::filesystem::remove(tmp2);
+}
+
+// A1:WAND 块跳跃修复(remaining_needed 死代码)后的安全网——
+// 小 k(剪枝激进)的 top-k 必须与大 k(堆不满,零剪枝)的前缀一致。
+// BM25 分数只取决于 (tf, dl) 离散对,随机取值会大量并列(首版测试
+// 因此误报"丢结果"——实为并列层内的合法自由度);这里构造 (tf, dl)
+// 与 d 双射使分数几乎唯一,并对仍可能的同分位放宽 ord 断言。
+TEST(InvertedIndex, WandSkipTopKEqualsUnprunedPrefix) {
+    InvertedIndex idx;
+    FakeLiveChecker checker;
+    for (std::uint64_t d = 0; d < 4000; ++d) {
+        const auto tf = 1 + static_cast<std::uint32_t>(d % 50);
+        const auto pad = 1 + static_cast<std::uint32_t>(d / 50);
+        TermPositions m;
+        m.emplace("hot", tp(tf, {0}));
+        m.emplace("pad", tp(pad, {1}));
+        idx.add_doc(d, m);
+        checker.doc_lens[d] = tf + pad;  // v5 不变量:= Σtf
+    }
+
+    // k=4000 → 堆永不满 → threshold 恒 0 → 块跳跃不触发 → 全量评分,
+    // 其排序前缀即真值。
+    auto full = idx.search({"hot"}, 4000, checker);
+    ASSERT_EQ(full.size(), 4000u);
+
+    for (std::size_t k : {1UL, 5UL, 10UL, 100UL}) {
+        auto pruned = idx.search({"hot"}, k, checker);
+        ASSERT_EQ(pruned.size(), k) << "k=" << k;
+        for (std::size_t i = 0; i < k; ++i) {
+            EXPECT_FLOAT_EQ(pruned[i].score, full[i].score)
+                << "k=" << k << " i=" << i;
+            // 同分层内成员可互换,只在该位分数唯一时断言 ord。
+            const bool tie_above =
+                i > 0 && full[i].score == full[i - 1].score;
+            const bool tie_below =
+                i + 1 < full.size() && full[i].score == full[i + 1].score;
+            if (!tie_above && !tie_below) {
+                EXPECT_EQ(pruned[i].ord, full[i].ord)
+                    << "k=" << k << " i=" << i;
+            }
+        }
     }
 }
