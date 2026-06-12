@@ -4,6 +4,7 @@
 #include "bitcask/highlighter.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -21,6 +22,63 @@ SearchLayer::SearchLayer(const SearchLayerConfig& config)
     , cache_(config.cache_max_entries)
     , doc_texts_(config.doc_text_cache_max)
 {
+    // V3.3:向量配置存在时创建 HNSW。metric 映射:cosine 已在写入端
+    // 归一化 → kDot;kDot → kDot;kL2 → kL2。
+    if (config.vector_dim > 0) {
+        vec::HnswConfig hc;
+        hc.dim = config.vector_dim;
+        hc.metric = config.vector_metric == meta::VectorMetric::kL2
+                        ? vec::HnswMetric::kL2
+                        : vec::HnswMetric::kDot;
+        hnsw_ = std::make_unique<vec::HnswIndex>(hc);
+    }
+}
+
+void SearchLayer::on_vector(std::uint64_t ord, std::span<const float> vec) {
+    // 防御:无 HNSW 配置 / dim 不符的向量直接忽略(不崩)。正常路径
+    // put_doc 已在写入端校验过 dim。
+    if (!hnsw_ || vec.size() != config_.vector_dim) return;
+    hnsw_->insert(ord, vec);
+}
+
+std::expected<std::vector<SearchHit>, std::string>
+SearchLayer::search_vector(std::span<const float> query, std::size_t k,
+                           std::size_t ef) const {
+    if (!hnsw_) {
+        return std::unexpected("no vector index configured");
+    }
+    if (query.size() != config_.vector_dim) {
+        return std::unexpected("query vector dim mismatch");
+    }
+    // cosine:查询向量同样入口归一化(hnsw-design §1);零向量无方向,
+    // 返回空结果(写入端零向量被拒,查询端宽容)。
+    std::vector<float> qn;
+    std::span<const float> q = query;
+    if (config_.vector_metric == meta::VectorMetric::kCosineNormalized) {
+        double sq = 0.0;
+        for (float v : query) sq += static_cast<double>(v) * v;
+        if (sq <= 0.0) return std::vector<SearchHit>{};
+        const auto inv = static_cast<float>(1.0 / std::sqrt(sq));
+        qn.reserve(query.size());
+        for (float v : query) qn.push_back(v * inv);
+        q = qn;
+    }
+    if (ef == 0) ef = std::max<std::size_t>(k, 64);
+
+    std::function<bool(std::uint64_t)> live = [this](std::uint64_t ord) {
+        return index_.is_live(ord);
+    };
+    auto raw = hnsw_->search(q, k, ef, &live);
+
+    std::vector<SearchHit> hits;
+    hits.reserve(raw.size());
+    for (auto& h : raw) {
+        auto ext_id = index_.ord_to_ext(h.ord);
+        if (!ext_id) continue;
+        hits.push_back(SearchHit{std::move(*ext_id), h.ord,
+                                 static_cast<double>(h.score)});
+    }
+    return hits;
 }
 
 bm25::InvertedIndex& SearchLayer::field_index(std::string_view field) {
@@ -462,7 +520,8 @@ SearchLayer::search_fields(std::string_view query, std::size_t k,
 void SearchLayer::recover_doc(std::string_view key, std::uint64_t ord,
                               std::string_view text,
                               std::uint32_t file_id, std::uint64_t offset,
-                              std::uint32_t total_sz, std::uint32_t tstamp) {
+                              std::uint32_t total_sz, std::uint32_t tstamp,
+                              std::span<const float> vector) {
     auto term_data = analyzer_->analyze_with_positions(text);
 
     std::uint32_t doc_len = 0;
@@ -481,6 +540,8 @@ void SearchLayer::recover_doc(std::string_view key, std::uint64_t ord,
     }
     doc_texts_.put(ord, std::string(text));
     cache_.invalidate();
+    // V3.3:向量段顺路重建 HNSW(水位幂等 → 重放重叠区安全)。
+    if (!vector.empty()) on_vector(ord, vector);
 }
 
 void SearchLayer::set_synonym_map(std::unique_ptr<text::SynonymMap> map) {

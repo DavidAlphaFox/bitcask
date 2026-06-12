@@ -34,8 +34,10 @@
 #include <vector>
 #include "bitcask/analyzer.hpp"
 #include "bitcask/highlighter.hpp"
+#include "bitcask/hnsw.hpp"
 #include "bitcask/index.hpp"
 #include "bitcask/inverted.hpp"
+#include "bitcask/meta_file.hpp"
 #include "bitcask/search_cache.hpp"
 #include "bitcask/synonym_map.hpp"
 
@@ -57,6 +59,11 @@ struct SearchLayerConfig {
     // 大幅省内存——代价：search_phrase / search_near 失效（无位置可匹配，返回空）。
     // 仅做 search_text/bool/fuzzy/wildcard 的部署可关闭。
     bool                 index_positions = true;
+    // V3.3:向量配置(Cask::open 从 meta 透传)。dim>0 时构造 HnswIndex;
+    // metric 映射:kCosineNormalized/kDot → HnswMetric::kDot(cosine 已在
+    // 写入端归一化),kL2 → kL2。
+    std::uint16_t        vector_dim = 0;
+    meta::VectorMetric   vector_metric = meta::VectorMetric::kNone;
 };
 
 // 搜索结果条目。
@@ -159,12 +166,26 @@ public:
 
     void set_synonym_map(std::unique_ptr<text::SynonymMap> map);
 
+    // ---- V3.3:向量写入(IndexPool worker 线程,单写者)----
+    // hnsw_ 存在且 vec.size()==配置 dim 才 insert;不符直接忽略(防御,
+    // 不崩)。水位幂等由 HnswIndex 保证(回放重叠区安全)。
+    void on_vector(std::uint64_t ord, std::span<const float> vec);
+
+    // ---- V3.3:向量查询(线程安全)----
+    // cosine 配置时内部归一化查询向量(零向量返回空);ef=0 → max(k,64)。
+    // 结果经 index_.is_live 过滤死文档,翻译为 SearchHit{key,ord,score}。
+    [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
+    search_vector(std::span<const float> query, std::size_t k,
+                  std::size_t ef = 0) const;
+
     // ---- 恢复：从磁盘 record 重放活文档 ----
     // 恢复文档到索引（全量 analyze + add_doc）。
+    // V3.3:vector 非空时顺路重建 HNSW(on_vector;水位幂等保证重放安全)。
     void recover_doc(std::string_view key, std::uint64_t ord,
                      std::string_view text,
                      std::uint32_t file_id, std::uint64_t offset,
-                     std::uint32_t total_sz, std::uint32_t tstamp);
+                     std::uint32_t total_sz, std::uint32_t tstamp,
+                     std::span<const float> vector = {});
 
     // ---- 恢复：从磁盘 record 重放墓碑 ----
     void recover_tomb(std::string_view key, std::uint64_t ord);
@@ -287,6 +308,10 @@ private:
     std::unordered_map<std::uint64_t,
                        std::vector<std::pair<std::string, std::uint32_t>>> ord_field_lens_;
     std::unique_ptr<text::Analyzer>      analyzer_;
+    // V3.3:HNSW 向量索引(config.vector_dim>0 时创建)。单写者
+    // (IndexPool worker 的 on_vector/recover_doc)+ 多读者(search_vector)
+    // 并发安全,协议见 hnsw.hpp。持久化 V3.5;当前恢复走全量 fold。
+    std::unique_ptr<vec::HnswIndex>      hnsw_;
     mutable SearchCache cache_;
     mutable DocTextLru  doc_texts_;
     mutable std::string snapshot_path_;
