@@ -103,20 +103,20 @@ struct EntryAt {
 // 全屏障辅助：按下标升序锁住全部分片（锁全序第一段）。
 // =============================================================================
 
-std::array<std::unique_lock<std::shared_mutex>, KeyDir::kShards>
+std::array<std::unique_lock<std::mutex>, KeyDir::kShards>
 KeyDir::lock_all_shards() const {
-    std::array<std::unique_lock<std::shared_mutex>, kShards> locks;
+    std::array<std::unique_lock<std::mutex>, kShards> locks;
     for (std::size_t i = 0; i < kShards; ++i) {
         locks[i] = std::unique_lock(shards_[i].mu);
     }
     return locks;
 }
 
-std::array<std::shared_lock<std::shared_mutex>, KeyDir::kShards>
+std::array<std::unique_lock<std::mutex>, KeyDir::kShards>
 KeyDir::lock_all_shards_shared() const {
-    std::array<std::shared_lock<std::shared_mutex>, kShards> locks;
+    std::array<std::unique_lock<std::mutex>, kShards> locks;
     for (std::size_t i = 0; i < kShards; ++i) {
-        locks[i] = std::shared_lock(shards_[i].mu);
+        locks[i] = std::unique_lock(shards_[i].mu);
     }
     return locks;
 }
@@ -252,7 +252,7 @@ std::uint32_t KeyDir::trim_fstats(std::span<const std::uint32_t> ids) {
 std::optional<EntryProxy> KeyDir::get(std::string_view key,
                                        std::uint64_t target_epoch) const {
     const Shard& sh = shards_[shard_for(key)];
-    std::shared_lock slock(sh.mu);
+    std::unique_lock slock(sh.mu);
 
     auto it = sh.entries.find(key);
     if (it != sh.entries.end()) {
@@ -618,7 +618,7 @@ PutResult KeyDir::conditional_remove(std::string_view key,
         // 探测阶段：只读。探测顺序与 get/remove 一致:entries 优先,miss
         // 再嵌套 meta shared 查 pending（锁序分片→meta）。
         const Shard& sh = shards_[shard_for(key)];
-        std::shared_lock slock(sh.mu);
+        std::unique_lock slock(sh.mu);
         SingleEntry cur{};
         bool found = false;
         auto it = sh.entries.find(key);
@@ -730,7 +730,7 @@ std::optional<EntryProxy> IterHandle::next(bool include_tombstones) {
     while (cursor_ < keys_snapshot_.size()) {
         const std::string& k = keys_snapshot_[cursor_++];
         const auto& sh = parent_->shards_[KeyDir::shard_for(k)];
-        std::shared_lock lock(sh.mu);
+        std::unique_lock lock(sh.mu);
         auto it = sh.entries.find(k);
         if (it == sh.entries.end()) continue;  // 拍快照后被删了
 

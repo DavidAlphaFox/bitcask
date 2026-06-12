@@ -866,7 +866,7 @@ search 路径 ord 恒由 keydir 分配,无复用风险)。
 
 ---
 
-## M6 — KeyDir 分片(设计定稿 ◐,实施排程)
+## M6 — KeyDir 分片 ✅(S1-S5 全部完成)
 
 > 设计:`doc/keydir-sharding-design-zh.md`(锁序/MVCC 屏障协议/fstats
 > 无锁发布/分阶段 S1-S5 全部定稿)。动机数据(新增护栏基准
@@ -883,7 +883,7 @@ search 路径 ord 恒由 keydir 分配,无复用风险)。
 | M6.2 | S2:entries 16 分片 + 热路径单分片锁(fold 全屏障粗化)。Mixed 8t 0.22M→1.22M(5.4×)、2t 2.66M→11.5M;Get 4t 3.17M→15.2M、8t 2.44M→13.2M;单线程持平(~0.96×)。plain/ASan/TSan 357/357 + eunit 44/44(TSan 全插桩门禁过)。附带:next() 已是单分片锁、A4 save/load 已接分片(S3/S4 主体已随 S2 落地,余验证项) | ✅ |
 | M6.3 | S3:iter next() meta+shard 两段锁细化 | ☐ |
 | M6.4 | S4:A4 快照接分片(save 屏障 / load 分发) | ☐ |
-| M6.5 | S5:基准定稿入 baseline.json;红线 = 8t ≥ 1t,Get/4t 摆脱负扩展;TSan 全插桩全绿 | ☐ |
+| M6.5 | S5:**kShards 16→256 + 分片锁 rwlock→std::mutex**(两级杠杆逐级实测,设计 doc §10)。Mixed/8t 0.22M→**8.34M(37×)**,Get 负扩展消除,单线程全面无回退;baseline.json 已刷新。红线复盘:Get/4t ✅;「8t≥1t」聚合未达(8.34M vs 24.8M),残差归因 epoch_ 全局 RMW + active-file fstats 真共享 + P/E 混合核,进一步收敛复杂度/收益比差,**有意止步关账**。门禁:plain/ASan/TSan 357/357 + eunit 44/44 | ✅ |
 
 ---
 

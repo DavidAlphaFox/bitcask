@@ -338,11 +338,11 @@ private:
     // 锁全序（严格遵守,详见文件头）:
     //     shards_[0..kShards)（下标升序）→ meta_mu_ → fstats_grow_mu_
     // 允许持分片锁时嵌套拿 meta_mu_;严禁持 meta_mu_ 时再拿任何分片锁。
-    static constexpr std::size_t kShards = 16;
+    static constexpr std::size_t kShards = 256;  // S5:16→64,降低分片碰撞与写者停车传染面
     struct alignas(64) Shard {
         // 分片锁。主 hash 的值是 variant;判别用 std::get_if<Single|Multi>。
         // 透明 hash:get/put/remove 热路径用 string_view 直接查,零拷贝(O1)。
-        mutable std::shared_mutex mu;
+        mutable std::mutex mu;  // S5 实验:rwlock→mutex(消写者偏好停车;短临界区)
         // map 头独占缓存行:find 路径读 map 头,别让它与锁字(每次加解锁
         // RMW)同行。
         alignas(64) std::unordered_map<std::string, Entry, StringHash, std::equal_to<>> entries;
@@ -357,9 +357,9 @@ private:
     }
 
     // 按下标升序锁住全部分片(全屏障第一段;之后通常再拿 meta_mu_)。
-    [[nodiscard]] std::array<std::unique_lock<std::shared_mutex>, kShards>
+    [[nodiscard]] std::array<std::unique_lock<std::mutex>, kShards>
     lock_all_shards() const;
-    [[nodiscard]] std::array<std::shared_lock<std::shared_mutex>, kShards>
+    [[nodiscard]] std::array<std::unique_lock<std::mutex>, kShards>
     lock_all_shards_shared() const;
 
     // fold 期间「pending 表」：写时复制规则触发后，新 key 的写入和
