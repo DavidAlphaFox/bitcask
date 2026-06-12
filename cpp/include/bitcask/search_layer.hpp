@@ -171,6 +171,28 @@ public:
     // 不崩)。水位幂等由 HnswIndex 保证(回放重叠区安全)。
     void on_vector(std::uint64_t ord, std::span<const float> vec);
 
+    // ---- V3.5:HNSW 快照(BCVS v1)+ merge 重建 ----
+    // save:把当前图(向量+邻接+entry)整体落盘;无向量配置返回 false。
+    // 调用点 = 写者静止处(close;merge 末尾如启用)。
+    [[nodiscard]] bool save_vec_snapshot(std::string_view path) const;
+    // load:open 期调用。新建同 config 实例 → HnswIndex::load 全量校验,
+    // 成功才原子换入(整体拒绝语义:失败弃新实例,现图原样保留——
+    // 调用方走全量 fold,insert 水位幂等收敛)。
+    [[nodiscard]] bool load_vec_snapshot(std::string_view path);
+    // covers 标记(A4 门合取项):图水位 + 1;空图(或无向量配置)= 0。
+    // 语义:所有 ord < 返回值的**向量**文档已在图中(墓碑/无向量文档不占
+    // 图水位——但它们消耗 ord,故尾部若是此类记录,门会保守关闭,回退
+    // 全量 fold;与 bm25 floor 门同款保守性,安全方向)。
+    [[nodiscard]] std::uint64_t hnsw_covers_next_ord() const;
+    // 图节点数(含软删死节点;测试/观测用)。无向量配置 = 0。
+    [[nodiscard]] std::size_t hnsw_size() const;
+    // merge 重建(物理清除死节点)。**只能由 IndexPool worker 执行**
+    // (与 on_vector 同线程 → 维持 HNSW 单写者约束):新建同 config 图,
+    // 遍历旧图节点,跳过 !index_.is_live(ord),重插活节点,完毕原子换
+    // 指针。重建期间查询走旧图(含死节点,结果语义不变);换入后旧图由
+    // 在途读者的 shared_ptr 引用计数续命。
+    void rebuild_hnsw();
+
     // ---- V3.3:向量查询(线程安全)----
     // cosine 配置时内部归一化查询向量(零向量返回空);ef=0 → max(k,64)。
     // 结果经 index_.is_live 过滤死文档,翻译为 SearchHit{key,ord,score}。
@@ -309,9 +331,13 @@ private:
                        std::vector<std::pair<std::string, std::uint32_t>>> ord_field_lens_;
     std::unique_ptr<text::Analyzer>      analyzer_;
     // V3.3:HNSW 向量索引(config.vector_dim>0 时创建)。单写者
-    // (IndexPool worker 的 on_vector/recover_doc)+ 多读者(search_vector)
-    // 并发安全,协议见 hnsw.hpp。持久化 V3.5;当前恢复走全量 fold。
-    std::unique_ptr<vec::HnswIndex>      hnsw_;
+    // (IndexPool worker 的 on_vector/recover_doc/rebuild_hnsw)+ 多读者
+    // (search_vector)并发安全,协议见 hnsw.hpp。
+    // V3.5:atomic<shared_ptr>——merge 重建以"新图旁路构建 + 原子换指针"
+    // 实现,读者每次操作开头 load 一次快照指针,旧图由引用计数续命;
+    // 写路径(worker 单线程)同样经 load 取图。指针仅在构造与
+    // rebuild_hnsw/load_vec_snapshot 的换入点变更。
+    std::atomic<std::shared_ptr<vec::HnswIndex>> hnsw_;
     mutable SearchCache cache_;
     mutable DocTextLru  doc_texts_;
     mutable std::string snapshot_path_;

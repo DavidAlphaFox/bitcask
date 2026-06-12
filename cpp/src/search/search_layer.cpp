@@ -30,21 +30,72 @@ SearchLayer::SearchLayer(const SearchLayerConfig& config)
         hc.metric = config.vector_metric == meta::VectorMetric::kL2
                         ? vec::HnswMetric::kL2
                         : vec::HnswMetric::kDot;
-        hnsw_ = std::make_unique<vec::HnswIndex>(hc);
+        hnsw_.store(std::make_shared<vec::HnswIndex>(hc),
+                    std::memory_order_release);
     }
 }
 
 void SearchLayer::on_vector(std::uint64_t ord, std::span<const float> vec) {
     // 防御:无 HNSW 配置 / dim 不符的向量直接忽略(不崩)。正常路径
-    // put_doc 已在写入端校验过 dim。
-    if (!hnsw_ || vec.size() != config_.vector_dim) return;
-    hnsw_->insert(ord, vec);
+    // put_doc 已在写入端校验过 dim。V3.5:经 atomic load 取图快照——
+    // worker 是唯一写者,但指针可能被本线程稍早的 rebuild_hnsw 换过。
+    auto hnsw = hnsw_.load(std::memory_order_acquire);
+    if (!hnsw || vec.size() != config_.vector_dim) return;
+    hnsw->insert(ord, vec);
+}
+
+// ---- V3.5:HNSW 快照 + merge 重建(协议见 search_layer.hpp 声明)----
+
+bool SearchLayer::save_vec_snapshot(std::string_view path) const {
+    auto hnsw = hnsw_.load(std::memory_order_acquire);
+    if (!hnsw) return false;
+    return hnsw->save(path);
+}
+
+bool SearchLayer::load_vec_snapshot(std::string_view path) {
+    auto cur = hnsw_.load(std::memory_order_acquire);
+    if (!cur) return false;  // 无向量配置
+    auto fresh = std::make_shared<vec::HnswIndex>(cur->config());
+    if (!fresh->load(path)) return false;  // 整体拒绝:弃 fresh,现图不动
+    hnsw_.store(std::move(fresh), std::memory_order_release);
+    return true;
+}
+
+std::uint64_t SearchLayer::hnsw_covers_next_ord() const {
+    auto hnsw = hnsw_.load(std::memory_order_acquire);
+    if (!hnsw) return 0;
+    const auto wm = hnsw->max_inserted_ord();
+    return wm == static_cast<std::uint64_t>(-1) ? 0 : wm + 1;
+}
+
+std::size_t SearchLayer::hnsw_size() const {
+    auto hnsw = hnsw_.load(std::memory_order_acquire);
+    return hnsw ? hnsw->size() : 0;
+}
+
+void SearchLayer::rebuild_hnsw() {
+    // 仅 IndexPool worker 线程调用(单写者约束:新图的 insert 与后续
+    // on_vector 都在本线程串行)。重建期间并发查询走旧图(含死节点,
+    // 语义同 V3.4 软删);换入后旧图由在途读者 shared_ptr 续命。
+    auto old = hnsw_.load(std::memory_order_acquire);
+    if (!old) return;
+    auto fresh = std::make_shared<vec::HnswIndex>(old->config());
+    const auto n = static_cast<std::uint32_t>(old->size());
+    for (std::uint32_t id = 0; id < n; ++id) {
+        const std::uint64_t ord = old->node_ord(id);
+        if (!index_.is_live(ord)) continue;  // 物理清死(merge 承诺)
+        fresh->insert(ord, old->node_vec(id));
+    }
+    hnsw_.store(std::move(fresh), std::memory_order_release);
 }
 
 std::expected<std::vector<SearchHit>, std::string>
 SearchLayer::search_vector(std::span<const float> query, std::size_t k,
                            std::size_t ef) const {
-    if (!hnsw_) {
+    // V3.5:查询开头取一次图快照指针——与 merge 重建的换指针并发安全
+    // (旧图被换出后由本地 shared_ptr 引用计数续命到查询结束)。
+    auto hnsw = hnsw_.load(std::memory_order_acquire);
+    if (!hnsw) {
         return std::unexpected("no vector index configured");
     }
     if (query.size() != config_.vector_dim) {
@@ -68,7 +119,7 @@ SearchLayer::search_vector(std::span<const float> query, std::size_t k,
     std::function<bool(std::uint64_t)> live = [this](std::uint64_t ord) {
         return index_.is_live(ord);
     };
-    auto raw = hnsw_->search(q, k, ef, &live);
+    auto raw = hnsw->search(q, k, ef, &live);
 
     std::vector<SearchHit> hits;
     hits.reserve(raw.size());

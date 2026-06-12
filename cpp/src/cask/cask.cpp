@@ -19,6 +19,8 @@ namespace bitcask {
 inline constexpr const char* kKeydirSnapName = "bitcask.keydir.snap";
 // A4-P3:Index 侧表 sidecar(search 模式成对快照的第三块)。
 inline constexpr const char* kIndexSidecarName = "bitcask.index.snap";
+// V3.5:HNSW 图快照(BCVS v1,vector 集合成对快照的第四块)。
+inline constexpr const char* kHnswSnapName = "hnsw.snap";
 
 namespace {
 namespace fs = std::filesystem;
@@ -501,6 +503,12 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
         cask->search_ = std::make_unique<search::SearchLayer>(scfg);
         cask->index_pool_ = std::make_unique<IndexPool>(1, 10240);
         cask->index_pool_->start([&search = *cask->search_](const IndexTask& task) {
+            if (task.op == IndexOp::RebuildHnsw) {
+                // V3.5:merge 后图重建(物理清死)。在 worker 执行 →
+                // 与 on_vector 同线程,维持 HNSW 单写者约束。
+                search.rebuild_hnsw();
+                return true;
+            }
             if (task.op == IndexOp::Delete) {
                 search.on_delete(task.key(), task.ord);
             } else if (!task.fields.empty()) {
@@ -585,6 +593,11 @@ void Cask::close() noexcept {
         (void)search_->save_snapshot(dirname_ + "/bm25_snapshot.inv");
         (void)search_->save_index_sidecar(
             dirname_ + "/" + kIndexSidecarName, keydir_->peek_next_ord());
+        // V3.5:保存顺序 bm25 → sidecar → hnsw snap → keydir snap。
+        // worker 已停 → 图静止,save 落盘的水位 == max_inserted_ord。
+        if (meta_config_.vector_dim > 0) {
+            (void)search_->save_vec_snapshot(dirname_ + "/" + kHnswSnapName);
+        }
     }
     if (opts_.read_write) write_keydir_snapshot();
     if (registry_ && !keydir_name_.empty()) {
@@ -640,6 +653,7 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
     std::vector<std::pair<std::uint32_t, std::uint64_t>> snap_wms;
     bool snap_loaded = false;
     bool search_snap_ok = false;
+    bool hnsw_snap_ok = false;
     std::optional<std::uint64_t> sidecar_covers;
     if (search_layer) {
         auto sl = search_layer->load_snapshot(dirname_ + "/bm25_snapshot.inv");
@@ -648,16 +662,19 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
             sidecar_covers = search_layer->load_index_sidecar(
                 dirname_ + "/" + kIndexSidecarName);
         }
+        // V3.5:HNSW 图快照(BCVS)。校验失败 → 空图全量重建;成功但
+        // 下方门未过 → 已载入的图保留无害(fold 重放经 insert 水位幂等
+        // 收敛,与 bm25 同款协议)。撤销 V3.3 的"向量集合强制全量 fold"
+        // 特判(hnsw-design §3 偏差 7)。
+        if (meta_config_.vector_dim > 0) {
+            hnsw_snap_ok = search_layer->load_vec_snapshot(
+                dirname_ + "/" + kHnswSnapName);
+        }
     }
     if (auto w = keydir_->load_snapshot(dirname_ + "/" + kKeydirSnapName)) {
         snap_wms = std::move(*w);
         snap_loaded = true;
     }
-    // V3.3 过渡(撤销点:V3.5 vec/hnsw 快照并入 covers 门):HNSW 尚无
-    // 持久化,快照快路径会跳过向量重建 → 向量集合一律全量 fold(data
-    // file 即向量 WAL,hnsw-design §5)。bm25 快照仍先载入,fold 重放
-    // 经 add_doc 水位幂等收敛。
-    if (search_layer && meta_config_.vector_dim > 0) snap_loaded = false;
     if (search_layer && snap_loaded) {
         // 成对性门:min_field(已索引 ord 水位)+1 ≥ keydir 快照 next_ord
         // ⟹ 跳过区每个文档在每个字段索引中都已存在(设计 §4 论证)。
@@ -665,11 +682,18 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
         const auto need = keydir_->peek_next_ord();
         // P3:三块状态齐备才放行——inverted(bm25 快照+WAL,floor 门)
         // + Index 侧表(sidecar,covers 标记)+ keydir(快照本体)。
-        const bool covered =
+        bool covered =
             search_snap_ok && sidecar_covers.has_value() &&
             (need == 0 ||
              ((floor != static_cast<std::uint64_t>(-1) && floor + 1 >= need) &&
               *sidecar_covers >= need));
+        // V3.5:向量集合追加第四块合取项——hnsw 快照健康 ∧ 图水位覆盖
+        // 跳过区(否则跳过区里的向量文档进不了图)。与 floor 门同款保守:
+        // 尾部 ord 若被墓碑/无向量文档占用,门关闭走全量 fold(安全方向)。
+        if (covered && meta_config_.vector_dim > 0 && need != 0) {
+            covered = hnsw_snap_ok &&
+                      search_layer->hnsw_covers_next_ord() >= need;
+        }
         if (!covered) snap_loaded = false;
     }
     auto wm_of = [&](std::uint32_t fid) -> std::uint64_t {
@@ -1507,6 +1531,15 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
         search_->save_snapshot(snap);
         (void)search_->save_index_sidecar(
             dirname_ + "/" + kIndexSidecarName, keydir_->peek_next_ord());
+
+        // V3.5:merge 后提交 HNSW 重建任务(物理清除死节点)。异步:由
+        // IndexPool worker 执行(单写者约束),merge 不等待——重建期间
+        // 查询走旧图(死节点仍滤除,语义不变),期间新 put 排在其后由同
+        // 一 worker 顺序消化。hnsw 快照不在此落盘(重建未完,落了也是
+        // 旧图);留待 close 静止点,merge 后未 close 即崩仅损失快路径。
+        if (meta_config_.vector_dim > 0 && index_pool_) {
+            index_pool_->submit(IndexTask{IndexOp::RebuildHnsw});
+        }
     }
 
     // After run_merge, every live record from `files` has been CAS-rewritten

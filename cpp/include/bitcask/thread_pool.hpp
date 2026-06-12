@@ -42,9 +42,13 @@ namespace bitcask {
 
 // 索引操作类型。
 enum class IndexOp : std::uint8_t {
-    Add,       // 文档写入（分词 + put_doc + add_doc）
-    Delete,    // 文档删除（remove_doc + index.remove）
-    Sentinel,  // 停止信号，worker 收到后退出循环
+    Add,         // 文档写入（分词 + put_doc + add_doc）
+    Delete,      // 文档删除（remove_doc + index.remove）
+    // V3.5:merge 后 HNSW 重建(物理清死)。由 worker 执行以维持 HNSW
+    // 单写者约束——重建期间到达的 put 任务排在其后,由同一 worker 顺序
+    // 消化,无写写并发;查询线程经 atomic 指针走旧图。
+    RebuildHnsw,
+    Sentinel,    // 停止信号，worker 收到后退出循环
 };
 
 // 索引任务：put/delete 路径提交到 Index Pool 的异步任务。
