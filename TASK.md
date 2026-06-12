@@ -697,6 +697,30 @@ CaskIter 析构竞态（M4）——API 滥用才触发，文档已警示。
 
 ---
 
+## V2 检索加速:K1 — run_must_intersect k-way 化 ✅
+
+> 路线:`doc/kway-blockmax-bmw-zh.md`(k-way → 块级元数据 → BMW)。
+> K1 落地 leapfrog 游标骨架与 advance(target) 接口——这是块级元数据
+> 与 BMW 的消费接口;**即期性能持平,价值在地基**(数据见下)。
+
+| # | 内容 | 状态 |
+|---|------|------|
+| K1.1 | k-way leapfrog(最短列表驱动 + galloping advance + liveness 全检,语义与 pairwise 等价) | ✅ |
+| K1.2 | 分发:k==1 过滤直拷;**k==2 保留 SIMD pairwise**(实测 leapfrog 慢 10-13%:44.3→50.3μs@4096);k≥3 leapfrog | ✅ |
+| K1.3 | 测试:三词交集 / 删除排除 / 极不对称 / 4 词随机对拍(vs 暴力参考集) +4 | ✅ |
+| K1.4 | 基准 BoolMustHot3(新增):k-way 1011μs vs pairwise 1005μs@100k(+0.6%,噪声内);31.2 vs 30.2μs@4096(+3%) | ✅ |
+| K1.5 | 回归:ctest 346/346 + ASan 346/346 + TSan 失败集零新增 + eunit 44/44 | ✅ |
+
+**诚实结论**:尺寸升序 pairwise + SIMD/galloping 内核在密集与不对称形态
+都已经很强,k-way 仅靠去物化拿不到可测收益。保留 k≥3 leapfrog 的理由是
+**游标接口先行**——下一步(块级元数据)直接挂进 advance(),不用再改写
+交集骨架;若块元数据落地后仍无收益,k≥3 回退 pairwise 只需删一个分支。
+
+**顺手修复**:CaskDocValueTest.SearchTextAfterPut 既有时序竞态(异步 put
+索引 vs 同步 on_write 赛跑 ord 0 水位)——测试中补 flush_index() 定序。
+
+---
+
 ## 未来任务
 
 ### P1 — 查询路径 PostingList 零拷贝（Phase 1 ✅ + Phase 2-min ✅）
