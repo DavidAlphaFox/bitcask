@@ -47,6 +47,8 @@
           search_near/3, search_near/4,
           search_fuzzy/3, search_fuzzy/4,
           search_wildcard/2, search_wildcard/3,
+          search_vector/2, search_vector/3, search_vector/4,
+          search_hybrid/3, search_hybrid/4,
           set_synonym_map/2]).
 
 -include("bitcask.hrl").
@@ -62,7 +64,8 @@
     small_file_threshold, expiry_grace_time,
     max_merge_size,
     analyzer, dict_path, enable_stop_words,
-    min_n, max_n, min_token_length, enable_stemming
+    min_n, max_n, min_token_length, enable_stemming,
+    vector_dim, vector_metric
 ]).
 
 %% =========================================================================
@@ -504,6 +507,34 @@ search_wildcard(Ref, Pattern) ->
 
 search_wildcard(Ref, Pattern, K) ->
     bitcask_cpp_nifs:cask_search_wildcard(Ref, Pattern, K).
+
+%% =========================================================================
+%% 向量 / 混合检索（V3.6）
+%%
+%% 必须在向量集合（open 时带 {vector_dim, N}，且为索引模式）上调用。
+%% VecBin = f32 LE 二进制（Dim×4 字节），与 put 的 doc map vector 键同格式：
+%%   << <<X:32/float-little>> || X <- Floats >>
+%% embedding 由调用方提供（bitcask_embedder behaviour），引擎只收向量。
+%% =========================================================================
+
+%% HNSW 近邻检索。Ef=0 → 引擎默认 max(K, 64)。
+search_vector(Ref, VecBin) ->
+    search_vector(Ref, VecBin, 10).
+
+search_vector(Ref, VecBin, K) ->
+    search_vector(Ref, VecBin, K, 0).
+
+search_vector(Ref, VecBin, K, Ef) ->
+    bitcask_cpp_nifs:cask_search_vector(Ref, VecBin, K, Ef).
+
+%% RRF 混合检索：BM25 与向量两路各取 K'=max(K×4,64)，按 1/(60+rank) 融合，
+%% 平局 ord 小者在前。TextQuery/VecBin 允许其一为 <<>>（单路退化），
+%% 两路都空 → {error, _}。返回 {ok, [{Key, Ord, RrfScore}]}。
+search_hybrid(Ref, TextQuery, VecBin) ->
+    search_hybrid(Ref, TextQuery, VecBin, 10).
+
+search_hybrid(Ref, TextQuery, VecBin, K) ->
+    bitcask_cpp_nifs:cask_search_hybrid(Ref, TextQuery, VecBin, K).
 
 %% 设置同义词词典（S8.2）：从文件加载，查询时自动展开。
 set_synonym_map(Ref, FilePath) ->

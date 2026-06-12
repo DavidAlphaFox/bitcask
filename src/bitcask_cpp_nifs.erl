@@ -23,6 +23,8 @@
          cask_search_near/4,
          cask_search_fuzzy/4,
          cask_search_wildcard/3,
+         cask_search_vector/4,
+         cask_search_hybrid/4,
          cask_set_synonym_map/2,
          cask_fold_start/3,
          cask_fold_start/4,
@@ -76,6 +78,11 @@ cask_search_fields(_Ref, _Q, _K) -> erlang:nif_error({error, not_loaded}).
 cask_search_near(_Ref, _Q, _Slop, _K) -> erlang:nif_error({error, not_loaded}).
 cask_search_fuzzy(_Ref, _Q, _MaxEdit, _K) -> erlang:nif_error({error, not_loaded}).
 cask_search_wildcard(_Ref, _Pattern, _K) -> erlang:nif_error({error, not_loaded}).
+%% V3.6:VecBin = f32 LE 二进制(Dim×4 字节),<< <<X:32/float-little>> || X <- L >>。
+%% size 非 4 倍数 → badarg;维度不符 → {error, _}。Ef=0 → 引擎默认 max(K,64)。
+cask_search_vector(_Ref, _VecBin, _K, _Ef) -> erlang:nif_error({error, not_loaded}).
+%% V3.6:RRF 混合检索。TextBin/VecBin 允许其一为 <<>>(单路退化),都空 → {error, _}。
+cask_search_hybrid(_Ref, _TextBin, _VecBin, _K) -> erlang:nif_error({error, not_loaded}).
 cask_set_synonym_map(_Ref, _Path) -> erlang:nif_error({error, not_loaded}).
 cask_fold_start(_R, _MA, _MP) -> erlang:nif_error({error, not_loaded}).
 cask_fold_start(_R, _MA, _MP, _SeeTomb) -> erlang:nif_error({error, not_loaded}).
