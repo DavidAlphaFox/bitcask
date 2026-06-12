@@ -1,10 +1,13 @@
-# Bitcask — A Log-Structured Hash Table for Fast Key/Value Data with BM25 Full-Text Search
+# Bitcask — A Log-Structured Hash Table for Fast Key/Value Data with BM25 Full-Text Search & HNSW Vector Retrieval
 
 [![CI](https://github.com/basho/bitcask/workflows/CI/badge.svg)](https://github.com/basho/bitcask/actions)
 
 Bitcask is a log-structured hash table for fast key/value data, written in C++23
 with an Erlang NIF interface. On-disk format uses typed records (`kDoc`/`kTombstone`)
 with per-write ordinal numbers and optional DocValue encoding (text + vector + metadata).
+
+Features include BM25 full-text search, HNSW approximate nearest-neighbor vector
+retrieval, and RRF hybrid search that fuses both ranking signals.
 
 The implementation is a single C++23 NIF (`cpp/`) with a thin Erlang facade (`src/bitcask.erl`).
 All operations go through `bitcask_cpp_nifs` → `priv/bitcask_cpp.so`.
@@ -94,6 +97,29 @@ ok
 > Calling any `search_*` on a cask opened **without** an analyzer returns
 > `{error, no_index}`.
 
+**HNSW vector search** — open with `{vector_dim, N}` to enable. Vectors are f32
+little-endian binaries (`<< <<X:32/float-little>> || X <- Floats >>`):
+
+```erlang
+1> R = bitcask:open("/tmp/vec", [read_write,
+1>     {analyzer, whitespace}, {vector_dim, 4}]).
+2> Vec = << <<X:32/float-little>> || X <- [1.0, 0.0, 0.0, 0.0] >>.
+3> bitcask:put(R, <<"d1">>, #{text => <<"hello">>, vector => Vec}).
+ok
+4> Q = << <<X:32/float-little>> || X <- [0.9, 0.1, 0.0, 0.0] >>.
+5> bitcask:search_vector(R, Q).          % top-K nearest neighbors
+{ok,[{<<"d1">>,0,0.99499}]}
+6> bitcask:close(R).
+ok
+```
+
+**Hybrid search (BM25 + Vector RRF)** — combines text and vector relevance:
+
+```erlang
+1> bitcask:search_hybrid(R, <<"hello">>, Q).   % RRF fusion, k=10
+{ok,[...]}
+```
+
 ## API highlights
 
 | Function | Description |
@@ -105,6 +131,7 @@ ok
 | `merge/1,2,3`, `needs_merge/1,2`, `status/1` | Merge management |
 | `search_text/2,3`, `search_phrase/2,3`, `search_fields/2,3` | BM25 search (full-text / phrase / `field:term^boost`) |
 | `search_near/3,4`, `search_fuzzy/3,4`, `search_wildcard/2,3` | Proximity / fuzzy (edit-distance) / wildcard search |
+| `search_vector/2,3,4`, `search_hybrid/3,4` | HNSW vector nearest-neighbor / RRF hybrid (BM25+vector) |
 | `set_synonym_map/2` | Load a synonym dictionary |
 | `is_empty_estimate/1`, `is_frozen/1`, `close_write_file/1` | Utilities |
 
@@ -124,15 +151,20 @@ ok
 | `doc/vector-search-extension-zh.md` | 向量搜索扩展：HNSW + RRF 混合检索（动手切片） |
 | `doc/vector-graph-db-zh.md` | 向量库/图库可行性分析 |
 | `doc/unified-architecture-plan-zh.md` | 统一架构计划 |
-| `TASK.md` | Project roadmap (V1–V2.10 done, U0–U6 planned) |
+| `doc/hnsw-design-zh.md` | HNSW 向量索引设计（并发/持久化/RRF/实施表） |
+| `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
+| `doc/TASK.md` | Project roadmap (V1–V3.6 done, V3.7 planned) |
 
 ## Project status
 
 - **C++ NIF** covers all core KV operations (`get`/`put`/`delete`/`sync`/`fold`/`merge`)
-- **BM25 full-text search** is operational — text / phrase / fields / proximity / fuzzy / wildcard, plus synonyms and snippet highlighting
+- **BM25 full-text search** — text / phrase / fields / proximity / fuzzy / wildcard, plus synonyms and snippet highlighting
+- **HNSW vector retrieval** — approximate nearest-neighbor search with configurable metric (cosine / L2 / dot), per-node locking for concurrent reads, BCVS snapshot persistence, and merge rebuild for dead-node eviction
+- **RRF hybrid search** — fuses BM25 and HNSW via Reciprocal Rank Fusion (`score = Σ 1/(60+rank)`)
+- **Embedder behaviour** — `bitcask_embedder` callback with OpenAI-compatible reference implementation
 - **Jieba Chinese analyzer** integrated (whitespace / n-gram / jieba)
 - **Typed record format** (`kDoc`/`kTombstone` with per-write ordinal) is the default
-- **Unified architecture** (merging Cask + Collection) is planned — see `TASK.md` (U0–U6)
+- **Unified architecture** (merging Cask + Collection) is planned — see `TASK.md`
 
 ## License
 
