@@ -226,6 +226,11 @@ TEST_F(CaskDocValueTest, SearchTextAfterPut) {
     auto* search = (*c)->search();
     ASSERT_NE(search, nullptr);
 
+    // 先等异步 IndexPool 消费完 put 的索引任务,再做同步 on_write——
+    // 否则两者赛跑 ord 0 的 add_doc 水位幂等,结果取决于时序
+    // (曾在 ASan 构建下偶发失败)。
+    (*c)->flush_index();
+
     search->on_write("testkey", 0, "hello world", 1, 100, 50, 1000);
 
     auto r1 = search->search_text("hello", 10);

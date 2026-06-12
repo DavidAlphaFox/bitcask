@@ -151,6 +151,39 @@ void BM_Inverted_BoolMustHot(benchmark::State& state) {
 BENCHMARK(BM_Inverted_BoolMustHot)->Arg(4096)->Arg(100000)
     ->Unit(benchmark::kMicrosecond);
 
+// K1:3 个 MUST 热词——k-way leapfrog 路径(k≥3)。三词命中率
+// 全/偶/3 的倍数,交集 = n/6,覆盖"被挡住 → 驱动游标跳跃"分支。
+void BM_Inverted_BoolMustHot3(benchmark::State& state) {
+    const auto n = static_cast<std::size_t>(state.range(0));
+    auto idx = std::make_unique<InvertedIndex>();
+    for (std::size_t i = 0; i < n; ++i) {
+        bitcask::bm25::TermPositions m;
+        m.emplace("alpha", std::make_pair(2u, std::vector<std::uint32_t>{0, 4}));
+        if (i % 2 == 0) {
+            m.emplace("beta", std::make_pair(2u, std::vector<std::uint32_t>{1, 5}));
+        }
+        if (i % 3 == 0) {
+            m.emplace("gamma", std::make_pair(1u, std::vector<std::uint32_t>{2}));
+        }
+        m.emplace("filler", std::make_pair(4u, std::vector<std::uint32_t>{3, 6}));
+        idx->add_doc(static_cast<std::uint64_t>(i), m);
+    }
+    AllLiveChecker live;
+    auto query = bitcask::bm25::QueryNode::must_all(
+        {bitcask::bm25::QueryNode::must_term("alpha"),
+         bitcask::bm25::QueryNode::must_term("beta"),
+         bitcask::bm25::QueryNode::must_term("gamma")});
+
+    for (auto _ : state) {
+        auto results = idx->bool_search(query, 10, live);
+        benchmark::DoNotOptimize(results);
+    }
+    state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations()) *
+                            static_cast<std::int64_t>(n));
+}
+BENCHMARK(BM_Inverted_BoolMustHot3)->Arg(4096)->Arg(100000)
+    ->Unit(benchmark::kMicrosecond);
+
 // 多线程：thread 0 负责建索引 + 启动 writer（Google Benchmark 保证全部
 // 线程在计时循环入口汇合，setup 先于其他线程的首次迭代）。
 struct IndexingFixtureState {
