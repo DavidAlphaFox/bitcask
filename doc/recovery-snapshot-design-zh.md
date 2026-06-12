@@ -45,12 +45,19 @@ O11 同款防御:长度/CRC 校验失败、截断、版本不识 → load 返回
 ## 4. 阶段划分(诚实边界)
 
 - **Phase 1(本次)**:仅 **KV 路径**(无 search_layer)启用快照快路径。
-- **Phase 2(待做)**:search 路径——open 现状**从不加载** bm25 快照
-  (只在 merge 时保存),search 恢复完全依赖全量 data fold 的
-  recover_doc。启用前缀跳过必须先:① open 接通
-  `search_->load_snapshot` + WAL 重放;② keydir 快照与 bm25 快照在
-  同一静止点成对落盘,加载时校验成对性(否则跳过的前缀文档在搜索侧
-  丢失)。add_doc 的 ord 水位幂等已为重放重叠区兜底。
+- **Phase 2(部分落地,2026-06-12)**:已接通——close 在同一静止点
+  成对保存 bm25 快照(per-field WAL 随之截断)与 keydir 快照;open
+  先 `search_->load_snapshot`(含 WAL 重放)再装 keydir 快照;成对性
+  门 = `min_field(max_indexed_ord)+1 ≥ keydir.next_ord`
+  (`SearchLayer::indexed_ord_floor` / `KeyDir::peek_next_ord`)。
+  **门暂强制关闭(search 模式仍全量 fold)**:实测
+  (SearchSurvivesMerge)暴露缺口——search 状态还含 **Index 侧表**
+  (ext2ord/live/doc_lens),bm25 快照不含;且 doc_len 无持久化来源
+  (倒排快照不存 per-posting dl),跳过前缀 ⟹ live 全空 + v5 dl
+  不变量失守。**解锁条件(Phase 3)**:Index sidecar 快照
+  (ext2ord/slots/doc_lens/live,可并入 keydir 快照扩展节,doc_len
+  由 SearchLayer 在 put 路径回填)。落地的基建(成对保存/加载链/门)
+  在 sidecar 就位后翻开 `covered` 即生效。
 
 ## 5. 写入点与触发
 

@@ -283,6 +283,10 @@ public:
     explicit InvertedIndex(Bm25Params params, bool index_positions = true);
 
     [[nodiscard]] bool index_positions() const { return index_positions_; }
+    // A4-P2:已索引最大 ord 水位(u64(-1)=尚无文档)。快照成对性门用。
+    [[nodiscard]] std::uint64_t max_indexed_ord() const {
+        return max_indexed_ord_;
+    }
 
     // ---- 写 ----
 

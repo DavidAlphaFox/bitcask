@@ -833,6 +833,22 @@ sanitizer 构建只插桩了测试 TU,库代码的数据竞争仅靠 memcpy/new
 
 ---
 
+## A4-P2 — search 快照链(基建落地,门暂闭)◐
+
+| # | 内容 | 状态 |
+|---|------|------|
+| P2.1 | close 成对保存 bm25 快照 + keydir 快照(同一写者静止点;WAL 随 save 截断) | ✅ |
+| P2.2 | open 接通 search_->load_snapshot + per-field WAL 重放(此前从不加载) | ✅ |
+| P2.3 | 成对性门:SearchLayer::indexed_ord_floor / KeyDir::peek_next_ord / InvertedIndex::max_indexed_ord 三个访问器 + 门逻辑 | ✅ |
+| P2.4 | **门强制关闭**:实测 SearchSurvivesMerge 暴露 Index 侧表缺口(ext2ord/live/doc_lens 无持久化来源;doc_len 不在任何快照里)——跳过前缀 ⟹ live 全空 + v5 dl 不变量失守 | ⚠️ |
+| P2.5 | 回归:plain/ASan/TSan 354/354 + eunit 44/44(search 全量 fold 语义不变,快照加载经 add_doc 水位幂等无害) | ✅ |
+
+**Phase 3 解锁条件**:Index sidecar 快照(ext2ord/slots/doc_lens/live;
+建议并入 keydir 快照的扩展节)。就位后把 cask.cpp 成对性门里的
+`covered = false` 行删掉即生效——其余链路已通。
+
+---
+
 ## 未来任务
 
 ### P1 — 查询路径 PostingList 零拷贝（Phase 1 ✅ + Phase 2-min ✅）

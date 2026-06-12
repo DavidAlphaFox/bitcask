@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <string>
 #include <utility>
 
@@ -490,6 +491,20 @@ void SearchLayer::recover_tomb(std::string_view key, std::uint64_t ord) {
 
 // S8.6：多字段快照 = manifest（字段名清单）+ 每字段一个 `<path>.f<N>.inv`。
 // manifest 文本行：第一行字段数，之后每行一个字段名。字段名→序号即行号。
+std::uint64_t SearchLayer::indexed_ord_floor() const {
+    std::shared_lock lk(fields_mu_);
+    if (fields_.empty()) return static_cast<std::uint64_t>(-1);
+    std::uint64_t floor = std::numeric_limits<std::uint64_t>::max() - 1;
+    for (auto& [_, inv] : fields_) {
+        const auto wm = inv->max_indexed_ord();
+        if (wm == static_cast<std::uint64_t>(-1)) {
+            return static_cast<std::uint64_t>(-1);  // 有空字段:无覆盖保证
+        }
+        floor = std::min(floor, wm);
+    }
+    return floor;
+}
+
 std::expected<void, std::string> SearchLayer::save_snapshot(std::string_view path) const {
     const std::string base(path);
     snapshot_path_ = base;

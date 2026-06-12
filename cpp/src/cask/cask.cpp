@@ -555,6 +555,11 @@ void Cask::close() noexcept {
         index_pool_->stop();
         index_pool_.reset();
     }
+    // A4-P2:写者静止,bm25 快照与 keydir 快照在同一静止点成对落盘
+    // (per-field WAL 随 save 截断;成对性门见 recovery 设计 §4)。
+    if (search_ && opts_.read_write) {
+        (void)search_->save_snapshot(dirname_ + "/bm25_snapshot.inv");
+    }
     search_.reset();
     if (write_lock_) {
         write_lock_->release_quiet();
@@ -595,16 +600,38 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
     auto entries = fileops::scan_dir(dirname_);
     if (!entries) return std::unexpected(io_fault(entries.error().errnum, dirname_));
 
-    // A4 Phase 1:KV 路径(无 search_layer)尝试 keydir 段快照——加载成功
-    // 则各文件只 fold 水位之后的尾巴。search 路径维持全量 fold(open 现状
-    // 不加载 bm25 快照,前缀文档无处恢复;Phase 2 见设计文档 §4)。
+    // A4:keydir 段快照快路径。Phase 2(search):先加载 bm25 快照
+    // (含 per-field WAL 重放),再用成对性门判定 search 状态是否覆盖
+    // keydir 快照的跳过区——覆盖才允许尾部回放,否则全量 fold
+    // (keydir 已载入的快照态保留无害:全量 fold 幂等覆盖)。
     std::vector<std::pair<std::uint32_t, std::uint64_t>> snap_wms;
     bool snap_loaded = false;
-    if (!search_layer) {
-        if (auto w = keydir_->load_snapshot(dirname_ + "/" + kKeydirSnapName)) {
-            snap_wms = std::move(*w);
-            snap_loaded = true;
-        }
+    bool search_snap_ok = false;
+    if (search_layer) {
+        auto sl = search_layer->load_snapshot(dirname_ + "/bm25_snapshot.inv");
+        search_snap_ok = sl.has_value() && *sl;
+    }
+    if (auto w = keydir_->load_snapshot(dirname_ + "/" + kKeydirSnapName)) {
+        snap_wms = std::move(*w);
+        snap_loaded = true;
+    }
+    if (search_layer && snap_loaded) {
+        // 成对性门:min_field(已索引 ord 水位)+1 ≥ keydir 快照 next_ord
+        // ⟹ 跳过区每个文档在每个字段索引中都已存在(设计 §4 论证)。
+        const auto floor = search_layer->indexed_ord_floor();
+        const auto need = keydir_->peek_next_ord();
+        bool covered =
+            search_snap_ok &&
+            (need == 0 ||
+             (floor != static_cast<std::uint64_t>(-1) && floor + 1 >= need));
+        // ⚠️ P2 已知缺口(实测 SearchSurvivesMerge 抓出):search 状态还
+        // 包含 Index 侧表(ext2ord/live/doc_lens),bm25 快照不含它,且
+        // doc_len 暂无持久化来源(倒排快照不存 per-posting dl)——跳过
+        // 前缀会让 live 全空、v5 dl 不变量失守。在 Index sidecar 快照
+        // 落地前,search 模式强制全量 fold(快照态保留无害,
+        // recover_doc 经 add_doc 水位幂等去重)。
+        covered = false;
+        if (!covered) snap_loaded = false;
     }
     auto wm_of = [&](std::uint32_t fid) -> std::uint64_t {
         for (auto& [id, off] : snap_wms) {

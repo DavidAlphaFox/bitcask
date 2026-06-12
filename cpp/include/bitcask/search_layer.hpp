@@ -169,6 +169,11 @@ public:
     // ---- 恢复：从磁盘 record 重放墓碑 ----
     void recover_tomb(std::string_view key, std::uint64_t ord);
 
+    // A4-P2:全字段已索引 ord 水位的下确界(min over fields)。
+    // u64(-1) = 任一字段无文档/无字段——调用方据此判定 search 状态是否
+    // 覆盖 keydir 快照的跳过区(成对性门,recovery 设计 §4)。
+    [[nodiscard]] std::uint64_t indexed_ord_floor() const;
+
     // ---- 快照持久化 ----
     [[nodiscard]] std::expected<void, std::string> save_snapshot(std::string_view path) const;
 

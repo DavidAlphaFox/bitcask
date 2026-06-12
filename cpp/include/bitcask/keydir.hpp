@@ -277,6 +277,11 @@ public:
     // 线程安全: 是。锁: 内部 unique_lock(mutex_)。
     std::uint32_t increment_file_id_at_least(std::uint32_t conditional_id);
 
+    // A4-P2:当前 next_ord(成对性门比较用;原子读,无锁)。
+    [[nodiscard]] std::uint64_t peek_next_ord() const {
+        return next_ord_.load(std::memory_order_relaxed);
+    }
+
     // ---- A4:keydir 段快照(open 加速;设计 doc/recovery-snapshot-design-zh.md)----
     // dump 当前内存态 + 调用方给的 per-file 字节水位。有活跃 fold
     // (MultiEntry 可能存在)时拒绝并返回 false(快照是纯优化)。
