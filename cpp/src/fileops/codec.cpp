@@ -4,9 +4,8 @@
 #include <cassert>
 #include <cstring>
 
-#include <zlib.h>
-
 #include "bitcask/format.hpp"
+#include "bitcask/hw_crc32.hpp"
 
 namespace bitcask::codec {
 
@@ -77,20 +76,21 @@ inline bool vbyte_read(std::span<const std::byte> buf, std::size_t& pos, std::ui
 
 }  // namespace
 
-// 一次性算 CRC——薄包装 zlib::crc32(0, ...)。
+// 一次性算 CRC——薄包装 hw::crc32_update(0, ...)。
 std::uint32_t crc32(std::span<const std::byte> data) noexcept {
     return crc32_update(0, data);
 }
 
 // 流式 CRC：seed 是上一段的结果，可以多段累计。hint 文件的 trailer CRC
-// 就靠这个边写边累加。zlib 的 CRC32 有 incremental 性质——seed 起始值是
-// 0，append 一段后的 CRC 跟「整段一次性算」结果一致。
+// 就靠这个边写边累加。CRC32 有 incremental 性质——seed 起始值是 0，append
+// 一段后的 CRC 跟「整段一次性算」结果一致。
+//
+// 实际计算交给 bitcask::hw::crc32_update（PCLMULQDQ 硬件加速 + zlib 兜底），
+// 输出与 zlib::crc32() bit-identical，确保现有 data file / hint file 的
+// on-disk CRC 与历史数据兼容。
 std::uint32_t crc32_update(std::uint32_t seed,
                            std::span<const std::byte> data) noexcept {
-    return static_cast<std::uint32_t>(
-        ::crc32(static_cast<uLong>(seed),
-                reinterpret_cast<const Bytef*>(data.data()),
-                static_cast<uInt>(data.size())));
+    return bitcask::hw::crc32_update(seed, data);
 }
 
 // ---------------------------------------------------------------------------
