@@ -143,6 +143,35 @@ search_hybrid(query, qvec, k)     → BM25 top-K' ∥ HNSW top-K'
   `search_vector(qvec, k, filter_query?)` 形状,实现 V3.x 再议
   (预过滤/后过滤/图内过滤是独立课题)。
 
+### V3.6 落地记录(2026-06-12,search_hybrid + NIF/Erlang 接口)
+
+实现主体在 `SearchLayer::search_hybrid`(Cask 门面只做向量配置校验 +
+flush),语义定稿如下:
+
+1. **rank 从 1 起**;只在单路出现的文档照常累加该路项,不做缺路惩罚。
+2. **确定性平局序**:RRF 分相等 → ord 小者在前(测试
+   V36HybridRrfFusion 用「1/61+1/63 ≡ 1/63+1/61」的精确浮点平局锁死
+   该行为,浮点加法可交换故两文档分逐位相等)。
+3. **单路退化语义**:text 空 + vec 合法 → 等价纯向量(BM25 路空),
+   反之亦然——结果序 = 单路原序,分数被 RRF 重打为 1/61, 1/62, …;
+   **两路都空才报错**(kInvalidOption)。无向量配置的集合调 hybrid →
+   kInvalidOption(即使纯文本退化也拒——hybrid 属向量集合 API);
+   vec 维度不符 → kInvalidOption(经 search_vector 内核校验)。
+4. 返回沿用 TextSearchResult,score = RRF 分(替换单路原始分)。
+5. **NIF 跨界**:向量 = **f32 LE 二进制**(dim×4 字节 binary,与
+   DocValue 存储一致),Erlang 侧 `<< <<X:32/float-little>> || X <- L >>`
+   构造;`cask_put` 的 doc map 新增 `vector` 键(坏尺寸/非 binary →
+   badarg,不落盘);新增 `cask_search_vector(Ref,VecBin,K,Ef)` /
+   `cask_search_hybrid(Ref,TextBin,VecBin,K)`(dirty CPU 调度);open
+   新增 `{vector_dim,N}` / `{vector_metric,cosine|l2|dot}` 选项。
+6. **Erlang embedder**:`bitcask_embedder` behaviour
+   (`embed(binary()) -> {ok, VecBin} | {error,_}`,可选 `dim/0`);
+   参考实现 `bitcask_embedder_openai`(OpenAI 兼容 /v1/embeddings,
+   httpc + OTP 27+ 内置 json;32K token 上限按 32768 字节保守截断 +
+   UTF-8 尾部回退,粗糙但安全)。eunit 门禁用确定性 mock
+   (test/bitcask_embedder_mock),真实端点用例默认 skip
+   (BITCASK_EMBEDDER_LIVE=1 手动开)。
+
 ## 5. 持久化与恢复(A4 体系的第四块;V3.5 落地定稿)
 
 > 实施记录(2026-06-12):本节由设计稿的"vec/hnsw 两文件"方案合并
@@ -214,7 +243,7 @@ close 保存顺序:bm25 → sidecar → **hnsw snap** → keydir snap(worker
 | V3.3 | 并发化(per-node 锁 + 发布式增长)+ IndexPool 接线 | N 读 × 1 写并发测试;TSan 全插桩全绿 |
 | V3.4 | 软删过滤 + LiveChecker 接入。**落地记录(2026-06-12)**:机制随 V3.3 已在位(`Index.live_` 位图即 LiveChecker;search_vector 注入 `is_live` 回调;HNSW 结果侧滤死),V3.4 为语义证明:覆写测试(旧向量不可达,key 仅经新向量出现一次)+ 死区导航测试(删掉查询近邻 150/300 形成死壳,k=10 仍凑满、零死文档泄入、与活集暴力真值重合 ≥9/10)。**已知边界**:结果侧过滤意味着 ef 候选内活者 < k 时返回不足 k——死文档占比高的邻域调用方需加大 ef;根治靠 merge 重建物理清除(V3.5) | 删除/覆写/死区三类可见性测试 ✅ |
 | V3.5 | 持久化(BCVS 完整图快照 + covers 门并入 A4)+ merge 重建。**落地记录(2026-06-12)**:单文件 `hnsw.snap` 取代设计稿 vec/hnsw 两文件(§5 定稿);hnsw_ 改 atomic<shared_ptr>,merge 经 IndexPool 提交 RebuildHnsw 由 worker 重建换图(单写者保持);§3 偏差 7 特判撤销。**开库收益实测(10k×384d,tmpfs)**:快照 reopen 82ms vs 删 hnsw.snap 全量 fold 3770ms(≈46×,BM_Cask_Open_Vec{Snapshot,FullFold}) | A4 同款三件套(快照/全量等价 + 快照孤本可检索实证、陈旧尾部回放、位翻转回退)+ MergeRebuildEvictsDead(50→25 节点物理清死)+ ConcurrentSearchDuringRebuild;plain/TSan/ASan ctest 378/378(TSan 零报告);eunit 44/44 ✅ |
-| V3.6 | search_hybrid RRF + NIF/Erlang 接口 | 端到端 eunit;hybrid 排序确定性测试 |
+| V3.6 | search_hybrid RRF + NIF/Erlang 接口。**落地记录(2026-06-12)**:SearchLayer::search_hybrid(两路 K'=max(k×4,64),RRF k=60,rank 从 1 起;平局 → ord 小者;单路退化/双空报错语义见 §4 落地记录);NIF 跨界 f32 LE 二进制(put doc map `vector` 键 + cask_search_vector/4 + cask_search_hybrid/4 + open {vector_dim,N}/{vector_metric,M});bitcask_embedder behaviour + bitcask_embedder_openai 参考实现(httpc + OTP≥27 json,32K 字节级保守截断)。测试 +3(V36HybridRrfFusion 精确浮点平局 + SingleLeg + Errors)+ eunit +6(mock embedder 全链路,不打在线端点) | plain/TSan/ASan ctest 381/381(TSan 零报告)+ ldd 无 tsan + eunit 50/50 ✅ |
 | V3.7 | 基准定稿:BM_Hnsw_Insert/{10k,100k}、BM_Hnsw_Search/{10k,100k}×{ef64,ef256}、BM_Hybrid;入 baseline | 红线:100k/ef64 查询 < 1ms;插入 > 2k/s(384d,本机) |
 
 ## 7. 明确不做(V3 边界)
