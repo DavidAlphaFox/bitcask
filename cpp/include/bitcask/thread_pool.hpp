@@ -30,6 +30,14 @@
 #include <oneapi/tbb/concurrent_queue.h>  // concurrent_bounded_queue（oneTBB 已并入此头）
 #include <oneapi/tbb/global_control.h>
 
+#if defined(__SANITIZE_THREAD__) || \
+    (defined(__has_feature) && __has_feature(thread_sanitizer))
+extern "C" {
+void __tsan_acquire(void* addr);
+void __tsan_release(void* addr);
+}
+#endif
+
 namespace bitcask {
 
 // 索引操作类型。
@@ -97,19 +105,40 @@ public:
         queue_.set_capacity(capacity);
     }
 
-    void push(IndexTask task) { queue_.push(std::move(task)); }
+    // C1:tbb 队列内部以 fence 同步,TSan 不建模独立 fence——producer
+    // 构造的任务 payload 与 consumer 的读取会被误报 data race(任务
+    // 字符串上的假阳性族)。用 TSan 标注 API 把移交的 happens-before
+    // 显式告知 runtime;非 TSan 构建为空操作。
+    void push(IndexTask task) {
+        annotate_release();
+        queue_.push(std::move(task));
+    }
 
     IndexTask pop() {
         IndexTask task;
         queue_.pop(task);
+        annotate_acquire();
         return task;
     }
 
-    bool try_pop(IndexTask& task) { return queue_.try_pop(task); }
+    bool try_pop(IndexTask& task) {
+        if (!queue_.try_pop(task)) return false;
+        annotate_acquire();
+        return true;
+    }
 
     std::size_t size() const { return queue_.size(); }
 
 private:
+#if defined(__SANITIZE_THREAD__) || \
+    (defined(__has_feature) && __has_feature(thread_sanitizer))
+    void annotate_release() { __tsan_release(&queue_); }
+    void annotate_acquire() { __tsan_acquire(&queue_); }
+#else
+    void annotate_release() {}
+    void annotate_acquire() {}
+#endif
+
     tbb::concurrent_bounded_queue<IndexTask> queue_;
 };
 

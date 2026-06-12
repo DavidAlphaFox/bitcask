@@ -8,22 +8,29 @@
 //   删除：on_delete(key) → index_.get → inverted_->remove_doc → index_.remove
 //   查询：search_text(query, k) → analyzer_->analyze → inverted_->search → ord_to_ext → SearchHit
 //
-// === 约束 ===
-//   - 非线程安全：caller 负责并发控制
+// === 约束(线程模型,C1 修订)===
+//   - 生产形态:单写者(IndexPool worker 串行消费 on_write/on_delete)
+//     + 多读者(查询线程)。曾声明"非线程安全,caller 串行化",与实际
+//     使用不符——TSan 全插桩后实测修复了 fields_ map 并发 emplace/find
+//     与 DocTextLru 并发 put/get 两处真竞态;现 fields_(shared_mutex)、
+//     doc_texts_(内置 mutex)、cache_(shared_mutex)、index_/InvertedIndex
+//     (自带锁/分片)在该模型下安全。**多写者仍未支持**。
 //   - ord 唯一且单调分配，不复用
 //   - analyzer_ 在构造时创建，失败则整个 SearchLayer 创建失败
 
 #pragma once
 
 #include <cstdint>
+#include <expected>
 #include <list>
 #include <memory>
 #include <optional>
+#include <mutex>
+#include <shared_mutex>
 #include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <expected>
 #include <vector>
 #include "bitcask/analyzer.hpp"
 #include "bitcask/highlighter.hpp"
@@ -187,13 +194,16 @@ public:
 private:
     // 高亮原文 LRU（S9.3）：ord → 原文，带容量上限。只为高亮路径服务；
     // 冷文档被挤出后高亮降级为无片段，不影响 BM25 检索本身。
-    // 非线程安全——与 SearchLayer 整体一致，由 caller 串行化。
+    // C1:内置 mutex——IndexPool 工作线程 put 与查询线程 get(高亮)并发,
+    // TSan 降噪后实测捕获竞态;原"caller 串行化"假设与生产线程模型不符。
+    // get 返回拷贝而非内部指针:旧接口指针在锁外可被并发淘汰释放(UAF 窗口)。
     class DocTextLru {
     public:
         explicit DocTextLru(std::size_t cap) : cap_(cap) {}
 
         void put(std::uint64_t ord, std::string text) {
             if (cap_ == 0) return;
+            std::lock_guard<std::mutex> lk(mu_);
             if (auto it = map_.find(ord); it != map_.end()) {
                 it->second->second = std::move(text);
                 lru_.splice(lru_.begin(), lru_, it->second);
@@ -207,15 +217,17 @@ private:
             }
         }
 
-        // 命中返回原文指针并提升为最近使用；未命中返回 nullptr。
-        const std::string* get(std::uint64_t ord) {
+        // 命中返回原文拷贝并提升为最近使用；未命中返回 nullopt。
+        std::optional<std::string> get(std::uint64_t ord) {
+            std::lock_guard<std::mutex> lk(mu_);
             auto it = map_.find(ord);
-            if (it == map_.end()) return nullptr;
+            if (it == map_.end()) return std::nullopt;
             lru_.splice(lru_.begin(), lru_, it->second);
-            return &it->second->second;
+            return it->second->second;
         }
 
         void erase(std::uint64_t ord) {
+            std::lock_guard<std::mutex> lk(mu_);
             auto it = map_.find(ord);
             if (it == map_.end()) return;
             lru_.erase(it->second);
@@ -223,6 +235,7 @@ private:
         }
 
         void clear() {
+            std::lock_guard<std::mutex> lk(mu_);
             lru_.clear();
             map_.clear();
         }
@@ -232,6 +245,7 @@ private:
         std::list<std::pair<std::uint64_t, std::string>> lru_;  // front=最近
         std::unordered_map<std::uint64_t,
             std::list<std::pair<std::uint64_t, std::string>>::iterator> map_;
+        std::mutex mu_;
     };
 
     // 取或建某字段的 InvertedIndex（S8.6 阶段2）。
@@ -244,6 +258,11 @@ private:
     // S8.6：每字段一个 InvertedIndex（字段间 avgdl/idf 隔离）。
     // 旧单 text 文档与无字段限定查询都走 kDefaultField。
     // O8：透明 hash——field_index 查找直接吃 string_view，免临时 string。
+    // C1:fields_mu_ 保护 map 结构——IndexPool 工作线程首次写入新字段会
+    // emplace,与查询线程的 find 并发(TSan 降噪后实测捕获的真竞态)。
+    // InvertedIndex 本体地址稳定(unique_ptr)且内部自带分片并发,
+    // 锁只管 map;引用/指针可出锁使用。
+    mutable std::shared_mutex fields_mu_;
     std::unordered_map<std::string, std::unique_ptr<bm25::InvertedIndex>,
                        StringHash, std::equal_to<>> fields_;
     // R3：ord → (字段名 → 该字段 doc_len)，供 on_delete 按字段精确扣减统计。

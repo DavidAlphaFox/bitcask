@@ -19,7 +19,31 @@ target_compile_options(bitcask_warnings INTERFACE
 )
 
 find_package(ZLIB REQUIRED)
-find_package(TBB REQUIRED)
+
+# C1:TSan 构建改用源码编译的**插桩版** oneTBB——系统 libtbb 未插桩,
+# 其内部同步(parallel_* 任务交接、concurrent_hash_map)的 happens-before
+# 对 TSan 不可见,曾产生固定 19 例假阳性族且无法用 suppression 精确覆盖
+# (残余报告两侧栈均为本项目帧,再宽的 pattern 会掩盖真实 race)。
+# 插桩后 HB 边可见:假阳性归零,TBB 任务体内的真实 race 也不再漏报。
+# TSan 标志只注入 oneTBB 子项目作用域,NIF .so 不受影响。
+if(BITCASK_SANITIZE MATCHES "thread")
+    include(FetchContent)
+    set(TBB_TEST OFF CACHE BOOL "" FORCE)
+    set(TBB_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(TBB_STRICT OFF CACHE BOOL "" FORCE)
+    set(_bitcask_saved_cxx_flags "${CMAKE_CXX_FLAGS}")
+    set(CMAKE_CXX_FLAGS
+        "${CMAKE_CXX_FLAGS} -fsanitize=thread -fno-omit-frame-pointer")
+    FetchContent_Declare(oneTBB
+        GIT_REPOSITORY https://github.com/uxlfoundation/oneTBB.git
+        GIT_TAG v2022.0.0
+        GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(oneTBB)
+    set(CMAKE_CXX_FLAGS "${_bitcask_saved_cxx_flags}")
+    message(STATUS "bitcask: TSan build -> instrumented oneTBB from source")
+else()
+    find_package(TBB REQUIRED)
+endif()
 
 # ---------------------------------------------------------------------------
 # Release 性能选项（评审记录见 TASK.md「P1 — Phase 2-min」节）：
@@ -63,7 +87,7 @@ add_library(bitcask_format STATIC
 target_include_directories(bitcask_format PUBLIC include)
 target_link_libraries(bitcask_format
     PUBLIC ZLIB::ZLIB
-    PRIVATE bitcask_warnings
+    PRIVATE bitcask_warnings bitcask_sanitizers
 )
 
 # ---------------------------------------------------------------------------
@@ -77,7 +101,7 @@ add_library(bitcask_fileops STATIC
 target_include_directories(bitcask_fileops PUBLIC include)
 target_link_libraries(bitcask_fileops
     PUBLIC bitcask_format bitcask_io
-    PRIVATE bitcask_warnings
+    PRIVATE bitcask_warnings bitcask_sanitizers
 )
 
 # ---------------------------------------------------------------------------
@@ -89,7 +113,7 @@ add_library(bitcask_io STATIC
     src/lock/file_lock.cpp
 )
 target_include_directories(bitcask_io PUBLIC include)
-target_link_libraries(bitcask_io PRIVATE bitcask_warnings)
+target_link_libraries(bitcask_io PRIVATE bitcask_warnings bitcask_sanitizers)
 
 # ---------------------------------------------------------------------------
 # bitcask_keydir — in-memory keydir (KeyDir class for bitcask).
@@ -101,7 +125,7 @@ add_library(bitcask_keydir STATIC
 target_include_directories(bitcask_keydir PUBLIC include)
 target_link_libraries(bitcask_keydir
     PUBLIC  bitcask_fileops bitcask_io
-    PRIVATE bitcask_warnings
+    PRIVATE bitcask_warnings bitcask_sanitizers
 )
 
 # ---------------------------------------------------------------------------
@@ -114,7 +138,7 @@ add_library(bitcask_index STATIC
 target_include_directories(bitcask_index PUBLIC include)
 target_link_libraries(bitcask_index
     PUBLIC  bitcask_text
-    PRIVATE bitcask_warnings
+    PRIVATE bitcask_warnings bitcask_sanitizers
 )
 
 # ---------------------------------------------------------------------------
@@ -129,7 +153,7 @@ add_library(bitcask_bm25 STATIC
 target_include_directories(bitcask_bm25 PUBLIC include)
 target_link_libraries(bitcask_bm25
     PUBLIC bitcask_format            # WAL framing 的 codec::crc32(O11)
-    PRIVATE bitcask_warnings TBB::tbb)
+    PRIVATE bitcask_warnings bitcask_sanitizers TBB::tbb)
 
 # ---------------------------------------------------------------------------
 # bitcask_search — SearchLayer (Index + InvertedIndex + Analyzer wrapper).
@@ -142,7 +166,7 @@ add_library(bitcask_search STATIC
 target_include_directories(bitcask_search PUBLIC include)
 target_link_libraries(bitcask_search
     PUBLIC  bitcask_index bitcask_bm25 bitcask_text
-    PRIVATE bitcask_warnings
+    PRIVATE bitcask_warnings bitcask_sanitizers
 )
 
 # ---------------------------------------------------------------------------
@@ -155,7 +179,7 @@ add_library(bitcask_merge STATIC
 target_include_directories(bitcask_merge PUBLIC include)
 target_link_libraries(bitcask_merge
     PUBLIC  bitcask_keydir bitcask_fileops bitcask_io bitcask_format bitcask_search
-    PRIVATE bitcask_warnings
+    PRIVATE bitcask_warnings bitcask_sanitizers
 )
 
 # ---------------------------------------------------------------------------
@@ -168,7 +192,7 @@ add_library(bitcask_cask STATIC
 target_include_directories(bitcask_cask PUBLIC include)
 target_link_libraries(bitcask_cask
     PUBLIC  bitcask_keydir bitcask_fileops bitcask_io bitcask_format bitcask_merge bitcask_search
-    PRIVATE bitcask_warnings TBB::tbb
+    PRIVATE bitcask_warnings bitcask_sanitizers TBB::tbb
 )
 
 # ---------------------------------------------------------------------------
@@ -242,7 +266,7 @@ else()
 endif()
 target_link_libraries(bitcask_text
     PUBLIC  ${UTF8PROC_TARGET}
-    PRIVATE bitcask_warnings cppjieba
+    PRIVATE bitcask_warnings bitcask_sanitizers cppjieba
 )
 
 # NOTE(V1): legacy targets bitcask_keydir / bitcask_merge / bitcask_cask 已从构建

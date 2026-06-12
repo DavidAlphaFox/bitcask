@@ -186,26 +186,36 @@ target_link_libraries(bitcask_fuzzy_test PRIVATE
 )
 
 include(GoogleTest)
-gtest_discover_tests(bitcask_smoke_test)
-gtest_discover_tests(bitcask_codec_test)
-gtest_discover_tests(bitcask_posix_file_test)
-gtest_discover_tests(bitcask_file_lock_test)
-gtest_discover_tests(bitcask_index_test)
-gtest_discover_tests(bitcask_data_file_test)
-gtest_discover_tests(bitcask_scanner_test)
-gtest_discover_tests(bitcask_analyzer_test)
-gtest_discover_tests(bitcask_porter_stemmer_test)
-gtest_discover_tests(bitcask_stemming_analyzer_test)
-gtest_discover_tests(bitcask_inverted_test)
-gtest_discover_tests(bitcask_jieba_analyzer_test)
-gtest_discover_tests(bitcask_keydir_test)
-gtest_discover_tests(bitcask_cask_docvalue_test)
-gtest_discover_tests(bitcask_search_layer_test)
-gtest_discover_tests(bitcask_inverted_wal_test)
-gtest_discover_tests(bitcask_highlighter_test)
-gtest_discover_tests(bitcask_wildcard_test)
-gtest_discover_tests(bitcask_synonym_test)
-gtest_discover_tests(bitcask_fuzzy_test)
+
+# C1:TSan 下给所有测试注入 suppression 文件(见 cmake/tsan.supp 头注释:
+# TBB 的 fence 同步对 TSan 不可见,插桩自编 oneTBB 后仍有残余假阳性)。
+# 动态 libtsan 不回调二进制内的 __tsan_default_suppressions,env 是
+# 唯一可靠通道。
+set(_bitcask_test_props "")
+if(BITCASK_SANITIZE MATCHES "thread")
+    set(_bitcask_test_props PROPERTIES ENVIRONMENT
+        "TSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/cmake/tsan.supp")
+endif()
+gtest_discover_tests(bitcask_smoke_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_codec_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_posix_file_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_file_lock_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_index_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_data_file_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_scanner_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_analyzer_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_porter_stemmer_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_stemming_analyzer_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_inverted_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_jieba_analyzer_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_keydir_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_cask_docvalue_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_search_layer_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_inverted_wal_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_highlighter_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_wildcard_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_synonym_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_fuzzy_test ${_bitcask_test_props})
 
 add_executable(bitcask_thread_pool_test thread_pool_test.cpp)
 target_link_libraries(bitcask_thread_pool_test PRIVATE
@@ -215,4 +225,4 @@ target_link_libraries(bitcask_thread_pool_test PRIVATE
     bitcask_sanitizers
     TBB::tbb
 )
-gtest_discover_tests(bitcask_thread_pool_test)
+gtest_discover_tests(bitcask_thread_pool_test ${_bitcask_test_props})

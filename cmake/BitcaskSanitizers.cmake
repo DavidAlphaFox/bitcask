@@ -44,5 +44,11 @@ if(NOT "${BITCASK_SANITIZE}" STREQUAL "")
 
     target_compile_options(bitcask_sanitizers INTERFACE ${_san_flags})
     target_link_options(bitcask_sanitizers INTERFACE ${_san_flags})
+
+    # C1 注:TSan 抑制不在此注入——动态 libtsan 不回调可执行文件内的
+    # __tsan_default_suppressions 覆盖(实测零匹配),改由
+    # cpp/tests/CMakeLists.txt 经测试 ENVIRONMENT 属性传
+    # TSAN_OPTIONS=suppressions=cmake/tsan.supp。
+
     message(STATUS "bitcask: sanitizers enabled -> ${BITCASK_SANITIZE}")
 endif()

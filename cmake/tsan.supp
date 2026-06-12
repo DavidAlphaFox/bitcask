@@ -1,0 +1,6 @@
+# TSan 假阳性抑制:TBB 调度器用 atomic_thread_fence 同步,TSan 不建模
+# 独立 fence——即便 TSan 插桩自编 oneTBB(见 cpp/CMakeLists.txt)仍有
+# 残余假阳性,以 tbb 帧名兜底。代价:经 TBB 任务体的真实 race 也会被压,
+# TBB 并行区内的共享状态正确性靠专项并发测试保证(如
+# SearchConcurrentWithSingleWriter),不靠全量 TSan。
+race:*tbb*

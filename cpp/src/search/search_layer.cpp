@@ -20,6 +20,13 @@ SearchLayer::SearchLayer(const SearchLayerConfig& config)
 }
 
 bm25::InvertedIndex& SearchLayer::field_index(std::string_view field) {
+    // 双检:常态(字段已存在)只拿共享锁;首次出现的字段才升级独占建索引。
+    {
+        std::shared_lock lk(fields_mu_);
+        auto it = fields_.find(field);
+        if (it != fields_.end()) return *it->second;
+    }
+    std::unique_lock lk(fields_mu_);
     auto it = fields_.find(field);
     if (it == fields_.end()) {
         it = fields_.emplace(std::string(field),
@@ -29,6 +36,7 @@ bm25::InvertedIndex& SearchLayer::field_index(std::string_view field) {
 }
 
 const bm25::InvertedIndex* SearchLayer::field_index(std::string_view field) const {
+    std::shared_lock lk(fields_mu_);
     auto it = fields_.find(field);
     return it == fields_.end() ? nullptr : it->second.get();
 }
@@ -134,7 +142,7 @@ std::optional<std::uint64_t> SearchLayer::on_delete(std::string_view key, std::u
 
     // S9.2：取被删文档词集做选择性失效。原文 LRU 命中则精确 analyze；
     // miss（冷文档被挤出）则降级为整缓存失效（安全但粗粒度）。
-    const std::string* text = doc_texts_.get(slot->ord);
+    auto text = doc_texts_.get(slot->ord);  // 拷贝(C1:并发安全,见 DocTextLru)
     std::vector<std::string> changed_terms;
     if (text) {
         auto tf = analyzer_->analyze(*text);
@@ -150,6 +158,7 @@ std::optional<std::uint64_t> SearchLayer::on_delete(std::string_view key, std::u
         }
         ord_field_lens_.erase(it);
     } else {
+        std::shared_lock lk(fields_mu_);  // 只读 map 结构;remove_doc 自带并发
         for (auto& [_, inv] : fields_) {
             inv->remove_doc(slot->doc_len, {});
         }
@@ -486,6 +495,7 @@ std::expected<void, std::string> SearchLayer::save_snapshot(std::string_view pat
     snapshot_path_ = base;
     std::ofstream mf(base + ".manifest", std::ios::binary);
     if (!mf) return std::unexpected("failed to open manifest for " + base);
+    std::shared_lock fields_lk(fields_mu_);  // 快照期间禁止新字段插入
     mf << fields_.size() << '\n';
     std::size_t idx = 0;
     for (auto& [field, inv] : fields_) {
@@ -508,6 +518,7 @@ std::expected<bool, std::string> SearchLayer::load_snapshot(std::string_view pat
         std::size_t count = 0;
         mf >> count;
         mf.get();  // 吃掉换行
+        std::unique_lock fields_lk(fields_mu_);
         fields_.clear();
         for (std::size_t i = 0; i < count; ++i) {
             std::string field;
@@ -613,7 +624,7 @@ SearchLayer::search_text_highlight(std::string_view query, std::size_t k,
 
         // S9.3：原文 LRU 命中才生成高亮片段；冷文档被挤出（miss）时降级为
         // 无片段的 hit，而非整条丢弃——保证结果集不因 LRU 容量而缩水。
-        const std::string* doc_text = doc_texts_.get(r.ord);
+        auto doc_text = doc_texts_.get(r.ord);  // 拷贝(C1)
         std::vector<Snippet> snippets;
         if (doc_text) {
             // S9.19：analyze_with_offsets 产出的 byte offset 相对「归一化文本」，
