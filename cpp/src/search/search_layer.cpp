@@ -89,6 +89,106 @@ void SearchLayer::rebuild_hnsw() {
     hnsw_.store(std::move(fresh), std::memory_order_release);
 }
 
+namespace {
+
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("avx2,fma")))
+inline double sum_sq_avx2(const float* v, std::size_t n) noexcept {
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    std::size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m256 a0 = _mm256_loadu_ps(v + i);
+        const __m256 a1 = _mm256_loadu_ps(v + i + 8);
+        acc0 = _mm256_fmadd_ps(a0, a0, acc0);
+        acc1 = _mm256_fmadd_ps(a1, a1, acc1);
+    }
+    if (i + 8 <= n) {
+        const __m256 a = _mm256_loadu_ps(v + i);
+        acc0 = _mm256_fmadd_ps(a, a, acc0);
+        i += 8;
+    }
+    __m256 s = _mm256_add_ps(acc0, acc1);
+    __m128 lo = _mm256_castps256_ps128(s);
+    __m128 hi = _mm256_extractf128_ps(s, 1);
+    __m128 s128 = _mm_add_ps(lo, hi);
+    s128 = _mm_hadd_ps(s128, s128);
+    s128 = _mm_hadd_ps(s128, s128);
+    double sq = static_cast<double>(_mm_cvtss_f32(s128));
+    for (; i < n; ++i) sq += static_cast<double>(v[i]) * v[i];
+    return sq;
+}
+
+__attribute__((target("avx2,fma")))
+inline void scale_avx2(float* dst, const float* src, float inv, std::size_t n) noexcept {
+    const __m256 vinv = _mm256_set1_ps(inv);
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 a = _mm256_loadu_ps(src + i);
+        _mm256_storeu_ps(dst + i, _mm256_mul_ps(a, vinv));
+    }
+    for (; i < n; ++i) dst[i] = src[i] * inv;
+}
+
+__attribute__((target("avx512f")))
+inline double sum_sq_avx512(const float* v, std::size_t n) noexcept {
+    __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
+    std::size_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        const __m512 x0 = _mm512_loadu_ps(v + i);
+        const __m512 x1 = _mm512_loadu_ps(v + i + 16);
+        a0 = _mm512_fmadd_ps(x0, x0, a0);
+        a1 = _mm512_fmadd_ps(x1, x1, a1);
+    }
+    __m512 s = _mm512_add_ps(a0, a1);
+    double sq = static_cast<double>(_mm512_reduce_add_ps(s));
+    for (; i < n; ++i) sq += static_cast<double>(v[i]) * v[i];
+    return sq;
+}
+
+__attribute__((target("avx512f")))
+inline void scale_avx512(float* dst, const float* src, float inv, std::size_t n) noexcept {
+    const __m512 vinv = _mm512_set1_ps(inv);
+    std::size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512 a = _mm512_loadu_ps(src + i);
+        _mm512_storeu_ps(dst + i, _mm512_mul_ps(a, vinv));
+    }
+    for (; i < n; ++i) dst[i] = src[i] * inv;
+}
+#endif
+
+// 查询向量归一化两段(SIMD):sq = Σ v*v 用 double 累加保留标量版精度契约;
+// 缩放 v *= inv 用 float 乘。运行时 AVX-512F > AVX2/FMA > 标量三档兜底。
+inline double sum_sq(const float* v, std::size_t n) noexcept {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    if (n >= 16 && __builtin_cpu_supports("avx512f")) {
+        return sum_sq_avx512(v, n);
+    }
+    if (n >= 8 && __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+        return sum_sq_avx2(v, n);
+    }
+#endif
+    double sq = 0.0;
+    for (std::size_t i = 0; i < n; ++i) sq += static_cast<double>(v[i]) * v[i];
+    return sq;
+}
+
+inline void scale_query(float* dst, const float* src, float inv, std::size_t n) noexcept {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    if (n >= 16 && __builtin_cpu_supports("avx512f")) {
+        scale_avx512(dst, src, inv, n);
+        return;
+    }
+    if (n >= 8 && __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+        scale_avx2(dst, src, inv, n);
+        return;
+    }
+#endif
+    for (std::size_t i = 0; i < n; ++i) dst[i] = src[i] * inv;
+}
+
+}  // namespace
+
 std::expected<std::vector<SearchHit>, std::string>
 SearchLayer::search_vector(std::span<const float> query, std::size_t k,
                            std::size_t ef) const {
@@ -106,12 +206,11 @@ SearchLayer::search_vector(std::span<const float> query, std::size_t k,
     std::vector<float> qn;
     std::span<const float> q = query;
     if (config_.vector_metric == meta::VectorMetric::kCosineNormalized) {
-        double sq = 0.0;
-        for (float v : query) sq += static_cast<double>(v) * v;
+        const double sq = sum_sq(query.data(), query.size());
         if (sq <= 0.0) return std::vector<SearchHit>{};
         const auto inv = static_cast<float>(1.0 / std::sqrt(sq));
-        qn.reserve(query.size());
-        for (float v : query) qn.push_back(v * inv);
+        qn.resize(query.size());
+        scale_query(qn.data(), query.data(), inv, query.size());
         q = qn;
     }
     if (ef == 0) ef = std::max<std::size_t>(k, 64);
