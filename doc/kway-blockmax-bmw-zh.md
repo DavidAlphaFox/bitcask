@@ -6,7 +6,14 @@
 >
 > 本文解释三个递进的概念——k-way 交集、posting 块级元数据、
 > Block-Max WAND——以及它们为什么应排在 AVX-512 内核之前。
-> 状态：**设计路线说明，未实施**。
+> 状态：**§2(k-way)已落地(TASK.md K1,2026-06-12)**;块级元数据、
+> BMW 未实施。
+>
+> K1 实测修正本文 §2 的预期:在尺寸升序 pairwise + SIMD/galloping
+> 内核(经预分配/游标优化)之上,k-way 的去物化**没有可测时间收益**
+> (BoolMustHot3@100k:1011 vs 1005μs);k==2 leapfrog 反而慢 10-13%,
+> 故分发保留 k==2 SIMD pairwise、k≥3 走 leapfrog。落地价值=
+> advance(target) 游标接口先行,块级元数据(§3)直接挂入。
 
 ## 1. 背景与动机
 
