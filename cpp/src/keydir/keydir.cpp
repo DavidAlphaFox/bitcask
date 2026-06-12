@@ -101,15 +101,21 @@ void KeyDir::update_fstats_locked(std::uint32_t file_id, std::uint32_t tstamp,
                                    std::int32_t live_bytes_inc,
                                    std::int32_t total_bytes_inc,
                                    bool should_create) {
-    auto it = fstats_.find(file_id);
-    if (it == fstats_.end()) {
+    const std::size_t idx = file_id;
+    const bool exists = idx < fstats_present_.size() && fstats_present_[idx];
+    if (!exists) {
         if (!should_create) return;
+        if (idx >= fstats_.size()) {
+            fstats_.resize(idx + 1);
+            fstats_present_.resize(idx + 1, 0);
+        }
         FStatsEntry e;
         e.file_id          = file_id;
         e.expiration_epoch = kMaxEpoch;
-        it = fstats_.emplace(file_id, e).first;
+        fstats_[idx]         = e;
+        fstats_present_[idx] = 1;
     }
-    auto& f = it->second;
+    auto& f = fstats_[idx];
     f.live_keys = static_cast<std::uint64_t>(
         static_cast<std::int64_t>(f.live_keys) + live_inc);
     f.total_keys = static_cast<std::uint64_t>(
@@ -130,20 +136,6 @@ void KeyDir::update_fstats_locked(std::uint32_t file_id, std::uint32_t tstamp,
     }
 }
 
-// 加锁版本对外入口。每个 put / remove 会调一次，put 一般 should_create=true
-// （首次写入新 file），remove 一般 should_create=false。
-void KeyDir::update_fstats(std::uint32_t file_id, std::uint32_t tstamp,
-                            std::uint64_t expiration_epoch,
-                            std::int32_t live_inc, std::int32_t total_inc,
-                            std::int32_t live_bytes_inc,
-                            std::int32_t total_bytes_inc,
-                            bool should_create) {
-    std::unique_lock lock(mutex_);
-    update_fstats_locked(file_id, tstamp, expiration_epoch,
-                         live_inc, total_inc, live_bytes_inc, total_bytes_inc,
-                         should_create);
-}
-
 // 标记某 file_id「等迭代结束就可以删」。把当前 epoch_ 写到该 file 的
 // expiration_epoch；后续 needs_merge 看到 expiration_epoch < newest fold
 // epoch 就把这个文件标记为「safe to delete」。
@@ -160,7 +152,12 @@ std::uint32_t KeyDir::trim_fstats(std::span<const std::uint32_t> ids) {
     std::unique_lock lock(mutex_);
     std::uint32_t missing = 0;
     for (auto id : ids) {
-        if (fstats_.erase(id) == 0) ++missing;
+        if (id < fstats_present_.size() && fstats_present_[id]) {
+            fstats_present_[id] = 0;
+            fstats_[id] = FStatsEntry{};  // 清零槽位,防陈旧数据被误读
+        } else {
+            ++missing;
+        }
     }
     return missing;
 }
@@ -217,13 +214,16 @@ std::uint64_t KeyDir::get_epoch() const {
 }
 
 std::uint64_t KeyDir::alloc_ord() {
-    std::unique_lock lock(mutex_);
-    return next_ord_++;
+    return next_ord_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void KeyDir::advance_ord(std::uint64_t ord) {
-    std::unique_lock lock(mutex_);
-    next_ord_ = std::max(next_ord_, ord + 1);
+    // CAS max:只向前推,与并发 alloc_ord 兼容。
+    std::uint64_t cur = next_ord_.load(std::memory_order_relaxed);
+    while (cur < ord + 1 &&
+           !next_ord_.compare_exchange_weak(cur, ord + 1,
+                                            std::memory_order_relaxed)) {
+    }
 }
 
 // keydir 写入主入口。
@@ -761,7 +761,9 @@ KeyDirInfo KeyDir::info() const {
         pending_.has_value() ? std::optional<std::uint64_t>(pending_start_epoch_)
                                : std::nullopt;
     r.fstats.reserve(fstats_.size());
-    for (const auto& [_, f] : fstats_) r.fstats.push_back(f);
+    for (std::size_t i = 0; i < fstats_.size(); ++i) {
+        if (fstats_present_[i]) r.fstats.push_back(fstats_[i]);
+    }
     return r;
 }
 
@@ -775,10 +777,12 @@ std::shared_ptr<KeyDir> KeyDir::deep_copy() const {
     copy->entries_         = entries_;
     copy->pending_         = pending_;
     copy->fstats_          = fstats_;
+    copy->fstats_present_  = fstats_present_;
     copy->key_count_       = key_count_;
     copy->key_bytes_       = key_bytes_;
     copy->epoch_           = epoch_;
-    copy->next_ord_        = next_ord_;
+    copy->next_ord_.store(next_ord_.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
     copy->biggest_file_id_ = biggest_file_id_;
     copy->is_ready_        = is_ready_;
     copy->iter_generation_ = iter_generation_;

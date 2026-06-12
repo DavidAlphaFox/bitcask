@@ -29,6 +29,7 @@
 
 #include "bitcask/string_hash.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -277,17 +278,9 @@ public:
     std::uint32_t increment_file_id_at_least(std::uint32_t conditional_id);
 
     // ---- 文件统计 ----
+    // (注:fstats 的增量更新只发生在 put/remove 已持有的 unique_lock 内,
+    //  经私有 update_fstats_locked;曾有的带锁公开版零调用方,O13 核实后删除。)
 
-    // 增量更新某个 file_id 的 live/total 计数（put 调 +live+total，
-    // remove 调 -live；merge 用 total_inc 调整历史值）。should_create=true
-    // 时不存在则新建一条。
-    // 线程安全: 是。锁: 内部 unique_lock(mutex_)。
-    void update_fstats(std::uint32_t file_id, std::uint32_t tstamp,
-                       std::uint64_t expiration_epoch,
-                       std::int32_t live_inc, std::int32_t total_inc,
-                       std::int32_t live_bytes_inc,
-                       std::int32_t total_bytes_inc,
-                       bool should_create);
     // 标记某 file_id 为「等迭代结束就可删」。
     // 线程安全: 是。锁: 内部 unique_lock(mutex_)。
     void set_pending_delete(std::uint32_t file_id);
@@ -325,12 +318,18 @@ private:
     std::uint64_t pending_start_time_  = 0;  // 第一个 fold 启动时的 wall-clock
     std::uint64_t pending_updated_     = 0;  // pending 中累积的写入次数
 
-    std::unordered_map<std::uint32_t, FStatsEntry> fstats_;
+    // file_id 是 keydir_registry 分配的小整数单调计数,直接用 vector 按
+    // 下标存(替代 unordered_map:update_fstats 在 put/remove 热路径上)。
+    // present 位独立存;trim 后槽位清空但数组不收缩。
+    std::vector<FStatsEntry>  fstats_;
+    std::vector<std::uint8_t> fstats_present_;
 
     std::uint64_t key_count_       = 0;
     std::uint64_t key_bytes_       = 0;
     std::uint64_t epoch_           = 0;
-    std::uint64_t next_ord_       = 0;
+    // ord 分配器独立为 atomic:alloc_ord/advance_ord 不再抢全局
+    // unique_lock(put 热路径上每次写都要分配 ord)。
+    std::atomic<std::uint64_t> next_ord_{0};
     std::uint32_t biggest_file_id_ = 0;
     bool is_ready_                 = false;
 
