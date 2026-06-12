@@ -14,6 +14,7 @@
 #include <cstring>
 #include <span>
 #include <string>
+#include <vector>
 
 #include <erl_nif.h>
 
@@ -108,6 +109,17 @@ inline ERL_NIF_TERM make_uint64_bin(ErlNifEnv* env, std::uint64_t value) {
 // 用于替代重复的 enif_inspect_binary + badarg 模式。
 inline bool ensure_binary(ErlNifEnv* env, ERL_NIF_TERM term, ErlNifBinary& bin) noexcept {
     return enif_inspect_binary(env, term, &bin) != 0;
+}
+
+// V3.6:f32 LE 二进制 → float 向量(向量跨界格式,与 DocValue 存储一致)。
+// Erlang 侧用 << <<X:32/float-little>> || X <- List >> 构造。size 不是
+// 4 的倍数返回 false(调用方 badarg)。引擎仅支持 LE 平台(与
+// get_uint64_bin 的 native 契约同款),直接 memcpy。
+inline bool binary_to_f32vec(const ErlNifBinary& bin, std::vector<float>& out) {
+    if (bin.size % sizeof(float) != 0) return false;
+    out.resize(bin.size / sizeof(float));
+    if (bin.size != 0) std::memcpy(out.data(), bin.data, bin.size);
+    return true;
 }
 
 // 构造 {ok, Value} term。

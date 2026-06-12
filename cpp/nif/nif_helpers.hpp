@@ -53,8 +53,11 @@ ERL_NIF_TERM fault_to_term(ErlNifEnv* env, const CaskFault& f) noexcept;
 
 // 从 Erlang map 中提取 DocInput（text 和可选 meta 字段）。
 // map 必须包含 text 二进制字段，meta 二进制字段可选。
-// 提取成功返回 true；字段缺失或类型不对时返回 false。
-bool parse_doc_map(ErlNifEnv* env, ERL_NIF_TERM map_term, DocInput& doc);
+// V3.6:可选 vector 键 = f32 LE 二进制(dim×4 字节),解码进 caller 提供
+// 的 vec_storage(DocInput.vector 是 span,需要外部存储),size%4 ≠ 0 或
+// 非 binary → 返回 false(调用方 badarg)。其余形态错误沿旧语义静默跳过。
+bool parse_doc_map(ErlNifEnv* env, ERL_NIF_TERM map_term, DocInput& doc,
+                   std::vector<float>& vec_storage);
 
 // 搜索 NIF 的统一骨架（Strategy 模式，用 std::function 承载策略）。
 //

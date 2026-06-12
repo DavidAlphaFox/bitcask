@@ -49,7 +49,8 @@ CaskIterHandle* cask_iter_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept {
 // DocInput 解析
 // ---------------------------------------------------------------------------
 
-bool parse_doc_map(ErlNifEnv* env, ERL_NIF_TERM map_term, DocInput& doc) {
+bool parse_doc_map(ErlNifEnv* env, ERL_NIF_TERM map_term, DocInput& doc,
+                   std::vector<float>& vec_storage) {
     ERL_NIF_TERM text_val;
     if (enif_get_map_value(env, map_term, atoms().text, &text_val)) {
         ErlNifBinary tb{};
@@ -64,6 +65,17 @@ bool parse_doc_map(ErlNifEnv* env, ERL_NIF_TERM map_term, DocInput& doc) {
             doc.meta = as_bytes(mb);
         }
     }
+    // V3.6:vector 键 = f32 LE 二进制。格式错误(非 binary / size%4≠0)
+    // 必须显式拒绝——静默跳过会把带坏向量的 put 当无向量文档写入。
+    ERL_NIF_TERM vec_val;
+    if (enif_get_map_value(env, map_term, atoms().vector, &vec_val)) {
+        ErlNifBinary vb{};
+        if (!enif_inspect_binary(env, vec_val, &vb) ||
+            !binary_to_f32vec(vb, vec_storage)) {
+            return false;
+        }
+        doc.vector = vec_storage;
+    }
     // S8.6 多字段：遍历 map，把 text/meta 之外的「atom 键 → binary 值」作为命名字段。
     // span 指向 NIF binary（put_doc 同步编码完才返回，生命周期安全）。
     ErlNifMapIterator iter;
@@ -74,7 +86,7 @@ bool parse_doc_map(ErlNifEnv* env, ERL_NIF_TERM map_term, DocInput& doc) {
             int n = enif_get_atom(env, k, namebuf, sizeof(namebuf), ERL_NIF_LATIN1);
             if (n > 0) {
                 std::string name(namebuf, static_cast<std::size_t>(n - 1));  // 去末尾 NUL
-                if (name != "text" && name != "meta") {
+                if (name != "text" && name != "meta" && name != "vector") {
                     ErlNifBinary fb{};
                     if (enif_inspect_binary(env, v, &fb)) {
                         doc.fields.push_back({std::move(name), as_bytes(fb)});

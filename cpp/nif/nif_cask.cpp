@@ -83,7 +83,12 @@ ERL_NIF_TERM nif_cask_put(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[
 
     if (enif_is_map(env, argv[2])) {
         DocInput doc;
-        parse_doc_map(env, argv[2], doc);
+        // V3.6:vector 键的 f32 解码缓冲(doc.vector 是 span,指向它);
+        // 坏向量(非 binary / size%4≠0)→ badarg,不落盘。
+        std::vector<float> vec_storage;
+        if (!parse_doc_map(env, argv[2], doc, vec_storage)) {
+            return enif_make_badarg(env);
+        }
         auto r = h->cask->put_doc(as_bytes(key), doc);
         if (!r) return fault_to_term(env, r.error());
         return atoms().ok;
@@ -181,6 +186,48 @@ ERL_NIF_TERM nif_cask_search_wildcard(ErlNifEnv* env, int /*argc*/,
     const auto k = static_cast<std::size_t>(get_positive_int(env, argv[2], 10));
     return run_search(env, argv[0], argv[1],
         [k](Cask& c, std::string_view p) { return c.search_wildcard(p, k); });
+}
+
+// V3.6:HNSW 向量检索（ref, vec_bin, k, ef）。vec_bin = f32 LE 二进制
+// (dim×4 字节,与 put_doc 的 vector 键同格式);size%4≠0 → badarg;
+// dim 与集合配置不符 / 无向量配置 → 经 fault_to_term({error, ...})。
+// ef=0 → 引擎默认 max(k, 64)。
+ERL_NIF_TERM nif_cask_search_vector(ErlNifEnv* env, int /*argc*/,
+                                      const ERL_NIF_TERM argv[]) {
+    auto* h = checked_cask_handle(env, argv[0]);
+    ErlNifBinary vec_bin{};
+    if (!h || !ensure_binary(env, argv[1], vec_bin)) {
+        return enif_make_badarg(env);
+    }
+    const auto k  = static_cast<std::size_t>(get_positive_int(env, argv[2], 10));
+    const auto ef = static_cast<std::size_t>(get_nonneg_int(env, argv[3], 0));
+    std::vector<float> query;
+    if (!binary_to_f32vec(vec_bin, query)) return enif_make_badarg(env);
+    if (!h->cask->has_search()) return make_error(env, atoms().no_index);
+    auto r = h->cask->search_vector(query, k, ef);
+    if (!r) return fault_to_term(env, r.error());
+    return make_ok(env, make_search_hits(env, r->hits));
+}
+
+// V3.6:RRF 混合检索（ref, text_bin, vec_bin, k）。vec_bin 可为 <<>>
+// (纯文本退化),text_bin 可为 <<>>(纯向量退化);两者都空 →
+// {error, ...}(经 Cask 的 kInvalidOption)。score = RRF 分。
+ERL_NIF_TERM nif_cask_search_hybrid(ErlNifEnv* env, int /*argc*/,
+                                      const ERL_NIF_TERM argv[]) {
+    auto* h = checked_cask_handle(env, argv[0]);
+    ErlNifBinary text_bin{};
+    ErlNifBinary vec_bin{};
+    if (!h || !ensure_binary(env, argv[1], text_bin) ||
+        !ensure_binary(env, argv[2], vec_bin)) {
+        return enif_make_badarg(env);
+    }
+    const auto k = static_cast<std::size_t>(get_positive_int(env, argv[3], 10));
+    std::vector<float> query;
+    if (!binary_to_f32vec(vec_bin, query)) return enif_make_badarg(env);
+    if (!h->cask->has_search()) return make_error(env, atoms().no_index);
+    auto r = h->cask->search_hybrid(as_string_view(text_bin), query, k);
+    if (!r) return fault_to_term(env, r.error());
+    return make_ok(env, make_search_hits(env, r->hits));
 }
 
 // S8.2：设置同义词词典（ref, file_path）。

@@ -72,6 +72,15 @@ struct Atoms {
     ERL_NIF_TERM text;
     ERL_NIF_TERM meta;
 
+    // V3.6:向量选项 / doc map 键。vector = put_doc 的 f32 LE 二进制段;
+    // vector_dim/vector_metric = open 选项;cosine/l2/dot = metric 值。
+    ERL_NIF_TERM vector;
+    ERL_NIF_TERM vector_dim;
+    ERL_NIF_TERM vector_metric;
+    ERL_NIF_TERM cosine;
+    ERL_NIF_TERM l2;
+    ERL_NIF_TERM dot;
+
     // 线程安全: 否（写入静态状态）；仅 on_load 调用一次。
     void init(ErlNifEnv* env) noexcept;
 };

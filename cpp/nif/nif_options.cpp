@@ -125,6 +125,18 @@ void parse_2tuple_option(ErlNifEnv* env, const ERL_NIF_TERM* tup, CaskOptions& o
         if (opt_int(env, val, &v) && v == 2) o.tombstone_version = 2;
     } else if (key == atoms().sync_strategy) {
         if (val == atoms().o_sync) o.o_sync = true;
+    } else if (key == atoms().vector_dim) {
+        // V3.6:{vector_dim, N},N ∈ [1, 65535]。dim>0 要求索引模式
+        // (Cask::open 校验 enable_search,不符 → kInvalidOption)。
+        int v = 0;
+        if (enif_get_int(env, val, &v) && v > 0 && v <= 0xFFFF) {
+            o.vector_dim = static_cast<std::uint16_t>(v);
+        }
+    } else if (key == atoms().vector_metric) {
+        // V3.6:{vector_metric, cosine|l2|dot};默认 cosine(写入归一化)。
+        if      (val == atoms().cosine) o.vector_metric = meta::VectorMetric::kCosineNormalized;
+        else if (val == atoms().l2)     o.vector_metric = meta::VectorMetric::kL2;
+        else if (val == atoms().dot)    o.vector_metric = meta::VectorMetric::kDot;
     } else if (is_analyzer_key(key)) {
         if (!o.search_config) o.search_config.emplace();
         parse_analyzer_option(env, tup, o);
