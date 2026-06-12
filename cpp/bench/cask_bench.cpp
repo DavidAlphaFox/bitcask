@@ -242,3 +242,37 @@ static void BM_Cask_Open_VecFullFold(benchmark::State& state) {
 BENCHMARK(BM_Cask_Open_VecFullFold)
     ->Unit(benchmark::kMillisecond)
     ->Iterations(2);
+
+// -----------------------------------------------------------------------------
+// V3.7:hybrid 端到端(BM25 ∥ HNSW → RRF)。同语料 1 万条 384d;查询 =
+// 轮转文本词 + 随机归一化向量,k=10。库在计时区外开关(度量纯查询)。
+// -----------------------------------------------------------------------------
+static void BM_Cask_SearchHybrid(benchmark::State& state) {
+    auto dir = prepare_vec_open_dir();
+    auto c = Cask::open(dir, vec_opts());
+    if (!c) { state.SkipWithError("open failed"); return; }
+    std::mt19937 rng(0x9337);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> qs(1000 * 384);
+    for (int i = 0; i < 1000; ++i) {
+        double sq = 0.0;
+        float* p = &qs[static_cast<std::size_t>(i) * 384];
+        for (int d = 0; d < 384; ++d) {
+            p[d] = nd(rng);
+            sq += static_cast<double>(p[d]) * p[d];
+        }
+        const auto inv = static_cast<float>(1.0 / std::sqrt(sq));
+        for (int d = 0; d < 384; ++d) p[d] *= inv;
+    }
+    std::size_t qi = 0;
+    for (auto _ : state) {
+        const auto i = qi++ % 1000;
+        const std::string tq = "doc " + std::to_string(i * 7 % 10000);
+        auto r = (*c)->search_hybrid(
+            tq, std::span<const float>(&qs[i * 384], 384), 10);
+        if (!r) { state.SkipWithError("hybrid failed"); break; }
+        benchmark::DoNotOptimize(r->hits);
+    }
+    (*c)->close();
+}
+BENCHMARK(BM_Cask_SearchHybrid)->Unit(benchmark::kMicrosecond);
