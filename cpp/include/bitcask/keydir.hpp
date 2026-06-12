@@ -277,6 +277,19 @@ public:
     // 线程安全: 是。锁: 内部 unique_lock(mutex_)。
     std::uint32_t increment_file_id_at_least(std::uint32_t conditional_id);
 
+    // ---- A4:keydir 段快照(open 加速;设计 doc/recovery-snapshot-design-zh.md)----
+    // dump 当前内存态 + 调用方给的 per-file 字节水位。有活跃 fold
+    // (MultiEntry 可能存在)时拒绝并返回 false(快照是纯优化)。
+    // 线程安全: 是(内部 unique_lock;只应在写者静止点调用)。
+    [[nodiscard]] bool save_snapshot(
+        std::string_view path,
+        const std::vector<std::pair<std::uint32_t, std::uint64_t>>& watermarks) const;
+    // 校验 magic/ver/CRC 并整体重建内存态,返回水位表;任何不一致返回
+    // nullopt 且清空状态(调用方走全量 fold)。仅限全新 KeyDir(open 路径)。
+    [[nodiscard]] std::optional<
+        std::vector<std::pair<std::uint32_t, std::uint64_t>>>
+    load_snapshot(std::string_view path);
+
     // ---- 文件统计 ----
     // (注:fstats 的增量更新只发生在 put/remove 已持有的 unique_lock 内,
     //  经私有 update_fstats_locked;曾有的带锁公开版零调用方,O13 核实后删除。)

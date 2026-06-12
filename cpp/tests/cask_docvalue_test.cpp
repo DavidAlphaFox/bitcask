@@ -777,3 +777,148 @@ TEST(FieldSchema, PersistsAcrossReopen) {
 }
 
 }  // namespace
+
+// ── A4:keydir 段快照 + 尾部回放(doc/recovery-snapshot-design-zh.md)──────
+
+namespace {
+std::span<const std::byte> sv_bytes(const std::string& s) {
+    return {reinterpret_cast<const std::byte*>(s.data()), s.size()};
+}
+}  // namespace
+
+// 快照路径 reopen 与全量 fold reopen 等价(键集/值/删除一致)。
+TEST_F(CaskDocValueTest, KeydirSnapshotRoundTripEquivalence) {
+    CaskOptions opts;
+    opts.read_write = true;
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        for (int i = 0; i < 500; ++i) {
+            const std::string k = "k" + std::to_string(i);
+            const std::string v = "v" + std::to_string(i * 7);
+            ASSERT_TRUE((*c)->put(sv_bytes(k), sv_bytes(v)));
+        }
+        for (int i = 0; i < 100; ++i) {
+            ASSERT_TRUE((*c)->remove(sv_bytes("k" + std::to_string(i * 5))));
+        }
+        (*c)->close();
+    }
+    const auto snap = tmpdir_ / "bitcask.keydir.snap";
+    ASSERT_TRUE(std::filesystem::exists(snap));
+
+    auto collect = [&]() {
+        std::map<std::string, std::string> m;
+        auto c = Cask::open(tmpdir_.string(), opts);
+        EXPECT_TRUE(c);
+        for (int i = 0; i < 500; ++i) {
+            const std::string k = "k" + std::to_string(i);
+            auto g = (*c)->get(sv_bytes(k));
+            if (g) {
+                m[k] = std::string(
+                    reinterpret_cast<const char*>(g->value.data()),
+                    g->value.size());
+            }
+        }
+        (*c)->close();
+        return m;
+    };
+
+    auto with_snap = collect();          // 快照快路径
+    std::filesystem::remove(snap);
+    auto full_fold = collect();          // 全量 fold(close 会重写快照)
+    EXPECT_EQ(with_snap.size(), 400u);
+    EXPECT_EQ(with_snap, full_fold);
+}
+
+// 陈旧快照:会话 2 的写/删必须经尾部回放可见。
+TEST_F(CaskDocValueTest, KeydirSnapshotStaleTailReplay) {
+    CaskOptions opts;
+    opts.read_write = true;
+    const auto snap = tmpdir_ / "bitcask.keydir.snap";
+    const auto snap_old = tmpdir_ / "snap.old";
+
+    {   // 会话 1
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        for (int i = 0; i < 200; ++i) {
+            ASSERT_TRUE((*c)->put(sv_bytes("a" + std::to_string(i)),
+                                  sv_bytes("old")));
+        }
+        (*c)->close();
+    }
+    std::filesystem::copy_file(snap, snap_old);
+
+    {   // 会话 2:新增 + 覆写 + 删除
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        for (int i = 0; i < 100; ++i) {
+            ASSERT_TRUE((*c)->put(sv_bytes("b" + std::to_string(i)),
+                                  sv_bytes("new")));
+        }
+        ASSERT_TRUE((*c)->put(sv_bytes("a0"), sv_bytes("updated")));
+        ASSERT_TRUE((*c)->remove(sv_bytes("a1")));
+        (*c)->close();
+    }
+    // 用会话 1 的旧快照覆盖 → 模拟"快照落后于数据文件"(崩溃形态)。
+    std::filesystem::copy_file(snap_old, snap,
+        std::filesystem::copy_options::overwrite_existing);
+
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+    auto g = (*c)->get(sv_bytes(std::string("b42")));
+    ASSERT_TRUE(g);  // 会话 2 新键:尾部回放恢复
+    auto g2 = (*c)->get(sv_bytes(std::string("a0")));
+    ASSERT_TRUE(g2);
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(g2->value.data()),
+                          g2->value.size()),
+              "updated");
+    EXPECT_FALSE((*c)->get(sv_bytes(std::string("a1"))));  // 尾部墓碑生效
+    (*c)->close();
+}
+
+// 损坏快照(位翻转/截断)→ 回退全量 fold,数据完好。
+TEST_F(CaskDocValueTest, KeydirSnapshotCorruptFallsBackToFullFold) {
+    CaskOptions opts;
+    opts.read_write = true;
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        for (int i = 0; i < 300; ++i) {
+            ASSERT_TRUE((*c)->put(sv_bytes("k" + std::to_string(i)),
+                                  sv_bytes("v" + std::to_string(i))));
+        }
+        (*c)->close();
+    }
+    const auto snap = tmpdir_ / "bitcask.keydir.snap";
+
+    // 位翻转 payload 中部。
+    {
+        std::FILE* f = std::fopen(snap.string().c_str(), "rb+");
+        ASSERT_NE(f, nullptr);
+        std::fseek(f, 0, SEEK_END);
+        const long mid = std::ftell(f) / 2;
+        std::fseek(f, mid, SEEK_SET);
+        int ch = std::fgetc(f);
+        std::fseek(f, mid, SEEK_SET);
+        std::fputc(ch ^ 0xFF, f);
+        std::fclose(f);
+    }
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        for (int i = 0; i < 300; ++i) {
+            EXPECT_TRUE((*c)->get(sv_bytes("k" + std::to_string(i)))) << i;
+        }
+        (*c)->close();  // 重写好快照
+    }
+    // 截断注入。
+    std::filesystem::resize_file(snap, std::filesystem::file_size(snap) / 3);
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        for (int i = 0; i < 300; ++i) {
+            EXPECT_TRUE((*c)->get(sv_bytes("k" + std::to_string(i)))) << i;
+        }
+        (*c)->close();
+    }
+}

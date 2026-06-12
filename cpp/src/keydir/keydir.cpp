@@ -1,4 +1,8 @@
 #include "bitcask/keydir.hpp"
+#include "bitcask/codec.hpp"
+
+#include <cstdio>
+#include <cstring>
 
 #include <algorithm>
 #include <cassert>
@@ -793,6 +797,223 @@ std::shared_ptr<KeyDir> KeyDir::deep_copy() const {
     copy->pending_start_time_  = pending_start_time_;
     copy->pending_updated_     = pending_updated_;
     return copy;
+}
+
+
+// ============================================================================
+// A4:keydir 段快照(设计 doc/recovery-snapshot-design-zh.md)
+// 格式:[magic "BCKS"][ver=1][payload][crc32(payload)],LE,tmp+rename。
+// ============================================================================
+
+namespace {
+
+constexpr std::uint32_t kSnapMagic   = 0x42434B53;  // "BCKS"
+constexpr std::uint32_t kSnapVersion = 1;
+
+void snap_put32(std::vector<std::uint8_t>& b, std::uint32_t v) {
+    const auto* p = reinterpret_cast<const std::uint8_t*>(&v);
+    b.insert(b.end(), p, p + 4);
+}
+void snap_put64(std::vector<std::uint8_t>& b, std::uint64_t v) {
+    const auto* p = reinterpret_cast<const std::uint8_t*>(&v);
+    b.insert(b.end(), p, p + 8);
+}
+
+struct SnapCursor {
+    const std::uint8_t* p;
+    const std::uint8_t* end;
+    bool fail = false;
+    bool need(std::size_t n) {
+        if (static_cast<std::size_t>(end - p) < n) { fail = true; return false; }
+        return true;
+    }
+    std::uint16_t u16() { std::uint16_t v = 0; if (need(2)) { std::memcpy(&v, p, 2); p += 2; } return v; }
+    std::uint32_t u32() { std::uint32_t v = 0; if (need(4)) { std::memcpy(&v, p, 4); p += 4; } return v; }
+    std::uint64_t u64() { std::uint64_t v = 0; if (need(8)) { std::memcpy(&v, p, 8); p += 8; } return v; }
+    bool bytes(void* dst, std::size_t n) {
+        if (!need(n)) return false;
+        std::memcpy(dst, p, n);
+        p += n;
+        return true;
+    }
+};
+
+}  // namespace
+
+bool KeyDir::save_snapshot(
+    std::string_view path,
+    const std::vector<std::pair<std::uint32_t, std::uint64_t>>& watermarks) const {
+    std::unique_lock lock(mutex_);
+    if (keyfolders_ != 0) return false;  // 活跃 fold:MultiEntry 可能存在,放弃
+
+    std::vector<std::uint8_t> buf;
+    buf.reserve(64 + entries_.size() * 56);
+    snap_put32(buf, kSnapMagic);
+    snap_put32(buf, kSnapVersion);
+    const std::size_t payload_begin = buf.size();
+
+    snap_put64(buf, next_ord_.load(std::memory_order_relaxed));
+    snap_put64(buf, epoch_);
+    snap_put32(buf, biggest_file_id_);
+    snap_put64(buf, key_count_);
+    snap_put64(buf, key_bytes_);
+
+    std::uint32_t fstats_n = 0;
+    for (std::size_t i = 0; i < fstats_.size(); ++i) {
+        if (fstats_present_[i]) ++fstats_n;
+    }
+    snap_put32(buf, fstats_n);
+    for (std::size_t i = 0; i < fstats_.size(); ++i) {
+        if (!fstats_present_[i]) continue;
+        const auto& f = fstats_[i];
+        snap_put32(buf, f.file_id);
+        snap_put64(buf, f.live_keys);
+        snap_put64(buf, f.total_keys);
+        snap_put64(buf, f.live_bytes);
+        snap_put64(buf, f.total_bytes);
+        snap_put32(buf, f.oldest_tstamp);
+        snap_put32(buf, f.newest_tstamp);
+        snap_put64(buf, f.expiration_epoch);
+    }
+
+    snap_put32(buf, static_cast<std::uint32_t>(watermarks.size()));
+    for (auto& [fid, off] : watermarks) {
+        snap_put32(buf, fid);
+        snap_put64(buf, off);
+    }
+
+    snap_put64(buf, entries_.size());
+    for (auto& [key, entry] : entries_) {
+        const auto* se = std::get_if<SingleEntry>(&entry);
+        if (se == nullptr) return false;  // 防御:不应出现(keyfolders_==0)
+        if (key.size() > 0xFFFF) return false;
+        const auto klen = static_cast<std::uint16_t>(key.size());
+        const auto* kp = reinterpret_cast<const std::uint8_t*>(&klen);
+        buf.insert(buf.end(), kp, kp + 2);
+        const auto* kd = reinterpret_cast<const std::uint8_t*>(key.data());
+        buf.insert(buf.end(), kd, kd + key.size());
+        snap_put32(buf, se->file_id);
+        snap_put32(buf, se->total_sz);
+        snap_put64(buf, se->offset);
+        snap_put64(buf, se->epoch);
+        snap_put32(buf, se->tstamp);
+        snap_put64(buf, se->ord);
+    }
+
+    const std::uint32_t crc = codec::crc32(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(buf.data() + payload_begin),
+        buf.size() - payload_begin));
+    snap_put32(buf, crc);
+
+    const std::string final_path(path);
+    const std::string tmp_path = final_path + ".tmp";
+    std::FILE* f = std::fopen(tmp_path.c_str(), "wb");
+    if (!f) return false;
+    const bool wrote =
+        std::fwrite(buf.data(), 1, buf.size(), f) == buf.size();
+    std::fclose(f);
+    if (!wrote) {
+        std::remove(tmp_path.c_str());
+        return false;
+    }
+    if (std::rename(tmp_path.c_str(), final_path.c_str()) != 0) {
+        std::remove(tmp_path.c_str());
+        return false;
+    }
+    return true;
+}
+
+auto KeyDir::load_snapshot(std::string_view path)
+    -> std::optional<std::vector<std::pair<std::uint32_t, std::uint64_t>>> {
+    std::FILE* f = std::fopen(std::string(path).c_str(), "rb");
+    if (!f) return std::nullopt;
+    std::fseek(f, 0, SEEK_END);
+    const long fsz = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (fsz < 16) { std::fclose(f); return std::nullopt; }
+    std::vector<std::uint8_t> buf(static_cast<std::size_t>(fsz));
+    const bool rd = std::fread(buf.data(), 1, buf.size(), f) == buf.size();
+    std::fclose(f);
+    if (!rd) return std::nullopt;
+
+    SnapCursor c{buf.data(), buf.data() + buf.size()};
+    if (c.u32() != kSnapMagic || c.u32() != kSnapVersion) return std::nullopt;
+    // CRC 覆盖 [8, size-4)。
+    std::uint32_t stored_crc = 0;
+    std::memcpy(&stored_crc, buf.data() + buf.size() - 4, 4);  // 未对齐安全
+    const std::uint32_t crc = codec::crc32(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(buf.data() + 8), buf.size() - 12));
+    if (crc != stored_crc) return std::nullopt;
+    c.end -= 4;  // payload 不含尾部 CRC
+
+    std::unique_lock lock(mutex_);
+    auto reset_all = [&] {
+        entries_.clear();
+        fstats_.clear();
+        fstats_present_.clear();
+        key_count_ = 0;
+        key_bytes_ = 0;
+        epoch_ = 0;
+        next_ord_.store(0, std::memory_order_relaxed);
+        biggest_file_id_ = 0;
+    };
+
+    next_ord_.store(c.u64(), std::memory_order_relaxed);
+    epoch_ = c.u64();
+    biggest_file_id_ = c.u32();
+    key_count_ = c.u64();
+    key_bytes_ = c.u64();
+
+    const std::uint32_t fstats_n = c.u32();
+    if (c.fail || fstats_n > (1u << 24)) { reset_all(); return std::nullopt; }
+    for (std::uint32_t i = 0; i < fstats_n; ++i) {
+        FStatsEntry fe;
+        fe.file_id          = c.u32();
+        fe.live_keys        = c.u64();
+        fe.total_keys       = c.u64();
+        fe.live_bytes       = c.u64();
+        fe.total_bytes      = c.u64();
+        fe.oldest_tstamp    = c.u32();
+        fe.newest_tstamp    = c.u32();
+        fe.expiration_epoch = c.u64();
+        if (c.fail || fe.file_id > (1u << 24)) { reset_all(); return std::nullopt; }
+        if (fe.file_id >= fstats_.size()) {
+            fstats_.resize(fe.file_id + 1);
+            fstats_present_.resize(fe.file_id + 1, 0);
+        }
+        fstats_[fe.file_id] = fe;
+        fstats_present_[fe.file_id] = 1;
+    }
+
+    const std::uint32_t wm_n = c.u32();
+    if (c.fail || wm_n > (1u << 24)) { reset_all(); return std::nullopt; }
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> wms;
+    wms.reserve(wm_n);
+    for (std::uint32_t i = 0; i < wm_n; ++i) {
+        const auto fid = c.u32();
+        const auto off = c.u64();
+        wms.emplace_back(fid, off);
+    }
+
+    const std::uint64_t entry_n = c.u64();
+    if (c.fail || entry_n > (1ull << 40)) { reset_all(); return std::nullopt; }
+    entries_.reserve(static_cast<std::size_t>(entry_n));
+    for (std::uint64_t i = 0; i < entry_n; ++i) {
+        const std::uint16_t klen = c.u16();
+        std::string key(klen, '\0');
+        if (!c.bytes(key.data(), klen)) { reset_all(); return std::nullopt; }
+        SingleEntry se;
+        se.file_id  = c.u32();
+        se.total_sz = c.u32();
+        se.offset   = c.u64();
+        se.epoch    = c.u64();
+        se.tstamp   = c.u32();
+        se.ord      = c.u64();
+        if (c.fail) { reset_all(); return std::nullopt; }
+        entries_.emplace(std::move(key), se);
+    }
+    if (c.fail || c.p != c.end) { reset_all(); return std::nullopt; }
+    return wms;
 }
 
 }  // namespace bitcask::keydir

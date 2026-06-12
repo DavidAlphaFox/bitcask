@@ -157,15 +157,16 @@ DataFile::read(std::uint64_t offset, std::uint32_t total_size) {
 
 std::expected<void, DataFileFault>
 DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
-                std::uint64_t* out_last_valid_end) {
-    if (out_last_valid_end) *out_last_valid_end = 0;
+                std::uint64_t* out_last_valid_end,
+                std::uint64_t start_offset) {
+    if (out_last_valid_end) *out_last_valid_end = start_offset;
     // 进入 fold 时拍个文件大小快照（防止 fold 期间被人 append），再 seek 回头。
     auto eof = file_.seek(0, SEEK_END);
     if (!eof) return std::unexpected(io_fault(eof.error()));
     const std::uint64_t total = *eof;
     if (auto r = file_.seek_bof(); !r) return std::unexpected(io_fault(r.error()));
 
-    std::uint64_t offset = 0;
+    std::uint64_t offset = start_offset;
     int crc_errors = 0;
 
     // 先读 header（14 字节）拿 KeySz / ValueSz 算出整条 record 的大小，

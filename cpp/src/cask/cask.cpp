@@ -14,6 +14,9 @@
 
 namespace bitcask {
 
+// A4:keydir 段快照文件名(目录级,与 bitcask.meta 同级)。
+inline constexpr const char* kKeydirSnapName = "bitcask.keydir.snap";
+
 namespace {
 namespace fs = std::filesystem;
 
@@ -540,6 +543,8 @@ void Cask::close() noexcept {
         active_data_.reset();
         read_files_.clear();
     }
+    // A4:写者已静止,落 keydir 段快照(失败无害——open 回退全量 fold)。
+    if (opts_.read_write) write_keydir_snapshot();
     if (registry_ && !keydir_name_.empty()) {
         registry_->release(keydir_name_);
         registry_ = nullptr;
@@ -557,6 +562,24 @@ void Cask::close() noexcept {
     }
 }
 
+// A4:写 keydir 段快照(best-effort,设计 doc/recovery-snapshot-design-zh.md)。
+// 水位 = 各 data 文件当前磁盘大小,**先于** dump 捕获(尾部回放重叠区
+// 幂等,方向安全);调用点都在写者静止处(close / merge 末尾)。
+void Cask::write_keydir_snapshot() noexcept {
+    if (!keydir_) return;
+    auto entries = fileops::scan_dir(dirname_);
+    if (!entries) return;
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> wms;
+    wms.reserve(entries->size());
+    for (const auto& e : *entries) {
+        std::error_code ec;
+        const auto sz = std::filesystem::file_size(e.data_path, ec);
+        if (ec) return;  // 文件态不稳定,放弃本次快照
+        wms.emplace_back(static_cast<std::uint32_t>(e.tstamp), sz);
+    }
+    (void)keydir_->save_snapshot(dirname_ + "/" + kKeydirSnapName, wms);
+}
+
 // T3: 提交索引任务到 IndexPool，带背压控制。
 // 队列超过 80% 水位（8192/10240）时自旋等待，让 put 路径减速以避免内存溢出。
 void Cask::submit_index_task(IndexTask task) {
@@ -572,6 +595,24 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
     auto entries = fileops::scan_dir(dirname_);
     if (!entries) return std::unexpected(io_fault(entries.error().errnum, dirname_));
 
+    // A4 Phase 1:KV 路径(无 search_layer)尝试 keydir 段快照——加载成功
+    // 则各文件只 fold 水位之后的尾巴。search 路径维持全量 fold(open 现状
+    // 不加载 bm25 快照,前缀文档无处恢复;Phase 2 见设计文档 §4)。
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> snap_wms;
+    bool snap_loaded = false;
+    if (!search_layer) {
+        if (auto w = keydir_->load_snapshot(dirname_ + "/" + kKeydirSnapName)) {
+            snap_wms = std::move(*w);
+            snap_loaded = true;
+        }
+    }
+    auto wm_of = [&](std::uint32_t fid) -> std::uint64_t {
+        for (auto& [id, off] : snap_wms) {
+            if (id == fid) return off;
+        }
+        return 0;  // 快照不认识的文件(快照后新建/merge 产物)→ 全量 fold
+    };
+
     // 按 tstamp 升序遍历每个 data file。fold 顺序是关键：后写入的 entry
     // 必须覆盖前面的，否则 keydir 重建出来会跟实际「最新值」不一致。
     for (const auto& e : *entries) {
@@ -582,8 +623,11 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
         // 优先走 hint 文件加速路径（不读 value，省掉绝大部分 I/O）。
         // hint 缺失或 trailer CRC 不通过则 fallback 到 fold(data) 全量重建。
         // SearchLayer 恢复需要读 value（text 段），有 search_layer 时跳过 hint。
+        const std::uint64_t fold_start =
+            snap_loaded ? wm_of(static_cast<std::uint32_t>(e.tstamp)) : 0;
+
         bool used_hint = false;
-        if (e.has_hint && !search_layer) {
+        if (e.has_hint && !search_layer && !snap_loaded) {
             auto hf = fileops::HintFile::open(e.hint_path,
                                                 fileops::HintFile::Mode::kRead);
             if (hf) {
@@ -642,7 +686,8 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
                     }
                 }
             }, /*tolerate_crc_errors*/ true,
-            /*out_last_valid_end*/ &last_valid_end);
+            /*out_last_valid_end*/ &last_valid_end,
+            /*start_offset*/ fold_start);
         if (!fr) {
             return std::unexpected(err(CaskError::kBadCrc, e.data_path));
         }
@@ -1345,6 +1390,7 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
     if (!trimmed_ids.empty()) {
         (void)keydir_->trim_fstats(trimmed_ids);
     }
+    write_keydir_snapshot();  // A4:merge 后状态最紧凑,顺手落快照
     return *r;
 }
 

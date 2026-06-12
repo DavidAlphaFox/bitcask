@@ -135,7 +135,8 @@ public:
     [[nodiscard]] std::expected<void, DataFileFault>
     fold(FoldFn fn,
          bool tolerate_crc_errors = false,
-         std::uint64_t* out_last_valid_end = nullptr);
+         std::uint64_t* out_last_valid_end = nullptr,
+         std::uint64_t start_offset = 0);  // A4:从该偏移起扫(快照尾部回放)
 
     // 截断到 new_size。给 fold 发现 torn write 后做尾部修复用。
     // caller 必须处于 write/append 模式；截断后内部 seek 到末尾，

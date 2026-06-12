@@ -117,3 +117,50 @@ static void BM_Cask_Get_Hot(benchmark::State& state) {
     state.SetBytesProcessed(state.iterations() * static_cast<int64_t>(value.size()));
 }
 BENCHMARK(BM_Cask_Get_Hot);
+
+// -----------------------------------------------------------------------------
+// A4:open 冷启动——keydir 段快照 vs 全量 fold(20k 记录)。
+// 两者共用同一份预生成目录;FullFold 变体每轮删快照(close 会重写)。
+// -----------------------------------------------------------------------------
+namespace {
+std::string prepare_open_dir() {
+    static TempDir td;
+    static bool done = false;
+    if (!done) {
+        auto c = Cask::open(td.path(), rw_opts());
+        const std::string value(64, 'v');
+        for (int i = 0; i < 20000; ++i) {
+            (void)(*c)->put(as_bytes("key" + std::to_string(i)), as_bytes(value));
+        }
+        (*c)->close();  // 写下快照
+        done = true;
+    }
+    return td.path();
+}
+}  // namespace
+
+static void BM_Cask_Open_Snapshot(benchmark::State& state) {
+    auto dir = prepare_open_dir();
+    for (auto _ : state) {
+        auto c = Cask::open(dir, rw_opts());
+        if (!c) state.SkipWithError("open failed");
+        benchmark::DoNotOptimize(c);
+        (*c)->close();  // 重写快照,下一轮仍走快路径
+    }
+}
+BENCHMARK(BM_Cask_Open_Snapshot)->Unit(benchmark::kMicrosecond);
+
+static void BM_Cask_Open_FullFold(benchmark::State& state) {
+    auto dir = prepare_open_dir();
+    for (auto _ : state) {
+        state.PauseTiming();
+        std::error_code ec;
+        fs::remove(fs::path(dir) / "bitcask.keydir.snap", ec);
+        state.ResumeTiming();
+        auto c = Cask::open(dir, rw_opts());
+        if (!c) state.SkipWithError("open failed");
+        benchmark::DoNotOptimize(c);
+        (*c)->close();
+    }
+}
+BENCHMARK(BM_Cask_Open_FullFold)->Unit(benchmark::kMicrosecond);

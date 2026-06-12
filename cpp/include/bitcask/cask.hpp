@@ -402,6 +402,9 @@ private:
     // 队列超过 80% 水位（8192/10240）时自旋等待。
     void submit_index_task(IndexTask task);
 
+    // A4:落 keydir 段快照(best-effort;close/merge 末尾调)。
+    void write_keydir_snapshot() noexcept;
+
 public:
     // 访问 IndexPool（用于 T3 阶段启动 worker）
     [[nodiscard]] IndexPool* index_pool() { return index_pool_.get(); }

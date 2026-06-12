@@ -811,6 +811,28 @@ sanitizer 构建只插桩了测试 TU,库代码的数据竞争仅靠 memcpy/new
 
 ---
 
+## A4 — keydir 段快照 + 尾部回放(Phase 1,KV 路径)✅
+
+> 设计:`doc/recovery-snapshot-design-zh.md`。close/merge 末尾把 keydir
+> 内存态 + per-file 字节水位落盘(BCKS v1,CRC + tmp/rename);open 加载
+> 快照后各文件只 fold 水位后的尾巴。快照是纯优化:任何校验失败回退
+> 全量 fold。水位先于 dump 捕获(回放重叠区幂等,方向安全)。
+
+| # | 内容 | 状态 |
+|---|------|------|
+| A4.1 | KeyDir::save_snapshot/load_snapshot(BCKS v1;活跃 fold 拒绝;load 失败清态回退) | ✅ |
+| A4.2 | DataFile::fold 增 start_offset;load_keydir_from_disk 快照快路径(仅 KV;hint 分支让位) | ✅ |
+| A4.3 | 写入点:close()(写者静止)+ merge 末尾(最紧凑态);best-effort | ✅ |
+| A4.4 | 测试 +3:快照/全量 fold 等价、陈旧快照尾部回放(新增/覆写/墓碑)、损坏注入回退(位翻转+截断) | ✅ |
+| A4.5 | 基准 BM_Cask_Open:**29.1ms → 2.58ms(11.3×,20k 记录;计时含 close 重写快照)** | ✅ |
+| A4.6 | 回归:plain/ASan/TSan 354/354 + eunit 44/44(UBSan 抓到一处未对齐读,已修) | ✅ |
+
+**Phase 2(待做,设计 §4)**:search 路径——open 现状从不加载 bm25 快照,
+启用前缀跳过需先接通 search_->load_snapshot + WAL 链,并与 keydir 快照
+成对落盘/校验。该结构同时是 V3 HNSW 持久化(快照+回放)的模板。
+
+---
+
 ## 未来任务
 
 ### P1 — 查询路径 PostingList 零拷贝（Phase 1 ✅ + Phase 2-min ✅）
