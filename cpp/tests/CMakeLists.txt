@@ -199,10 +199,12 @@ include(GoogleTest)
 # TBB 的 fence 同步对 TSan 不可见,插桩自编 oneTBB 后仍有残余假阳性)。
 # 动态 libtsan 不回调二进制内的 __tsan_default_suppressions,env 是
 # 唯一可靠通道。
+# detect_deadlocks=1 固化(屏障 v2 验收门禁):KeyDir 屏障曾因同时持
+# 257 把锁撞 TSan 死锁检测器 64 持锁硬上限崩溃,该开关保证回归可见。
 set(_bitcask_test_props "")
 if(BITCASK_SANITIZE MATCHES "thread")
     set(_bitcask_test_props PROPERTIES ENVIRONMENT
-        "TSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/cmake/tsan.supp")
+        "TSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/cmake/tsan.supp:detect_deadlocks=1")
 endif()
 gtest_discover_tests(bitcask_smoke_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_codec_test ${_bitcask_test_props})

@@ -884,6 +884,7 @@ search 路径 ord 恒由 keydir 分配,无复用风险)。
 | M6.3 | S3:iter next() meta+shard 两段锁细化 | ☐ |
 | M6.4 | S4:A4 快照接分片(save 屏障 / load 分发) | ☐ |
 | M6.5 | S5:**kShards 16→256 + 分片锁 rwlock→std::mutex**(两级杠杆逐级实测,设计 doc §10)。Mixed/8t 0.22M→**8.34M(37×)**,Get 负扩展消除,单线程全面无回退;baseline.json 已刷新。红线复盘:Get/4t ✅;「8t≥1t」聚合未达(8.34M vs 24.8M),残差归因 epoch_ 全局 RMW + active-file fstats 真共享 + P/E 混合核,进一步收敛复杂度/收益比差,**有意止步关账**。门禁:plain/ASan/TSan 357/357 + eunit 44/44 | ✅ |
+| M6.6 | **屏障 v2:写者闸门替代"同时持全部分片锁"**(设计 doc §4/§11)。动机:257 把锁撞 TSan 死锁检测器 64 持锁硬上限(sanitizer_deadlock_detector.h:67 CHECK,DeepCopyPreservesOrd 在 detect_deadlocks=1 下必崩)。BarrierGuard(barrier_mu_+gate_mu_/cv+barrier_active_)逐分片排干,任意瞬间 ≤1 把分片锁;屏障期间读者照常并发;iter release 合并拆三阶段(meta_shared→shard 屏障内例外)。detect_deadlocks=1 固化进 tests/CMakeLists ENVIRONMENT。门禁:plain/ASan/TSan(detect_deadlocks=1)371/371 + eunit 44/44;KeyDir 基准 vs baseline 全档 ±10% 内(最大 +6.6%,噪声) | ✅ |
 
 ---
 
@@ -899,8 +900,8 @@ search 路径 ord 恒由 keydir 分配,无复用风险)。
 | V3.0 | 设计文档定稿(结构/并发/持久化/七步实施表/红线) | ✅ |
 | V3.1 | meta VectorConfig(保留区零兼容启用)+ CaskOptions/open 双向校验 + put_doc 校验/cosine 写入归一化 + get 透传 + 黄金字节锁格式。测试 +4,plain/ASan/TSan 361/361 + eunit 44/44 | ✅ |
 | V3.2 | HNSW 核心落地(bitcask_vector 新库:分层图/启发式选边/邻居收缩/AVX2-FMA 内核分发/ord 水位幂等/live 钩子)。召回:32d/10k 过线 **≥0.95@ef64、≥0.99@ef256**;384d 收敛曲线 0.824/0.960/0.996/1.0(ef64..512,纯随机高维最坏形态,标定 ef128/256≥0.93/0.98)。测试 +8;plain/ASan/TSan 369/369 + eunit 44/44 | ✅ |
-| V3.3 | 并发化(per-node 锁 + 发布式增长)+ IndexPool 接线;TSan 门禁 | ☐ |
-| V3.4 | 软删 + LiveChecker | ☐ |
+| V3.3 | 并发化(chunk 目录 + count_ 发布序 + per-node 自旋锁 + entry_meta_ 原子)+ IndexPool 接线(IndexTask.vec → on_vector)+ 端到端测试(V33VectorSearchEndToEnd / ConcurrentReadersWithSingleWriter)。偏差 8 条记 hnsw-design §3。门禁:plain/ASan/TSan 371/371(TSan 含 detect_deadlocks=1,M6.6 屏障 v2 后重跑)+ eunit 44/44 | ✅ |
+| V3.4 | 软删 + LiveChecker:机制 V3.3 已在位(Index.live_ 即 LiveChecker,结果侧滤死),本步补语义证明——V34OverwriteVectorMovesKey(覆写后旧向量不可达)+ V34DeadZoneNavigation(死壳 150/300 下 k=10 凑满、零泄入、真值重合 ≥9/10)。边界记 hnsw-design §6:死密邻域 ef 候选活者不足时 <k,调用方加大 ef,根治在 V3.5 merge 重建。门禁:plain/ASan/TSan 373/373(测试 +2;eunit 无涉) | ✅ |
 | V3.5 | vec/hnsw 快照并入 A4 covers 门 + merge 重建 | ☐ |
 | V3.6 | search_hybrid RRF + NIF 接口 | ☐ |
 | V3.7 | 基准定稿(红线:100k/ef64 < 1ms 查询;插入 > 2k/s @384d) | ☐ |
