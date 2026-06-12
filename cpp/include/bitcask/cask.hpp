@@ -290,6 +290,16 @@ public:
     search_vector(std::span<const float> query, std::size_t k = 10,
                   std::size_t ef = 0);
 
+    // V3.6:RRF 混合检索(hnsw-design §4)。两路各取 K'=max(k×4,64):
+    // BM25 走 search_text 内核,向量走 search_vector 内核;融合
+    // score = Σ 1/(60+rank),rank 从 1 起;平局 → ord 小者在前。
+    // text 空 → 纯向量;vec 空 → 纯文本;两路都空 / 无向量配置 /
+    // vec 维度不符 → kInvalidOption;无 search_ → kNoIndex。
+    // 返回沿用 TextSearchResult,score = RRF 分。
+    [[nodiscard]] std::expected<TextSearchResult, CaskFault>
+    search_hybrid(std::string_view text_query,
+                  std::span<const float> vec_query, std::size_t k = 10);
+
     // BM25 多字段搜索（S8.6）：支持 `field:term^boost` 语法，跨字段加权合并。
     // 无字段限定的词等价于默认字段词袋搜索。线程安全: 否。
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>

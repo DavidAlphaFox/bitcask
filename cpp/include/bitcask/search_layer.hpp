@@ -200,6 +200,19 @@ public:
     search_vector(std::span<const float> query, std::size_t k,
                   std::size_t ef = 0) const;
 
+    // ---- V3.6:RRF 混合检索(hnsw-design §4)----
+    // 两路各取 K' = max(k×4, 64):BM25 词袋走 search_text 内核,向量走
+    // search_vector 内核(查询归一化/live 过滤/ord 翻译全部复用)。融合:
+    //   score(doc) = Σ_路 1/(60 + rank_路),rank 从 1 起;
+    // 单路出现的文档照常只累加该路项,无需分数归一化。**确定性平局序**:
+    // RRF 分相等 → ord 小者在前。text_query 空 → 纯向量(BM25 路空);
+    // vec_query 空 → 纯文本(RRF 重打分);两路都空 → 错误。vec 维度
+    // 不符 → 错误(经 search_vector)。返回 score = RRF 分。
+    // 线程安全:同两条内核(text 路同 search_text,vec 路同 search_vector)。
+    [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
+    search_hybrid(std::string_view text_query,
+                  std::span<const float> vec_query, std::size_t k) const;
+
     // ---- 恢复：从磁盘 record 重放活文档 ----
     // 恢复文档到索引（全量 analyze + add_doc）。
     // V3.3:vector 非空时顺路重建 HNSW(on_vector;水位幂等保证重放安全)。

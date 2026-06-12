@@ -1345,6 +1345,22 @@ Cask::search_vector(std::span<const float> query, std::size_t k,
     return TextSearchResult{std::move(*hits)};
 }
 
+// search_hybrid:RRF 混合检索(V3.6)。门面只做向量配置校验,两路检索
+// 与 RRF 融合在 SearchLayer::search_hybrid(单路退化/平局序语义见彼处)。
+std::expected<TextSearchResult, CaskFault>
+Cask::search_hybrid(std::string_view text_query,
+                    std::span<const float> vec_query, std::size_t k) {
+    if (!search_) return std::unexpected(err(CaskError::kNoIndex));
+    if (meta_config_.vector_dim == 0) {
+        return std::unexpected(err(CaskError::kInvalidOption,
+            "collection has no vector config"));
+    }
+    flush_index();
+    auto hits = search_->search_hybrid(text_query, vec_query, k);
+    if (!hits) return std::unexpected(err(CaskError::kInvalidOption, hits.error()));
+    return TextSearchResult{std::move(*hits)};
+}
+
 // search_text：BM25 词袋模式搜索。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_text(std::string_view query, std::size_t k) {

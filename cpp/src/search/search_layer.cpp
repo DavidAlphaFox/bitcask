@@ -132,6 +132,62 @@ SearchLayer::search_vector(std::span<const float> query, std::size_t k,
     return hits;
 }
 
+std::expected<std::vector<SearchHit>, std::string>
+SearchLayer::search_hybrid(std::string_view text_query,
+                           std::span<const float> vec_query,
+                           std::size_t k) const {
+    // 两路都空才报错;单路空 = 退化为另一路的 RRF 重打分(hnsw-design §4)。
+    if (text_query.empty() && vec_query.empty()) {
+        return std::unexpected("hybrid query empty (no text, no vector)");
+    }
+    const std::size_t kp = std::max<std::size_t>(k * 4, 64);  // K'
+
+    std::vector<SearchHit> text_hits;
+    if (!text_query.empty()) {
+        auto t = search_text(text_query, kp);
+        if (!t) return std::unexpected(std::move(t.error()));
+        text_hits = std::move(*t);
+    }
+    std::vector<SearchHit> vec_hits;
+    if (!vec_query.empty()) {
+        auto v = search_vector(vec_query, kp);
+        if (!v) return std::unexpected(std::move(v.error()));  // 维度不符等
+        vec_hits = std::move(*v);
+    }
+
+    // RRF(k=60):按 ord 并桶,逐路累加 1/(60+rank),rank 从 1 起。
+    struct Fused {
+        SearchHit hit;
+        double score = 0.0;
+    };
+    std::unordered_map<std::uint64_t, Fused> acc;
+    acc.reserve(text_hits.size() + vec_hits.size());
+    auto fold_leg = [&acc](std::vector<SearchHit>& leg) {
+        for (std::size_t i = 0; i < leg.size(); ++i) {
+            auto [it, fresh] = acc.try_emplace(leg[i].ord);
+            if (fresh) it->second.hit = std::move(leg[i]);
+            it->second.score += 1.0 / (60.0 + static_cast<double>(i + 1));
+        }
+    };
+    fold_leg(text_hits);
+    fold_leg(vec_hits);
+
+    std::vector<SearchHit> fused;
+    fused.reserve(acc.size());
+    for (auto& [ord, f] : acc) {
+        f.hit.score = f.score;  // score = RRF 分(替换掉单路原始分)
+        fused.push_back(std::move(f.hit));
+    }
+    // 确定性平局序:RRF 分相等 → ord 小者在前(测试锁此行为)。
+    std::sort(fused.begin(), fused.end(),
+              [](const SearchHit& a, const SearchHit& b) {
+                  if (a.score != b.score) return a.score > b.score;
+                  return a.ord < b.ord;
+              });
+    if (fused.size() > k) fused.resize(k);
+    return fused;
+}
+
 bm25::InvertedIndex& SearchLayer::field_index(std::string_view field) {
     // 双检:常态(字段已存在)只拿共享锁;首次出现的字段才升级独占建索引。
     {
