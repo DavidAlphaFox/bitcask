@@ -30,7 +30,7 @@ public:
     InvertedWal(InvertedWal&&) noexcept;
     InvertedWal& operator=(InvertedWal&&) noexcept;
 
-    void append_add_doc(std::uint64_t ord, WalTermPositions term_data);
+    void append_add_doc(std::uint64_t ord, const WalTermPositions& term_data);
     void append_remove_doc(std::uint32_t doc_len,
                            const std::unordered_map<std::string, std::uint32_t>& term_freqs);
 
@@ -39,8 +39,12 @@ public:
     bool valid() const { return file_ != nullptr; }
 
 private:
+    // O11:回填长度前缀 + 追加 CRC + 一次 fwrite(entry framing 封口)。
+    void seal_and_write();
+
     std::string path_;
     std::FILE* file_ = nullptr;
+    std::vector<std::uint8_t> enc_buf_;  // append_* 复用的整条 entry 编码缓冲
 };
 
 }  // namespace bitcask::bm25

@@ -258,3 +258,79 @@ TEST(CrashRecovery, ReplayDuplicateKeepsItemsSortedUnique) {
     std::filesystem::remove(snap);
     std::filesystem::remove(wal);
 }
+
+// O11 framing:截尾注入——最后一条 entry 只落了一半(模拟崩溃),
+// replay 应只回放完整条目,且把文件截断修复到上一完整 entry 末尾。
+TEST(WalFraming, TruncatedTailDetectedAndRepaired) {
+    auto tmp = std::filesystem::temp_directory_path() / "wal_frame_trunc.wal";
+    std::filesystem::remove(tmp);
+
+    {
+        InvertedWal wal(tmp.string());
+        ASSERT_TRUE(wal.valid());
+        TermPositions terms;
+        terms.emplace("alpha", tp(1, {0}));
+        wal.append_add_doc(0, terms);
+        wal.append_add_doc(1, terms);
+    }
+    const auto full_size = std::filesystem::file_size(tmp);
+
+    // 追加第三条后砍掉它的后 6 字节(CRC+部分 payload),制造半条 entry。
+    {
+        InvertedWal wal(tmp.string());
+        TermPositions terms;
+        terms.emplace("alpha", tp(1, {0}));
+        wal.append_add_doc(2, terms);
+    }
+    std::filesystem::resize_file(tmp, std::filesystem::file_size(tmp) - 6);
+
+    // 直接用 InvertedWal::replay——上层 InvertedIndex::replay_wal 在重放
+    // 成功后会整体清空 WAL(既有语义),观察不到截断修复。
+    InvertedIndex idx;
+    InvertedWal wal(tmp.string());
+    int count = wal.replay(idx);
+    EXPECT_EQ(count, 2);                  // 半条不回放
+    EXPECT_EQ(idx.live_doc_count(), 2u);
+    // 截断修复:文件应回到前两条的精确末尾。
+    EXPECT_EQ(std::filesystem::file_size(tmp), full_size);
+
+    std::filesystem::remove(tmp);
+}
+
+// O11 framing:位翻转注入——CRC 必须拦住 payload 中部的字节腐坏。
+TEST(WalFraming, BitflipDetectedByCrc) {
+    auto tmp = std::filesystem::temp_directory_path() / "wal_frame_flip.wal";
+    std::filesystem::remove(tmp);
+
+    {
+        InvertedWal wal(tmp.string());
+        TermPositions terms;
+        terms.emplace("alpha", tp(1, {0}));
+        wal.append_add_doc(0, terms);
+        wal.append_add_doc(1, terms);
+    }
+
+    // 翻转第二条 entry payload 中间一个字节(跳过第一条:4+len+4)。
+    {
+        std::FILE* f = std::fopen(tmp.string().c_str(), "rb+");
+        ASSERT_NE(f, nullptr);
+        std::uint32_t len1 = 0;
+        ASSERT_EQ(std::fread(&len1, 1, 4, f), 4u);
+        const long second_payload_mid =
+            static_cast<long>(4 + len1 + 4 + 4 + len1 / 2);
+        ASSERT_EQ(std::fseek(f, second_payload_mid, SEEK_SET), 0);
+        int ch = std::fgetc(f);
+        ASSERT_NE(ch, EOF);
+        ASSERT_EQ(std::fseek(f, second_payload_mid, SEEK_SET), 0);
+        std::fputc(ch ^ 0xFF, f);
+        std::fclose(f);
+    }
+
+    InvertedIndex idx;
+    idx.enable_wal(tmp.string());
+    int count = idx.replay_wal();
+    EXPECT_EQ(count, 1);                  // 第二条被 CRC 拦下
+    EXPECT_EQ(idx.live_doc_count(), 1u);
+
+    std::filesystem::remove(tmp);
+}

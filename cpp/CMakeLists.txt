@@ -127,7 +127,9 @@ add_library(bitcask_bm25 STATIC
     src/bm25/query_parser.cpp
 )
 target_include_directories(bitcask_bm25 PUBLIC include)
-target_link_libraries(bitcask_bm25 PRIVATE bitcask_warnings TBB::tbb)
+target_link_libraries(bitcask_bm25
+    PUBLIC bitcask_format            # WAL framing 的 codec::crc32(O11)
+    PRIVATE bitcask_warnings TBB::tbb)
 
 # ---------------------------------------------------------------------------
 # bitcask_search — SearchLayer (Index + InvertedIndex + Analyzer wrapper).
