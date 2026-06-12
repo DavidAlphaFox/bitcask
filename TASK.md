@@ -721,6 +721,26 @@ CaskIter 析构竞态（M4）——API 滥用才触发，文档已警示。
 
 ---
 
+## V2 检索加速:B1 — must-only 合取 Block-Max 路径 ✅
+
+> 设计与实测:`doc/kway-blockmax-bmw-zh.md` §6/§6.1。building on K1 游标。
+
+| # | 内容 | 状态 |
+|---|------|------|
+| B1.1 | must-only 门(should/must_not 空,k>0)→ 合取 BMW 路径:K1 leapfrog 对齐 + 堆满后块上界剪枝 + 整块跳跃 | ✅ |
+| B1.2 | live/doc_len 懒取(128-ord 块粒度,触达才批量填)——收益主来源 | ✅ |
+| B1.3 | idf 改基于 df(O(1);无删除时与原路径位级一致;删除期近似与 Lucene docFreq 同语义) | ✅ |
+| B1.4 | 测试 +3:无删除逐分等价(vs 强制原路径)/ 删除成员集 / 深块高分不被误剪 | ✅ |
+| B1.5 | 基准:BoolMustHot3/100k **1011→695μs(-31%)**;Hot/100k -8%;Hot/4096 +4.7%(SIMD→懒 leapfrog);新增 BoolMustSkewed canary | ✅ |
+| B1.6 | 回归:ctest 349/349 + ASan + TSan 零新增 + eunit 44/44 | ✅ |
+
+**关键发现(改变 v5 设计)**:块跳跃剪枝在全部被测形态未触发——
+dl=1 上界有 ~25%/词固有松弛,且 BM25 长度归一压平 tf 钉子(tf=50 ⇒
+dl≥50)。**v5 块元数据必须存量化块级最高分(真实 tf+dl),而非 max_tf**;
+BoolMustSkewed 是 v5 的验收标尺。详见 kway 文档 §6.1。
+
+---
+
 ## 未来任务
 
 ### P1 — 查询路径 PostingList 零拷贝（Phase 1 ✅ + Phase 2-min ✅）
