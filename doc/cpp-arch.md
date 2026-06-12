@@ -95,6 +95,57 @@ dependencies in the NIF .so. GoogleTest and Google Benchmark are pulled
 via `FetchContent` and only compiled when `BUILD_TESTING` /
 `BITCASK_BUILD_BENCHMARKS` are on.
 
+## On-disk file inventory
+
+A bitcask instance is a single flat directory containing the following files.
+Detailed byte-level spec lives in `doc/format.md` (English) / `doc/format-zh.md` (中文).
+
+```
+<dir>/
+├── bitcask.meta                # binary metadata (mode marker, 18 B)
+├── <tstamp1>.bitcask.data      # append-only data file (can be many)
+├── <tstamp1>.bitcask.hint      # sidecar index for data file (one per data, optional)
+├── <tstamp2>.bitcask.data
+├── <tstamp2>.bitcask.hint
+├── ...
+├── field.schema                # field-name→id registry (index mode only)
+├── bitcask.write.lock          # held by the live writer (exclusive)
+├── bitcask.merge.lock          # held by the active merger (exclusive)
+├── bitcask.keydir.snap         # keydir segment snapshot (A4, optional)
+└── bitcask.index.snap          # index side-table snapshot (A4, optional)
+```
+
+### File-by-file
+
+| File | Count | Lifetime | Purpose |
+|------|-------|----------|---------|
+| `bitcask.meta` | 1 | persistent | Magic `BCME` + version + mode (0=KV, 1=Index/search). Source: `meta_file.hpp`. |
+| `<tstamp>.bitcask.data` | many | persistent, old files removed by merge | Core data. Sequence of records: `CRC(4)+Type(1)+Tstamp(4)+Ord(8)+KeySz(2)+ValueSz(4)+Key+Value` (23 B header). Append-only; no file-level header. `<tstamp>` = monotonically increasing uint32 file id, never reused. |
+| `<tstamp>.bitcask.hint` | 0..N | persistent, paired 1:1 with data files | Sidecar index: key + offset + total_sz (no value). Speeds up keydir rebuild at open — only reads keys, not values. Terminated by an 18 B sentinel whose `TotalSz` field carries a whole-file CRC32. If the CRC check fails, the hint is ignored and the keydir is rebuilt from the data file instead. |
+| `field.schema` | 0 or 1 | persistent | Index mode only. Append-only field-name→id registry. Each entry: `[NameLen:u16 BE][name]`, id = order of appearance (0-based). DocValue v3 stores field ids instead of inlining names. |
+| `bitcask.write.lock` | 0 or 1 | runtime (created on open RW, unlinked on close) | Exclusive write lock via `O_CREAT|O_EXCL`. Content: `<pid> <active_data_file_path>\n`. Mergers read this to learn the live writer's active file and exclude it from merge candidates. Stale locks auto-reclaimed via `kill(pid, 0)` probe. |
+| `bitcask.merge.lock` | 0 or 1 | runtime (held during merge) | Exclusive merge lock. **Deliberately independent** from write.lock — writer and merger run concurrently without contending. |
+| `bitcask.keydir.snap` | 0 or 1 | persistent | KeyDir segment snapshot (A4 feature). Speeds up open by avoiding full data-file scan. |
+| `bitcask.index.snap` | 0 or 1 | persistent | Index side-table snapshot (A4 feature). Paired with keydir.snap. |
+
+### How operations touch the files
+
+| Operation | Files touched |
+|-----------|---------------|
+| `put(K,V)` | Append record to active `.data` + append hint to active `.hint` + update in-memory keydir |
+| `get(K)` | Lookup in-memory keydir → `pread(file_id, offset)` from one `.data` file |
+| `delete(K)` | Append tombstone record (`type=kTombstone`) to active `.data` + tombstone hint |
+| `open` | Read `bitcask.meta` → scan all `.data` files (prefer `.hint` for speed, fallback to full data scan) → rebuild in-memory keydir |
+| `merge` | Acquire `merge.lock` → read `write.lock` for active file id → pick high-fragmentation candidates → copy live records to new `.data`+`.hint` pair → CAS-update keydir → unlink old files |
+| `close` | Release `write.lock` (unlink) |
+
+### Key design points
+
+- **File ids never reused**: `KeyDirRegistry` persists `biggest_file_id + 1` across open/close.
+- **Append-only**: every put/delete appends a new record; old versions become dead bytes.
+- **Two independent locks**: writer holds `write.lock`, merger holds `merge.lock` — they never block each other.
+- **Hints are optional/defensive**: a corrupt or missing hint just triggers a slower full-scan rebuild from the data file. Correctness never depends on hints.
+
 ## Concurrency model
 
 Three lock layers exist at runtime; understand which one you're under
