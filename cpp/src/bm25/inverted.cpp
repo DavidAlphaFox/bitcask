@@ -3,6 +3,7 @@
 #include "bitcask/inverted_wal.hpp"
 #include "bitcask/myers.hpp"
 #include "bitcask/wildcard_matcher.hpp"
+#include "bitcask/bm25_kernels.hpp"
 
 #include <oneapi/tbb/blocked_range.h>
 #include <oneapi/tbb/parallel_reduce.h>
@@ -132,14 +133,17 @@ std::vector<SearchResult> score_bow_topk(
                 // ② 标量 append 进线程本地扁平数组。
                 contrib.resize(n);
                 const float fidf = static_cast<float>(idf);
-                for (std::size_t i = 0; i < n; ++i) {
-                    auto tf_norm = static_cast<float>(fp.tfs[i]) *
-                                   (params.k1 + 1.0F) /
-                                   (static_cast<float>(fp.tfs[i]) + params.k1 *
-                                    (1.0F - params.b + params.b *
-                                     static_cast<float>(dls[i]) / static_cast<float>(avgdl)));
-                    contrib[i] = fidf * (tf_norm + params.delta);
-                }
+                const float inv_avgdl = 1.0f / static_cast<float>(avgdl);
+                detail::bm25_score_dispatch(
+                    fp.tfs.data(), dls.data(),
+                    params.k1 + 1.0f,
+                    params.k1 * (1.0f - params.b),
+                    params.k1 * params.b,
+                    params.delta,
+                    fidf,
+                    inv_avgdl,
+                    contrib.data(),
+                    n);
                 local.reserve(local.size() + live_df);
                 for (std::size_t i = 0; i < n; ++i) {
                     if (live[i]) local.emplace_back(fp.ords[i], contrib[i]);
