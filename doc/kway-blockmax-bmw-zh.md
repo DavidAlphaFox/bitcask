@@ -165,7 +165,64 @@ BMW / MaxScore（§4）      → 按分数整块跳过，top-k 只触碰少量 p
 分块与将来 FOR/PFor 块压缩天然同构——一份分块投入同时解决
 skip 地基与 u64 flat posting 的带宽问题。
 
-## 6. 参考
+## 6. B1 实施设计(2026-06-12 定稿,must-only 合取 BMW)
+
+现状修正:v4 已具备 128-ord 块元数据(`PostingBlock{base_ord, end_ord,
+max_tf, start_idx, count}`,FlatPostings 浅拷携带)与 WAND 基建——B1
+不新增格式,直接消费现有块。
+
+**适用门**:`should_terms` 与 `must_not_terms` 均空、`must_terms` 非空、
+k>0 → 合取 BMW 路径;否则维持原路径(eager fill + 完整交集 + 全量评分)。
+
+**核心决策**:
+
+1. **idf 改基于 df(=列表长)而非 live_df**:live_df 需要 O(n) 全列表
+   live 扫描,与 BMW 的亚线性目标矛盾。df 含未 merge 的死 posting,
+   与 Lucene docFreq 语义一致(删除近实时近似,merge 后收敛)。
+   **无删除时 live_df == df,与原路径分数位级一致**(等价性测试基础)。
+   极端删除比下 idf 可为负——上界仍 admissible(ub<θ ⇒ 真实分<θ),
+   剪枝正确性不破,记录为良性边角。
+2. **live/doc_len 懒取**:按 128-ord 块粒度,首次触达才批量
+   fill_is_live/fill_doc_lens(每块一次虚调用 + 一次锁)。未触达的块
+   零成本——这是 10× 类收益的来源(原路径 eager 填全列表)。
+3. **剪枝**:K1 leapfrog 对齐出候选 v 后,若堆已满:
+   Σ_t upper_bound_from(块max_tf, idf_t) ≤ θ → 驱动游标跳到
+   min_t(块end_ord)+1(整块跳过,不评分不查 live)。
+4. **尾块**(未 seal,无块元数据):上界退化用列表级 max_tf,admissible。
+5. **评分公式与原路径逐运算一致**(分数位级不变约定);跨词累加顺序
+   为列表长升序(与原路径的词名序不同,k≥3 时浮点结合性可差最后
+   1 ulp——测试用 FLOAT_EQ + 集合断言)。
+
+**等价性测试策略**:无删除时,`+a +b` (BMW) vs `+a +b zzz_nonexistent`
+(should 含不存在词 → 强制走原路径且分数不受影响)逐 ord/score 对比;
+有删除时断言成员集(死文档排除、活文档齐全),不断言排序。
+
+### 6.1 B1 实测结果与关键发现(落地后补записи)
+
+| 基准(7 次中位) | K1 后 | B1 后 | Δ |
+|---|---|---|---|
+| BoolMustHot/4096(k=2) | 46.9μs | 49.1μs | +4.7%(SIMD pairwise → 懒填充 leapfrog) |
+| BoolMustHot/100k | 1560μs | 1431μs | **-8%** |
+| BoolMustHot3/100k | 1011μs | **695μs** | **-31%** |
+| BoolMustSkewed/100k(新) | — | 1451μs | 剪枝未触发(见下) |
+
+**收益来源全部是懒填充**(未触达块不付 live/doc_len 批量取数),
+**块跳跃剪枝在所有被测形态下均未触发**。机制(canary 基准实证):
+
+1. `upper_bound_from` 的 **dl=1 假设带来 ~25%/词的固有松弛**——
+   近均匀语料里 θ ≈ 真实最高分 ≈ 上界/1.25,`Σub ≤ θ` 永假;
+2. **BM25 长度归一天然压平 tf 钉子**:tf=50 的文档 doc_len 必然 ≥50,
+   归一后其分数未必高于普通文档——"高 tf 块撑高 θ 后跳过低 tf 块"
+   这个直觉故事在 dl 一致的数据上不成立;
+3. 剪枝真正的生效域:**idf 差异大**(冷热词混合,θ 被冷词 idf 主导)
+   或**上界更紧**。
+
+**⇒ v5 块元数据的硬需求(取代 §3.2 的 max_tf 方案)**:每块存
+**量化的块级最高分**(对块内每个 posting 用真实 tf+dl 算分取 max,
+quantize 到 u8/u16),上界零松弛(仅量化误差)。BoolMustSkewed 基准
+是该改动的验收标尺。B1 的剪枝骨架无需改动,只换 block_ub 的来源。
+
+## 7. 参考
 
 - Broder et al.: "Efficient Query Evaluation using a Two-Level
   Retrieval Process", CIKM 2003（WAND）。
