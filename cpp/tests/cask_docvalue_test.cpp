@@ -3,8 +3,12 @@
 #include <bitcask/codec.hpp>
 #include <bitcask/data_file.hpp>  // parse_data_tstamp（S13 测试枚举 data 文件）
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <map>
+#include <random>
+#include <set>
 #include <vector>
 
 namespace {
@@ -1216,4 +1220,117 @@ TEST_F(CaskDocValueTest, V33VectorSearchEndToEnd) {
     ASSERT_FALSE(bad2);
     EXPECT_EQ(bad2.error().kind, bitcask::CaskError::kNoIndex);
     (*c3)->close();
+}
+
+// ── V3.4:软删语义(机制在 Index.live_ + HNSW 结果侧过滤,此处证语义)──
+
+// 覆写:同 key 重写新向量后,旧向量必须不可达——key 只能经新向量的
+// 位置出现(旧 ord 翻死,新 ord 存活),且结果中恰出现一次。
+TEST_F(CaskDocValueTest, V34OverwriteVectorMovesKey) {
+    auto c = Cask::open(tmpdir_.string(), v31_opts(4));
+    ASSERT_TRUE(c);
+    const float va[4] = {1.0f, 0.0f, 0.0f, 0.0f};   // k1 初版
+    const float vb[4] = {0.0f, 0.0f, 1.0f, 0.0f};   // k1 覆写版(⊥ va)
+    const float v2[4] = {0.6f, 0.8f, 0.0f, 0.0f};   // k2 固定
+    auto put = [&](const std::string& key, const float* v) {
+        bitcask::DocInput doc;
+        const std::string text = "doc " + key;
+        doc.text = sv_bytes(text);
+        doc.vector = std::span<const float>(v, 4);
+        ASSERT_TRUE((*c)->put_doc(sv_bytes(key), doc, 1000));
+    };
+    put("k1", va);
+    put("k2", v2);
+    put("k1", vb);   // 覆写:旧 ord(va 处)翻死
+
+    // 查 va 方向:k1 的旧向量若可达会以 score=1.0 居首——必须不发生。
+    // 活集真值:k2·va=0.6 > k1(vb)·va=0。
+    auto ra = (*c)->search_vector(std::span<const float>(va, 4), 3);
+    ASSERT_TRUE(ra);
+    ASSERT_EQ(ra->hits.size(), 2u);
+    EXPECT_EQ(ra->hits[0].key, "k2");
+    EXPECT_NEAR(ra->hits[0].score, 0.6, 1e-5);
+    EXPECT_EQ(ra->hits[1].key, "k1");
+    EXPECT_NEAR(ra->hits[1].score, 0.0, 1e-5);      // 经 vb 出现,绝非 1.0
+
+    // 查 vb 方向:k1 经新向量以 1.0 居首。
+    auto rb = (*c)->search_vector(std::span<const float>(vb, 4), 3);
+    ASSERT_TRUE(rb);
+    ASSERT_EQ(rb->hits.size(), 2u);
+    EXPECT_EQ(rb->hits[0].key, "k1");
+    EXPECT_NEAR(rb->hits[0].score, 1.0, 1e-5);
+    (*c)->close();
+}
+
+// 死区导航:删掉查询近邻的一半(形成包住查询的死壳),搜索仍须凑满 k
+// 且与活集暴力真值一致——证"死节点留作图内路标"参与导航而不污染结果。
+TEST_F(CaskDocValueTest, V34DeadZoneNavigation) {
+    constexpr std::size_t kDim = 8, kN = 300, kDead = 150, kTopK = 10;
+    auto c = Cask::open(tmpdir_.string(), v31_opts(kDim));
+    ASSERT_TRUE(c);
+
+    std::mt19937 rng(0x5EED34);  // 固定种子可复现
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<std::vector<float>> vecs(kN);
+    for (std::size_t i = 0; i < kN; ++i) {
+        auto& v = vecs[i];
+        v.resize(kDim);
+        double sq = 0.0;
+        for (auto& x : v) { x = nd(rng); sq += static_cast<double>(x) * x; }
+        const auto inv = static_cast<float>(1.0 / std::sqrt(sq));
+        for (auto& x : v) x *= inv;
+        char key[8];
+        std::snprintf(key, sizeof key, "d%03zu", i);
+        bitcask::DocInput doc;
+        const std::string text = "filler";
+        doc.text = sv_bytes(text);
+        doc.vector = std::span<const float>(v.data(), kDim);
+        ASSERT_TRUE((*c)->put_doc(sv_bytes(std::string(key)), doc, 1000));
+    }
+    std::vector<float> q(kDim);
+    { double sq = 0.0;
+      for (auto& x : q) { x = nd(rng); sq += static_cast<double>(x) * x; }
+      const auto inv = static_cast<float>(1.0 / std::sqrt(sq));
+      for (auto& x : q) x *= inv; }
+
+    // 暴力真值排序(按内积降序)。
+    auto dot = [&](const std::vector<float>& v) {
+        double s = 0.0;
+        for (std::size_t d = 0; d < kDim; ++d) s += static_cast<double>(q[d]) * v[d];
+        return s;
+    };
+    std::vector<std::size_t> order(kN);
+    for (std::size_t i = 0; i < kN; ++i) order[i] = i;
+    std::sort(order.begin(), order.end(),
+              [&](std::size_t a, std::size_t b) { return dot(vecs[a]) > dot(vecs[b]); });
+
+    // 删掉最近的 kDead 个 → 查询被死壳包围。
+    std::set<std::string> dead;
+    for (std::size_t r = 0; r < kDead; ++r) {
+        char key[8];
+        std::snprintf(key, sizeof key, "d%03zu", order[r]);
+        ASSERT_TRUE((*c)->remove(sv_bytes(std::string(key))));
+        dead.insert(key);
+    }
+    // 活集真值 top-k = 排序中第 kDead 起的 kTopK 个。
+    std::set<std::string> truth;
+    for (std::size_t r = kDead; r < kDead + kTopK; ++r) {
+        char key[8];
+        std::snprintf(key, sizeof key, "d%03zu", order[r]);
+        truth.insert(key);
+    }
+
+    auto res = (*c)->search_vector(std::span<const float>(q.data(), kDim),
+                                   kTopK, /*ef=*/256);
+    ASSERT_TRUE(res);
+    ASSERT_EQ(res->hits.size(), kTopK);              // 死壳没有压垮凑满 k
+    std::size_t overlap = 0;
+    for (const auto& h : res->hits) {
+        EXPECT_EQ(dead.count(h.key), 0u) << "死文档泄入结果: " << h.key;
+        overlap += truth.count(h.key);
+    }
+    // ef=256 对 300 节点近乎穷举;留 1 个并列容差。
+    EXPECT_GE(overlap, kTopK - 1)
+        << "活集 top-k 重合 " << overlap << "/" << kTopK;
+    (*c)->close();
 }

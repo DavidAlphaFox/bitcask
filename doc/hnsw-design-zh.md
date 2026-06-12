@@ -177,7 +177,7 @@ DocValue,补给 vector 段);on_relocate 对图为 no-op(图按 ord 键)。
 | V3.1 | meta VectorConfig + DocValue vector 段读写打通(put_doc/get 透传) | 格式 round-trip 测试 + 黄金 fixture |
 | V3.2 | HNSW 核心(单线程 insert/search,距离内核分发) | **召回对拍** vs 暴力 KNN:低维(32d/10k)recall@10 ≥ 0.95@ef64 / 0.99@ef256;高维纯随机(384d)按 ef=128/256 标定 ≥0.93/0.98——距离集中使其成为最坏形态,实测收敛曲线 0.824/0.960/0.996/1.000(ef 64..512)证实实现健康,真实 embedding 流形数据远易于此 |
 | V3.3 | 并发化(per-node 锁 + 发布式增长)+ IndexPool 接线 | N 读 × 1 写并发测试;TSan 全插桩全绿 |
-| V3.4 | 软删过滤 + LiveChecker 接入 | 删除可见性测试(删后不出现在结果) |
+| V3.4 | 软删过滤 + LiveChecker 接入。**落地记录(2026-06-12)**:机制随 V3.3 已在位(`Index.live_` 位图即 LiveChecker;search_vector 注入 `is_live` 回调;HNSW 结果侧滤死),V3.4 为语义证明:覆写测试(旧向量不可达,key 仅经新向量出现一次)+ 死区导航测试(删掉查询近邻 150/300 形成死壳,k=10 仍凑满、零死文档泄入、与活集暴力真值重合 ≥9/10)。**已知边界**:结果侧过滤意味着 ef 候选内活者 < k 时返回不足 k——死文档占比高的邻域调用方需加大 ef;根治靠 merge 重建物理清除(V3.5) | 删除/覆写/死区三类可见性测试 ✅ |
 | V3.5 | 持久化(vec/hnsw 快照 + covers 门并入 A4)+ merge 重建 | A4 同款三件套:快照/全量等价、陈旧尾部回放、损坏回退;eunit |
 | V3.6 | search_hybrid RRF + NIF/Erlang 接口 | 端到端 eunit;hybrid 排序确定性测试 |
 | V3.7 | 基准定稿:BM_Hnsw_Insert/{10k,100k}、BM_Hnsw_Search/{10k,100k}×{ef64,ef256}、BM_Hybrid;入 baseline | 红线:100k/ef64 查询 < 1ms;插入 > 2k/s(384d,本机) |
