@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <shared_mutex>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -363,16 +364,20 @@ private:
     std::string keydir_name_;
 
     // 当前 active write file。只读 / merge_only 时为 nullptr。
-    std::unique_ptr<fileops::DataFile> active_data_;
+    // shared_ptr:读路径(read_file)可能在锁外持有 active 句柄,roll/close
+    // 时旧对象由在途读者的引用计数续命,不会析构正在被 pread 的对象。
+    std::shared_ptr<fileops::DataFile> active_data_;
     std::unique_ptr<fileops::HintFile> active_hint_;
     std::uint32_t active_file_id_ = 0;
 
     // 按 file_id 缓存的 DataFile 读句柄。read 路径懒打开。
     // 多读者并发，read_cache_mu_ 保护 unordered_map 本身；DataFile 内部
     // 的 pread 是 thread-safe 的。
-    std::mutex read_cache_mu_;
+    std::shared_mutex read_cache_mu_;  // 命中走共享锁;lazy open/清理走独占
+    // 值用 shared_ptr:read_file 返回的句柄在锁外被使用,merge 清理
+    // erase 时在途读者靠引用计数 pin 住对象(修 UAF,O10)。
     std::unordered_map<std::uint32_t,
-                        std::unique_ptr<fileops::DataFile>> read_files_;
+                        std::shared_ptr<fileops::DataFile>> read_files_;
 
     // 目录锁。read_write 模式下是 bitcask.write.lock（live writer 持有），
     // merge_only 模式下是 bitcask.merge.lock（merger 跟 writer 并行）。
@@ -409,7 +414,8 @@ public:
     // put() 在 keydir.biggest_file_id 被并发 merger 顶过去时调用——
     // 必须放弃当前文件，让出 file_id 单调递增的不变量。
     [[nodiscard]] std::expected<void, CaskFault> roll_active();
-    [[nodiscard]] fileops::DataFile* read_file(std::uint32_t file_id);
+    [[nodiscard]] std::shared_ptr<fileops::DataFile>
+    read_file(std::uint32_t file_id);
 };
 
 }  // namespace bitcask

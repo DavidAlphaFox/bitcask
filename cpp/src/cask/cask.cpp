@@ -25,9 +25,17 @@ CaskFault err(CaskError k, std::string detail = {}) {
 }
 
 std::uint32_t now_sec_default() {
+#ifdef CLOCK_REALTIME_COARSE
+    // 每次 get/put 都要取秒级时间戳:COARSE 时钟走 vDSO 无 syscall,
+    // 粒度为内核 tick(1-4ms),对秒级语义无损。
+    timespec ts;
+    ::clock_gettime(CLOCK_REALTIME_COARSE, &ts);
+    return static_cast<std::uint32_t>(ts.tv_sec);
+#else
     return static_cast<std::uint32_t>(
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
+#endif
 }
 
 std::span<const std::byte> str_to_bytes(std::string_view s) {
@@ -239,10 +247,12 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
         // 已 open 的 fd 仍可读）；未 pin 的（active 文件 / fold 后新建的文件）
         // 退回共享 read_file——这些文件不会在本次 fold 期间被 merge 删除。
         fileops::DataFile* df = nullptr;
+        std::shared_ptr<fileops::DataFile> shared_df;  // pin 共享句柄到本次读结束
         if (auto pit = pinned_files_.find(proxy->file_id); pit != pinned_files_.end()) {
             df = pit->second.get();
         } else {
-            df = parent_->read_file(proxy->file_id);
+            shared_df = parent_->read_file(proxy->file_id);
+            df = shared_df.get();
         }
         if (!df) {
             return std::unexpected(err(CaskError::kIo,
@@ -463,12 +473,12 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
         cask->index_pool_ = std::make_unique<IndexPool>(1, 10240);
         cask->index_pool_->start([&search = *cask->search_](const IndexTask& task) {
             if (task.op == IndexOp::Delete) {
-                search.on_delete(task.key, task.ord);
+                search.on_delete(task.key(), task.ord);
             } else if (!task.fields.empty()) {
-                search.on_write_fields(task.key, task.ord, task.fields,
+                search.on_write_fields(task.key(), task.ord, task.fields,
                                        task.file_id, task.offset, task.total_sz, task.tstamp);
             } else {
-                search.on_write(task.key, task.ord, task.text,
+                search.on_write(task.key(), task.ord, task.text(),
                                 task.file_id, task.offset, task.total_sz, task.tstamp);
             }
             return true;
@@ -525,11 +535,9 @@ void Cask::close() noexcept {
         (void)active_hint_->finalize();
         active_hint_.reset();
     }
-    if (active_data_) {
-        active_data_.reset();
-    }
     {
         std::scoped_lock lk(read_cache_mu_);
+        active_data_.reset();
         read_files_.clear();
     }
     if (registry_ && !keydir_name_.empty()) {
@@ -696,7 +704,12 @@ std::expected<void, CaskFault> Cask::ensure_active_writer() {
                                        fileops::HintFile::Mode::kCreate,
                                        opts_.o_sync);
     if (!hf) return std::unexpected(io_fault(hf.error().errnum, hint_path));
-    active_data_ = std::make_unique<fileops::DataFile>(std::move(*df));
+    {
+        // active_data_ 被 read_file 在 read_cache_mu_ 下读取,
+        // 写点必须同锁互斥(O10:shared_ptr 拷贝与替换需要串行化)。
+        std::unique_lock lk(read_cache_mu_);
+        active_data_ = std::make_shared<fileops::DataFile>(std::move(*df));
+    }
     active_hint_ = std::make_unique<fileops::HintFile>(std::move(*hf));
 
     // 把新 active file 路径记到 write.lock 里：merger（merge_only=true）
@@ -731,7 +744,10 @@ std::expected<void, CaskFault> Cask::roll_active() {
                                              std::string(active_hint_->path())));
         }
     }
-    active_data_.reset();
+    {
+        std::unique_lock lk(read_cache_mu_);
+        active_data_.reset();  // 在途读者持 shared_ptr,旧对象由引用计数续命
+    }
     active_hint_.reset();
     return ensure_active_writer();
 }
@@ -754,7 +770,10 @@ std::expected<void, CaskFault> Cask::close_write_file() {
                                              std::string(active_hint_->path())));
         }
     }
-    active_data_.reset();
+    {
+        std::unique_lock lk(read_cache_mu_);
+        active_data_.reset();
+    }
     active_hint_.reset();
     active_file_id_ = 0;
     if (write_lock_) {
@@ -776,25 +795,35 @@ std::expected<void, CaskFault> Cask::close_write_file() {
 //   2. 当前 active writer 自身（避免重复 open）
 //   3. 新 open 一个只读句柄并加入缓存
 // 失败返回 nullptr——caller 用 errno 包装。
-fileops::DataFile* Cask::read_file(std::uint32_t file_id) {
-    std::scoped_lock lk(read_cache_mu_);
+std::shared_ptr<fileops::DataFile> Cask::read_file(std::uint32_t file_id) {
+    // 热路径(缓存命中)共享锁,多读者并发;miss 才升级独占做 lazy open。
+    // 返回 shared_ptr:调用方在锁外使用句柄期间,并发 merge 的 erase /
+    // roll_active 的替换不会析构它(O10 UAF 修复)。
+    {
+        std::shared_lock lk(read_cache_mu_);
+        auto it = read_files_.find(file_id);
+        if (it != read_files_.end()) return it->second;
+        if (active_data_ && file_id == active_file_id_) {
+            return active_data_;
+        }
+    }
+
+    std::unique_lock lk(read_cache_mu_);
+    // 双检:释放共享锁到拿独占锁之间可能有人已 open。
     auto it = read_files_.find(file_id);
-    if (it != read_files_.end()) return it->second.get();
+    if (it != read_files_.end()) return it->second;
 
     // active writer 也能给自己当 reader 用——pread 不影响 append 写入位置。
     if (active_data_ && file_id == active_file_id_) {
-        return active_data_.get();
+        return active_data_;
     }
 
     auto path = fileops::mk_data_filename(dirname_, file_id);
     auto df = fileops::DataFile::open(path, fileops::DataFile::Mode::kRead);
     if (!df) return nullptr;
-    auto* raw = df.value().path().data();  // touch to suppress unused
-    (void)raw;
-    auto up = std::make_unique<fileops::DataFile>(std::move(*df));
-    auto* p = up.get();
-    read_files_.emplace(file_id, std::move(up));
-    return p;
+    auto sp = std::make_shared<fileops::DataFile>(std::move(*df));
+    read_files_.emplace(file_id, sp);
+    return sp;
 }
 
 // ---- get / put / delete ----------------------------------------------------
@@ -823,7 +852,7 @@ Cask::get(std::span<const std::byte> key) {
         }
     }
 
-    auto* df = read_file(entry->file_id);
+    auto df = read_file(entry->file_id);
     if (!df) return std::unexpected(err(CaskError::kIo,
         "open file_id=" + std::to_string(entry->file_id)));
 
@@ -927,21 +956,17 @@ auto pr = keydir_->put(bytes_to_view(key), active_file_id_,
         if (pr2 == keydir::PutResult::kAlreadyExists) {
             return std::unexpected(err(CaskError::kAlreadyExists));
         }
-        submit_index_task(IndexTask{
-            IndexOp::Add,
-            std::string(bytes_to_view(key)),
-            ord2,
-            std::string(reinterpret_cast<const char*>(value.data()), value.size()),
-            active_file_id_, w2->offset, w2->total_size, tstamp, 0
-        });
+        submit_index_task(IndexTask::make(
+            IndexOp::Add, bytes_to_view(key), ord2,
+            std::string_view(reinterpret_cast<const char*>(value.data()),
+                             value.size()),
+            active_file_id_, w2->offset, w2->total_size, tstamp, 0));
     } else {
-        submit_index_task(IndexTask{
-            IndexOp::Add,
-            std::string(bytes_to_view(key)),
-            ord,
-            std::string(reinterpret_cast<const char*>(value.data()), value.size()),
-            active_file_id_, w->offset, w->total_size, tstamp, 0
-        });
+        submit_index_task(IndexTask::make(
+            IndexOp::Add, bytes_to_view(key), ord,
+            std::string_view(reinterpret_cast<const char*>(value.data()),
+                             value.size()),
+            active_file_id_, w->offset, w->total_size, tstamp, 0));
     }
     return {};
 }
@@ -991,11 +1016,8 @@ Cask::remove(std::span<const std::byte> key, std::uint32_t tstamp) {
     if (!h) return std::unexpected(io_fault(h.error().errnum));
     keydir_->remove(bytes_to_view(key), tstamp);
     if (index_pool_) {
-        submit_index_task(IndexTask{
-            IndexOp::Delete,
-            std::string(bytes_to_view(key)),
-            ord, {}, 0, 0, 0, tstamp, 0
-        });
+        submit_index_task(IndexTask::make(
+            IndexOp::Delete, bytes_to_view(key), ord, {}, 0, 0, 0, tstamp, 0));
     } else if (search_) {
         search_->on_delete(bytes_to_view(key), ord);
     }
@@ -1095,23 +1117,19 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
         if (pr2 == keydir::PutResult::kAlreadyExists) {
             return std::unexpected(err(CaskError::kAlreadyExists));
         }
-        submit_index_task(IndexTask{
-            IndexOp::Add,
-            std::string(bytes_to_view(key)),
-            ord2,
-            std::string(reinterpret_cast<const char*>(doc.text.data()), doc.text.size()),
+        submit_index_task(IndexTask::make(
+            IndexOp::Add, bytes_to_view(key), ord2,
+            std::string_view(reinterpret_cast<const char*>(doc.text.data()),
+                             doc.text.size()),
             active_file_id_, w2->offset, w2->total_size, tstamp, 0,
-            task_fields()
-        });
+            task_fields()));
     } else {
-        submit_index_task(IndexTask{
-            IndexOp::Add,
-            std::string(bytes_to_view(key)),
-            ord,
-            std::string(reinterpret_cast<const char*>(doc.text.data()), doc.text.size()),
+        submit_index_task(IndexTask::make(
+            IndexOp::Add, bytes_to_view(key), ord,
+            std::string_view(reinterpret_cast<const char*>(doc.text.data()),
+                             doc.text.size()),
             active_file_id_, w->offset, w->total_size, tstamp, 0,
-            task_fields()
-        });
+            task_fields()));
     }
     return {};
 }
@@ -1284,7 +1302,7 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
         search_->rebuild_index(
             [this](std::uint32_t fid, std::uint64_t off, std::uint32_t sz)
                 -> std::optional<std::string> {
-                auto* df = read_file(fid);
+                auto df = read_file(fid);
                 if (!df) return std::nullopt;
                 auto rec = df->read(off, sz);
                 if (!rec) return std::nullopt;
@@ -1298,31 +1316,30 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
         search_->save_snapshot(snap);
     }
 
-    // 关键顺序：先关 fd 再 unlink。
-    {
-        std::scoped_lock lk(read_cache_mu_);
-        for (const auto& path : files) {
-            if (auto t = fileops::parse_data_tstamp(path)) {
-                read_files_.erase(static_cast<std::uint32_t>(*t));
-            }
-        }
-    }
-
     // After run_merge, every live record from `files` has been CAS-rewritten
     // into the new merge file, and stale records were already pointing
     // elsewhere. So nothing in the keydir references these inputs anymore —
     // safe to unlink the .data + .hint pair and drop the fstats entry.
     //
+    // erase + unlink 收在同一临界区(O10):放锁后再 unlink 会留一个窗口,
+    // 持旧 keydir 快照的在途 get 在 unlink 后 lazy reopen 报 ENOENT 假失败。
+    // 持锁做文件系统操作可接受——merge 收尾是冷路径。被 erase 的句柄若仍
+    // 被在途读者持有,由 shared_ptr 引用计数续命(UAF 修复)。
+    //
     // Failures here are best-effort: the keydir is already consistent. A
     // residual file just wastes disk until the next process tries the same.
     std::vector<std::uint32_t> trimmed_ids;
     trimmed_ids.reserve(files.size());
-    for (const auto& path : files) {
-        std::error_code ec;
-        std::filesystem::remove(path, ec);
-        std::filesystem::remove(fileops::mk_hint_filename(path), ec);
-        if (auto t = fileops::parse_data_tstamp(path)) {
-            trimmed_ids.push_back(static_cast<std::uint32_t>(*t));
+    {
+        std::scoped_lock lk(read_cache_mu_);
+        for (const auto& path : files) {
+            std::error_code ec;
+            if (auto t = fileops::parse_data_tstamp(path)) {
+                read_files_.erase(static_cast<std::uint32_t>(*t));
+                trimmed_ids.push_back(static_cast<std::uint32_t>(*t));
+            }
+            std::filesystem::remove(path, ec);
+            std::filesystem::remove(fileops::mk_hint_filename(path), ec);
         }
     }
     if (!trimmed_ids.empty()) {
