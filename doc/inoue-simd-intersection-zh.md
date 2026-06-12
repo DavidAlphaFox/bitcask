@@ -4,6 +4,12 @@
 > `inverted.cpp` 的 `run_must_intersect`。
 > 前置阅读：`doc/bool-search-intersection-zh.md`。
 
+> **状态（2026-06-12 决策，见 §8.5）**：ord 恒为 u64，**u32 收窄路径已整体
+> 移除**——commit 08fbc92 起 `bool_search` 统一走 `intersect_u64`，
+> `narrow_ok` 门与 `intersect_u32` 内核已从代码中删除。本文中 u32 相关内容
+> （§2.3 / §2.5 u32 内核、§2.7 u32 分发、§4.3 u32 触发条件、§5.3 的
+> `narrow_ok` 代码段）**保留作历史参考，不再是现行设计**。
+
 ## 1. 设计动机
 
 ### 1.1 当前方案（Schlegel/Lemire 旋转法）的局限
@@ -188,6 +194,11 @@ void exact_match_u64_avx2(const std::uint64_t* a, const std::uint64_t* b,
 | 掩码提取 | `_mm256_movemask_pd` | 4-bit 掩码（4 个 u64 lane） |
 | 压缩存储 | `_mm256_extract_epi64` × 4 | 4 lane 条件提取，比 LUT + `permutevar8x32` 简单且无需成对 u32 模拟 |
 
+> ⚠️ **"零 LUT"是用分支换的（见 §8.2.3）**：4 个 `if (mask & k) push_back`
+> 是最内层循环里 4 个数据相关分支 + capacity 检查。PairLut（512B，常驻 L1）
+> 的 lookup + permute + store 是无分支的。命中率中等（mask 难预测）时
+> 条件提取可能反而更慢——"零 LUT 更优"需基准实测支撑，不能仅凭代码简洁判定。
+
 **与 §7.1 原型（paired u32 `permutevar8x32`）的对比**：
 
 | 维度 | §7.1 paired u32 原型 | 本方案（原生 u64） |
@@ -230,6 +241,12 @@ void exact_match_u32_avx512(const std::uint32_t* a, const std::uint32_t* b,
 
 **注意**：消费级 Intel 12 代后无 AVX-512，本机（i9-13900H）无法验证。
 部署目标需明确为 Xeon/EPYC 服务器。部分微架构有降频代价，需实测。
+
+**必须评估的对照项——AVX512-VP2INTERSECT**：`vp2intersectd`/`vp2intersectq`
+一条指令完成两个向量的全对全相等比较（输出双侧 mask），正是上面 16 次
+旋转循环要做的事。Intel 端 Tiger Lake 引入后被砍且为微码慢速实现，但
+**AMD Zen 5 提供硬件快速实现**。若部署目标含 Zen 5（EPYC Turin），
+VP2INTERSECT 内核应优先于 16-旋转方案；写 AVX-512 内核前先确认目标微架构。
 
 ### 2.6 u64 AVX-512 精确匹配内核
 
@@ -297,6 +314,13 @@ intersect_u64(a, b, out)   ← 替代当前 set_intersection 标量回退
 | u64 交集（任何形态） | 标量 `set_intersection` | **~3-4x** | 原生 u64 SIMD + 块过滤 |
 | u64 交集（不对称） | 标量 | **>5x** | 块过滤跳过大部分块 + SIMD 精确匹配 |
 
+> ⚠️ **关键前提（见 §8.2.1）**：上表"10% 重叠 → 90% 块被跳过"假设交集元素
+> **在值域上成簇**。块过滤跳过的条件是两个块的 [min, max] **区间不相交**，
+> 与元素重叠率无关。若 doc ID 均匀散布全值域（真实 posting list 的常态），
+> 相近大小的两列表即使 0% 元素重叠，块区间也几乎必然互相覆盖——阶段 1
+> 一个块都跳不掉，每块反而多付 2 次标量比较。该行预测必须用
+> 均匀分布 + 成簇分布两种数据形态实测后才可作为决策依据。
+
 ### 3.2 旋转法 vs Inoue + SIMD 的指令开销对比
 
 **以 u64 AVX2 为例，单块处理**：
@@ -341,18 +365,26 @@ u64 只有 4 lane（u32 的一半），SIMD 加速比本就有限。Inoue 的阶
 4. **Sanitizer**：ASan + UBSan（P3.1 越界写教训要求所有 SIMD 内核必须有
    sanitizer 实测兜底）。
 5. **基准对比**：与当前旋转法在 BoolMustHot/4096 和 /100k 上对齐测量。
+6. **分布形态矩阵（见 §8.2.1）**：基准必须覆盖
+   {均匀散布, 成簇, 区段错开} × {0%, 10%, 100% 重叠} × {对称, 4x, 32x}。
+   其中"均匀散布 + 相近大小"是真实 posting list 的常态，也是块过滤
+   预期收益为零甚至为负的形态——该格子的结果决定 **u64 内核是否保留
+   块过滤阶段**（跳过率 ≈ 0 时块过滤是每块 2 次标量比较的小额纯开销，
+   保留或删除以实测定）。只测成簇形态会系统性高估收益。
+7. **块跳过率计数器**：基准内核加编译期开关统计「阶段 1 跳过块数 / 总块数」，
+   把"块过滤是否生效"从推测变成可观测指标。
 
 ### 4.3 触发条件
 
-**u32 路径替换**（Inoue + AVX2 替代当前旋转法）：
-- 触发条件：基准测试证明 Inoue + AVX2 在典型工作负载上与旋转法持平
-  （≤5% 回归）且在不对称查询上有可测量加速。
-- 前置：对拍测试全部通过。
+**u32 路径替换** —— **已作废（2026-06-12，见 §8.5）**：u32 收窄路径
+整体移除，不存在"替换 u32 旋转法"的问题。原触发条件与「均匀散布格子
+无回归」前置随之失效；分布矩阵实验（§4.2 第 6 条）降级为 u64 内核
+调优实验（块过滤保留与否）。
 
-**u64 路径替换**（Inoue + AVX2 替代 `set_intersection` 标量回退）：
-- 触发条件：单索引累计写入超 2³²（与 §7.1 相同），u64 回退从影子路径
-  变成热路径。
-- 前置：`intersect_u64` 三路分发（galloping / AVX2 / 标量）+ 对拍测试就绪。
+**u64 路径** —— **已是唯一生产路径（08fbc92 落地）**：原触发条件
+「累计写入超 2³² 使 u64 从影子路径变热路径」作废——u32 收窄移除后
+`intersect_u64` 对所有查询生效。三路分发（galloping / AVX2 / 标量）
++ 对拍测试已就绪。
 
 **AVX-512 内核**：
 - 触发条件：部署目标明确为带 AVX-512 的服务器（同 §7.2）。
@@ -408,6 +440,11 @@ roaring64_bitmap_and(r1, r2):
 CRoaring 自身基准显示 roaring64 大约为 roaring32 性能的 **50%**。
 
 ### 5.3 结论：u32 Roaring + Inoue u64 回退
+
+> ⚠️ **历史参考**：本节写于 u32 收窄路径仍存在时。2026-06-12 决策后
+> （§8.5）`narrow_ok` 已删除、u64 为唯一路径，下述 if/else 分发不再存在。
+> 本节仍有效的结论只剩一条：**如引入 Roaring，用 u32 容器需先做 ord
+> 分段重映射，且不用 Roaring64**（ART 开销使其不如原生 u64 SIMD）。
 
 **Roaring 混合设计不需要 Roaring64。** 推荐组合：
 
@@ -494,3 +531,135 @@ run_must_intersect 骨架中的分发：
   ADMS 2011. 当前 `intersect_avx2` 所用方案。
 - **4096 阈值**：Roaring bitmap 的 ArrayContainer → BitmapContainer 切换点。
   4096 个 u16 = 8KB = 一个 BitmapContainer（65536-bit bitset）的大小。
+
+## 8. 设计评审：与工业界方案的差异与已知缺陷
+
+> 2026-06 评审补充。本节记录该设计相对工业主流方案的定位偏差与
+> 分析性缺陷，作为 §4.3 触发条件的决策背景。结论先行：
+> **本设计在「flat 数组交集内核」局部题目内是干净的，但有局部最优嫌疑**——
+> 核心收益假设（块过滤跳过率）对真实 doc ID 分布大概率不成立，
+> 且若 V2 做 BM25 top-k，更高优先级的是 Block-Max 类结构而非交集内核。
+
+### 8.1 与工业界主流的四点差异
+
+| 维度 | 本设计 | 工业主流（Lucene/ES 系） | 差距影响 |
+|---|---|---|---|
+| 数据形态 | flat `vector<u64>` 全量驻留，8B/id | 128-doc 块压缩（FOR/PFor）+ skip 结构，~1-2 bit/id 有效 | 100K posting = 800KB，出 L2 后内核是**带宽瓶颈**，§3 的指令数对比可能不兑现 |
+| 跳跃粒度 | 块过滤一次跳 4-16 元素；>32x 走 galloping | skip list / 块元数据一次跳 128~数千 | 4x~32x 中等不对称区间两边线性推进，正是 skip 结构最赚的区间 |
+| 评分集成 | 完整 must 交集 → 再评分 | WAND / Block-Max WAND / MaxScore：分数上界跳文档，top-k 出来时大部分 posting 未被触碰 | 交集内核优化的环节会被 BMW 整体绕开；纯 filter 场景工业答案是 Roaring AND（§5 已分析） |
+| doc ID 宽度 | ord 恒 u64，单一 u64 路径（决策见 §8.5） | segment 内 u32 局部 ID（Lucene 段上限 2³¹），分段消解 u64 需求 | 有意识的取舍：接受 2x 内存带宽 / 半数 SIMD lane，换单路径简单性；带宽代价的正解是将来块压缩，不是 u32 收窄 |
+
+另一处工程差异：`run_must_intersect`（inverted.cpp:900）是 pairwise
+物化交集——k 个 must 词产生 k-1 次中间 vector 分配 + move。工业实现用
+k-way leapfrog 或迭代器 advance 链零物化。短交集上此开销可能盖过内核优化。
+
+### 8.2 已知缺陷（按严重程度排序）
+
+#### 8.2.1 块过滤的收益假设与真实分布不符（最严重）
+
+块过滤跳过的条件是块 [min, max] **区间不相交**，§3.1 的预测表把
+「元素重叠率」当成了「块区间不相交率」。两者只在交集元素值域成簇时近似：
+
+```
+成簇形态（块过滤有效）：
+  a: [1..1000]            b: [900..1900]
+  → a 的前 ~90% 块整块 < b[0]，阶段 1 直接跳过
+
+均匀散布形态（块过滤失效，真实 posting 常态）：
+  a: 1, 3, 5, 7, ...      b: 2, 4, 6, 8, ...
+  → 0% 元素重叠，但每对块区间都互相覆盖
+  → 阶段 1 一个块都跳不掉，每块多付 2 次标量比较 + 2 个分支
+```
+
+对相近大小、均匀分布的列表，块过滤阶段退化为纯开销。
+**影响已降级（u32 收窄移除后）**：u64 内核的对照基线是标量
+`set_intersection`，即使块跳过率为 0，SIMD 精确匹配部分仍稳赚——
+本缺陷不再威胁路线成立性，只影响调优。处置：§4.2 第 6/7 条
+（分布矩阵 + 跳过率计数器）决定 u64 内核**保留还是删除块过滤阶段**。
+
+#### 8.2.2 引用的是 Inoue，实现的不是 Inoue
+
+Inoue 2015 的核心贡献是**无分支 SIMD 低字节指纹过滤**消除
+`if (a[i] < b[j])` 的预测失败；本文档 §2.2 的 max/min 标量块过滤
+实质是经典 block-skipping merge，且重新引入了两个数据相关分支
+（块很少被跳过时恒为 false、预测良好；跳过/不跳交替时会 mispredict）。
+引用论文与实现物不一致——保留现名可以，但不应预期获得论文中
+报告的 branch-miss 消除收益。
+
+#### 8.2.3 u64 内核「零 LUT」的代价是 4 个内层分支
+
+见 §2.4 警示框。`if (mask & k) push_back` × 4 + capacity 检查
+vs 512B PairLut（常驻 L1）无分支 lookup+permute+store——
+后者在 mask 难预测时可能更快。另外所有内核直接 `push_back`/`resize`
+进 `vector`；应预分配 `min(na, nb)` 上界 + 裸指针游标写出，
+循环结束后一次 `resize` 收尾。
+**两项的收益分析、实测方案与依赖顺序详见
+`doc/intersect-kernel-internals-zh.md` §2/§3。**
+
+#### 8.2.4 AVX-512 方案未对照 VP2INTERSECT
+
+见 §2.5 警示框。Zen 5 的 `vp2intersectq` 一条指令即完成 8-lane u64
+全对全比较，16-旋转循环在该微架构上是错误选型。AVX-512 内核动工前
+必须先确认部署微架构并对照评估。
+
+#### 8.2.5 带宽瓶颈未纳入性能模型
+
+§3 全部以指令条数论证，未考虑 100K×100K（u64 下 1.6MB 工作集）
+已出 L2。带宽受限时减少 SIMD 指令几乎不改变吞吐——这同时削弱
+旋转法和 Inoue 的差异，也意味着压缩（缩小工作集）比内核优化
+对大 posting 更有效。基准须报告工作集大小与 L2/L3 边界的关系。
+
+### 8.3 评审结论对路线的修正
+
+1. ~~u32 路径替换降级为「待证伪」~~ **已作废**：u32 收窄路径整体移除
+   （§8.5），不存在替换问题。分布矩阵实验降级为 u64 内核调优
+   （块过滤阶段保留与否，预期仅区段错开形态——如按时间分区的
+   ord 空间——有收益）。
+2. **u64 路径为唯一热路径**：08fbc92 起 `intersect_u64` 即生产路径，
+   不再是影子路径，内核投入的 ROI 直接成立；其收益不依赖块过滤假设
+   （SIMD 精确匹配相对标量本身就赚）。
+3. **若 V2 确做 BM25 top-k**：交集内核之后的优化预算应转向
+   Block-Max 元数据（每块 max tf/score）+ MaxScore/BMW，
+   以及 `run_must_intersect` 的 k-way 化（消除中间物化）。
+   **详细路线说明见 `doc/kway-blockmax-bmw-zh.md`**
+   （k-way → 块元数据 → BMW 的依赖链与各自收益）。
+4. **AVX-512**：维持 §4.3 触发条件，新增前置——确认目标微架构后
+   先评估 VP2INTERSECT 路线。
+
+### 8.5 决策记录：放弃 u32 收窄，ord 恒为 u64（2026-06-12）
+
+**决策**：ord 在类型语义上就是 64 位单调序号，查询路径不做 u32 收窄。
+`narrow_ok` 门与 `intersect_u32` 内核自 08fbc92 起从代码中移除，
+`bool_search` 统一走 `intersect_u64`。
+
+**放弃 u32 收窄的理由**：
+
+1. **查询时收窄有自身成本**：u64 → u32 需逐 posting 拷贝
+   （读 8B/id + 写 4B/id），大 posting 上这趟带宽吃掉相当部分内核收益；
+   若改为存储层原生 u32 则违背 ord=u64 的类型设计，且引入双格式
+   （save/load、snapshot、merger 全要感知）。
+2. **双路径维护成本**：两套内核族 × 两套对拍/对抗/sanitizer 测试矩阵
+   + 收窄门自身的边界条件（恰好跨 2³² 的索引），换来的只是
+   热路径上的常数加速。
+3. **per-element 指令数两者同阶**：全对全旋转每块 B 次 permute+cmp
+   覆盖 B² 对、推进 ≥B 个元素——per-element ALU 成本与 lane 宽度
+   基本无关。u32 的真实优势主要是**内存占用/带宽减半**，不是指令吞吐。
+
+**接受的代价**（诚实记录）：
+
+- flat posting 8B/id，是 u32 的 2 倍内存与带宽；与工业压缩格式
+  （~1-2 bit/id 有效）差距进一步放大。
+- **该代价的正解是将来的块压缩（FOR/PFor + 块级元数据），不是
+  u32 收窄**——压缩同时为 BMW/MaxScore 提供 skip 地基（§8.3 第 3 条），
+  一份投入解两个问题。当前规模（100K×2 列表 = 1.6MB，在 L3 内）
+  带宽尚不构成瓶颈，posting 规模显著增长时再触发压缩路线。
+
+- Inoue, Ohara, Taura: "Faster Set Intersection with SIMD Instructions by
+  Reducing Branch Mispredictions", VLDB 2015 —— 注意其过滤阶段为
+  无分支 SIMD 字节指纹，非本设计的标量 max/min 块过滤。
+- Ding & Suel: "Faster Top-k Document Retrieval Using Block-Max Indexes",
+  SIGIR 2011（Block-Max WAND）。
+- Broder et al.: "Efficient Query Evaluation using a Two-Level Retrieval
+  Process", CIKM 2003（WAND）。
+- AVX512-VP2INTERSECT：Intel ISA 扩展，Tiger Lake 引入后弃用；
+  AMD Zen 5（EPYC Turin）提供硬件快速实现。

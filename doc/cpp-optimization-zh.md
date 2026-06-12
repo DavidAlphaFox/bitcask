@@ -318,3 +318,146 @@ if (!shard.inverted.find(acc, std::string(term))) return 0;  // <--- copy on eve
 | 15 | `fold` 单次 pread 合并 | I/O | ⭐⭐ | 中 |
 
 **推荐的实施顺序**: 先做 #2、#3（改动小、收益确定），然后做 #1（收益最大但改动面广），再推进 #4 和 #5（架构性改进）。
+
+---
+
+## 七、验收基线（2026-06-12，内存批次落地后实测）
+
+> 本节是内存优化批次（P0-1..4 + P1-5..8，见 git log）的验收数据，
+> 也是**将来评估任何池化/分配器方案的对照基线**——先打平或解释这些
+> 数字，再谈引入新机制。
+
+### 7.1 方法
+
+- 工具：`scripts/alloc_audit/alloc_shim.c`（LD_PRELOAD malloc 计数 shim）
+  + `scripts/alloc_audit/alloc_audit.cpp`（分阶段驱动）。统计的是
+  **malloc/calloc/realloc/posix_memalign 调用次数**（不是字节数）——
+  与"热路径 per-op 分配降到 0-1"的验收口径一致。
+- 编译：驱动分别链接基线（HEAD）与优化后工作树的静态库，同一二进制
+  逻辑、同一机器（i9-13900H, tmpfs /tmp）。
+- 负载：put/get = 1024 keyspace × 128B value × 10000 次（覆写态）；
+  fold = 20000 条 record 扫盘；intersect = 2×100K u64（~33% 重叠）
+  ×1000 次；BoolMust = 2 热词 × 20000 docs 全命中 × 100 查询。
+
+### 7.2 结果（次分配 / 操作）
+
+| 指标 | 基线（优化前） | 优化后 | 变化 |
+|---|---|---|---|
+| put（覆写，无 search） | 4.00 | **2.00** | −50%（write_buf_ 复用 ×2） |
+| get（热读） | 4.00 | **3.00** | −25%（pread_into + thread_local 缓冲） |
+| fold（扫盘/条） | 2.00 | **≈0** | 每条 2 次 malloc → 循环复用缓冲 |
+| intersect_u64（out 复用） | 0.017 | **≈0** | — |
+| intersect_u64（out 新建） | 17.0 | **1.00** | push_back 倍增链 → 一次 resize |
+| BoolMust（/查询） | 20064 | 20049 | 见 7.3 ③ |
+
+### 7.2.1 第二批(并发/算法小项)后的更新
+
+同日第二批落地后复测(同方法同负载):
+
+| 指标 | 第一批后 | 第二批后 | 改动 |
+|---|---|---|---|
+| BoolMust（/查询） | 20049 | **39** | bool_search 评分:per-candidate hash 节点播种 → 平行分数数组 + 每词双指针归并(候选与 posting 均已升序) |
+| 其余指标 | — | 持平 | 第二批不触及 |
+
+第二批其余项:`alloc_ord`/`advance_ord` 改 atomic(fetch_add / CAS max,
+不再抢 KeyDir 全局 unique_lock);SearchCache 改 shared_mutex + 计数式
+LRU(get 共享锁并发,顺带修掉「返回内部指针,解锁后可被 evict 释放」的
+既有 UAF 窗口——改返回拷贝);`Cask::read_file` 命中路径改共享锁(双检
+升级);`now_sec_default` 改 CLOCK_REALTIME_COARSE(vDSO,零 syscall)。
+
+验证:GoogleTest 340/340;ASan+UBSan 340/340;TSan 失败集与 HEAD 基线
+逐项对比为严格子集(20 → 19,无新增;既有失败源于本地系统 libtbb 未
+插桩的 parallel_reduce 假阳性,CI 的 TSan 环境不受影响);eunit 44/44。
+
+### 7.3 解读与遗留
+
+1. **get 剩余 3 次**：`ReadRecord` 的 key/value 拷出（2 次）+ 返回
+   结构（1 次）——正是 P2「ReadRecord 零拷贝」（§2.5）的目标，挂 V2。
+2. **put 剩余 2 次**：写路径缓冲已全复用后的余量（keydir/记录簿一侧），
+   下一轮 profiling 再归因；不阻塞验收（≤2 达标口径内）。
+3. **BoolMust ≈ 2 万次/查询，与候选集大小同量级**：分配发生在
+   「完整交集 → 逐候选评分」的评分侧——根因是 per-candidate hash
+   节点播种，**已在第二批修复（→ 39 次/查询，见 §7.2.1）**。
+   注意：分配问题解决后，「完整交集 → 逐候选评分」的**遍历量**问题
+   仍在——top-k 查询仍要触碰全部候选,这部分仍是
+   `doc/kway-blockmax-bmw-zh.md` 路线（k-way + 块级元数据 + BMW）
+   的论据，量级靠 BMW 才能降。
+4. **池化评估门槛（重申）**：仅当某热路径在结构修复后仍有 per-op
+   多次分配、且 profiler 显示 allocator >5% CPU 时，才重启
+   scalable_allocator 评估（决策记录见
+   `doc/inoue-simd-intersection-zh.md` §8.5 同期讨论）。
+
+### 7.4 复现(见文末 §7.4 命令)
+
+---
+
+## 八、三维度深审(2026-06-12:内存安全 / 读写分离 / 文件布局)
+
+> 三路并行代码审计 + 高影响发现逐条对照源码核实。两个审计给出的
+> "CRITICAL" 经核实为**误报**,已剔除并记录理由(防止将来重复提出)。
+
+### 8.1 内存管理与智能指针
+
+**经核实的真问题**:
+
+| # | 位置 | 问题 | 严重度 |
+|---|---|---|---|
+| M1 | cask.cpp read_file + merge 清理 | `read_file()` 返回缓存内 `unique_ptr.get()` 裸指针,调用方锁外使用;并发 merge `read_files_.erase()` 析构 DataFile → 在途 get UAF。窗口窄但机制成立,NIF 内崩的是 BEAM | **高** |
+| M2 | cask.cpp merge unlink 窗口 | erase fd(持锁)→放锁→unlink 之间,持旧 keydir 快照的在途 get lazy reopen:unlink 后打开 ENOENT → 假失败。与 M1 同根 | 低 |
+| M3 | inverted.cpp mutable_pl | CoW 协议(`use_count()==1 ⟺ 无读者`)前提"调用方持写 accessor"仅靠注释维持,无断言/类型强制 | 隐患 |
+| M4 | keydir.hpp CaskIter | 析构与并发 next() 竞态,文档自认,无防护(API 滥用才触发) | 低 |
+
+**剔除的误报**:
+- "IndexPool lambda 引用捕获 SearchLayer 是 UAF"——`close()` 顺序
+  `stop() → index_pool_.reset() → search_.reset()`,且成员声明序保证
+  隐式析构同样先停线程。安全。
+- "InvertedIndex::load() FILE* 泄漏"——全部 `return false` 调用点
+  均带 `fclose`(逐条核过)。无泄漏;14 处手工 fclose 是风格脆弱点,
+  RAII 化属改进非修复。
+
+### 8.2 并发读写分离
+
+已最优(不动):KeyDir MVCC fold、InvertedIndex 64 分片、SearchCache
+计数 LRU、alloc_ord atomic、Index 批量 fill API。
+
+机会(按收益):
+1. ~~fstats_ 原子计数器化~~ **前置核实后不做(O13)**:所有更新都在
+   put/remove 已持有的 unique_lock 内(经 update_fstats_locked),
+   原子化不减少任何锁获取;info() 停顿由同锁的 entries 状态读主导。
+   顺手删除了零调用方的带锁公开 update_fstats。赢面仍是 M6 分片。
+2. **deep_copy() 标记 deprecated**(持锁拷整个 entries_,秒级停顿)。
+3. **M6 分片障碍清单**(已逐项确认,无硬阻塞):epoch_ 保持全局;
+   pending_ 单表 hash 路由;fstats 见 1;fold 保持全局单 fold;
+   唯一需认真 MVCC 推演的是 merge_pending_and_collapse 的 per-shard 化。
+4. 四条锁链方向一致,无死锁风险。
+
+约束重申(M5.3 实测):锁类型替换不解决 KeyDir 扩展性,赢面只在分片。
+
+### 8.3 文件布局(不考虑兼容)
+
+当前:data header 23B/条(小 KV 开销率 62%);hint 18B+key(key 双份);
+WAL entry 无长度前缀无 CRC(半条不可检测);倒排快照 v4 = gap+VByte ords
++ 裸 u32 tf + 28B/128-ord 块元数据;无对齐无 mmap。
+
+| 提案 | 内容 | ROI | 状态 |
+|---|---|---|---|
+| L1 WAL framing | entry 改 `[len][payload][crc32]`,replay 可精确截断/跳损坏。**是将来去 per-entry fflush(§WAL 决策选项 b)的前置** | 高 | → O11 |
+| L2 merge 后生成 hint | ~~merge 产物现无 hint~~ **核实为审计误报**:merger.cpp:108 本来就逐条写 hint + finalize trailer。不做 | — | ❌ |
+| L3 倒排快照 v5 | TF 量化(4B→1B)+ 块内 FOR + 块元数据扩展,**与 kway-blockmax-bmw 的块设计一次定稿** | 中高 | V2 设计 |
+| L4 段快照+增量回放 | open 从 fold 全文件 → 快照+回放尾巴,-90%;即 vector-db-design 的恢复路线 | 高 | V2 |
+| 否决 | 块结构/前缀压缩(破坏单条自包含与 O(1) merge 拷贝);**tstamp delta 同理否决**(需前条上下文,破坏随机 offset 独立解码——审计漏看了这层);WiscKey 暂缓至 V3 向量落地再评估 | — | — |
+
+### 8.4 路线衔接
+
+立即批次结果(→ TASK.md O10-O13):M1/M2 修复(O10 ✅)、L1(O11 ✅);
+O12/O13 实施前核实判为不做(误报/收益为零,理由见上)。V2 节奏:
+L3+L4 与 BMW/恢复路线合并设计。M6:分片按 8.2-3 清单推进。
+
+```bash
+gcc -O2 -shared -fPIC scripts/alloc_audit/alloc_shim.c -o /tmp/alloc_shim.so -ldl
+g++ -O2 -std=c++23 scripts/alloc_audit/alloc_audit.cpp -I cpp/include \
+    -Wl,--start-group _build/cmake/cpp/libbitcask_*.a \
+    _build/cmake/_deps/utf8proc-build/libutf8proc.a -Wl,--end-group \
+    -ltbb -lz -lpthread -ldl -o /tmp/alloc_audit
+LD_PRELOAD=/tmp/alloc_shim.so /tmp/alloc_audit
+```
