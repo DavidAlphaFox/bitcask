@@ -632,6 +632,71 @@ wildcard 词典剪枝（trie/后缀索引工程量大，归入 V6）；LTO（已
 
 ---
 
+## 性能优化第二轮（O10-O13 + 内存批次 ✅）
+
+> 来源：`doc/cpp-optimization-zh.md` §七（验收基线）/ §八（三维度深审）。
+> 三路并行审计 + 高影响发现逐条对照源码核实；两个审计 "CRITICAL" 为误报
+> 已剔除（IndexPool lambda UAF / load() FILE* 泄漏，理由见 §8.1）。
+
+### ✅ 内存优化批次（2026-06-12，两批）
+
+第一批（P0-1..4 + P1-5..8）：live_ 去 vector<bool>；data/hint 写路径成员
+复用缓冲；WAL 整条编码一次 fwrite（顺手消掉 add_doc→WAL 的整 map 深拷贝）；
+交集内核预分配+裸指针游标；pread_into + fold/get 缓冲复用；score_bow_topk
+去 hash map；IndexTask key/text 合并单分配；fstats_ 改 vector 下标。
+第二批：bool_search 评分 per-candidate hash 播种 → 平行数组+双指针归并
+（**20049 → 39 次分配/查询**）；alloc_ord/advance_ord atomic；SearchCache
+shared_mutex+计数 LRU（顺手修返回内部指针的 UAF 窗口）；read_file 双检
+共享锁；now_sec_default → CLOCK_REALTIME_COARSE。
+验收数字（LD_PRELOAD malloc 计数，`scripts/alloc_audit/`）：put 4→2、
+get 4→3、fold 2→0、intersect 17→1 次/操作。回归：ctest 340/340 +
+ASan/UBSan 340/340 + TSan 失败集为 HEAD 严格子集（既有 libtbb 假阳性）
++ eunit 44/44。
+
+### O10 — read_file 生命周期修复（UAF + ENOENT 窗口）
+
+**目标**：`read_files_` 缓存改存 `shared_ptr<DataFile>`，`read_file()` 返回
+shared_ptr（引用计数 pin 住在途读，merge erase 不再析构正在使用的对象）；
+merge 清理把 unlink 收进 read_cache_mu_ 锁内（封死 ENOENT 假失败窗口）。
+
+| # | 目标 | 改动范围 | 关键内容 | 状态 |
+|---|------|---------|---------|------|
+| **O10.1** | shared_ptr 缓存 | cask.hpp / cask.cpp | read_files_ 值类型、read_file 返回值、全部调用方 | ☐ |
+| **O10.2** | unlink 进锁 | cask.cpp merge 尾部 | erase + unlink 同临界区（冷路径，可持锁做文件系统操作） | ☐ |
+| **O10.3** | 回归 | 全量 | ctest + ASan/UBSan + eunit | ☐ |
+
+### O11 — WAL entry framing（[len][payload][crc32]）
+
+**目标**：WAL entry 加长度前缀 + CRC32，replay 可检测半条 entry、精确截断、
+跳过损坏条目。这是将来"去 per-entry fflush"（WAL 决策选项 b）的前置。
+不向后兼容（约定：不考虑兼容性），replay 直接按新格式。
+
+| # | 目标 | 改动范围 | 关键内容 | 状态 |
+|---|------|---------|---------|------|
+| **O11.1** | 写侧 framing | inverted_wal.cpp | enc_buf_ 前置 4B len 占位 + 末尾 crc32(payload)，一次 fwrite | ☐ |
+| **O11.2** | replay 校验 | inverted_wal.cpp | len 越界/CRC 不符 → 截断至上一完整 entry,返回已回放数 | ☐ |
+| **O11.3** | 损坏注入测试 | inverted_wal_test.cpp | 截尾/翻转字节两类注入，replay 不读坏数据 | ☐ |
+
+### O12 — merge 后为产物生成 hint ❌（审计误报，核实后不做）
+
+**核实结论**：merger.cpp 的重写循环**本来就逐条写 hint**（merger.cpp:108
+`out_hint->write`）且结束时 `finalize()` 封 trailer CRC（merger.cpp:153）。
+"merge 产物无 hint、open 被迫 fold(data)" 是布局审计的误报。无事可做。
+
+### O13 — fstats 原子计数器化 ❌（前置核实后不做）
+
+**核实结论**：所有 fstats 更新都经私有 `update_fstats_locked`，发生在
+put/remove **已持有**的 unique_lock 内——原子化不会从写路径移除任何一次
+锁获取，收益≈0；`info()` 的停顿被 entries 相关状态的同锁读主导，单独
+原子化 fstats 救不动。真正的赢面仍是 M6 分片（见 doc §8.2 障碍清单）。
+**顺手清理**：带锁公开版 `update_fstats` 零调用方，已删除（API 收窄）。
+
+**记录在案（不实施）**：mutable_pl CoW 协议加断言——无法在运行时检查
+"调用方持写 accessor"，类型封装收益/改动比不划算，维持注释约定（M3）；
+CaskIter 析构竞态（M4）——API 滥用才触发，文档已警示。
+
+---
+
 ## 未来任务
 
 ### P1 — 查询路径 PostingList 零拷贝（Phase 1 ✅ + Phase 2-min ✅）
