@@ -42,6 +42,7 @@
 #include <memory>
 #include <random>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace bitcask::vec {
@@ -90,6 +91,33 @@ public:
         return max_inserted_ord_.load(std::memory_order_relaxed);
     }
     [[nodiscard]] const HnswConfig& config() const noexcept { return cfg_; }
+
+    // ---- V3.5:重建用只读访问(merge 物理清死,SearchLayer::rebuild_hnsw)----
+    // 前置:id < size()(已发布节点)。vec 的底层存储地址稳定(chunk 定容)。
+    [[nodiscard]] std::uint64_t node_ord(std::uint32_t id) const {
+        return ord_of(id);
+    }
+    [[nodiscard]] std::span<const float> node_vec(std::uint32_t id) const {
+        return {vec_of(id), cfg_.dim};
+    }
+
+    // ---- V3.5:快照持久化(BCVS v1,设计 doc/hnsw-design-zh.md §5)----
+    // 外壳与 BCKS/BCIS 同款:[magic "BCVS"][ver u32=1][payload][crc32(payload)],
+    // tmp+rename 原子落盘。payload 存完整图(向量+邻接+entry)——重插的
+    // 距离计算才是开库慢的大头,只存向量等于没省。
+    //
+    // save:线程安全(遵守读者协议:entry/count acquire 快照 + per-node 锁
+    // 拷邻接,≥ 快照水位的邻居 id 一律滤掉)。落盘的 max_inserted_ord 取
+    // **已保存节点的最大 ord**(= ord_of(n-1)),而非 max_inserted_ord_ 原子
+    // ——后者在写者 mid-insert 时可能领先于 count 发布,照抄会让重开后的
+    // 水位幂等错杀该文档的尾部回放。静止点(close/merge flush 后)两者相等。
+    [[nodiscard]] bool save(std::string_view path) const;
+    // load:仅 open 期单线程调用(空图上,不可与任何读写并发)。校验:
+    // config(dim/metric/M)一致、邻居/entry id < count、level/cnt 不超容、
+    // ord 严格递增、邻居层数覆盖(layer-l 表只允许 level ≥ l 的节点,防
+    // copy_neighbors 越块读)——任何违例**整体拒绝**返回 false(本实例
+    // 报废,调用方弃之换全量 fold;绝不半载示人)。
+    [[nodiscard]] bool load(std::string_view path);
 
 private:
     static constexpr std::uint32_t kChunkBits = 16;

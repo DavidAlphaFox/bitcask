@@ -2,12 +2,15 @@
 // 工程选择见 doc/hnsw-design-zh.md §2,并发协议见 §3 与 hnsw.hpp 文件头。
 
 #include "bitcask/hnsw.hpp"
+#include "bitcask/codec.hpp"
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <queue>
+#include <string>
 
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
@@ -449,6 +452,254 @@ std::vector<HnswIndex::Hit> HnswIndex::search(
         if (hits.size() >= k) break;
     }
     return hits;
+}
+
+// ---- V3.5:BCVS v1 快照(协议注释见 hnsw.hpp;格式见设计 §5)----
+//
+// payload 布局(LE):
+//   dim u16 | metric u8 | M u32 | ef_construction u32 | seed u64
+//   count u32 | entry_meta u64 | max_inserted_ord u64
+//   count 个节点(节点 id 即写出顺序 0..count-1,邻接 id 引用该编号):
+//     ord u64 | level u8 | vec f32×dim | (level+1) 层: cnt u32 | cnt×u32 id
+
+namespace {
+
+constexpr std::uint32_t kBcvsMagic   = 0x42435653;  // "BCVS"
+constexpr std::uint32_t kBcvsVersion = 1;
+
+void vs_put16(std::vector<std::uint8_t>& b, std::uint16_t v) {
+    const auto* p = reinterpret_cast<const std::uint8_t*>(&v);
+    b.insert(b.end(), p, p + 2);
+}
+void vs_put32(std::vector<std::uint8_t>& b, std::uint32_t v) {
+    const auto* p = reinterpret_cast<const std::uint8_t*>(&v);
+    b.insert(b.end(), p, p + 4);
+}
+void vs_put64(std::vector<std::uint8_t>& b, std::uint64_t v) {
+    const auto* p = reinterpret_cast<const std::uint8_t*>(&v);
+    b.insert(b.end(), p, p + 8);
+}
+
+}  // namespace
+
+bool HnswIndex::save(std::string_view path) const {
+    // 读者协议快照:entry 先于 count(同 search;entry 发布 happens-after
+    // 其 count 发布)。n 之后追加的节点/反向边一律不进本快照。
+    const std::uint64_t em = entry_meta_.load(std::memory_order_acquire);
+    const std::uint32_t n  = count_.load(std::memory_order_acquire);
+    // entry 必 < n(发布序保证);防御性兜底:不一致就放弃本次快照。
+    if (em != 0 && static_cast<std::uint32_t>(em & 0xFFFFFFFFu) >= n) {
+        return false;
+    }
+
+    std::vector<std::uint8_t> buf;
+    buf.reserve(64 + static_cast<std::size_t>(n) *
+                         (16 + static_cast<std::size_t>(cfg_.dim) * 4 +
+                          (1 + cfg_.M * 2) * 4));
+    vs_put32(buf, kBcvsMagic);
+    vs_put32(buf, kBcvsVersion);
+    vs_put16(buf, cfg_.dim);
+    buf.push_back(static_cast<std::uint8_t>(cfg_.metric));
+    vs_put32(buf, cfg_.M);
+    vs_put32(buf, cfg_.ef_construction);
+    vs_put64(buf, cfg_.seed);
+    vs_put32(buf, n);
+    vs_put64(buf, em);
+    // 落盘水位 = 已保存节点的最大 ord(见 hpp:不抄 max_inserted_ord_ 原子,
+    // 防 mid-insert 领先 count 的窗口;ord 按插入序单调 → 尾节点即最大)。
+    vs_put64(buf, n > 0 ? ord_of(n - 1) : static_cast<std::uint64_t>(-1));
+
+    std::vector<std::uint32_t> scratch(1 + cfg_.M * 2);
+    for (std::uint32_t id = 0; id < n; ++id) {
+        const NodeChunk* c = chunk_of(id);
+        const std::uint32_t slot = id & kChunkMask;
+        vs_put64(buf, c->ords[slot]);
+        const std::uint8_t level = c->levels[slot];
+        buf.push_back(level);
+        const auto* v = reinterpret_cast<const std::uint8_t*>(
+            c->vecs.data() + static_cast<std::size_t>(slot) * cfg_.dim);
+        buf.insert(buf.end(), v,
+                   v + static_cast<std::size_t>(cfg_.dim) * sizeof(float));
+        for (std::uint32_t l = 0; l <= level; ++l) {
+            // 持节点锁拷邻接(与并发写者互斥);≥ n 的邻居(快照水位外的
+            // 反向边)滤掉,保证文件内不变量 id < count。
+            const std::uint32_t cnt = copy_neighbors(id, l, scratch.data());
+            std::uint32_t kept = 0;
+            for (std::uint32_t i = 0; i < cnt; ++i) {
+                if (scratch[i] < n) ++kept;
+            }
+            vs_put32(buf, kept);
+            for (std::uint32_t i = 0; i < cnt; ++i) {
+                if (scratch[i] < n) vs_put32(buf, scratch[i]);
+            }
+        }
+    }
+
+    const std::uint32_t crc = bitcask::codec::crc32(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(buf.data() + 8), buf.size() - 8));
+    vs_put32(buf, crc);
+
+    const std::string fp(path);
+    const std::string tmp = fp + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+    const bool wrote = std::fwrite(buf.data(), 1, buf.size(), f) == buf.size();
+    std::fclose(f);
+    if (!wrote || std::rename(tmp.c_str(), fp.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+bool HnswIndex::load(std::string_view path) {
+    // open 期单线程(本实例尚未发布给任何读者)——成员虽是 atomic,直填
+    // relaxed 即可;对外可见性由调用方的发布点(shared_ptr atomic store /
+    // count_ release)建立。
+    assert(count_.load(std::memory_order_relaxed) == 0 &&
+           "HnswIndex::load: 仅限空图(open 期)调用");
+
+    std::FILE* f = std::fopen(std::string(path).c_str(), "rb");
+    if (!f) return false;
+    std::fseek(f, 0, SEEK_END);
+    const long fsz = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    // 最小:magic+ver+header(39)+crc。
+    if (fsz < 51) { std::fclose(f); return false; }
+    std::vector<std::uint8_t> buf(static_cast<std::size_t>(fsz));
+    const bool rd = std::fread(buf.data(), 1, buf.size(), f) == buf.size();
+    std::fclose(f);
+    if (!rd) return false;
+
+    auto rd32at = [&](std::size_t off) {
+        std::uint32_t v;
+        std::memcpy(&v, buf.data() + off, 4);
+        return v;
+    };
+    if (rd32at(0) != kBcvsMagic || rd32at(4) != kBcvsVersion) return false;
+    std::uint32_t stored_crc = 0;
+    std::memcpy(&stored_crc, buf.data() + buf.size() - 4, 4);
+    const std::uint32_t crc = bitcask::codec::crc32(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(buf.data() + 8), buf.size() - 12));
+    if (crc != stored_crc) return false;
+
+    const std::uint8_t* p   = buf.data() + 8;
+    const std::uint8_t* end = buf.data() + buf.size() - 4;
+    auto need = [&](std::size_t nb) {
+        return static_cast<std::size_t>(end - p) >= nb;
+    };
+
+    std::uint16_t dim;
+    std::memcpy(&dim, p, 2); p += 2;
+    const std::uint8_t metric = *p++;
+    std::uint32_t m, efc;
+    std::memcpy(&m, p, 4); p += 4;
+    std::memcpy(&efc, p, 4); p += 4;
+    p += 8;  // seed:信息留档,不参与校验(层数随机性不影响图有效性)
+    (void)efc;
+    // config 一致性:dim/metric/M 决定布局与距离语义,任一不符整体拒绝。
+    if (dim != cfg_.dim || metric != static_cast<std::uint8_t>(cfg_.metric) ||
+        m != cfg_.M) {
+        return false;
+    }
+
+    std::uint32_t cnt = 0;
+    std::uint64_t em = 0, max_ord = 0;
+    std::memcpy(&cnt, p, 4); p += 4;
+    std::memcpy(&em, p, 8); p += 8;
+    std::memcpy(&max_ord, p, 8); p += 8;
+    if (cnt > kMaxChunks * static_cast<std::uint64_t>(kChunkSize)) return false;
+    if (cnt == 0) {
+        // 空图:entry 必须也为空,水位必须为 -1。
+        if (em != 0 || max_ord != static_cast<std::uint64_t>(-1) || p != end) {
+            return false;
+        }
+        return true;
+    }
+    const auto entry_id    = static_cast<std::uint32_t>(em & 0xFFFFFFFFu);
+    const auto entry_level = static_cast<std::int64_t>(em >> 32) - 1;
+    if (em == 0 || entry_id >= cnt || entry_level < 0 || entry_level > 31) {
+        return false;
+    }
+
+    const std::size_t vec_bytes =
+        static_cast<std::size_t>(cfg_.dim) * sizeof(float);
+    std::uint64_t prev_ord = 0;
+    bool have_prev = false;
+    for (std::uint32_t id = 0; id < cnt; ++id) {
+        const std::uint32_t ci = id >> kChunkBits;
+        NodeChunk* c = chunks_[ci].load(std::memory_order_relaxed);
+        if (c == nullptr) {
+            c = new NodeChunk(cfg_.dim);
+            chunks_[ci].store(c, std::memory_order_relaxed);
+        }
+        const std::uint32_t slot = id & kChunkMask;
+
+        if (!need(9 + vec_bytes)) return false;
+        std::uint64_t ord;
+        std::memcpy(&ord, p, 8); p += 8;
+        // ord 严格递增是写者不变量(插入序分配),也是水位幂等的前提。
+        if (have_prev && ord <= prev_ord) return false;
+        prev_ord = ord;
+        have_prev = true;
+        const std::uint8_t level = *p++;
+        if (level > 31) return false;
+        std::memcpy(c->vecs.data() + static_cast<std::size_t>(slot) * cfg_.dim,
+                    p, vec_bytes);
+        p += vec_bytes;
+        c->ords[slot]   = ord;
+        c->levels[slot] = level;
+        const std::size_t slots =
+            (1 + cfg_.M * 2) + static_cast<std::size_t>(level) * (1 + cfg_.M);
+        auto* adj = new std::uint32_t[slots]();
+        c->adj[slot] = adj;  // 失败路径由 ~NodeChunk 统一回收
+        for (std::uint32_t l = 0; l <= level; ++l) {
+            if (!need(4)) return false;
+            std::uint32_t nb_cnt;
+            std::memcpy(&nb_cnt, p, 4); p += 4;
+            if (nb_cnt > layer_cap(l)) return false;
+            if (!need(static_cast<std::size_t>(nb_cnt) * 4)) return false;
+            std::uint32_t* row = adj + layer_off(l);
+            row[0] = nb_cnt;
+            for (std::uint32_t i = 0; i < nb_cnt; ++i) {
+                std::uint32_t nid;
+                std::memcpy(&nid, p, 4); p += 4;
+                if (nid >= cnt || nid == id) return false;
+                row[i + 1] = nid;
+            }
+        }
+    }
+    if (p != end) return false;
+    // 水位与尾节点 ord 必一致(save 即按此落盘;不符 = 文件不自洽)。
+    if (max_ord != prev_ord) return false;
+
+    // 第二遍:邻居层数覆盖校验——layer-l 表只允许 level ≥ l 的节点,
+    // 否则 copy_neighbors(nid, l) 会越过其邻接块(内存安全,非仅逻辑)。
+    // 顺带校验 entry 的 level 与 entry_meta 一致。
+    auto level_of = [&](std::uint32_t id) -> std::uint8_t {
+        return chunks_[id >> kChunkBits]
+            .load(std::memory_order_relaxed)
+            ->levels[id & kChunkMask];
+    };
+    if (level_of(entry_id) != static_cast<std::uint8_t>(entry_level)) {
+        return false;
+    }
+    for (std::uint32_t id = 0; id < cnt; ++id) {
+        const NodeChunk* c = chunk_of(id);
+        const std::uint32_t slot = id & kChunkMask;
+        const std::uint32_t* adj = c->adj[slot];
+        for (std::uint32_t l = 0; l <= c->levels[slot]; ++l) {
+            const std::uint32_t* row = adj + layer_off(l);
+            for (std::uint32_t i = 1; i <= row[0]; ++i) {
+                if (level_of(row[i]) < l) return false;
+            }
+        }
+    }
+
+    max_inserted_ord_.store(max_ord, std::memory_order_relaxed);
+    entry_meta_.store(em, std::memory_order_relaxed);
+    count_.store(cnt, std::memory_order_release);
+    return true;
 }
 
 }  // namespace bitcask::vec
