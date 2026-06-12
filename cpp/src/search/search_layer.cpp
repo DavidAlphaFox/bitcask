@@ -184,11 +184,13 @@ SearchLayer::search_text(std::string_view query, std::size_t k,
     if (term_freqs.empty()) return std::vector<SearchHit>{};
 
     auto cache_key = CacheKey::make("text", query, k);
-    auto* cached = params_override ? nullptr : cache_.get(cache_key);
+    auto cached = params_override
+                      ? std::optional<std::vector<bm25::SearchResult>>{}
+                      : cache_.get(cache_key);
 
     std::vector<bm25::SearchResult> results;
     if (cached) {
-        results = *cached;
+        results = std::move(*cached);
     } else {
         std::vector<std::string> terms;
         terms.reserve(term_freqs.size());
@@ -223,11 +225,13 @@ SearchLayer::search_phrase(std::string_view query, std::size_t k,
     if (tpm.empty()) return std::vector<SearchHit>{};
 
     auto cache_key = CacheKey::make("phrase", query, k);
-    auto* cached = params_override ? nullptr : cache_.get(cache_key);
+    auto cached = params_override
+                      ? std::optional<std::vector<bm25::SearchResult>>{}
+                      : cache_.get(cache_key);
 
     std::vector<bm25::SearchResult> results;
     if (cached) {
-        results = *cached;
+        results = std::move(*cached);
     } else {
         std::vector<std::pair<std::uint32_t, std::string>> ordered;  // (position, term)
         for (auto& [term, data] : tpm) {
@@ -319,11 +323,13 @@ SearchLayer::bool_search(std::string_view query, std::size_t k,
     }
 
     auto cache_key = CacheKey::make("bool", query, k);
-    auto* cached = params_override ? nullptr : cache_.get(cache_key);
+    auto cached = params_override
+                      ? std::optional<std::vector<bm25::SearchResult>>{}
+                      : cache_.get(cache_key);
 
     std::vector<bm25::SearchResult> results;
     if (cached) {
-        results = *cached;
+        results = std::move(*cached);
     } else {
         const auto* inv = field_index(kDefaultField);
         if (inv) results = inv->bool_search(query_node, k, index_, params_override);
@@ -582,11 +588,11 @@ SearchLayer::search_text_highlight(std::string_view query, std::size_t k,
     if (term_freqs.empty()) return std::vector<SearchHitEx>{};
 
     auto cache_key = CacheKey::make("highlight", query, k);
-    auto* cached = cache_.get(cache_key);
+    auto cached = cache_.get(cache_key);
 
     std::vector<bm25::SearchResult> results;
     if (cached) {
-        results = *cached;
+        results = std::move(*cached);
     } else {
         std::vector<std::string> terms;
         terms.reserve(term_freqs.size());
