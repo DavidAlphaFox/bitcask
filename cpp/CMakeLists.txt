@@ -156,6 +156,17 @@ target_link_libraries(bitcask_bm25
     PRIVATE bitcask_warnings bitcask_sanitizers TBB::tbb)
 
 # ---------------------------------------------------------------------------
+# bitcask_vector — HNSW 向量索引(V3,doc/hnsw-design-zh.md)。
+# ---------------------------------------------------------------------------
+add_library(bitcask_vector STATIC
+    src/vector/hnsw.cpp
+)
+target_include_directories(bitcask_vector PUBLIC include)
+target_link_libraries(bitcask_vector
+    PRIVATE bitcask_warnings bitcask_sanitizers
+)
+
+# ---------------------------------------------------------------------------
 # bitcask_search — SearchLayer (Index + InvertedIndex + Analyzer wrapper).
 # ---------------------------------------------------------------------------
 add_library(bitcask_search STATIC
@@ -165,7 +176,7 @@ add_library(bitcask_search STATIC
 )
 target_include_directories(bitcask_search PUBLIC include)
 target_link_libraries(bitcask_search
-    PUBLIC  bitcask_index bitcask_bm25 bitcask_text
+    PUBLIC  bitcask_index bitcask_bm25 bitcask_text bitcask_vector
     PRIVATE bitcask_warnings bitcask_sanitizers
 )
 

@@ -887,6 +887,26 @@ search 路径 ord 恒由 keydir 分配,无复用风险)。
 
 ---
 
+## V3 — HNSW 向量检索(设计定稿 ◐,实施排程)
+
+> 设计:`doc/hnsw-design-zh.md`。边界已与 owner 定稿:引擎只收向量
+> 不算向量(embedding 走 Erlang 层 behaviour);dim 库内恒定、
+> VectorConfig 显式初始化进 meta;cosine = 写入归一化 + 内积;
+> 持久化复用 A4 五块快照 + covers 门;data file 即向量 WAL。
+
+| # | 内容 | 状态 |
+|---|------|------|
+| V3.0 | 设计文档定稿(结构/并发/持久化/七步实施表/红线) | ✅ |
+| V3.1 | meta VectorConfig(保留区零兼容启用)+ CaskOptions/open 双向校验 + put_doc 校验/cosine 写入归一化 + get 透传 + 黄金字节锁格式。测试 +4,plain/ASan/TSan 361/361 + eunit 44/44 | ✅ |
+| V3.2 | HNSW 核心落地(bitcask_vector 新库:分层图/启发式选边/邻居收缩/AVX2-FMA 内核分发/ord 水位幂等/live 钩子)。召回:32d/10k 过线 **≥0.95@ef64、≥0.99@ef256**;384d 收敛曲线 0.824/0.960/0.996/1.0(ef64..512,纯随机高维最坏形态,标定 ef128/256≥0.93/0.98)。测试 +8;plain/ASan/TSan 369/369 + eunit 44/44 | ✅ |
+| V3.3 | 并发化(per-node 锁 + 发布式增长)+ IndexPool 接线;TSan 门禁 | ☐ |
+| V3.4 | 软删 + LiveChecker | ☐ |
+| V3.5 | vec/hnsw 快照并入 A4 covers 门 + merge 重建 | ☐ |
+| V3.6 | search_hybrid RRF + NIF 接口 | ☐ |
+| V3.7 | 基准定稿(红线:100k/ef64 < 1ms 查询;插入 > 2k/s @384d) | ☐ |
+
+---
+
 ## 未来任务
 
 ### P1 — 查询路径 PostingList 零拷贝（Phase 1 ✅ + Phase 2-min ✅）

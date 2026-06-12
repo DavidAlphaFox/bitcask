@@ -20,7 +20,12 @@ class CaskDocValueTest : public ::testing::Test {
 protected:
     void SetUp() override {
         namespace fs = std::filesystem;
-        tmpdir_ = std::filesystem::temp_directory_path() / "bitcask_docvalue_test";
+        // V3.3:目录加测试名后缀——ctest 按 case 并行调度,共享固定目录
+        // 会被并发 case 的 SetUp/TearDown 互相清掉(实测偶发互踩)。
+        const auto* info =
+            ::testing::UnitTest::GetInstance()->current_test_info();
+        tmpdir_ = std::filesystem::temp_directory_path() /
+                  (std::string("bitcask_docvalue_test_") + info->name());
         std::error_code ec;
         std::filesystem::remove_all(tmpdir_, ec);
         std::filesystem::create_directories(tmpdir_, ec);
@@ -1024,4 +1029,191 @@ TEST_F(CaskDocValueTest, SearchSnapshotCorruptSidecarFallsBack) {
     EXPECT_EQ(sr->hits.size(), 120u);
     EXPECT_TRUE((*c)->get(sv_bytes(std::string("k99"))));
     (*c)->close();
+}
+
+// ── V3.1:DocValue vector 段 + meta VectorConfig 打通 ────────────────────
+
+namespace {
+CaskOptions v31_opts(std::uint16_t dim) {
+    auto opts = p3_search_opts();
+    opts.vector_dim = dim;
+    return opts;
+}
+}  // namespace
+
+// 写入归一化 + get 透传 + 重开持久(cosine_normalized 默认度量)。
+TEST_F(CaskDocValueTest, V31VectorRoundTripNormalized) {
+    auto opts = v31_opts(4);
+    const float raw[4] = {3.0f, 4.0f, 0.0f, 0.0f};   // 模长 5
+    std::vector<std::byte> key{std::byte{'k'}};
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        bitcask::DocInput doc;
+        const std::string text = "hello vec";
+        doc.text = sv_bytes(text);
+        doc.vector = std::span<const float>(raw, 4);
+        ASSERT_TRUE((*c)->put_doc(key, doc, 1000));
+
+        auto g = (*c)->get(key);
+        ASSERT_TRUE(g);
+        ASSERT_EQ(g->vector.size(), 4u);
+        EXPECT_FLOAT_EQ(g->vector[0], 0.6f);
+        EXPECT_FLOAT_EQ(g->vector[1], 0.8f);
+        (*c)->close();
+    }
+    // 重开(快照路径)后向量仍在(data file 为 source of truth)。
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+    auto g = (*c)->get(key);
+    ASSERT_TRUE(g);
+    ASSERT_EQ(g->vector.size(), 4u);
+    EXPECT_FLOAT_EQ(g->vector[0], 0.6f);
+    EXPECT_FLOAT_EQ(g->vector[1], 0.8f);
+    (*c)->close();
+}
+
+// 校验:dim 不符 / 未配置却带向量 / cosine 下零向量,全部拒绝。
+TEST_F(CaskDocValueTest, V31VectorValidation) {
+    std::vector<std::byte> key{std::byte{'k'}};
+    const std::string text = "t";
+    {
+        auto c = Cask::open(tmpdir_.string(), v31_opts(4));
+        ASSERT_TRUE(c);
+        bitcask::DocInput doc;
+        doc.text = sv_bytes(text);
+        const float wrong[2] = {1.0f, 2.0f};
+        doc.vector = std::span<const float>(wrong, 2);
+        auto r = (*c)->put_doc(key, doc, 1000);
+        ASSERT_FALSE(r);
+        EXPECT_EQ(r.error().kind, bitcask::CaskError::kInvalidOption);
+
+        const float zeros[4] = {0, 0, 0, 0};
+        doc.vector = std::span<const float>(zeros, 4);
+        r = (*c)->put_doc(key, doc, 1000);
+        ASSERT_FALSE(r);
+        EXPECT_EQ(r.error().kind, bitcask::CaskError::kInvalidOption);
+        (*c)->close();
+    }
+    // 未配置向量的集合拒收向量(新目录,search 模式 dim=0)。
+    auto tmp2 = tmpdir_ / "novec";
+    std::filesystem::create_directories(tmp2);
+    auto c2 = Cask::open(tmp2.string(), p3_search_opts());
+    ASSERT_TRUE(c2);
+    bitcask::DocInput doc;
+    doc.text = sv_bytes(text);
+    const float v4[4] = {1, 0, 0, 0};
+    doc.vector = std::span<const float>(v4, 4);
+    auto r = (*c2)->put_doc(key, doc, 1000);
+    ASSERT_FALSE(r);
+    EXPECT_EQ(r.error().kind, bitcask::CaskError::kInvalidOption);
+    (*c2)->close();
+}
+
+// 重开配置必须与 meta 一致:dim 改变 / 去掉向量配置 → kModeMismatch。
+TEST_F(CaskDocValueTest, V31MetaVectorMismatchOnReopen) {
+    {
+        auto c = Cask::open(tmpdir_.string(), v31_opts(4));
+        ASSERT_TRUE(c);
+        (*c)->close();
+    }
+    auto bad_dim = Cask::open(tmpdir_.string(), v31_opts(8));
+    ASSERT_FALSE(bad_dim);
+    EXPECT_EQ(bad_dim.error().kind, bitcask::CaskError::kModeMismatch);
+
+    auto no_vec = Cask::open(tmpdir_.string(), p3_search_opts());
+    ASSERT_FALSE(no_vec);
+    EXPECT_EQ(no_vec.error().kind, bitcask::CaskError::kModeMismatch);
+
+    auto ok = Cask::open(tmpdir_.string(), v31_opts(4));
+    EXPECT_TRUE(ok);
+    if (ok) (*ok)->close();
+}
+
+// ── V3.3:HNSW 并发化 + IndexPool 接线(端到端)──────────────────────────
+
+// put_doc(带向量)→ IndexPool → HNSW;search_vector 命中最近者;
+// remove 后 live 过滤;close+reopen(向量集合走全量 fold)恢复接线。
+TEST_F(CaskDocValueTest, V33VectorSearchEndToEnd) {
+    auto opts = v31_opts(4);
+    const std::string k1 = "k1", k2 = "k2", k3 = "k3";
+    const float v1[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    const float v2[4] = {0.0f, 1.0f, 0.0f, 0.0f};
+    const float v3[4] = {0.7f, 0.7f, 0.0f, 0.0f};   // 归一化后 (0.7071, 0.7071)
+    const float q[4]  = {2.0f, 0.0f, 0.0f, 0.0f};   // 未归一化查询(引擎归一化)
+
+    auto put_vec_doc = [&](Cask& c, const std::string& key, const float* v) {
+        bitcask::DocInput doc;
+        const std::string text = "doc " + key;
+        doc.text = sv_bytes(text);
+        doc.vector = std::span<const float>(v, 4);
+        ASSERT_TRUE(c.put_doc(sv_bytes(key), doc, 1000));
+    };
+
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        put_vec_doc(**c, k1, v1);
+        put_vec_doc(**c, k2, v2);
+        put_vec_doc(**c, k3, v3);
+        (*c)->flush_index();
+
+        auto r = (*c)->search_vector(std::span<const float>(q, 4), 3);
+        ASSERT_TRUE(r);
+        ASSERT_EQ(r->hits.size(), 3u);
+        EXPECT_EQ(r->hits[0].key, k1);              // cos=1.0 最近
+        EXPECT_NEAR(r->hits[0].score, 1.0, 1e-5);
+        EXPECT_EQ(r->hits[1].key, k3);              // cos≈0.7071
+        EXPECT_NEAR(r->hits[1].score, 0.7071, 1e-3);
+        EXPECT_EQ(r->hits[2].key, k2);              // cos=0
+
+        // remove k1 → live 过滤,死节点不出现(图内仍作路标)。
+        ASSERT_TRUE((*c)->remove(sv_bytes(k1)));
+        auto r2 = (*c)->search_vector(std::span<const float>(q, 4), 3);
+        ASSERT_TRUE(r2);
+        ASSERT_EQ(r2->hits.size(), 2u);
+        EXPECT_EQ(r2->hits[0].key, k3);
+        for (const auto& h : r2->hits) EXPECT_NE(h.key, k1);
+        (*c)->close();
+    }
+
+    // reopen:V3.3 向量集合强制全量 fold(HNSW 持久化是 V3.5)——
+    // 恢复路径 recover_doc(…, vector) 重建图;k1 的墓碑令其仍被滤掉。
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+    auto r = (*c)->search_vector(std::span<const float>(q, 4), 3);
+    ASSERT_TRUE(r);
+    ASSERT_EQ(r->hits.size(), 2u);
+    EXPECT_EQ(r->hits[0].key, k3);
+    EXPECT_NEAR(r->hits[0].score, 0.7071, 1e-3);
+    EXPECT_EQ(r->hits[1].key, k2);
+    for (const auto& h : r->hits) EXPECT_NE(h.key, k1);
+
+    // 错误路径:零向量查询 → 空命中(非错误)。
+    const float zq[4] = {0, 0, 0, 0};
+    auto rz = (*c)->search_vector(std::span<const float>(zq, 4), 3);
+    ASSERT_TRUE(rz);
+    EXPECT_TRUE(rz->hits.empty());
+    (*c)->close();
+
+    // 无向量配置的 search 集合 → kInvalidOption;KV 集合 → kNoIndex。
+    auto tmp2 = tmpdir_ / "novec33";
+    std::filesystem::create_directories(tmp2);
+    auto c2 = Cask::open(tmp2.string(), p3_search_opts());
+    ASSERT_TRUE(c2);
+    auto bad = (*c2)->search_vector(std::span<const float>(q, 4), 3);
+    ASSERT_FALSE(bad);
+    EXPECT_EQ(bad.error().kind, bitcask::CaskError::kInvalidOption);
+    (*c2)->close();
+
+    auto tmp3 = tmpdir_ / "kv33";
+    std::filesystem::create_directories(tmp3);
+    CaskOptions kv_opts;
+    kv_opts.read_write = true;
+    auto c3 = Cask::open(tmp3.string(), kv_opts);
+    ASSERT_TRUE(c3);
+    auto bad2 = (*c3)->search_vector(std::span<const float>(q, 4), 3);
+    ASSERT_FALSE(bad2);
+    EXPECT_EQ(bad2.error().kind, bitcask::CaskError::kNoIndex);
+    (*c3)->close();
 }

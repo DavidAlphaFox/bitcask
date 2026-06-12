@@ -185,6 +185,14 @@ target_link_libraries(bitcask_fuzzy_test PRIVATE
     bitcask_sanitizers
 )
 
+add_executable(bitcask_hnsw_test hnsw_test.cpp)
+target_link_libraries(bitcask_hnsw_test PRIVATE
+    GTest::gtest_main
+    bitcask_vector
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 include(GoogleTest)
 
 # C1:TSan 下给所有测试注入 suppression 文件(见 cmake/tsan.supp 头注释:
@@ -216,6 +224,7 @@ gtest_discover_tests(bitcask_highlighter_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_wildcard_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_synonym_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_fuzzy_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_hnsw_test ${_bitcask_test_props})
 
 add_executable(bitcask_thread_pool_test thread_pool_test.cpp)
 target_link_libraries(bitcask_thread_pool_test PRIVATE
