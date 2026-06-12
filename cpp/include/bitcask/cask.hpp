@@ -84,6 +84,10 @@ struct CaskOptions {
     // search_config.has_value() 时才真正创建 SearchLayer。
     bool enable_search = false;
     std::optional<search::SearchLayerConfig> search_config;
+    // V3.1:向量配置(hnsw-design §1)。dim>0 即启用,要求 enable_search;
+    // 创建时写入 meta,重开校验不符 → kModeMismatch。库内 dim 恒定。
+    std::uint16_t vector_dim = 0;
+    meta::VectorMetric vector_metric = meta::VectorMetric::kCosineNormalized;
 };
 
 // --- 错误码 ------------------------------------------------------------------
@@ -111,6 +115,7 @@ struct CaskFault {
 struct GetResult {
     std::vector<std::byte> value;  // DocValue 解码后的 text 段（纯 binary）
     std::vector<std::byte> meta;   // DocValue 解码后的 meta 段（可为空）
+    std::vector<float> vector;     // V3.1:向量段(空 = 该文档无向量)
     std::uint32_t tstamp = 0;
     std::uint64_t ord = 0;
 };
@@ -124,6 +129,9 @@ struct TextSearchResult {
 struct DocInput {
     std::span<const std::byte> text;    // required（多字段时可空，作默认字段）
     std::span<const std::byte> meta;    // optional
+    // V3.1:文档向量(空 = 无)。长度必须 == meta 配置的 vector_dim;
+    // cosine_normalized 度量下引擎写入前归一化(存储的即归一化值)。
+    std::span<const float> vector{};
     std::vector<std::pair<std::string, std::span<const std::byte>>> fields;  // S8.6
 };
 
@@ -271,6 +279,16 @@ public:
 
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
     bool_search(std::string_view query, std::size_t k = 10);
+
+    // V3.3:HNSW 向量检索。query 长度必须 == meta 配置的 vector_dim;
+    // cosine 配置时内部归一化查询向量(零向量返回空命中)。ef=0 →
+    // max(k,64)。结果按相似度降序(kDot:内积;kL2:-平方距离),
+    // 死文档经 live 过滤不出现。
+    // 无 search_ → kNoIndex;无向量配置 → kInvalidOption。
+    // 线程安全: 是(HNSW 读路径线程安全,V3.3)。
+    [[nodiscard]] std::expected<TextSearchResult, CaskFault>
+    search_vector(std::span<const float> query, std::size_t k = 10,
+                  std::size_t ef = 0);
 
     // BM25 多字段搜索（S8.6）：支持 `field:term^boost` 语法，跨字段加权合并。
     // 无字段限定的词等价于默认字段词袋搜索。线程安全: 否。

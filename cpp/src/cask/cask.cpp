@@ -4,6 +4,7 @@
 #include <unistd.h>     // ::getpid, ::unlink
 
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <thread>
@@ -463,10 +464,27 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
             return std::unexpected(err(CaskError::kModeMismatch,
                 "directory is index mode, cannot open as KV"));
         }
+        // V3.1:向量配置必须与 meta 完全一致(dim 库内恒定)。
+        const auto want_metric = opts.vector_dim > 0
+                                     ? opts.vector_metric
+                                     : meta::VectorMetric::kNone;
+        if (mc->vector_dim != opts.vector_dim ||
+            mc->vector_metric != want_metric) {
+            return std::unexpected(err(CaskError::kModeMismatch,
+                "vector config mismatch (meta dim/metric vs options)"));
+        }
         cask->meta_config_ = *mc;
     } else {
+        if (opts.vector_dim > 0 && !opts.enable_search) {
+            return std::unexpected(err(CaskError::kInvalidOption,
+                "vector_dim requires enable_search"));
+        }
         meta::MetaConfig mc;
         mc.mode = opts.enable_search ? meta::Mode::kIndex : meta::Mode::kKV;
+        if (opts.vector_dim > 0) {
+            mc.vector_dim = opts.vector_dim;
+            mc.vector_metric = opts.vector_metric;
+        }
         auto wr = meta::write_meta(cask->dirname_, mc);
         if (!wr) return std::unexpected(err(CaskError::kIo, "write meta failed"));
         cask->meta_config_ = mc;
@@ -474,7 +492,13 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
 
     // 创建 SearchLayer + IndexPool（如果配置了 search_config）
     if (opts.search_config) {
-        cask->search_ = std::make_unique<search::SearchLayer>(*opts.search_config);
+        // V3.3:向量配置从 meta 透传进 SearchLayerConfig(dim>0 时
+        // SearchLayer 内部创建 HnswIndex)。以 meta 为准——open 已校验
+        // opts 与 meta 一致。
+        auto scfg = *opts.search_config;
+        scfg.vector_dim = cask->meta_config_.vector_dim;
+        scfg.vector_metric = cask->meta_config_.vector_metric;
+        cask->search_ = std::make_unique<search::SearchLayer>(scfg);
         cask->index_pool_ = std::make_unique<IndexPool>(1, 10240);
         cask->index_pool_->start([&search = *cask->search_](const IndexTask& task) {
             if (task.op == IndexOp::Delete) {
@@ -485,6 +509,10 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
             } else {
                 search.on_write(task.key(), task.ord, task.text(),
                                 task.file_id, task.offset, task.total_sz, task.tstamp);
+            }
+            // V3.3:向量接入 HNSW(单写者 = 本 worker 线程)。
+            if (task.op != IndexOp::Delete && !task.vec.empty()) {
+                search.on_vector(task.ord, task.vec);
             }
             return true;
         });
@@ -625,6 +653,11 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
         snap_wms = std::move(*w);
         snap_loaded = true;
     }
+    // V3.3 过渡(撤销点:V3.5 vec/hnsw 快照并入 covers 门):HNSW 尚无
+    // 持久化,快照快路径会跳过向量重建 → 向量集合一律全量 fold(data
+    // file 即向量 WAL,hnsw-design §5)。bm25 快照仍先载入,fold 重放
+    // 经 add_doc 水位幂等收敛。
+    if (search_layer && meta_config_.vector_dim > 0) snap_loaded = false;
     if (search_layer && snap_loaded) {
         // 成对性门:min_field(已索引 ord 水位)+1 ≥ keydir 快照 next_ord
         // ⟹ 跳过区每个文档在每个字段索引中都已存在(设计 §4 论证)。
@@ -709,13 +742,26 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
                 keydir_->advance_ord(view.ord);
                 if (search_layer) {
                     auto dv = codec::decode_doc_value(std::span<const std::byte>(view.value));
-                    if (dv && !dv->text.empty()) {
+                    // V3.3:带向量的文档即使 text 为空也要恢复(否则
+                    // Index 无该 ord,live 过滤会把它当死文档)。
+                    if (dv && (!dv->text.empty() || dv->has_vector)) {
                         std::string_view text_sv(
                             reinterpret_cast<const char*>(dv->text.data()),
                             dv->text.size());
+                        // V3.3:vector_raw 是字节流,**未对齐**——memcpy
+                        // 进局部 float 缓冲,严禁 reinterpret_cast 直读
+                        // (UBSan 未对齐前科)。
+                        std::vector<float> vbuf;
+                        if (dv->has_vector && dv->dim > 0 &&
+                            dv->vector_raw.size() == dv->dim * sizeof(float)) {
+                            vbuf.resize(dv->dim);
+                            std::memcpy(vbuf.data(), dv->vector_raw.data(),
+                                        dv->vector_raw.size());
+                        }
                         search_layer->recover_doc(bytes_to_view(view.key), view.ord,
                                                   text_sv, static_cast<std::uint32_t>(e.tstamp),
-                                                  offset, total_size, view.tstamp);
+                                                  offset, total_size, view.tstamp,
+                                                  vbuf);
                     }
                 }
             }, /*tolerate_crc_errors*/ true,
@@ -956,12 +1002,22 @@ Cask::get(std::span<const std::byte> key) {
     if (!dv) {
         return std::unexpected(err(CaskError::kIo, "corrupt DocValue"));
     }
-    return GetResult{
+    GetResult out{
         std::vector<std::byte>(dv->text.begin(), dv->text.end()),
         std::vector<std::byte>(dv->meta.begin(), dv->meta.end()),
+        {},
         rec->tstamp,
         rec->ord
     };
+    // V3.1:向量段透传(f32 小端,LE 主机直拷;dim 自描述与 meta 一致性
+    // 由写入端保证,这里按数据为准)。
+    if (dv->has_vector && dv->dim > 0 &&
+        dv->vector_raw.size() == dv->dim * sizeof(float)) {
+        out.vector.resize(dv->dim);
+        std::memcpy(out.vector.data(), dv->vector_raw.data(),
+                    dv->vector_raw.size());
+    }
+    return out;
 }
 
 // put 流程：
@@ -1146,14 +1202,46 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
         if (auto r = roll_active(); !r) return std::unexpected(r.error());
     }
 
+    // V3.1:向量校验 + cosine 写入归一化(存储即归一化值,merge/恢复
+    // 不再重算;hnsw-design §1)。归一化缓冲在双编码点(roll 重试)间复用。
+    std::vector<float> vec_norm;
+    std::span<const float> vec_out{};
+    if (!doc.vector.empty()) {
+        if (meta_config_.vector_dim == 0) {
+            return std::unexpected(err(CaskError::kInvalidOption,
+                "collection has no vector config"));
+        }
+        if (doc.vector.size() != meta_config_.vector_dim) {
+            return std::unexpected(err(CaskError::kInvalidOption,
+                "vector dim mismatch"));
+        }
+        if (meta_config_.vector_metric ==
+            meta::VectorMetric::kCosineNormalized) {
+            double sq = 0.0;
+            for (float v : doc.vector) sq += static_cast<double>(v) * v;
+            if (sq <= 0.0) {
+                return std::unexpected(err(CaskError::kInvalidOption,
+                    "zero vector not allowed under cosine metric"));
+            }
+            const float inv = static_cast<float>(1.0 / std::sqrt(sq));
+            vec_norm.reserve(doc.vector.size());
+            for (float v : doc.vector) vec_norm.push_back(v * inv);
+            vec_out = vec_norm;
+        } else {
+            vec_out = doc.vector;
+        }
+    }
+
     const std::uint64_t ord = keydir_->alloc_ord();
     std::vector<std::byte> encoded;
-    encoded.reserve(doc.text.size() + doc.meta.size() + 16);
+    encoded.reserve(doc.text.size() + doc.meta.size() +
+                    vec_out.size() * sizeof(float) + 16);
     codec::DocValueParts parts;
     parts.text = doc.text;
     if (!doc.meta.empty()) {
         parts.meta = doc.meta;
     }
+    if (!vec_out.empty()) parts.vector = vec_out;
     fill_parts(parts);
     codec::encode_doc_value(encoded, parts);
 
@@ -1180,6 +1268,7 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
         if (!doc.meta.empty()) {
             parts2.meta = doc.meta;
         }
+        if (!vec_out.empty()) parts2.vector = vec_out;
         fill_parts(parts2);
         codec::encode_doc_value(enc2, parts2);
         auto w2 = active_data_->write(format::RecordType::kDoc, tstamp,
@@ -1195,21 +1284,41 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
         if (pr2 == keydir::PutResult::kAlreadyExists) {
             return std::unexpected(err(CaskError::kAlreadyExists));
         }
-        submit_index_task(IndexTask::make(
+        auto task = IndexTask::make(
             IndexOp::Add, bytes_to_view(key), ord2,
             std::string_view(reinterpret_cast<const char*>(doc.text.data()),
                              doc.text.size()),
             active_file_id_, w2->offset, w2->total_size, tstamp, 0,
-            task_fields()));
+            task_fields());
+        task.vec.assign(vec_out.begin(), vec_out.end());  // V3.3:归一化向量随任务走
+        submit_index_task(std::move(task));
     } else {
-        submit_index_task(IndexTask::make(
+        auto task = IndexTask::make(
             IndexOp::Add, bytes_to_view(key), ord,
             std::string_view(reinterpret_cast<const char*>(doc.text.data()),
                              doc.text.size()),
             active_file_id_, w->offset, w->total_size, tstamp, 0,
-            task_fields()));
+            task_fields());
+        task.vec.assign(vec_out.begin(), vec_out.end());  // V3.3
+        submit_index_task(std::move(task));
     }
     return {};
+}
+
+// search_vector：HNSW 向量检索(V3.3)。薄包装:flush 索引队列后转
+// SearchLayer::search_vector(归一化/live 过滤/ord 翻译都在那边)。
+std::expected<TextSearchResult, CaskFault>
+Cask::search_vector(std::span<const float> query, std::size_t k,
+                    std::size_t ef) {
+    if (!search_) return std::unexpected(err(CaskError::kNoIndex));
+    if (meta_config_.vector_dim == 0) {
+        return std::unexpected(err(CaskError::kInvalidOption,
+            "collection has no vector config"));
+    }
+    flush_index();
+    auto hits = search_->search_vector(query, k, ef);
+    if (!hits) return std::unexpected(err(CaskError::kInvalidOption, hits.error()));
+    return TextSearchResult{std::move(*hits)};
 }
 
 // search_text：BM25 词袋模式搜索。
