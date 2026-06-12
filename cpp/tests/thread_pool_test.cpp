@@ -30,7 +30,7 @@ TEST(IndexPool, SubmitAndProcess) {
 
     constexpr std::size_t kTasks = 100;
     for (std::size_t i = 0; i < kTasks; ++i) {
-        pool.submit(IndexTask{IndexOp::Add, std::to_string(i), i, std::string("text"), 1, 0, 0, 0, 0});
+        pool.submit(IndexTask::make(IndexOp::Add, std::to_string(i), i, "text", 1, 0, 0, 0, 0));
     }
 
     pool.flush();
@@ -69,7 +69,7 @@ TEST(IndexPool, SentinelStopsWorker) {
 TEST(IndexTaskQueue, BoundedCapacity) {
     IndexTaskQueue queue(5);
     for (int i = 0; i < 5; ++i) {
-        queue.push(IndexTask{IndexOp::Add, std::to_string(i), 0, std::string("text"), 0, 0, 0, 0, 0});
+        queue.push(IndexTask::make(IndexOp::Add, std::to_string(i), 0, "text", 0, 0, 0, 0, 0));
     }
     EXPECT_EQ(queue.size(), 5);
 }
@@ -78,7 +78,7 @@ TEST(IndexTaskQueue, TaskOrderingFIFO) {
     IndexTaskQueue queue(1024);
     constexpr std::size_t kCount = 200;
     for (std::size_t i = 0; i < kCount; ++i) {
-        queue.push(IndexTask{IndexOp::Add, std::to_string(i), i, std::string("text"), 0, 0, 0, 0, 0});
+        queue.push(IndexTask::make(IndexOp::Add, std::to_string(i), i, "text", 0, 0, 0, 0, 0));
     }
 
     std::vector<std::uint64_t> received;

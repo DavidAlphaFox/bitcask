@@ -40,13 +40,14 @@ enum class IndexOp : std::uint8_t {
 };
 
 // 索引任务：put/delete 路径提交到 Index Pool 的异步任务。
-// key / text 必须拥有独立存储（string，非 string_view），
-// 因为原始数据在 put() 返回后可能被释放。
+// key / text 必须拥有独立存储（非 string_view），因为原始数据在 put()
+// 返回后可能被释放。两者合并进单个 buf（= key ⧺ text，key_len 划界），
+// 一次分配替代原先 key/text 两个 string。
 struct IndexTask {
     IndexOp              op;
-    std::string          key;
+    std::string          buf;          // key ⧺ text 合并存储
     std::uint64_t        ord       = 0;
-    std::string          text;         // Add 操作的文档文本（单字段路径）
+    std::uint32_t        key_len   = 0;
     std::uint32_t        file_id   = 0;
     std::uint64_t        offset    = 0;
     std::uint32_t        total_sz  = 0;
@@ -54,6 +55,37 @@ struct IndexTask {
     std::uint32_t        doc_len   = 0; // token 总数（BM25 统计用）
     // S8.6 多字段：非空时走 on_write_fields；text 字段保留兼容单字段路径。
     std::vector<std::pair<std::string, std::string>> fields;
+
+    [[nodiscard]] std::string_view key() const noexcept {
+        return std::string_view(buf).substr(0, key_len);
+    }
+    [[nodiscard]] std::string_view text() const noexcept {
+        return std::string_view(buf).substr(key_len);
+    }
+
+    // 唯一构造入口（Sentinel 除外）：key+text 一次分配进 buf。
+    static IndexTask make(IndexOp op_, std::string_view key_,
+                          std::uint64_t ord_, std::string_view text_,
+                          std::uint32_t file_id_, std::uint64_t offset_,
+                          std::uint32_t total_sz_, std::uint32_t tstamp_,
+                          std::uint32_t doc_len_,
+                          std::vector<std::pair<std::string, std::string>>
+                              fields_ = {}) {
+        IndexTask t;
+        t.op = op_;
+        t.buf.reserve(key_.size() + text_.size());
+        t.buf.append(key_);
+        t.buf.append(text_);
+        t.key_len  = static_cast<std::uint32_t>(key_.size());
+        t.ord      = ord_;
+        t.file_id  = file_id_;
+        t.offset   = offset_;
+        t.total_sz = total_sz_;
+        t.tstamp   = tstamp_;
+        t.doc_len  = doc_len_;
+        t.fields   = std::move(fields_);
+        return t;
+    }
 };
 
 // 索引任务队列：多生产者（put/delete 线程）→ 单消费者（Index Pool worker）。
