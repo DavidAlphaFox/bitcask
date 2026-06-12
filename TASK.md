@@ -902,7 +902,7 @@ search 路径 ord 恒由 keydir 分配,无复用风险)。
 | V3.2 | HNSW 核心落地(bitcask_vector 新库:分层图/启发式选边/邻居收缩/AVX2-FMA 内核分发/ord 水位幂等/live 钩子)。召回:32d/10k 过线 **≥0.95@ef64、≥0.99@ef256**;384d 收敛曲线 0.824/0.960/0.996/1.0(ef64..512,纯随机高维最坏形态,标定 ef128/256≥0.93/0.98)。测试 +8;plain/ASan/TSan 369/369 + eunit 44/44 | ✅ |
 | V3.3 | 并发化(chunk 目录 + count_ 发布序 + per-node 自旋锁 + entry_meta_ 原子)+ IndexPool 接线(IndexTask.vec → on_vector)+ 端到端测试(V33VectorSearchEndToEnd / ConcurrentReadersWithSingleWriter)。偏差 8 条记 hnsw-design §3。门禁:plain/ASan/TSan 371/371(TSan 含 detect_deadlocks=1,M6.6 屏障 v2 后重跑)+ eunit 44/44 | ✅ |
 | V3.4 | 软删 + LiveChecker:机制 V3.3 已在位(Index.live_ 即 LiveChecker,结果侧滤死),本步补语义证明——V34OverwriteVectorMovesKey(覆写后旧向量不可达)+ V34DeadZoneNavigation(死壳 150/300 下 k=10 凑满、零泄入、真值重合 ≥9/10)。边界记 hnsw-design §6:死密邻域 ef 候选活者不足时 <k,调用方加大 ef,根治在 V3.5 merge 重建。门禁:plain/ASan/TSan 373/373(测试 +2;eunit 无涉) | ✅ |
-| V3.5 | vec/hnsw 快照并入 A4 covers 门 + merge 重建 | ☐ |
+| V3.5 | HNSW 持久化(BCVS v1 单文件完整图快照 `hnsw.snap`,save 读者协议/load 全量校验整体拒绝)并入 A4 covers 门(第四合取项 `hnsw_snap_ok ∧ 图水位+1 ≥ keydir.next_ord`,V3.3 强制全量 fold 特判撤销)+ merge 重建(hnsw_ 改 atomic<shared_ptr>;IndexOp::RebuildHnsw 由 worker 旁路建新图换指针,物理清死,单写者保持)。测试 +5(三件套 + 清死 + 并发重建);开库收益 10k×384d:快照 82ms vs 全量 fold 3770ms(≈46×)。门禁:plain/TSan/ASan ctest 378/378(TSan 零报告,detect_deadlocks=1)+ ldd 无 tsan + eunit 44/44 | ✅ |
 | V3.6 | search_hybrid RRF + NIF 接口 | ☐ |
 | V3.7 | 基准定稿(红线:100k/ef64 < 1ms 查询;插入 > 2k/s @384d) | ☐ |
 

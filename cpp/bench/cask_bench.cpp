@@ -164,3 +164,81 @@ static void BM_Cask_Open_FullFold(benchmark::State& state) {
     }
 }
 BENCHMARK(BM_Cask_Open_FullFold)->Unit(benchmark::kMicrosecond);
+
+// -----------------------------------------------------------------------------
+// V3.5:vector 集合 open——hnsw 快照(BCVS)快路径 vs 全量 fold 重插。
+// 1 万条 384d(归一化)向量文档;FullFold 变体每轮删 hnsw.snap(covers 门
+// 关闭 → 整库 fold,重分词 + 重插 HNSW)。无红线,只记实测(设计 §6)。
+// -----------------------------------------------------------------------------
+namespace {
+CaskOptions vec_opts() {
+    CaskOptions o;
+    o.read_write = true;
+    o.enable_search = true;
+    bitcask::search::SearchLayerConfig sc;
+    sc.analyzer_config.type = bitcask::text::AnalyzerType::Whitespace;
+    o.search_config = sc;
+    o.vector_dim = 384;
+    return o;
+}
+
+std::string prepare_vec_open_dir() {
+    static TempDir td;
+    static bool done = false;
+    if (!done) {
+        auto c = Cask::open(td.path(), vec_opts());
+        std::mt19937 rng(0xBC35);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        std::vector<float> v(384);
+        for (int i = 0; i < 10000; ++i) {
+            double sq = 0.0;
+            for (auto& x : v) {
+                x = nd(rng);
+                sq += static_cast<double>(x) * x;
+            }
+            const auto inv = static_cast<float>(1.0 / std::sqrt(sq));
+            for (auto& x : v) x *= inv;
+            bitcask::DocInput doc;
+            const std::string key = "d" + std::to_string(i);
+            const std::string text = "doc " + std::to_string(i);
+            doc.text = as_bytes(text);
+            doc.vector = std::span<const float>(v.data(), v.size());
+            (void)(*c)->put_doc(as_bytes(key), doc);
+        }
+        (*c)->flush_index();
+        (*c)->close();  // 落四块快照(bm25/sidecar/hnsw/keydir)
+        done = true;
+    }
+    return td.path();
+}
+}  // namespace
+
+static void BM_Cask_Open_VecSnapshot(benchmark::State& state) {
+    auto dir = prepare_vec_open_dir();
+    for (auto _ : state) {
+        auto c = Cask::open(dir, vec_opts());
+        if (!c) state.SkipWithError("open failed");
+        benchmark::DoNotOptimize(c);
+        (*c)->close();
+    }
+}
+BENCHMARK(BM_Cask_Open_VecSnapshot)
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(5);
+
+static void BM_Cask_Open_VecFullFold(benchmark::State& state) {
+    auto dir = prepare_vec_open_dir();
+    for (auto _ : state) {
+        state.PauseTiming();
+        std::error_code ec;
+        fs::remove(fs::path(dir) / "hnsw.snap", ec);
+        state.ResumeTiming();
+        auto c = Cask::open(dir, vec_opts());
+        if (!c) state.SkipWithError("open failed");
+        benchmark::DoNotOptimize(c);
+        (*c)->close();
+    }
+}
+BENCHMARK(BM_Cask_Open_VecFullFold)
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(2);

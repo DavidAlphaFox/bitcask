@@ -118,10 +118,10 @@ embedder behaviour 的职责,引擎不感知。2560 = 8×320,AVX2 内核
    (20k×16d,1 写 4 读,TSan 插桩)无可观测停顿;锁外预选/arena 留 V3.x。
 6. **单写者用 writer_active_ 原子守卫 + debug assert 声明**(成员无条件
    存在,避免 NDEBUG 不一致的布局分歧);多写者仍不支持。
-7. **接线过渡**:HNSW 持久化在 V3.5 之前缺位,`load_keydir_from_disk`
-   对 vector_dim>0 的集合**强制全量 fold**(跳过 keydir 快照快路径;
-   data file 即向量 WAL,bm25 快照仍先载、重放靠 add_doc 水位幂等收敛)。
-   V3.5 落 vec/hnsw 快照并入 covers 门后撤销此特判。
+7. **接线过渡(V3.5 已撤销)**:HNSW 持久化在 V3.5 之前缺位,
+   `load_keydir_from_disk` 曾对 vector_dim>0 的集合**强制全量 fold**。
+   V3.5 落 BCVS 快照并入 covers 门(§5),该特判已删除——向量集合
+   与 search 集合同走四块快照合取门。
 8. **kMaxChunks=1024 定容目录**(上限 64M 节点,assert 越界);邻接块
    per-node `new u32[]`,arena 化留 V3.x(设计稿已注明)。
 
@@ -143,32 +143,67 @@ search_hybrid(query, qvec, k)     → BM25 top-K' ∥ HNSW top-K'
   `search_vector(qvec, k, filter_query?)` 形状,实现 V3.x 再议
   (预过滤/后过滤/图内过滤是独立课题)。
 
-## 5. 持久化与恢复(A4 体系的第四、五块)
+## 5. 持久化与恢复(A4 体系的第四块;V3.5 落地定稿)
 
-两个新文件,**沿用 BCxS 框架(magic/ver/CRC/tmp+rename)**:
+> 实施记录(2026-06-12):本节由设计稿的"vec/hnsw 两文件"方案合并
+> 定稿为**单文件完整图快照**——快照内容 = 向量 + 邻接 + entry。
+> 理由:重插的距离计算才是开库慢的大头,只存向量再重插等于没省。
 
-1. **`bitcask.vec`(BCVS v1)**:向量平面 dump——
-   `header(dim/metric/count/covers_next_ord)` + `count × (ord u64 +
-   f32×dim)`。**定长行**:将来可直接 mmap(V3 先整读入内存)。
-2. **`bitcask.hnsw.snap`(BCHS v1)**:图结构——
-   `header(M/efC/entry_point/max_level/count/covers_next_ord)` +
-   每节点 `(ord, level, 各层邻居 u32[])`。**不含向量**(在 .vec 里,
-   不重复)。
+### 5.1 格式:`hnsw.snap`(BCVS v1,`HnswIndex::save/load`)
 
-写入点与成对性:**完全复用 A4-P3 协议**——close/merge 末尾,在
-bm25+sidecar 之后追加保存 vec+hnsw(同一静止点,同一 covers 标记
-来源);open 时五块快照(keydir/bm25/sidecar/vec/hnsw)全过 CRC 且
-covers 门统一判定(`min(各 covers) ≥ keydir.next_ord` 并入现有门),
-才走尾部回放;任何一块缺/损 → 该子系统全量重建:
-- 向量/图的全量重建 = fold data files 读 DocValue vector 段逐条
-  insert(与 bm25 的 recover_doc 同一循环顺路完成,不另开扫描);
-- **无独立向量 WAL**:data file 本身就是向量的 WAL(尾部回放覆盖
-  崩溃窗口),与 bm25 需要 WAL(分词结果非持久)的处境不同。
-- 水位幂等:hnsw_.insert 按 ord 与 max_inserted_ord 去重
-  (同 add_doc 水位协议),重放重叠区安全。
+外壳与 BCKS/BCIS 同款:`[magic "BCVS"][ver u32=1][payload]
+[crc32(payload)]`,tmp+rename 原子落盘。payload(LE):
 
-merge:`rebuild_index` 扩展为同时重建图(doc_reader 已回传整条
-DocValue,补给 vector 段);on_relocate 对图为 no-op(图按 ord 键)。
+```
+dim u16 | metric u8 | M u32 | ef_construction u32 | seed u64
+count u32 | entry_meta u64 | max_inserted_ord u64
+count 个节点(节点 id 即写出顺序 0..count-1,邻接 id 引用该编号):
+  ord u64 | level u8 | vec f32×dim | (level+1) 层,每层: cnt u32 | cnt×u32 id
+```
+
+- save 遵守**读者协议**(entry→count acquire 快照、per-node 锁拷邻接、
+  ≥ 快照水位的邻居滤掉),与并发写者共存安全;落盘水位取
+  `ord_of(count-1)` 而非 max_inserted_ord_ 原子(防 mid-insert 时水位
+  领先 count 发布,重开后错杀尾部回放)。静止点两者相等。
+- load 仅 open 期单线程(空图直填,成员 atomic 用 relaxed,发布靠上层
+  shared_ptr 换入点)。校验:CRC、config(dim/metric/M)一致、邻居/
+  entry id < count、level/cnt 不超容、ord 严格递增、**邻居层数覆盖**
+  (layer-l 表只允许 level ≥ l 的节点——否则 copy_neighbors 越块读,
+  这是内存安全项不是洁癖)——任何违例**整体拒绝**(绝不半载),
+  SearchLayer 弃新实例保现图,上层回退全量 fold。
+
+### 5.2 covers 门(并入 A4 合取式)
+
+close 保存顺序:bm25 → sidecar → **hnsw snap** → keydir snap(worker
+已停,图静止)。open 时 `load_keydir_from_disk` 对 vector_dim>0 的
+集合在既有三块门(bm25 floor ∧ sidecar covers ∧ keydir 快照)上**追加
+第四项**:`hnsw_snap_ok ∧ hnsw_covers_next_ord ≥ keydir.next_ord`,
+其中 `hnsw_covers_next_ord = 图水位 + 1`(空图 = 0)。
+
+- 门过 → 尾部回放:fold 水位后的记录经 recover_doc 带向量重插,
+  ord ≤ 图水位被 insert 幂等丢弃(同 add_doc 水位协议);
+- 任何一块缺/损/覆盖不足 → 全量 fold。已成功载入的图保留无害
+  (重放靠水位幂等收敛,与 bm25 快照同款);
+- **保守性(有意为之)**:墓碑/无向量文档占用 ord 但不进图水位——
+  尾部 ord 若被此类记录占用,门关闭走全量 fold。与 bm25 floor 门同向
+  保守,安全方向;data file 即向量 WAL,无独立 WAL(与设计稿一致)。
+
+### 5.3 merge 重建(物理清除死节点)
+
+- `hnsw_` 改 `std::atomic<std::shared_ptr<HnswIndex>>`:读者
+  (search_vector)与写路径每次操作开头 load 一次图快照指针;旧图被
+  换出后由在途读者的引用计数续命。
+- merge 末尾(search 模式且 vector_dim>0)向 IndexPool 提交
+  `IndexOp::RebuildHnsw` 任务,**由 worker 执行**——单写者论证:
+  worker 是 on_vector/recover-replay 之外唯一触图写者,重建(新图旁路
+  构建 + store 换指针)与后续 put 任务在同一线程串行,无写写并发;
+  重建期间查询走旧图(死节点照旧结果侧滤除,语义不变)。
+- 重建 = 新建同 config 图,遍历旧图节点(0..count),跳过
+  `!Index.live_(ord)`,重插活节点(vec 从旧图读),完毕换指针。
+- hnsw 快照不在 merge 点落盘(重建异步未完,落了也是旧图):留待
+  close 静止点。merge 后未 close 即崩 → 旧 hnsw.snap covers 不足,
+  门关,全量 fold——纯优化损失,无正确性影响。
+- on_relocate 对图为 no-op(图按 ord 键),与设计稿一致。
 
 ## 6. 实施阶段(各自可验证,沿 TASK 惯例)
 
@@ -178,7 +213,7 @@ DocValue,补给 vector 段);on_relocate 对图为 no-op(图按 ord 键)。
 | V3.2 | HNSW 核心(单线程 insert/search,距离内核分发) | **召回对拍** vs 暴力 KNN:低维(32d/10k)recall@10 ≥ 0.95@ef64 / 0.99@ef256;高维纯随机(384d)按 ef=128/256 标定 ≥0.93/0.98——距离集中使其成为最坏形态,实测收敛曲线 0.824/0.960/0.996/1.000(ef 64..512)证实实现健康,真实 embedding 流形数据远易于此 |
 | V3.3 | 并发化(per-node 锁 + 发布式增长)+ IndexPool 接线 | N 读 × 1 写并发测试;TSan 全插桩全绿 |
 | V3.4 | 软删过滤 + LiveChecker 接入。**落地记录(2026-06-12)**:机制随 V3.3 已在位(`Index.live_` 位图即 LiveChecker;search_vector 注入 `is_live` 回调;HNSW 结果侧滤死),V3.4 为语义证明:覆写测试(旧向量不可达,key 仅经新向量出现一次)+ 死区导航测试(删掉查询近邻 150/300 形成死壳,k=10 仍凑满、零死文档泄入、与活集暴力真值重合 ≥9/10)。**已知边界**:结果侧过滤意味着 ef 候选内活者 < k 时返回不足 k——死文档占比高的邻域调用方需加大 ef;根治靠 merge 重建物理清除(V3.5) | 删除/覆写/死区三类可见性测试 ✅ |
-| V3.5 | 持久化(vec/hnsw 快照 + covers 门并入 A4)+ merge 重建 | A4 同款三件套:快照/全量等价、陈旧尾部回放、损坏回退;eunit |
+| V3.5 | 持久化(BCVS 完整图快照 + covers 门并入 A4)+ merge 重建。**落地记录(2026-06-12)**:单文件 `hnsw.snap` 取代设计稿 vec/hnsw 两文件(§5 定稿);hnsw_ 改 atomic<shared_ptr>,merge 经 IndexPool 提交 RebuildHnsw 由 worker 重建换图(单写者保持);§3 偏差 7 特判撤销。**开库收益实测(10k×384d,tmpfs)**:快照 reopen 82ms vs 删 hnsw.snap 全量 fold 3770ms(≈46×,BM_Cask_Open_Vec{Snapshot,FullFold}) | A4 同款三件套(快照/全量等价 + 快照孤本可检索实证、陈旧尾部回放、位翻转回退)+ MergeRebuildEvictsDead(50→25 节点物理清死)+ ConcurrentSearchDuringRebuild;plain/TSan/ASan ctest 378/378(TSan 零报告);eunit 44/44 ✅ |
 | V3.6 | search_hybrid RRF + NIF/Erlang 接口 | 端到端 eunit;hybrid 排序确定性测试 |
 | V3.7 | 基准定稿:BM_Hnsw_Insert/{10k,100k}、BM_Hnsw_Search/{10k,100k}×{ef64,ef256}、BM_Hybrid;入 baseline | 红线:100k/ef64 查询 < 1ms;插入 > 2k/s(384d,本机) |
 

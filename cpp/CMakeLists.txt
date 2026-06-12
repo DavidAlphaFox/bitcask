@@ -163,6 +163,7 @@ add_library(bitcask_vector STATIC
 )
 target_include_directories(bitcask_vector PUBLIC include)
 target_link_libraries(bitcask_vector
+    PUBLIC  bitcask_format   # V3.5:BCVS 快照外壳用 codec::crc32
     PRIVATE bitcask_warnings bitcask_sanitizers
 )
 
