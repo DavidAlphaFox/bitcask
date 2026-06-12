@@ -120,7 +120,8 @@ private:
                        StringHash, std::equal_to<>> ext2ord_;  // ext_id → 最新 ord
     std::vector<DocSlot>     slots_;                          // 下标 = ord
     std::vector<std::string> ord2ext_;                        // 下标 = ord
-    std::vector<bool>        live_;                           // 下标 = ord（Roaring 留待优化）
+    std::vector<std::uint8_t> live_;                          // 下标 = ord;0/1。非 vector<bool>:
+                                                              // 避免 bit-pack 的位操作与代理引用开销
     // P2.4：doc_len 的 SoA 读优化副本（下标 = ord）。slots_[ord].doc_len 仍是
     // API 返回值的来源（get/for_each_live 语义不变），但 BM25 评分的
     // fill_doc_lens 稀疏 gather 改读本数组：DocSlot 32B/项 → 每条 cache line
