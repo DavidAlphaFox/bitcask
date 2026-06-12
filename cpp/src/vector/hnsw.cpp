@@ -3,6 +3,7 @@
 
 #include "bitcask/hnsw.hpp"
 #include "bitcask/codec.hpp"
+#include "hnsw_kernels.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -18,7 +19,13 @@
 
 namespace bitcask::vec {
 
-namespace {
+// V3.9:距离内核从匿名命名空间外移一份到 bitcask::vec::detail,只给
+// cpp/bench/distance_bench.cpp 等 micro-bench 走 hnsw_kernels.hpp 直接调
+// 用做对拍/计时。生产路径 pick_kernel() 仍用本 TU 内同函数(在匿名命名
+// 空间里被强引用,链接器裁掉它们的具名符号时不会丢弃 —— 实际上 pick_kernel
+// 返回函数指针强保)。算法、签名、target 属性不变,只换命名空间。
+
+namespace detail {
 
 // ---- 距离内核:返回值统一为"越小越近"的 distance ----
 // kDot:dist = -dot(归一化向量下 = 余弦距离的单调变换);
@@ -114,18 +121,110 @@ float l2_avx2(const float* a, const float* b, std::size_t n) {
     }
     return s;
 }
+
+// V3.9:AVX-512 距离内核。__m512 = 16 floats,主循环 stride = 64(4 路累加 ×
+// 16),把 384d 缩到 6 轮、1536d 缩到 24 轮;在 Skylake-SP/Ice Lake 这类双
+// FMA 单元上,主循环理论上限 ~2 FMA/cyc(2 加载 + 2 FMA / cyc),相对 AVX2
+// 内核理论再翻倍。仅用 AVX512F 子集(无 BW/VL),最大化可移植。注意:
+// 求和顺序随累加器宽度变宽,与 AVX2 末位 ulp 可能有数 ulp 漂移,正确性
+// 检验见 cpp/bench/distance_bench.cpp。
+__attribute__((target("avx512f")))
+float hsum512(__m512 v) {
+#if defined(__GNUC__) && (__GNUC__ >= 10)
+    // GCC 10+/Clang 的 _mm512_reduce_add_ps:内部即树形归并,单指令。
+    return _mm512_reduce_add_ps(v);
+#else
+    // 兼容旧编译器:手工两两归并(8 步加法 vs 横向 ~16 步)。
+    __m256 lo = _mm512_castps512_ps256(v);
+    __m256 hi = _mm512_extractf64x4_ps(v, 1);
+    __m256 s256 = _mm256_add_ps(lo, hi);
+    __m128 lo2 = _mm256_castps256_ps128(s256);
+    __m128 hi2 = _mm256_extractf128_ps(s256, 1);
+    __m128 s128 = _mm_add_ps(lo2, hi2);
+    s128 = _mm_hadd_ps(s128, s128);
+    s128 = _mm_hadd_ps(s128, s128);
+    return _mm_cvtss_f32(s128);
 #endif
+}
+
+__attribute__((target("avx512f")))
+float dot_avx512(const float* a, const float* b, std::size_t n) {
+    __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
+    __m512 acc2 = _mm512_setzero_ps(), acc3 = _mm512_setzero_ps();
+    std::size_t i = 0;
+    for (; i + 64 <= n; i += 64) {
+        acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i),
+                               _mm512_loadu_ps(b + i), acc0);
+        acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 16),
+                               _mm512_loadu_ps(b + i + 16), acc1);
+        acc2 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 32),
+                               _mm512_loadu_ps(b + i + 32), acc2);
+        acc3 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 48),
+                               _mm512_loadu_ps(b + i + 48), acc3);
+    }
+    for (; i + 16 <= n; i += 16) {
+        acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i),
+                               _mm512_loadu_ps(b + i), acc0);
+    }
+    float s = hsum512(_mm512_add_ps(_mm512_add_ps(acc0, acc1),
+                                    _mm512_add_ps(acc2, acc3)));
+    for (; i < n; ++i) s += a[i] * b[i];
+    return -s;
+}
+
+__attribute__((target("avx512f")))
+float l2_avx512(const float* a, const float* b, std::size_t n) {
+    __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
+    __m512 acc2 = _mm512_setzero_ps(), acc3 = _mm512_setzero_ps();
+    std::size_t i = 0;
+    for (; i + 64 <= n; i += 64) {
+        const __m512 d0 = _mm512_sub_ps(_mm512_loadu_ps(a + i),
+                                        _mm512_loadu_ps(b + i));
+        const __m512 d1 = _mm512_sub_ps(_mm512_loadu_ps(a + i + 16),
+                                        _mm512_loadu_ps(b + i + 16));
+        const __m512 d2 = _mm512_sub_ps(_mm512_loadu_ps(a + i + 32),
+                                        _mm512_loadu_ps(b + i + 32));
+        const __m512 d3 = _mm512_sub_ps(_mm512_loadu_ps(a + i + 48),
+                                        _mm512_loadu_ps(b + i + 48));
+        acc0 = _mm512_fmadd_ps(d0, d0, acc0);
+        acc1 = _mm512_fmadd_ps(d1, d1, acc1);
+        acc2 = _mm512_fmadd_ps(d2, d2, acc2);
+        acc3 = _mm512_fmadd_ps(d3, d3, acc3);
+    }
+    for (; i + 16 <= n; i += 16) {
+        const __m512 d = _mm512_sub_ps(_mm512_loadu_ps(a + i),
+                                       _mm512_loadu_ps(b + i));
+        acc0 = _mm512_fmadd_ps(d, d, acc0);
+    }
+    float s = hsum512(_mm512_add_ps(_mm512_add_ps(acc0, acc1),
+                                    _mm512_add_ps(acc2, acc3)));
+    for (; i < n; ++i) {
+        const float d = a[i] - b[i];
+        s += d * d;
+    }
+    return s;
+}
+#endif
+
+}  // namespace detail
+
+namespace {
 
 // V3.8:候选向量软件预取。大图下每个候选是 ~1.5KB(384d)的冷 DRAM
 // 取数,先扫一遍邻居把向量首 256B 拉向 L1,再进距离循环——取数与计算
 // 重叠,后续行交给硬件流预取。非 x86 为空操作。
 inline void prefetch_vec(const float* p) {
 #ifdef BITCASK_HNSW_SIMD
+    // V3.9:拉宽到 384B(96 floats)以覆盖 384d(1.5KB)前两 AVX-512 行 =
+    // 128B;另加 256B 段为 384d 第 2-3 个 cache line 提前热身。AVX2 也
+    // 受益(384d 头 64B×4 cache line 已覆盖)。
     const char* c = reinterpret_cast<const char*>(p);
     _mm_prefetch(c, _MM_HINT_T0);
     _mm_prefetch(c + 64, _MM_HINT_T0);
     _mm_prefetch(c + 128, _MM_HINT_T0);
     _mm_prefetch(c + 192, _MM_HINT_T0);
+    _mm_prefetch(c + 256, _MM_HINT_T0);
+    _mm_prefetch(c + 320, _MM_HINT_T0);
 #else
     (void)p;
 #endif
@@ -135,13 +234,22 @@ using DistFn = float (*)(const float*, const float*, std::size_t);
 
 DistFn pick_kernel(HnswMetric metric) {
 #ifdef BITCASK_HNSW_SIMD
+    // V3.9:AVX-512F 优先(超集)。要求仅基础 AVX-512 Foundation,无 BW/VL,
+    // 覆盖 Skylake-SP / Ice Lake / Zen4。运行时一次探测,零查询开销。
+    static const bool kAvx512f = __builtin_cpu_supports("avx512f");
+    if (kAvx512f) {
+        return metric == HnswMetric::kDot ? detail::dot_avx512
+                                          : detail::l2_avx512;
+    }
     static const bool kAvx2 = __builtin_cpu_supports("avx2") &&
                               __builtin_cpu_supports("fma");
     if (kAvx2) {
-        return metric == HnswMetric::kDot ? dot_avx2 : l2_avx2;
+        return metric == HnswMetric::kDot ? detail::dot_avx2
+                                          : detail::l2_avx2;
     }
 #endif
-    return metric == HnswMetric::kDot ? dot_scalar : l2_scalar;
+    return metric == HnswMetric::kDot ? detail::dot_scalar
+                                      : detail::l2_scalar;
 }
 
 inline void cpu_pause() {

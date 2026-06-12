@@ -161,7 +161,11 @@ target_link_libraries(bitcask_bm25
 add_library(bitcask_vector STATIC
     src/vector/hnsw.cpp
 )
-target_include_directories(bitcask_vector PUBLIC include)
+# V3.9:距离内核内部头只对 vector 库 + bench 可见,不放进 public include/。
+target_include_directories(bitcask_vector
+    PUBLIC  include
+    PRIVATE src/vector
+)
 target_link_libraries(bitcask_vector
     PUBLIC  bitcask_format   # V3.5:BCVS 快照外壳用 codec::crc32
     PRIVATE bitcask_warnings bitcask_sanitizers
