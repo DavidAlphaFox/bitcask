@@ -184,6 +184,54 @@ void BM_Inverted_BoolMustHot3(benchmark::State& state) {
 BENCHMARK(BM_Inverted_BoolMustHot3)->Arg(4096)->Arg(100000)
     ->Unit(benchmark::kMicrosecond);
 
+// B1 上界松弛度 canary:偏斜 tf + dl 一致数据。实测结论(2026-06-12):
+// upper_bound_from 的 dl=1 假设带来 ~25% 固有松弛,dl 一致时高 tf 钉子
+// 被 BM25 长度归一压平(tf=50 ⇒ dl≥50),θ≈真实最高分≈上界/1.25 →
+// 剪枝不触发。本基准的意义:v5 块元数据若改存「量化块级最高分」
+// (真实 tf+dl 计算),此数字应显著下降——它是 v5 收益的验收标尺。
+// doc_len 与 add_doc 累计的 sum_doc_len 一致的 checker(AllLiveChecker
+// 的硬编码 dl=8 与 avgdl≈2 自相矛盾,会把真实分数压到 dl=1 上界之下,
+// 使剪枝假性失效)。
+class VecLenChecker : public AllLiveChecker {
+public:
+    std::vector<std::uint32_t> lens;
+    [[nodiscard]] std::uint32_t doc_len(std::uint64_t ord) const override {
+        return lens[static_cast<std::size_t>(ord)];
+    }
+    void fill_doc_lens(std::span<const std::uint64_t> ords,
+                       std::span<std::uint32_t> out) const override {
+        for (std::size_t i = 0; i < ords.size(); ++i) {
+            out[i] = lens[static_cast<std::size_t>(ords[i])];
+        }
+    }
+};
+
+void BM_Inverted_BoolMustSkewed(benchmark::State& state) {
+    const auto n = static_cast<std::size_t>(state.range(0));
+    auto idx = std::make_unique<InvertedIndex>();
+    VecLenChecker live;
+    live.lens.resize(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::uint32_t tf_a = (i % 997 == 0) ? 50 : 1;
+        const std::uint32_t tf_b = (i % 991 == 0) ? 40 : 1;
+        idx->add_doc(static_cast<std::uint64_t>(i),
+                     {{"alpha", {tf_a, {0}}}, {"beta", {tf_b, {1}}}});
+        live.lens[i] = tf_a + tf_b;  // = add_doc 累计的 doc_len
+    }
+    auto query = bitcask::bm25::QueryNode::must_all(
+        {bitcask::bm25::QueryNode::must_term("alpha"),
+         bitcask::bm25::QueryNode::must_term("beta")});
+
+    for (auto _ : state) {
+        auto results = idx->bool_search(query, 10, live);
+        benchmark::DoNotOptimize(results);
+    }
+    state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations()) *
+                            static_cast<std::int64_t>(n));
+}
+BENCHMARK(BM_Inverted_BoolMustSkewed)->Arg(100000)
+    ->Unit(benchmark::kMicrosecond);
+
 // 多线程：thread 0 负责建索引 + 启动 writer（Google Benchmark 保证全部
 // 线程在计时循环入口汇合，setup 先于其他线程的首次迭代）。
 struct IndexingFixtureState {
