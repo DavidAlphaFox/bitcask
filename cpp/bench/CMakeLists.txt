@@ -25,6 +25,7 @@ add_executable(bitcask_bench
     intersect_u64_proto_bench.cpp
     analyzer_bench.cpp
     hnsw_bench.cpp
+    crc32_bench.cpp
     bench_main.cpp
 )
 target_link_libraries(bitcask_bench
@@ -36,5 +37,6 @@ target_link_libraries(bitcask_bench
         bitcask_index
         bitcask_text
         bitcask_vector
+        bitcask_format
         bitcask_warnings
 )
