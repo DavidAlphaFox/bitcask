@@ -452,3 +452,31 @@ TEST(Layout, ConstantsLocked) {
     EXPECT_EQ(static_cast<std::uint8_t>(format::RecordType::kDoc), 0u);
     EXPECT_EQ(static_cast<std::uint8_t>(format::RecordType::kTombstone), 1u);
 }
+
+// V3.1:vector 段黄金字节(锁定磁盘布局)。
+// [Ver=3][Flags=0x01 hasVector][Dim varint=2(VByte 终止位:0x82)]
+// [1.0f LE: 00 00 80 3F][2.0f LE: 00 00 00 40]
+TEST(DocValue, VectorSegmentGoldenHex) {
+    const float vec[2] = {1.0f, 2.0f};
+    bitcask::codec::DocValueParts parts;
+    parts.vector = std::span<const float>(vec, 2);
+    std::vector<std::byte> out;
+    bitcask::codec::encode_doc_value(out, parts);
+
+    const std::uint8_t expect[] = {0x03, 0x01, 0x82,
+                                   0x00, 0x00, 0x80, 0x3F,
+                                   0x00, 0x00, 0x00, 0x40};
+    ASSERT_EQ(out.size(), sizeof(expect));
+    for (std::size_t i = 0; i < sizeof(expect); ++i) {
+        EXPECT_EQ(std::to_integer<std::uint8_t>(out[i]), expect[i]) << i;
+    }
+
+    auto dv = bitcask::codec::decode_doc_value(out);
+    ASSERT_TRUE(dv);
+    EXPECT_TRUE(dv->has_vector);
+    EXPECT_EQ(dv->dim, 2u);
+    float back[2];
+    std::memcpy(back, dv->vector_raw.data(), sizeof(back));
+    EXPECT_FLOAT_EQ(back[0], 1.0f);
+    EXPECT_FLOAT_EQ(back[1], 2.0f);
+}

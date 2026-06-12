@@ -63,6 +63,9 @@ struct IndexTask {
     std::uint32_t        doc_len   = 0; // token 总数（BM25 统计用）
     // S8.6 多字段：非空时走 on_write_fields；text 字段保留兼容单字段路径。
     std::vector<std::pair<std::string, std::string>> fields;
+    // V3.3:Add 任务的文档向量(已归一化;空 = 无)。worker 转交
+    // SearchLayer::on_vector → HNSW insert。
+    std::vector<float> vec;
 
     [[nodiscard]] std::string_view key() const noexcept {
         return std::string_view(buf).substr(0, key_len);
