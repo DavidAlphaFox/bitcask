@@ -858,6 +858,190 @@ auto InvertedIndex::bool_search(
     must_not_tps.reserve(must_not_terms.size());
     for (auto& term : must_not_terms) collect(term, false, must_not_tps);
 
+    // ── B1:must-only 合取 Block-Max 剪枝(设计:doc/kway-blockmax-bmw-zh.md §6)
+    // top-k 驱动:K1 leapfrog 对齐候选;堆满后用块级分数上界跳过注定
+    // 不竞争的整块;live/doc_len 按 128-ord 块懒取(每块一次虚调用+一次锁,
+    // 未触达的块零成本)。idf 基于 df(无删除时与原路径位级一致,见 §6)。
+    if (!must_terms.empty() && should_terms.empty() && must_not_terms.empty() &&
+        k > 0) {
+        if (must_tps.size() != must_terms.size()) return {};  // 缺词 → 空集
+
+        const auto N = live_doc_count_.load(std::memory_order_relaxed);
+        const auto sum_dl = sum_doc_len_.load(std::memory_order_relaxed);
+        const double avgdl =
+            N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
+        constexpr std::size_t B = PostingList::kBlockSize;
+
+        struct BmwCur {
+            TermPostings* tp;
+            std::size_t i = 0;               // posting 游标
+            float idf = 0.0F;
+            std::vector<char> block_filled;  // live/dls 是否已按块填充
+            std::vector<float> block_ub;     // 块分数上界缓存
+            std::vector<char> ub_done;
+        };
+        const std::size_t nterms = must_tps.size();
+        std::vector<BmwCur> curs(nterms);
+        {
+            std::vector<std::size_t> order(nterms);
+            for (std::size_t i = 0; i < nterms; ++i) order[i] = i;
+            std::sort(order.begin(), order.end(),
+                      [&](std::size_t a, std::size_t b2) {
+                          return must_tps[a].fp.size() <
+                                 must_tps[b2].fp.size();
+                      });
+            for (std::size_t s = 0; s < nterms; ++s) {
+                auto& c = curs[s];
+                c.tp = &must_tps[order[s]];
+                const auto& fp = c.tp->fp;
+                if (fp.empty()) return {};
+                const auto df = static_cast<double>(fp.size());
+                c.idf = static_cast<float>(std::log(
+                    1.0 + (static_cast<double>(N) - df + 0.5) / (df + 0.5)));
+                const std::size_t nblk = (fp.size() + B - 1) / B;
+                c.tp->live.resize(fp.size());
+                c.tp->dls.resize(fp.size());
+                c.block_filled.assign(nblk, 0);
+                c.block_ub.assign(nblk, 0.0F);
+                c.ub_done.assign(nblk, 0);
+            }
+        }
+
+        auto advance = [](BmwCur& c, std::uint64_t target) {
+            const auto* o = c.tp->fp.ords.data();
+            const std::size_t n = c.tp->fp.size();
+            std::size_t lo = c.i;
+            if (lo >= n || o[lo] >= target) return;
+            std::size_t step = 1;
+            std::size_t hi = lo + 1;
+            while (hi < n && o[hi] < target) {
+                lo = hi;
+                hi += step;
+                step <<= 1;
+            }
+            if (hi > n) hi = n;
+            c.i = static_cast<std::size_t>(
+                std::lower_bound(o + lo + 1, o + hi, target) - o);
+        };
+
+        // 懒填充:游标所在块的 live/doc_len 一次批量取(P2.1 的接口,
+        // 块粒度复用)。
+        auto ensure_block = [&](BmwCur& c) {
+            const std::size_t b = c.i / B;
+            if (c.block_filled[b]) return;
+            auto& fp = c.tp->fp;
+            const std::size_t start = b * B;
+            const std::size_t cnt = std::min(B, fp.size() - start);
+            live_checker.fill_is_live(
+                std::span<const std::uint64_t>(fp.ords.data() + start, cnt),
+                std::span<char>(c.tp->live.data() + start, cnt));
+            live_checker.fill_doc_lens(
+                std::span<const std::uint64_t>(fp.ords.data() + start, cnt),
+                std::span<std::uint32_t>(c.tp->dls.data() + start, cnt));
+            c.block_filled[b] = 1;
+        };
+
+        auto block_ub = [&](BmwCur& c) -> float {
+            const std::size_t b = c.i / B;
+            if (!c.ub_done[b]) {
+                const auto& fp = c.tp->fp;
+                // 尾块未 seal 无块元数据 → 列表级 max_tf 退化(admissible)。
+                const std::uint32_t mtf =
+                    b < fp.blocks.size() ? fp.blocks[b].max_tf : fp.max_tf;
+                c.block_ub[b] = upper_bound_from(mtf, c.idf, params, avgdl);
+                c.ub_done[b] = 1;
+            }
+            return c.block_ub[b];
+        };
+
+        auto block_end = [](const BmwCur& c) -> std::uint64_t {
+            const std::size_t b = c.i / B;
+            const auto& fp = c.tp->fp;
+            return b < fp.blocks.size() ? fp.blocks[b].end_ord
+                                        : fp.ords.back();
+        };
+
+        using Entry = std::pair<float, std::uint64_t>;
+        std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
+
+        bool exhausted = false;
+        while (!exhausted && curs[0].i < curs[0].tp->fp.size()) {
+            const std::uint64_t v = curs[0].tp->fp.ords[curs[0].i];
+            std::size_t j = 1;
+            for (; j < nterms; ++j) {
+                advance(curs[j], v);
+                if (curs[j].i == curs[j].tp->fp.size()) {
+                    exhausted = true;
+                    break;
+                }
+                if (curs[j].tp->fp.ords[curs[j].i] != v) break;
+            }
+            if (exhausted) break;
+            if (j < nterms) {
+                // 被第 j 列表挡住:驱动游标跳到挡路值。
+                advance(curs[0], curs[j].tp->fp.ords[curs[j].i]);
+                continue;
+            }
+
+            if (heap.size() == k) {
+                float ub = 0.0F;
+                for (auto& c : curs) ub += block_ub(c);
+                if (ub <= heap.top().first) {
+                    // 当前各块的上界之和够不到 θ:整段跳过,不查 live
+                    // 不评分。跳到各块末尾的最小值 +1。
+                    std::uint64_t next = block_end(curs[0]);
+                    for (std::size_t m = 1; m < nterms; ++m) {
+                        next = std::min(next, block_end(curs[m]));
+                    }
+                    advance(curs[0], next + 1);
+                    continue;
+                }
+            }
+
+            bool all_live = true;
+            for (auto& c : curs) {
+                ensure_block(c);
+                if (!c.tp->live[c.i]) {
+                    all_live = false;
+                    break;
+                }
+            }
+            if (all_live) {
+                float score = 0.0F;
+                for (auto& c : curs) {
+                    // 公式与原 must 评分循环逐运算一致(分数位级不变约定)。
+                    auto tf_norm =
+                        static_cast<float>(c.tp->fp.tfs[c.i]) *
+                        (params.k1 + 1.0F) /
+                        (static_cast<float>(c.tp->fp.tfs[c.i]) +
+                         params.k1 *
+                             (1.0F - params.b +
+                              params.b *
+                                  static_cast<float>(c.tp->dls[c.i]) /
+                                  static_cast<float>(avgdl)));
+                    score += c.idf * (tf_norm + params.delta);
+                }
+                if (heap.size() < k) {
+                    heap.push({score, v});
+                } else if (score > heap.top().first) {
+                    heap.pop();
+                    heap.push({score, v});
+                }
+            }
+            ++curs[0].i;
+        }
+
+        std::vector<SearchResult> results;
+        results.reserve(heap.size());
+        while (!heap.empty()) {
+            auto& [score, ord] = heap.top();
+            results.push_back({ord, score});
+            heap.pop();
+        }
+        std::reverse(results.begin(), results.end());
+        return results;
+    }
+
     // P2.1：每个 term 的 live 批量取一次（此前 must_not/交集/should/idf/评分
     // 五个阶段各自逐 posting 重扫 is_live——既重复又每次一锁）。
     // must/should 进评分循环，需 doc_len 批量（with_dls）；must_not 只用 live

@@ -1354,3 +1354,90 @@ TEST(InvertedIndex, BoolMustKwayRandomizedReference) {
     for (auto& r : results) got.insert(r.ord);
     EXPECT_EQ(got, reference);
 }
+
+// ── B1:must-only 合取 BMW 专项 ──────────────────────────────────────
+
+// 无删除等价性:BMW(+a +b)与原路径(+a +b zzz——不存在的 should 词
+// 强制走原路径且不影响分数)逐 ord/score 对比。tf 取变化值避免并列分。
+TEST(InvertedIndex, BmwMatchesFallbackNoDeletions) {
+    InvertedIndex idx;
+    FakeLiveChecker checker;
+    std::mt19937_64 rng(0xB1B1);
+    for (std::uint64_t d = 0; d < 3000; ++d) {
+        TermPositions m;
+        if (rng() % 100 < 70) {
+            m.emplace("aaa", tp(1 + static_cast<std::uint32_t>(rng() % 7), {0}));
+        }
+        if (rng() % 100 < 50) {
+            m.emplace("bbb", tp(1 + static_cast<std::uint32_t>(rng() % 5), {1}));
+        }
+        if (m.empty()) m.emplace("filler", tp(1, {0}));
+        idx.add_doc(d, m);
+        checker.doc_lens[d] = 2 + static_cast<std::uint32_t>(rng() % 9);
+    }
+
+    for (std::size_t k : {5UL, 37UL, 2000UL}) {
+        auto bmw = idx.bool_search(parse_query("+aaa +bbb"), k, checker);
+        auto ref = idx.bool_search(parse_query("+aaa +bbb zzz_nonexistent"),
+                                   k, checker);
+        ASSERT_EQ(bmw.size(), ref.size()) << "k=" << k;
+        for (std::size_t i = 0; i < bmw.size(); ++i) {
+            EXPECT_EQ(bmw[i].ord, ref[i].ord) << "k=" << k << " i=" << i;
+            EXPECT_FLOAT_EQ(bmw[i].score, ref[i].score)
+                << "k=" << k << " i=" << i;
+        }
+    }
+}
+
+// 有删除:死文档必须被排除(懒 live 检查),活文档成员集与参考一致
+// (k 取满,只断言成员不断言排序——BMW 的 idf 基于 df,删除下与原路径
+// 的 live_df idf 有意不同,见设计 §6)。
+TEST(InvertedIndex, BmwDeletedDocsExcluded) {
+    InvertedIndex idx;
+    FakeLiveChecker checker;
+    std::set<std::uint64_t> expect;
+    for (std::uint64_t d = 0; d < 1000; ++d) {
+        TermPositions m;
+        m.emplace("aaa", tp(1, {0}));
+        if (d % 3 == 0) m.emplace("bbb", tp(2, {1}));
+        idx.add_doc(d, m);
+        checker.doc_lens[d] = 2;
+        if (d % 3 == 0) expect.insert(d);
+    }
+    // 删掉交集里的每第 5 个(0,15,30,...)。
+    for (std::uint64_t d = 0; d < 1000; d += 15) {
+        checker.doc_lens.erase(d);
+        expect.erase(d);
+    }
+
+    auto results = idx.bool_search(parse_query("+aaa +bbb"), 1000, checker);
+    std::set<std::uint64_t> got;
+    for (auto& r : results) got.insert(r.ord);
+    EXPECT_EQ(got, expect);
+}
+
+// 剪枝正确性:高分文档藏在列表深处(后段块的高 tf),小 k 下 BMW 的块
+// 跳跃不允许漏掉它们——与原路径 top-k 集逐一对比。
+TEST(InvertedIndex, BmwHighScoreInLateBlocksNotPruned) {
+    InvertedIndex idx;
+    FakeLiveChecker checker;
+    for (std::uint64_t d = 0; d < 5000; ++d) {
+        // 大部分 tf=1;每 997 个一个 tf=50 的"高分钉子",分散在各块。
+        const std::uint32_t tf_a = (d % 997 == 0) ? 50 : 1;
+        const std::uint32_t tf_b = (d % 991 == 0) ? 40 : 1;
+        TermPositions m;
+        m.emplace("aaa", tp(tf_a, {0}));
+        m.emplace("bbb", tp(tf_b, {1}));
+        idx.add_doc(d, m);
+        checker.doc_lens[d] = 2;
+    }
+
+    auto bmw = idx.bool_search(parse_query("+aaa +bbb"), 10, checker);
+    auto ref = idx.bool_search(parse_query("+aaa +bbb zzz_nonexistent"),
+                               10, checker);
+    ASSERT_EQ(bmw.size(), ref.size());
+    for (std::size_t i = 0; i < bmw.size(); ++i) {
+        EXPECT_EQ(bmw[i].ord, ref[i].ord) << i;
+        EXPECT_FLOAT_EQ(bmw[i].score, ref[i].score) << i;
+    }
+}
