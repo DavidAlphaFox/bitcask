@@ -52,29 +52,62 @@ float hsum256(__m256 v) {
     return _mm_cvtss_f32(lo);
 }
 
+// V3.8:4 路独立累加器打破 FMA 依赖链。单累加器下每次 fmadd 依赖上一次
+// 结果(FMA 延迟 ~4cyc → 1 FMA/4cyc);4 路交错把循环顶到加载口上限
+// (2 加载/cyc = 1 FMA/cyc),内核理论余量 ~4×。384d=12 轮、2560d=80 轮
+// 整除主循环;8 宽次级循环 + 标量尾兜任意 n。注:求和顺序改变,结果与
+// 旧内核可有最后一两 ulp 漂移(测试容差均覆盖)。
 __attribute__((target("avx2,fma")))
 float dot_avx2(const float* a, const float* b, std::size_t n) {
-    __m256 acc = _mm256_setzero_ps();
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
     std::size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),
-                              _mm256_loadu_ps(b + i), acc);
+    for (; i + 32 <= n; i += 32) {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),
+                               _mm256_loadu_ps(b + i), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8),
+                               _mm256_loadu_ps(b + i + 8), acc1);
+        acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 16),
+                               _mm256_loadu_ps(b + i + 16), acc2);
+        acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 24),
+                               _mm256_loadu_ps(b + i + 24), acc3);
     }
-    float s = hsum256(acc);
+    for (; i + 8 <= n; i += 8) {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),
+                               _mm256_loadu_ps(b + i), acc0);
+    }
+    float s = hsum256(_mm256_add_ps(_mm256_add_ps(acc0, acc1),
+                                    _mm256_add_ps(acc2, acc3)));
     for (; i < n; ++i) s += a[i] * b[i];
     return -s;
 }
 
 __attribute__((target("avx2,fma")))
 float l2_avx2(const float* a, const float* b, std::size_t n) {
-    __m256 acc = _mm256_setzero_ps();
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
     std::size_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        const __m256 d0 = _mm256_sub_ps(_mm256_loadu_ps(a + i),
+                                        _mm256_loadu_ps(b + i));
+        const __m256 d1 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 8),
+                                        _mm256_loadu_ps(b + i + 8));
+        const __m256 d2 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 16),
+                                        _mm256_loadu_ps(b + i + 16));
+        const __m256 d3 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 24),
+                                        _mm256_loadu_ps(b + i + 24));
+        acc0 = _mm256_fmadd_ps(d0, d0, acc0);
+        acc1 = _mm256_fmadd_ps(d1, d1, acc1);
+        acc2 = _mm256_fmadd_ps(d2, d2, acc2);
+        acc3 = _mm256_fmadd_ps(d3, d3, acc3);
+    }
     for (; i + 8 <= n; i += 8) {
         const __m256 d = _mm256_sub_ps(_mm256_loadu_ps(a + i),
                                        _mm256_loadu_ps(b + i));
-        acc = _mm256_fmadd_ps(d, d, acc);
+        acc0 = _mm256_fmadd_ps(d, d, acc0);
     }
-    float s = hsum256(acc);
+    float s = hsum256(_mm256_add_ps(_mm256_add_ps(acc0, acc1),
+                                    _mm256_add_ps(acc2, acc3)));
     for (; i < n; ++i) {
         const float d = a[i] - b[i];
         s += d * d;
@@ -82,6 +115,21 @@ float l2_avx2(const float* a, const float* b, std::size_t n) {
     return s;
 }
 #endif
+
+// V3.8:候选向量软件预取。大图下每个候选是 ~1.5KB(384d)的冷 DRAM
+// 取数,先扫一遍邻居把向量首 256B 拉向 L1,再进距离循环——取数与计算
+// 重叠,后续行交给硬件流预取。非 x86 为空操作。
+inline void prefetch_vec(const float* p) {
+#ifdef BITCASK_HNSW_SIMD
+    const char* c = reinterpret_cast<const char*>(p);
+    _mm_prefetch(c, _MM_HINT_T0);
+    _mm_prefetch(c + 64, _MM_HINT_T0);
+    _mm_prefetch(c + 128, _MM_HINT_T0);
+    _mm_prefetch(c + 192, _MM_HINT_T0);
+#else
+    (void)p;
+#endif
+}
 
 using DistFn = float (*)(const float*, const float*, std::size_t);
 
@@ -185,6 +233,9 @@ std::uint32_t HnswIndex::greedy_closest(const float* q, std::uint32_t start,
         improved = false;
         const std::uint32_t cnt = copy_neighbors(cur, layer, scratch);
         for (std::uint32_t i = 0; i < cnt; ++i) {
+            if (scratch[i] < n) prefetch_vec(vec_of(scratch[i]));
+        }
+        for (std::uint32_t i = 0; i < cnt; ++i) {
             const std::uint32_t nid = scratch[i];
             if (nid >= n) continue;  // 本地 count 快照之外:尚未对我发布
             const float d = dist_id(q, nid);
@@ -232,6 +283,11 @@ void HnswIndex::search_layer(
         if (d > top.top().first && top.size() >= ef) break;  // 收敛
         cands.pop();
         const std::uint32_t cnt = copy_neighbors(id, layer, scratch);
+        // 预取与计算分两遍:未访问的在界邻居先把向量段拉过来。
+        for (std::uint32_t i = 0; i < cnt; ++i) {
+            const std::uint32_t nid = scratch[i];
+            if (nid < n && visited[nid] != ep) prefetch_vec(vec_of(nid));
+        }
         for (std::uint32_t i = 0; i < cnt; ++i) {
             const std::uint32_t nid = scratch[i];
             if (nid >= n) continue;  // 本地 count 快照之外(见 hpp 协议)
