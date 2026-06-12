@@ -917,24 +917,104 @@ auto InvertedIndex::bool_search(
                              must_tps[b].fp.size();
                   });
 
+        // K1:k-way leapfrog 交集(替代 pairwise:k-1 轮中间 vector 物化
+        // + 每轮 live 过滤拷贝)。k 个游标在各 posting 数组上同时推进,
+        // 最短列表驱动,其余 galloping advance——大小不对称时天然亚线性。
+        // 结果谓词与 pairwise 等价:ord ∈ 结果 ⟺ 出现在全部 MUST 列表
+        // 且各列表 live 标志全真。这里定下的 advance(target) 形态就是
+        // 后续块级元数据 / BMW 的游标接口(doc/kway-blockmax-bmw-zh.md)。
         auto run_must_intersect = [&] {
             std::vector<std::uint64_t> acc;
-            bool first_must = true;
+            const std::size_t k = must_order.size();
+
+            // 单词退化:live 过滤直拷(与旧实现首词分支等价)。
+            if (k == 1) {
+                auto& tp = must_tps[must_order[0]];
+                acc.reserve(tp.fp.size());
+                for (std::size_t i = 0; i < tp.fp.size(); ++i) {
+                    if (tp.live[i]) acc.push_back(tp.fp.ords[i]);
+                }
+                return acc;
+            }
+
+            // k==2 走 SIMD pairwise(intersect_u64:旋转内核 + galloping
+            // 分发)。实测两热词形态 leapfrog 比 SIMD 慢 ~10-13%
+            // (BoolMustHot 4096:44.3→50.3μs),两次 live 过滤拷贝的代价
+            // 小于 SIMD 对标量的优势;k≥3 才轮到 leapfrog(收益来自
+            // 消除 k-1 轮物化 + 多列表互相 gallop)。
+            if (k == 2) {
+                std::vector<std::uint64_t> a;
+                std::vector<std::uint64_t> b;
+                auto fill = [&](const TermPostings& tp,
+                                std::vector<std::uint64_t>& dst) {
+                    dst.reserve(tp.fp.size());
+                    for (std::size_t i = 0; i < tp.fp.size(); ++i) {
+                        if (tp.live[i]) dst.push_back(tp.fp.ords[i]);
+                    }
+                };
+                fill(must_tps[must_order[0]], a);
+                fill(must_tps[must_order[1]], b);
+                intersect_u64(a, b, acc);
+                return acc;
+            }
+
+            struct Cur {
+                const std::uint64_t* ords;
+                const char* live;
+                std::size_t n;
+                std::size_t i = 0;
+            };
+            std::vector<Cur> curs;
+            curs.reserve(k);
             for (auto mi : must_order) {
                 auto& tp = must_tps[mi];
-                if (!first_must && acc.empty()) break;
-                std::vector<std::uint64_t> ords;
-                ords.reserve(tp.fp.size());
-                for (std::size_t i = 0; i < tp.fp.size(); ++i) {
-                    if (tp.live[i]) ords.push_back(tp.fp.ords[i]);
+                if (tp.fp.size() == 0) return acc;  // 任一列表空 → 交集空
+                curs.push_back(Cur{tp.fp.ords.data(), tp.live.data(),
+                                   tp.fp.size(), 0});
+            }
+            acc.reserve(curs[0].n);  // 上界 = 最短列表长度
+
+            // advance:游标推到首个 ords[i] >= target 处(galloping +
+            // 二分收尾)。游标只前进不回退——target 跨轮单调不减。
+            auto advance = [](Cur& c, std::uint64_t target) {
+                std::size_t lo = c.i;
+                if (lo >= c.n || c.ords[lo] >= target) return;
+                std::size_t step = 1;
+                std::size_t hi = lo + 1;
+                while (hi < c.n && c.ords[hi] < target) {
+                    lo = hi;
+                    hi += step;
+                    step <<= 1;
                 }
-                if (first_must) {
-                    acc = std::move(ords);
-                    first_must = false;
+                if (hi > c.n) hi = c.n;
+                // ords[lo] < target 已知,二分区间 (lo, hi)。
+                c.i = static_cast<std::size_t>(
+                    std::lower_bound(c.ords + lo + 1, c.ords + hi, target) -
+                    c.ords);
+            };
+
+            while (curs[0].i < curs[0].n) {
+                const std::uint64_t v = curs[0].ords[curs[0].i];
+                std::size_t j = 1;
+                for (; j < k; ++j) {
+                    advance(curs[j], v);
+                    if (curs[j].i == curs[j].n) return acc;  // 耗尽 → 结束
+                    if (curs[j].ords[curs[j].i] != v) break; // 被挡住
+                }
+                if (j == k) {
+                    // 全列表命中:liveness 全检后输出。
+                    bool all_live = true;
+                    for (std::size_t m = 0; m < k; ++m) {
+                        if (!curs[m].live[curs[m].i]) {
+                            all_live = false;
+                            break;
+                        }
+                    }
+                    if (all_live) acc.push_back(v);
+                    ++curs[0].i;
                 } else {
-                    std::vector<std::uint64_t> out;
-                    intersect_u64(acc, ords, out);
-                    acc = std::move(out);
+                    // 驱动游标直接跳到挡路值,跳过中间注定不在交集的区段。
+                    advance(curs[0], curs[j].ords[curs[j].i]);
                 }
             }
             return acc;

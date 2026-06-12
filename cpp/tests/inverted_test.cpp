@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <random>
+#include <set>
 #include <filesystem>
 #include <fstream>
 #include <thread>
@@ -1247,4 +1249,108 @@ TEST(IntersectU64, FullAndNoOverlap) {
     for (std::uint64_t i = 0; i < 1000; ++i) b.push_back(i * 2 + 1);
     intersect_u64(a, b, out);
     EXPECT_TRUE(out.empty());
+}
+
+// ── K1:k-way 交集专项(run_must_intersect 从 pairwise 改 leapfrog)──────
+
+// 三词 MUST:A=全部,B=偶数,C=3 的倍数 → 交集 = 6 的倍数。
+TEST(InvertedIndex, BoolMustKwayThreeTerms) {
+    InvertedIndex idx;
+    FakeLiveChecker checker;
+    for (std::uint64_t d = 0; d < 100; ++d) {
+        TermPositions m;
+        m.emplace("aaa", tp(1, {0}));
+        if (d % 2 == 0) m.emplace("bbb", tp(1, {1}));
+        if (d % 3 == 0) m.emplace("ccc", tp(1, {2}));
+        idx.add_doc(d, m);
+        checker.doc_lens[d] = 3;
+    }
+
+    auto node = parse_query("+aaa +bbb +ccc");
+    auto results = idx.bool_search(node, 100, checker);
+    ASSERT_EQ(results.size(), 17u);  // 0,6,...,96
+    for (auto& r : results) {
+        EXPECT_EQ(r.ord % 6, 0u) << r.ord;
+    }
+}
+
+// 三词 MUST + 删除:交集内被删的文档必须被 liveness 全检排除。
+TEST(InvertedIndex, BoolMustKwayDeletedExcluded) {
+    InvertedIndex idx;
+    FakeLiveChecker checker;
+    for (std::uint64_t d = 0; d < 60; ++d) {
+        TermPositions m;
+        m.emplace("aaa", tp(1, {0}));
+        m.emplace("bbb", tp(1, {1}));
+        if (d % 2 == 0) m.emplace("ccc", tp(1, {2}));
+        idx.add_doc(d, m);
+        checker.doc_lens[d] = 3;
+    }
+    // 删掉交集(偶数)里的 0、6、12(FakeLiveChecker:不在 doc_lens 即死)。
+    checker.doc_lens.erase(0);
+    checker.doc_lens.erase(6);
+    checker.doc_lens.erase(12);
+
+    auto node = parse_query("+aaa +bbb +ccc");
+    auto results = idx.bool_search(node, 100, checker);
+    ASSERT_EQ(results.size(), 27u);  // 30 个偶数 - 3 个被删
+    for (auto& r : results) {
+        EXPECT_NE(r.ord, 0u);
+        EXPECT_NE(r.ord, 6u);
+        EXPECT_NE(r.ord, 12u);
+    }
+}
+
+// 极不对称:冷词(5 docs)∩ 热词(5000 docs)——驱动游标走冷词,
+// 热词侧全靠 galloping advance。
+TEST(InvertedIndex, BoolMustKwayAsymmetric) {
+    InvertedIndex idx;
+    FakeLiveChecker checker;
+    for (std::uint64_t d = 0; d < 5000; ++d) {
+        TermPositions m;
+        m.emplace("hot", tp(1, {0}));
+        if (d % 1000 == 7) m.emplace("rare", tp(1, {1}));  // 7,1007,...,4007
+        idx.add_doc(d, m);
+        checker.doc_lens[d] = 2;
+    }
+
+    auto node = parse_query("+hot +rare");
+    auto results = idx.bool_search(node, 100, checker);
+    ASSERT_EQ(results.size(), 5u);
+    for (auto& r : results) {
+        EXPECT_EQ(r.ord % 1000, 7u);
+    }
+}
+
+// 随机对拍:4 词 MUST,与暴力参考集逐 ord 比对(固定种子可复现)。
+TEST(InvertedIndex, BoolMustKwayRandomizedReference) {
+    std::mt19937_64 rng(0x5EEDBA5E);
+    InvertedIndex idx;
+    FakeLiveChecker checker;
+    const char* terms[4] = {"t0", "t1", "t2", "t3"};
+    std::set<std::uint64_t> reference;
+
+    for (std::uint64_t d = 0; d < 2000; ++d) {
+        TermPositions m;
+        bool in_all = true;
+        for (auto* t : terms) {
+            // 各词 60% 概率包含该文档 → 四词交集 ~13%。
+            if (rng() % 100 < 60) {
+                m.emplace(t, tp(1, {0}));
+            } else {
+                in_all = false;
+            }
+        }
+        if (m.empty()) m.emplace("filler", tp(1, {0}));
+        idx.add_doc(d, m);
+        checker.doc_lens[d] = 4;
+        if (in_all) reference.insert(d);
+    }
+    ASSERT_GT(reference.size(), 50u);  // 种子固定,交集非平凡
+
+    auto node = parse_query("+t0 +t1 +t2 +t3");
+    auto results = idx.bool_search(node, 5000, checker);
+    std::set<std::uint64_t> got;
+    for (auto& r : results) got.insert(r.ord);
+    EXPECT_EQ(got, reference);
 }
