@@ -77,6 +77,15 @@ ReadResult PosixFile::pread(std::uint64_t offset, std::size_t count) noexcept {
     return std::unexpected(IoError{errno});
 }
 
+// pread 零分配版：读进 caller 缓冲区，返回读到的字节数（0 = EOF）。
+std::expected<std::size_t, IoError>
+PosixFile::pread_into(std::uint64_t offset, std::span<std::byte> buf) noexcept {
+    const ssize_t n =
+        ::pread(fd_, buf.data(), buf.size(), static_cast<off_t>(offset));
+    if (n < 0) return std::unexpected(IoError{errno});
+    return static_cast<std::size_t>(n);
+}
+
 // pwrite：循环写直到全部完成或出错。部分写不会被当作成功返回。
 // 注意 w==0 也算错误（极少见，通常意味着 EAGAIN 在 non-blocking fd 上）。
 std::expected<void, IoError>

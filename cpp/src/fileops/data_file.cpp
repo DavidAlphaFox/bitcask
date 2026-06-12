@@ -70,12 +70,12 @@ DataFile::write(format::RecordType type,
     if (key.size()   > format::kMaxKeySize)   return std::unexpected(DataFileFault{DataFileError::kTooLarge});
     if (value.size() > format::kMaxValueSize) return std::unexpected(DataFileFault{DataFileError::kTooLarge});
 
-    std::vector<std::byte> buf;
-    buf.reserve(format::kHeaderSize + key.size() + value.size());
-    const std::size_t total = codec::encode_data_record(buf, type, tstamp, ord, key, value);
+    write_buf_.clear();  // 复用容量:稳态零分配(encode 是 append 语义)
+    const std::size_t total =
+        codec::encode_data_record(write_buf_, type, tstamp, ord, key, value);
 
     const std::uint64_t off = current_offset_;
-    auto w = file_.pwrite(off, buf);
+    auto w = file_.pwrite(off, write_buf_);
     if (!w) return std::unexpected(io_fault(w.error()));
     current_offset_ += total;
     return WriteResult{off, static_cast<std::uint32_t>(total)};
@@ -111,17 +111,21 @@ std::expected<void, DataFileFault> DataFile::sync() {
 // 下数据损坏或被截断）。CRC 不通过翻成 kBadCrc。
 std::expected<ReadRecord, DataFileFault>
 DataFile::read(std::uint64_t offset, std::uint32_t total_size) {
-    auto r = file_.pread(offset, total_size);
-    if (!r) return std::unexpected(io_fault(r.error()));
+    // get 热路径:per-thread 复用读缓冲,稳态零分配。pread 线程安全,
+    // 多线程可并发调 read(),故缓冲必须 thread_local 而非成员。
+    static thread_local std::vector<std::byte> read_buf;
+    // 防膨胀:一次超大 value 不让缓冲长期占住线程内存。
+    constexpr std::size_t kReadBufRetain = 1u << 20;  // 1 MiB
+    if (read_buf.size() < total_size) read_buf.resize(total_size);
 
-    if (std::holds_alternative<io::ReadEof>(*r)) {
+    auto n = file_.pread_into(offset,
+                              std::span(read_buf.data(), total_size));
+    if (!n) return std::unexpected(io_fault(n.error()));
+    if (*n < total_size) {  // 含 EOF(0 字节)
         return std::unexpected(DataFileFault{DataFileError::kShortRead});
     }
-    auto& ok = std::get<io::ReadOk>(*r);
-    if (ok.data.size() < total_size) {
-        return std::unexpected(DataFileFault{DataFileError::kShortRead});
-    }
-    auto rec = codec::decode_data_record(ok.data);
+    auto rec = codec::decode_data_record(
+        std::span<const std::byte>(read_buf.data(), total_size));
     if (!rec) {
         // codec::DecodeError → DataFileFault
         switch (rec.error()) {
@@ -143,6 +147,11 @@ DataFile::read(std::uint64_t offset, std::uint32_t total_size) {
     out.total_size = static_cast<std::uint32_t>(rec->total_size);
     out.key.assign(rec->key.begin(), rec->key.end());
     out.value.assign(rec->value.begin(), rec->value.end());
+    // key/value 已拷出,缓冲可以安全收缩(防超大 value 撑住线程内存)。
+    if (read_buf.size() > kReadBufRetain) {
+        read_buf.clear();
+        read_buf.shrink_to_fit();
+    }
     return out;
 }
 
@@ -162,20 +171,23 @@ DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
     // 先读 header（14 字节）拿 KeySz / ValueSz 算出整条 record 的大小，
     // 再一次 pread 把 body 读出来 decode。两次 pread 比一次大块读更省内存
     // —— 大 value（几 MB）下避免提前分配。
+    // 缓冲整个 fold 循环复用(容量只增):扫盘重建从每条 2 次 malloc
+    // 降到 0(摊销)。
+    std::vector<std::byte> buf;
     while (offset + format::kHeaderSize <= total) {
-        auto hr = file_.pread(offset, format::kHeaderSize);
-        if (!hr) return std::unexpected(io_fault(hr.error()));
-        if (std::holds_alternative<io::ReadEof>(*hr)) break;
-        auto& hdr = std::get<io::ReadOk>(*hr);
-        if (hdr.data.size() < format::kHeaderSize) break;
+        if (buf.size() < format::kHeaderSize) buf.resize(format::kHeaderSize);
+        auto hn = file_.pread_into(
+            offset, std::span(buf.data(), format::kHeaderSize));
+        if (!hn) return std::unexpected(io_fault(hn.error()));
+        if (*hn < format::kHeaderSize) break;  // 含 EOF(0 字节)
 
         // 只读出长度字段，CRC 等下读完整 record 再校验。手动做大端→主机
         // 字节序转换（不复用 codec 的 be_load_u* 是因为这里只想要这两个
         // 字段，不想 decode 整个 header）。
         std::uint16_t key_sz;
         std::uint32_t value_sz;
-        std::memcpy(&key_sz,  hdr.data.data() + format::kKeySzOffset,  sizeof(key_sz));
-        std::memcpy(&value_sz, hdr.data.data() + format::kValueSzOffset, sizeof(value_sz));
+        std::memcpy(&key_sz,  buf.data() + format::kKeySzOffset,  sizeof(key_sz));
+        std::memcpy(&value_sz, buf.data() + format::kValueSzOffset, sizeof(value_sz));
         key_sz   = static_cast<std::uint16_t>(((key_sz & 0xFF) << 8) | (key_sz >> 8));
         value_sz = ((value_sz & 0xFFu) << 24) | ((value_sz & 0xFF00u) << 8) |
                    ((value_sz & 0xFF0000u) >> 8) | (value_sz >> 24);
@@ -189,12 +201,15 @@ DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
         // 拿这个值跟 size() 比较，不一致就 truncate_to(out_last_valid_end)。
         if (offset + rec_total > total) break;
 
-        auto br = file_.pread(offset, rec_total);
-        if (!br) return std::unexpected(io_fault(br.error()));
-        if (std::holds_alternative<io::ReadEof>(*br)) break;
-        auto& body = std::get<io::ReadOk>(*br);
+        if (buf.size() < rec_total) buf.resize(rec_total);
+        auto bn = file_.pread_into(offset, std::span(buf.data(), rec_total));
+        if (!bn) return std::unexpected(io_fault(bn.error()));
+        if (*bn == 0) break;  // EOF
 
-        auto rec = codec::decode_data_record(body.data);
+        // 短读(*bn < rec_total)交给 decode 判 kBufferTooShort,
+        // 走与旧实现相同的错误路径。
+        auto rec = codec::decode_data_record(
+            std::span<const std::byte>(buf.data(), *bn));
         if (!rec) {
             if (rec.error() == codec::DecodeError::kBadCrc && tolerate_crc_errors) {
                 if (++crc_errors > kCrcSkipLimit) {

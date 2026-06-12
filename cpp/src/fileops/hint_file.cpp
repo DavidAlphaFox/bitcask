@@ -47,14 +47,13 @@ HintFile::write(std::uint32_t tstamp, std::uint32_t total_sz,
     if (offset > format::kMaxOffsetV2) {
         return std::unexpected(DataFileFault{DataFileError::kTooLarge});
     }
-    std::vector<std::byte> buf;
-    buf.reserve(format::kHintRecordSize + key.size());
-    codec::encode_hint_record(buf, tstamp, total_sz, offset, tombstone, key);
+    write_buf_.clear();  // 复用容量:稳态零分配(encode 是 append 语义)
+    codec::encode_hint_record(write_buf_, tstamp, total_sz, offset, tombstone, key);
 
-    auto w = file_.write(buf);
+    auto w = file_.write(write_buf_);
     if (!w) return std::unexpected(io_fault(w.error()));
 
-    running_crc_ = codec::crc32_update(running_crc_, buf);
+    running_crc_ = codec::crc32_update(running_crc_, write_buf_);
     return {};
 }
 
@@ -62,10 +61,9 @@ HintFile::write(std::uint32_t tstamp, std::uint32_t total_sz,
 // 没封口的 hint 文件下次 open 会被 validate_trailer() 判失败，cask 会
 // fallback 到 fold(data) 重建——慢但可靠。
 std::expected<void, DataFileFault> HintFile::finalize() {
-    std::vector<std::byte> buf;
-    buf.reserve(format::kHintRecordSize);
-    codec::encode_hint_eof(buf, running_crc_);
-    auto w = file_.write(buf);
+    write_buf_.clear();
+    codec::encode_hint_eof(write_buf_, running_crc_);
+    auto w = file_.write(write_buf_);
     if (!w) return std::unexpected(io_fault(w.error()));
     return {};
 }
@@ -83,17 +81,21 @@ std::expected<void, DataFileFault> HintFile::fold(FoldFn fn) {
 
     // 在文件尾留出 sentinel record 的位置——遇到 EOF sentinel 就停下，
     // 不会把 sentinel 喂给 fn。
+    // 缓冲整个 fold 循环复用(容量只增),每条 record 零分配。
+    std::vector<std::byte> buf;
     while (offset + format::kHintRecordSize <= total) {
         // 先读 18 字节固定 header 拿 key_sz（offset 4..5, BE u16）。
         // 直接 decode_hint_record(header_only) 会被 kBufferTooShort 拒掉，
         // 因为 decoder 要求 header + key 全部就位——所以分两次 pread。
-        auto hdr = file_.pread(offset, format::kHintRecordSize);
-        if (!hdr) return std::unexpected(io_fault(hdr.error()));
-        if (std::holds_alternative<io::ReadEof>(*hdr)) break;
-        auto& hb = std::get<io::ReadOk>(*hdr);
-        if (hb.data.size() < format::kHintRecordSize) break;
+        if (buf.size() < format::kHintRecordSize) {
+            buf.resize(format::kHintRecordSize);
+        }
+        auto hn = file_.pread_into(
+            offset, std::span(buf.data(), format::kHintRecordSize));
+        if (!hn) return std::unexpected(io_fault(hn.error()));
+        if (*hn < format::kHintRecordSize) break;  // 含 EOF
 
-        const auto* p = hb.data.data();
+        const auto* p = buf.data();
         const std::uint16_t key_sz =
             static_cast<std::uint16_t>(
                 (static_cast<std::uint16_t>(p[4]) << 8) |
@@ -103,12 +105,15 @@ std::expected<void, DataFileFault> HintFile::fold(FoldFn fn) {
 
         if (offset + rec_size > total) break;  // 文件尾被截断
 
-        auto full = file_.pread(offset, static_cast<std::size_t>(rec_size));
-        if (!full) return std::unexpected(io_fault(full.error()));
-        auto& fb = std::get<io::ReadOk>(*full);
-        if (fb.data.size() < rec_size) break;
+        if (buf.size() < rec_size) buf.resize(rec_size);
+        auto fn_ = file_.pread_into(
+            offset, std::span(buf.data(), static_cast<std::size_t>(rec_size)));
+        if (!fn_) return std::unexpected(io_fault(fn_.error()));
+        if (*fn_ < rec_size) break;
 
-        auto rec = codec::decode_hint_record(fb.data);
+        auto rec = codec::decode_hint_record(
+            std::span<const std::byte>(buf.data(),
+                                       static_cast<std::size_t>(rec_size)));
         if (!rec) return std::unexpected(DataFileFault{DataFileError::kShortRead});
 
         // 遇到 EOF sentinel 收工——不调 fn（它不是真正的 entry）。

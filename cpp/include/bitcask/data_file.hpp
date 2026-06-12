@@ -159,6 +159,7 @@ private:
     std::string    path_;
     std::uint64_t  current_offset_ = 0;
     Mode           mode_           = Mode::kRead;
+    std::vector<std::byte> write_buf_;  // write() 复用的编码缓冲;容量跨调用保留
 };
 
 // ---------------------------------------------------------------------------

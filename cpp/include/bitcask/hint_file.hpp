@@ -89,6 +89,7 @@ private:
     std::string   path_;
     std::uint32_t running_crc_ = 0;
     Mode          mode_        = Mode::kRead;
+    std::vector<std::byte> write_buf_;  // write()/finalize() 复用的编码缓冲
 };
 
 }  // namespace bitcask::fileops

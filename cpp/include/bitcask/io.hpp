@@ -95,6 +95,13 @@ public:
     // 线程安全: 是（pread 不修改 fd offset；多线程可并发 pread 同一对象）。
     [[nodiscard]] ReadResult pread(std::uint64_t offset, std::size_t count) noexcept;
 
+    // pread 的零分配版：读进 caller 提供的缓冲区。返回实际读到的字节数
+    // （0 = EOF；可能短读，语义同 pread）。热路径（get/fold）用它配合
+    // 复用缓冲，避免每次读都构造 vector。
+    // 线程安全: 是（同 pread）。
+    [[nodiscard]] std::expected<std::size_t, IoError>
+    pread_into(std::uint64_t offset, std::span<std::byte> buf) noexcept;
+
     // pwrite 循环直到全部写完或出错。pwrite 部分写不退化成短写——会继续。
     // 线程安全: 是（pwrite 不动 fd offset）；但 caller 自己保证写区间不重叠。
     [[nodiscard]] std::expected<void, IoError>
