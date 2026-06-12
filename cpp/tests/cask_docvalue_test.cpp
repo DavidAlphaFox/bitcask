@@ -1705,3 +1705,144 @@ TEST_F(CaskDocValueTest, V35ConcurrentSearchDuringRebuild) {
     EXPECT_EQ((*c)->search()->hnsw_size(), kN / 2 + 40);
     (*c)->close();
 }
+
+// ── V3.6:search_hybrid RRF 融合(hnsw-design §4)─────────────────────────
+
+namespace {
+
+// 两路排名已知的固定小语料(dim=4,whitespace 分词)。
+//   查询:text "x",vec (1,0,0,0)。
+//   key  text(BM25 rank)        vec(归一化后)   (vec rank,cos)
+//   d1   "x x x"  (rank1,tf=3)  (0.6,0.8,0,0)   (rank3,0.6)
+//   d2   "x x y"  (rank2,tf=2)  (0.8,0.6,0,0)   (rank2,0.8)
+//   d3   "x y y"  (rank3,tf=1)  (1,0,0,0)       (rank1,1.0)
+//   d4   "z z z"  (无命中)       (0,0,0,1)       (rank4,0.0,单路文档)
+// 四篇 doclen 同为 3 → BM25 单调于 tf,文本排名确定。
+void v36_put_corpus(Cask& c) {
+    struct Row { const char* key; const char* text; float v[4]; };
+    static constexpr Row rows[] = {
+        {"d1", "x x x", {0.6f, 0.8f, 0.0f, 0.0f}},
+        {"d2", "x x y", {0.8f, 0.6f, 0.0f, 0.0f}},
+        {"d3", "x y y", {1.0f, 0.0f, 0.0f, 0.0f}},
+        {"d4", "z z z", {0.0f, 0.0f, 0.0f, 1.0f}},
+    };
+    for (const auto& r : rows) {
+        bitcask::DocInput doc;
+        const std::string text = r.text;
+        doc.text = sv_bytes(text);
+        doc.vector = std::span<const float>(r.v, 4);
+        ASSERT_TRUE(c.put_doc(sv_bytes(std::string(r.key)), doc, 1000));
+    }
+}
+
+constexpr double v36_rrf(int rank) { return 1.0 / (60.0 + rank); }
+
+}  // namespace
+
+// RRF 真值逐位断言(含精确平局的 ord 序):
+//   d1 = 1/61 + 1/63(text r1 + vec r3)
+//   d2 = 1/62 + 1/62
+//   d3 = 1/63 + 1/61(与 d1 **精确平局**:同两项之和,浮点可交换)
+//   d4 = 1/64        (仅 vec 路,照常累加该路项)
+//   序:d1(ord 小)→ d3 → d2 → d4。
+TEST_F(CaskDocValueTest, V36HybridRrfFusion) {
+    auto opts = v31_opts(4);
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+    v36_put_corpus(**c);
+    const float q[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+
+    auto r = (*c)->search_hybrid("x", std::span<const float>(q, 4), 10);
+    ASSERT_TRUE(r);
+    ASSERT_EQ(r->hits.size(), 4u);
+    EXPECT_EQ(r->hits[0].key, "d1");   // 平局,ord 0 < ord 2
+    EXPECT_EQ(r->hits[1].key, "d3");
+    EXPECT_EQ(r->hits[2].key, "d2");
+    EXPECT_EQ(r->hits[3].key, "d4");
+    EXPECT_DOUBLE_EQ(r->hits[0].score, v36_rrf(1) + v36_rrf(3));
+    EXPECT_DOUBLE_EQ(r->hits[1].score, v36_rrf(3) + v36_rrf(1));
+    EXPECT_DOUBLE_EQ(r->hits[0].score, r->hits[1].score);  // 锁死精确平局
+    EXPECT_DOUBLE_EQ(r->hits[2].score, v36_rrf(2) + v36_rrf(2));
+    EXPECT_DOUBLE_EQ(r->hits[3].score, v36_rrf(4));
+    EXPECT_LT(r->hits[0].ord, r->hits[1].ord);             // 平局序 = ord 升序
+
+    // k 截断:top-2 = 平局对(d1, d3)。
+    auto r2 = (*c)->search_hybrid("x", std::span<const float>(q, 4), 2);
+    ASSERT_TRUE(r2);
+    ASSERT_EQ(r2->hits.size(), 2u);
+    EXPECT_EQ(r2->hits[0].key, "d1");
+    EXPECT_EQ(r2->hits[1].key, "d3");
+    (*c)->close();
+}
+
+// 单路退化:text 空 → 等价纯向量(RRF 重打分 1/61..);vec 空 → 纯文本。
+TEST_F(CaskDocValueTest, V36HybridSingleLeg) {
+    auto opts = v31_opts(4);
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+    v36_put_corpus(**c);
+    const float q[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+
+    // 纯向量:BM25 路空 → 排名 = search_vector 序(d3,d2,d1,d4)。
+    auto rv = (*c)->search_hybrid("", std::span<const float>(q, 4), 10);
+    ASSERT_TRUE(rv);
+    ASSERT_EQ(rv->hits.size(), 4u);
+    const char* vexp[] = {"d3", "d2", "d1", "d4"};
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_EQ(rv->hits[i].key, vexp[i]);
+        EXPECT_DOUBLE_EQ(rv->hits[i].score, v36_rrf(i + 1));
+    }
+
+    // 纯文本:vec 路空 → 排名 = search_text 序(d1,d2,d3),d4 无命中。
+    auto rt = (*c)->search_hybrid("x", std::span<const float>{}, 10);
+    ASSERT_TRUE(rt);
+    ASSERT_EQ(rt->hits.size(), 3u);
+    const char* texp[] = {"d1", "d2", "d3"};
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(rt->hits[i].key, texp[i]);
+        EXPECT_DOUBLE_EQ(rt->hits[i].score, v36_rrf(i + 1));
+    }
+    (*c)->close();
+}
+
+// 边界:无向量配置 → kInvalidOption;KV → kNoIndex;维度不符 →
+// kInvalidOption;两路都空 → kInvalidOption。
+TEST_F(CaskDocValueTest, V36HybridErrors) {
+    const float q[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+
+    // 无向量配置的 search 集合。
+    auto tmp_novec = tmpdir_ / "novec36";
+    std::filesystem::create_directories(tmp_novec);
+    auto c1 = Cask::open(tmp_novec.string(), p3_search_opts());
+    ASSERT_TRUE(c1);
+    auto e1 = (*c1)->search_hybrid("x", std::span<const float>(q, 4), 10);
+    ASSERT_FALSE(e1);
+    EXPECT_EQ(e1.error().kind, bitcask::CaskError::kInvalidOption);
+    (*c1)->close();
+
+    // KV 集合(无 search_)。
+    auto tmp_kv = tmpdir_ / "kv36";
+    std::filesystem::create_directories(tmp_kv);
+    CaskOptions kv_opts;
+    kv_opts.read_write = true;
+    auto c2 = Cask::open(tmp_kv.string(), kv_opts);
+    ASSERT_TRUE(c2);
+    auto e2 = (*c2)->search_hybrid("x", std::span<const float>(q, 4), 10);
+    ASSERT_FALSE(e2);
+    EXPECT_EQ(e2.error().kind, bitcask::CaskError::kNoIndex);
+    (*c2)->close();
+
+    // 向量集合:维度不符 / 双空。
+    auto c3 = Cask::open(tmpdir_.string(), v31_opts(4));
+    ASSERT_TRUE(c3);
+    v36_put_corpus(**c3);
+    const float wrong[2] = {1.0f, 0.0f};
+    auto e3 = (*c3)->search_hybrid("x", std::span<const float>(wrong, 2), 10);
+    ASSERT_FALSE(e3);
+    EXPECT_EQ(e3.error().kind, bitcask::CaskError::kInvalidOption);
+
+    auto e4 = (*c3)->search_hybrid("", std::span<const float>{}, 10);
+    ASSERT_FALSE(e4);
+    EXPECT_EQ(e4.error().kind, bitcask::CaskError::kInvalidOption);
+    (*c3)->close();
+}
