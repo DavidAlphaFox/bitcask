@@ -440,6 +440,8 @@ private:
 
     // keydir（多个 Cask 可能通过 registry 共享同一个）
     std::shared_ptr<keydir::KeyDir> keydir_;
+    // 非拥有指针：KeyDirRegistry 由 Erlang/NIF 层创建和销毁，Cask 仅借
+    // 用以调 acquire/release。close() 时 release 后置 nullptr，不 delete。
     keydir::KeyDirRegistry* registry_ = nullptr;
     std::string keydir_name_;
 

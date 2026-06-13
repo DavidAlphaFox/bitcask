@@ -1592,6 +1592,11 @@ static constexpr std::uint32_t kInvMagic   = 0x494E5632;
 //     整组编码；不再支持 v1..v5（旧快照需先经外部工具迁移或不加载）。
 static constexpr std::uint32_t kInvVersion = 6;
 
+// load() 反序列化上限：防止损坏或恶意文件触发 OOM。
+static constexpr std::uint32_t kMaxPostingsPerTerm     = 1u << 24;  // ~16M
+static constexpr std::uint32_t kMaxPositionsPerPosting = 1u << 20;  // ~1M
+static constexpr std::uint32_t kMaxBlocksPerTerm       = 1u << 17;  // ~131k
+
 // FOR (Frame of Reference) 块压缩：对一块已排序 ord 序列，按 (frame, bits, packed)
 // 三元组编码。frame = 块内最小 ord（升序故 = 第一条），delta[i] = ords[i] - frame；
 // bits = ceil(log2(max_delta+1))（max_delta=0 时 bits=0，无 packed 字节）。
@@ -1847,7 +1852,9 @@ auto InvertedIndex::load(std::string_view path) -> bool {
             }
 
             auto pc = read_u32();
-            if (pc == 0xFFFFFFFF) { std::fclose(f); return false; }
+            if (pc == 0xFFFFFFFF || pc > kMaxPostingsPerTerm) {
+                std::fclose(f); return false;
+            }
 
             PostingList pl;
             pl.items.resize(pc);
@@ -1918,7 +1925,9 @@ auto InvertedIndex::load(std::string_view path) -> bool {
             // positions：与 v4+ 同——每 posting (u32 个数 + u32 压缩字节数 + 字节流)。
             for (std::uint32_t p = 0; p < pc; ++p) {
                 auto posc = read_u32();
-                if (posc == 0xFFFFFFFF) { std::fclose(f); return false; }
+                if (posc == 0xFFFFFFFF || posc > kMaxPositionsPerPosting) {
+                    std::fclose(f); return false;
+                }
                 auto csize = read_u32();
                 if (csize == 0xFFFFFFFF) { std::fclose(f); return false; }
                 std::vector<std::uint8_t> comp(csize);
@@ -1935,7 +1944,9 @@ auto InvertedIndex::load(std::string_view path) -> bool {
 
             // Block-Max WAND 元数据：保持 v5 结构。
             auto block_count = read_u32();
-            if (block_count == 0xFFFFFFFF) { std::fclose(f); return false; }
+            if (block_count == 0xFFFFFFFF || block_count > kMaxBlocksPerTerm) {
+                std::fclose(f); return false;
+            }
             pl.blocks.resize(block_count);
             for (std::uint32_t b = 0; b < block_count; ++b) {
                 pl.blocks[b].base_ord = read_u64();

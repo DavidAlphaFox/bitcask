@@ -138,7 +138,9 @@ private:
         std::vector<float>          vecs;    // kChunkSize * dim
         std::vector<std::uint64_t>  ords;
         std::vector<std::uint8_t>   levels;
-        std::vector<std::uint32_t*> adj;     // 每节点邻接块首指针,永不搬迁
+        // 每节点邻接块:内层 vector 构造时 resize(slots) 定容,此后 .data()
+        // 地址永不搬迁,供并发读者经 count_ acquire 安全读取。
+        std::vector<std::vector<std::uint32_t>> adj;
         std::unique_ptr<std::atomic<std::uint8_t>[]> locks;  // per-node 自旋
 
         // V4.2:int8 量化副本(对称量化,scale = max |v[i]|)。codes 是紧
@@ -149,7 +151,7 @@ private:
         std::vector<std::int32_t>   qsums;   // kChunkSize(VNNI 偏置补偿)
 
         explicit NodeChunk(std::size_t dim);
-        ~NodeChunk();
+        ~NodeChunk() = default;
         NodeChunk(const NodeChunk&) = delete;
         NodeChunk& operator=(const NodeChunk&) = delete;
     };
@@ -255,7 +257,10 @@ private:
     double inv_log_m_;                  // mL = 1/ln(M)
     std::uint64_t instance_id_;         // thread_local visited 的实例区分键
 
-    // chunk 目录:定容,写者安装、读者 load。
+    // chunk 目录:定容,写者 store-release 安装、读者 load-acquire 读取。
+    // 必须保持裸指针 + atomic<NodeChunk*>:这是无锁发布协议的核心——
+    // shared_ptr 的原子引用计数开销不可接受(每次 search 都 load)。
+    // 析构由 ~HnswIndex() 单线程 delete,此时无并发读者。
     std::array<std::atomic<NodeChunk*>, kMaxChunks> chunks_{};
     std::atomic<std::uint32_t> count_{0};        // 发布水位(节点数)
     // 高 32 位 = max_level+1(0 表示空图),低 32 位 = entry id。
