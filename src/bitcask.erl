@@ -41,15 +41,16 @@
          is_frozen/1,
          is_empty_estimate/1,
          status/1,
-          search_text/2, search_text/3,
-          search_phrase/2, search_phrase/3,
-          search_fields/2, search_fields/3,
-          search_near/3, search_near/4,
-          search_fuzzy/3, search_fuzzy/4,
-          search_wildcard/2, search_wildcard/3,
-          search_vector/2, search_vector/3, search_vector/4,
-          search_hybrid/3, search_hybrid/4,
-          set_synonym_map/2]).
+           search_text/2, search_text/3, search_text/4,
+           search_phrase/2, search_phrase/3,
+           search_fields/2, search_fields/3,
+           search_near/3, search_near/4,
+           search_fuzzy/3, search_fuzzy/4,
+           search_wildcard/2, search_wildcard/3,
+           search_vector/2, search_vector/3, search_vector/4, search_vector/5,
+           search_hybrid/3, search_hybrid/4, search_hybrid/5,
+           encode_meta/1,
+           set_synonym_map/2]).
 
 -include("bitcask.hrl").
 
@@ -472,6 +473,14 @@ search_text(Ref, Query) ->
 search_text(Ref, Query, K) ->
     bitcask_cpp_nifs:cask_search_text(Ref, Query, K).
 
+%% V5:Search + metadata filter。Filter 形态:
+%%   undefined                — 无 filter(等同 search_text/3);
+%%   [CondMap, ...]           — And{conditions};
+%%   #{logic, conditions, children} — 嵌套 MetaFilter;
+%% 失败 → badarg。
+search_text(Ref, Query, K, Filter) ->
+    bitcask_cpp_nifs:cask_search_text(Ref, Query, K, Filter).
+
 %% 短语模式搜索，默认返回前 10 条。
 search_phrase(Ref, Query) ->
     search_phrase(Ref, Query, 10).
@@ -527,6 +536,10 @@ search_vector(Ref, VecBin, K) ->
 search_vector(Ref, VecBin, K, Ef) ->
     bitcask_cpp_nifs:cask_search_vector(Ref, VecBin, K, Ef).
 
+%% V5:vector 检索 + metadata filter。Filter 形态同上。
+search_vector(Ref, VecBin, K, Ef, Filter) ->
+    bitcask_cpp_nifs:cask_search_vector(Ref, VecBin, K, Ef, Filter).
+
 %% RRF 混合检索：BM25 与向量两路各取 K'=max(K×4,64)，按 1/(60+rank) 融合，
 %% 平局 ord 小者在前。TextQuery/VecBin 允许其一为 <<>>（单路退化），
 %% 两路都空 → {error, _}。返回 {ok, [{Key, Ord, RrfScore}]}。
@@ -536,6 +549,17 @@ search_hybrid(Ref, TextQuery, VecBin) ->
 search_hybrid(Ref, TextQuery, VecBin, K) ->
     bitcask_cpp_nifs:cask_search_hybrid(Ref, TextQuery, VecBin, K).
 
+%% V5:hybrid 检索 + metadata filter。Filter 形态同上。
+search_hybrid(Ref, TextQuery, VecBin, K, Filter) ->
+    bitcask_cpp_nifs:cask_search_hybrid(Ref, TextQuery, VecBin, K, Filter).
+
 %% 设置同义词词典（S8.2）：从文件加载，查询时自动展开。
 set_synonym_map(Ref, FilePath) ->
     bitcask_cpp_nifs:cask_set_synonym_map(Ref, FilePath).
+
+%% V5:把 map 或 proplist 编码成 put_doc 可用的 meta 二进制 blob。给
+%% 业务方 / 测试一个轻量入口,生产路径下通常自己编码更高效。Value 类型:
+%% integer -> int64, float -> double, binary -> string, true|false -> bool,
+%% undefined -> null。失败 → badarg。
+encode_meta(Entries) ->
+    bitcask_cpp_nifs:cask_encode_meta(Entries).

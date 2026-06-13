@@ -17,6 +17,7 @@
          cask_sync/1,
          cask_close_write_file/1,
          cask_search_text/3,
+         cask_search_text/4,
          cask_search_phrase/3,
          cask_bool_search/3,
          cask_search_fields/3,
@@ -24,7 +25,10 @@
          cask_search_fuzzy/4,
          cask_search_wildcard/3,
          cask_search_vector/4,
+         cask_search_vector/5,
          cask_search_hybrid/4,
+         cask_search_hybrid/5,
+         cask_encode_meta/1,
          cask_set_synonym_map/2,
          cask_fold_start/3,
          cask_fold_start/4,
@@ -72,6 +76,9 @@ cask_delete(_Ref, _Key)       -> erlang:nif_error({error, not_loaded}).
 cask_sync(_Ref)               -> erlang:nif_error({error, not_loaded}).
 cask_close_write_file(_Ref)   -> erlang:nif_error({error, not_loaded}).
 cask_search_text(_Ref, _Q, _K)   -> erlang:nif_error({error, not_loaded}).
+%% V5:Search + metadata filter. Filter term = list-of-cond / map(见 parse_filter_term 注释)。
+%% undefined 视为「无 filter」;其它 term 解析失败 → badarg。
+cask_search_text(_Ref, _Q, _K, _Filter)   -> erlang:nif_error({error, not_loaded}).
 cask_search_phrase(_Ref, _Q, _K) -> erlang:nif_error({error, not_loaded}).
 cask_bool_search(_Ref, _Q, _K)   -> erlang:nif_error({error, not_loaded}).
 cask_search_fields(_Ref, _Q, _K) -> erlang:nif_error({error, not_loaded}).
@@ -81,8 +88,16 @@ cask_search_wildcard(_Ref, _Pattern, _K) -> erlang:nif_error({error, not_loaded}
 %% V3.6:VecBin = f32 LE 二进制(Dim×4 字节),<< <<X:32/float-little>> || X <- L >>。
 %% size 非 4 倍数 → badarg;维度不符 → {error, _}。Ef=0 → 引擎默认 max(K,64)。
 cask_search_vector(_Ref, _VecBin, _K, _Ef) -> erlang:nif_error({error, not_loaded}).
+%% V5:HNSW 向量检索 + metadata filter(undefined 视为无 filter)。
+cask_search_vector(_Ref, _VecBin, _K, _Ef, _Filter) -> erlang:nif_error({error, not_loaded}).
 %% V3.6:RRF 混合检索。TextBin/VecBin 允许其一为 <<>>(单路退化),都空 → {error, _}。
 cask_search_hybrid(_Ref, _TextBin, _VecBin, _K) -> erlang:nif_error({error, not_loaded}).
+%% V5:RRF 混合检索 + metadata filter(undefined 视为无 filter)。
+cask_search_hybrid(_Ref, _TextBin, _VecBin, _K, _Filter) -> erlang:nif_error({error, not_loaded}).
+%% V5:把 [{Key, Value} | ...] proplist 编码为 meta blob(Value 类型:
+%% int/float/binary/true|false/undefined → int64/f64/string/bool/null)。
+%% 给 eunit 测试用 — 生产路径下 put_doc 的 meta 是由业务自行编码的。
+cask_encode_meta(_Entries) -> erlang:nif_error({error, not_loaded}).
 cask_set_synonym_map(_Ref, _Path) -> erlang:nif_error({error, not_loaded}).
 cask_fold_start(_R, _MA, _MP) -> erlang:nif_error({error, not_loaded}).
 cask_fold_start(_R, _MA, _MP, _SeeTomb) -> erlang:nif_error({error, not_loaded}).
