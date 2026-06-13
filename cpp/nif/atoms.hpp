@@ -81,6 +81,33 @@ struct Atoms {
     ERL_NIF_TERM l2;
     ERL_NIF_TERM dot;
 
+    // V5:metadata filter 解析所需的 atom。
+    //   filter/conditions/children = 嵌套 MetaFilter 的 map 字段;
+    //   key/op/value/values = 单条 MetaCondition 的字段;
+    //   logic + and_op/or_op = MetaFilter::Logic 取值;
+    //   eq/neq/gt/gte/lt/lte/in_op/exists = MetaOp 取值。
+    // in_op/and_op/or_op 加 _op 后缀以避开 Erlang `in`/`and`/`or` 是
+    // 关键字/保留字在 atom 字面量里写起来不直观——但 NIF 侧用字符串
+    // 走 enif_make_atom 不受限制,这里只是 C++ 端字段名要避开关键字。
+    ERL_NIF_TERM filter;
+    ERL_NIF_TERM key;
+    ERL_NIF_TERM op;
+    ERL_NIF_TERM value;
+    ERL_NIF_TERM values;
+    ERL_NIF_TERM logic;
+    ERL_NIF_TERM and_op;
+    ERL_NIF_TERM or_op;
+    ERL_NIF_TERM conditions;
+    ERL_NIF_TERM children;
+    ERL_NIF_TERM eq;
+    ERL_NIF_TERM neq;
+    ERL_NIF_TERM gt;
+    ERL_NIF_TERM gte;
+    ERL_NIF_TERM lt;
+    ERL_NIF_TERM lte;
+    ERL_NIF_TERM in_op;
+    ERL_NIF_TERM exists;
+
     // 线程安全: 否（写入静态状态）；仅 on_load 调用一次。
     void init(ErlNifEnv* env) noexcept;
 };

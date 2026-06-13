@@ -69,6 +69,25 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     cosine             = a("cosine");
     l2                 = a("l2");
     dot                = a("dot");
+
+    filter             = a("filter");
+    key                = a("key");
+    op                 = a("op");
+    value              = a("value");
+    values             = a("values");
+    logic              = a("logic");
+    and_op             = a("and");
+    or_op              = a("or");
+    conditions         = a("conditions");
+    children           = a("children");
+    eq                 = a("eq");
+    neq                = a("neq");
+    gt                 = a("gt");
+    gte                = a("gte");
+    lt                 = a("lt");
+    lte                = a("lte");
+    in_op              = a("in");
+    exists             = a("exists");
 }
 
 Atoms& atoms() noexcept { return g_atoms; }
