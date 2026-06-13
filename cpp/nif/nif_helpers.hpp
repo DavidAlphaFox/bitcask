@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -19,6 +20,7 @@
 #include <erl_nif.h>
 
 #include "bitcask/cask.hpp"
+#include "bitcask/meta_filter.hpp"
 
 namespace bitcask::nif {
 
@@ -78,6 +80,12 @@ ERL_NIF_TERM run_search(ErlNifEnv* env, ERL_NIF_TERM ref_term,
 ERL_NIF_TERM fold_start_impl(ErlNifEnv* env, CaskHandle* h,
                               int maxage, int maxputs,
                               bool see_tombstones);
+
+// V5:把 Erlang term 翻译成 MetaFilter。term 形态错/缺字段/类型不匹配
+// 返回 nullptr(caller 转 badarg)。list-of-cond 形态等价 And{conditions};
+// map 形态支持 logic + conditions + children 嵌套。
+std::unique_ptr<bitcask::meta::MetaFilter>
+parse_filter_term(ErlNifEnv* env, ERL_NIF_TERM term);
 
 // vector<string> → Erlang string list。倒着 cons 保持原始顺序。
 ERL_NIF_TERM make_string_list(ErlNifEnv* env,

@@ -5,9 +5,11 @@
 #include "nif_helpers.hpp"
 
 #include <cstring>
+#include <variant>
 
 #include "atoms.hpp"
 #include "bitcask/cask.hpp"
+#include "bitcask/meta_filter.hpp"
 #include "bitcask/search_layer.hpp"
 #include "resources.hpp"
 #include "term_conv.hpp"
@@ -122,6 +124,204 @@ ERL_NIF_TERM fault_to_term(ErlNifEnv* env, const CaskFault& f) noexcept {
         default:                          tag = atoms().error; break;
     }
     return enif_make_tuple2(env, atoms().error, tag);
+}
+
+// ---------------------------------------------------------------------------
+// V5:MetaFilter 解析
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Erlang term → MetaValue。
+// 支持 int(int64) / float(double) / binary(string) / true|false(bool) / undefined(monostate)。
+// 其他形态返回 false。
+bool parse_meta_value(ErlNifEnv* env, ERL_NIF_TERM term,
+                      bitcask::meta::MetaValue& out) {
+    if (enif_is_identical(term, atoms().undefined)) {
+        out = std::monostate{};
+        return true;
+    }
+    if (enif_is_identical(term, atoms().atom_true)) {
+        out = true;
+        return true;
+    }
+    if (enif_is_identical(term, atoms().atom_false)) {
+        out = false;
+        return true;
+    }
+    // 整数走 int64:enif_get_int64 在溢出时返回 false;大数用例罕见。
+    ErlNifSInt64 iv = 0;
+    if (enif_get_int64(env, term, &iv)) {
+        out = static_cast<std::int64_t>(iv);
+        return true;
+    }
+    double dv = 0.0;
+    if (enif_get_double(env, term, &dv)) {
+        out = dv;
+        return true;
+    }
+    ErlNifBinary bv{};
+    if (enif_inspect_binary(env, term, &bv)) {
+        out = std::string(reinterpret_cast<const char*>(bv.data), bv.size);
+        return true;
+    }
+    return false;
+}
+
+// op atom → MetaOp。不识别返回 false。
+bool parse_meta_op(ErlNifEnv* /*env*/, ERL_NIF_TERM term,
+                   bitcask::meta::MetaOp& out) {
+    if (enif_is_identical(term, atoms().eq))     { out = bitcask::meta::MetaOp::Eq;     return true; }
+    if (enif_is_identical(term, atoms().neq))    { out = bitcask::meta::MetaOp::Neq;    return true; }
+    if (enif_is_identical(term, atoms().gt))     { out = bitcask::meta::MetaOp::Gt;     return true; }
+    if (enif_is_identical(term, atoms().gte))    { out = bitcask::meta::MetaOp::Gte;    return true; }
+    if (enif_is_identical(term, atoms().lt))     { out = bitcask::meta::MetaOp::Lt;     return true; }
+    if (enif_is_identical(term, atoms().lte))    { out = bitcask::meta::MetaOp::Lte;    return true; }
+    if (enif_is_identical(term, atoms().in_op))  { out = bitcask::meta::MetaOp::In;     return true; }
+    if (enif_is_identical(term, atoms().exists)) { out = bitcask::meta::MetaOp::Exists; return true; }
+    return false;
+}
+
+// 解析单条 condition map → MetaCondition。失败返回 nullptr。
+// key 必填;op 必填;value/values 按 op 类型决定;In 必带 values 列表。
+std::unique_ptr<bitcask::meta::MetaCondition>
+parse_condition_map(ErlNifEnv* env, ERL_NIF_TERM map) {
+    using bitcask::meta::MetaCondition;
+    using bitcask::meta::MetaOp;
+    using bitcask::meta::MetaValue;
+
+    ERL_NIF_TERM key_term;
+    if (!enif_get_map_value(env, map, atoms().key, &key_term)) return nullptr;
+    ErlNifBinary kb{};
+    if (!enif_inspect_binary(env, key_term, &kb)) return nullptr;
+    std::string key(reinterpret_cast<const char*>(kb.data), kb.size);
+
+    ERL_NIF_TERM op_term;
+    if (!enif_get_map_value(env, map, atoms().op, &op_term)) return nullptr;
+    MetaOp op{};
+    if (!parse_meta_op(env, op_term, op)) return nullptr;
+
+    auto cond = std::make_unique<MetaCondition>();
+    cond->key = std::move(key);
+    cond->op = op;
+
+    if (op == MetaOp::In) {
+        ERL_NIF_TERM values_term;
+        if (!enif_get_map_value(env, map, atoms().values, &values_term)) return nullptr;
+        if (!enif_is_list(env, values_term)) return nullptr;
+        ERL_NIF_TERM head, tail = values_term;
+        while (enif_get_list_cell(env, tail, &head, &tail)) {
+            MetaValue v;
+            if (!parse_meta_value(env, head, v)) return nullptr;
+            cond->values.push_back(std::move(v));
+        }
+        if (cond->values.empty()) return nullptr;
+    } else if (op == MetaOp::Exists) {
+        // value field intentionally ignored
+    } else {
+        ERL_NIF_TERM value_term;
+        if (!enif_get_map_value(env, map, atoms().value, &value_term)) return nullptr;
+        if (!parse_meta_value(env, value_term, cond->value)) return nullptr;
+    }
+
+    return cond;
+}
+
+// 解析一个 MetaFilter map(含 logic/conditions/children 三个字段)。
+// conditions/children 都可缺省,缺省视为空;children 递归走本函数。
+// 任一子项解析失败返回 nullptr。
+std::unique_ptr<bitcask::meta::MetaFilter>
+parse_filter_map(ErlNifEnv* env, ERL_NIF_TERM map) {
+    using bitcask::meta::MetaFilter;
+
+    auto filter = std::make_unique<MetaFilter>();
+
+    ERL_NIF_TERM logic_term;
+    if (enif_get_map_value(env, map, atoms().logic, &logic_term)) {
+        if (enif_is_identical(logic_term, atoms().and_op)) {
+            filter->logic = MetaFilter::Logic::And;
+        } else if (enif_is_identical(logic_term, atoms().or_op)) {
+            filter->logic = MetaFilter::Logic::Or;
+        } else {
+            return nullptr;
+        }
+    }
+    // logic 缺省默认 And——与 list 形态行为一致。
+
+    ERL_NIF_TERM cond_term;
+    if (enif_get_map_value(env, map, atoms().conditions, &cond_term)) {
+        if (!enif_is_list(env, cond_term)) return nullptr;
+        ERL_NIF_TERM head, tail = cond_term;
+        while (enif_get_list_cell(env, tail, &head, &tail)) {
+            if (!enif_is_map(env, head)) return nullptr;
+            auto c = parse_condition_map(env, head);
+            if (!c) return nullptr;
+            filter->conditions.push_back(std::move(*c));
+        }
+    }
+
+    ERL_NIF_TERM children_term;
+    if (enif_get_map_value(env, map, atoms().children, &children_term)) {
+        if (!enif_is_list(env, children_term)) return nullptr;
+        ERL_NIF_TERM head, tail = children_term;
+        while (enif_get_list_cell(env, tail, &head, &tail)) {
+            if (!enif_is_map(env, head)) return nullptr;
+            auto child = parse_filter_map(env, head);
+            if (!child) return nullptr;
+            filter->children.push_back(std::move(child));
+        }
+    }
+
+    return filter;
+}
+
+}  // namespace
+
+// 把 Erlang term 翻译成 MetaFilter。
+//   简单列表 [CondMap, ...] →  And{conditions};
+//   map #{key, op, value/values}  → 单条 condition,包成 And{conditions};
+//   map #{logic, conditions, children} → 递归嵌套;logic/conditions/children 均可缺省。
+// 失败/形态错 → nullptr(caller 转 badarg)。
+std::unique_ptr<bitcask::meta::MetaFilter>
+parse_filter_term(ErlNifEnv* env, ERL_NIF_TERM term) {
+    if (enif_is_list(env, term)) {
+        auto f = std::make_unique<bitcask::meta::MetaFilter>();
+        ERL_NIF_TERM head, tail = term;
+        while (enif_get_list_cell(env, tail, &head, &tail)) {
+            if (!enif_is_map(env, head)) return nullptr;
+            auto c = parse_condition_map(env, head);
+            if (!c) return nullptr;
+            f->conditions.push_back(std::move(*c));
+        }
+        return f;
+    }
+    if (enif_is_map(env, term)) {
+        // 歧义消解:map 里有 key / op → 单条 condition;否则 → 嵌套 filter。
+        // 用 map iterator 比 enif_get_map_value 配 nullptr 输出更安全。
+        bool has_cond_field = false;
+        ErlNifMapIterator iter;
+        if (enif_map_iterator_create(env, term, &iter, ERL_NIF_MAP_ITERATOR_FIRST)) {
+            ERL_NIF_TERM k, v;
+            while (enif_map_iterator_get_pair(env, &iter, &k, &v)) {
+                if (enif_is_identical(k, atoms().key) ||
+                    enif_is_identical(k, atoms().op)) {
+                    has_cond_field = true;
+                    break;
+                }
+                enif_map_iterator_next(env, &iter);
+            }
+            enif_map_iterator_destroy(env, &iter);
+        }
+        if (has_cond_field) {
+            auto c = parse_condition_map(env, term);
+            if (!c) return nullptr;
+            auto f = std::make_unique<bitcask::meta::MetaFilter>();
+            f->conditions.push_back(std::move(*c));
+            return f;
+        }
+        return parse_filter_map(env, term);
+    }
+    return nullptr;
 }
 
 // ---------------------------------------------------------------------------
