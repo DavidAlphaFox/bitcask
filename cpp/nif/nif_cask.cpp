@@ -2,10 +2,12 @@
 // Phase 6 统一后：put 支持 binary（KV）和 map（search-doc）两种形态，
 // 并新增 cask_search_text / cask_search_phrase 搜索 NIF。
 
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "atoms.hpp"
+#include "bitcask/meta_filter.hpp"
 #include "nif_helpers.hpp"
 #include "priv_data.hpp"
 #include "resources.hpp"
@@ -226,6 +228,68 @@ ERL_NIF_TERM nif_cask_search_hybrid(ErlNifEnv* env, int /*argc*/,
     if (!binary_to_f32vec(vec_bin, query)) return enif_make_badarg(env);
     if (!h->cask->has_search()) return make_error(env, atoms().no_index);
     auto r = h->cask->search_hybrid(as_string_view(text_bin), query, k);
+    if (!r) return fault_to_term(env, r.error());
+    return make_ok(env, make_search_hits(env, r->hits));
+}
+
+// V5:解析「可选 filter term」 — 形态为 undefined atom → 无 filter;
+// 其它 term 走 parse_filter_term 翻译;解析失败 → badarg。
+// 返回的 unique_ptr 在 NIF 同步生命周期内持有,filter.get() 借给 cask
+// 搜索调用,本函数返回后即析构(与现有 3-arity 一样是同步调用)。
+static std::unique_ptr<bitcask::meta::MetaFilter>
+parse_optional_filter(ErlNifEnv* env, ERL_NIF_TERM term) {
+    if (enif_is_identical(term, atoms().undefined)) {
+        return nullptr;
+    }
+    return parse_filter_term(env, term);
+}
+
+ERL_NIF_TERM nif_cask_search_text_4(ErlNifEnv* env, int /*argc*/,
+                                     const ERL_NIF_TERM argv[]) {
+    const auto k = static_cast<std::size_t>(get_positive_int(env, argv[2], 10));
+    auto filter = parse_optional_filter(env, argv[3]);
+    if (argv[3] != atoms().undefined && !filter) return enif_make_badarg(env);
+    return run_search(env, argv[0], argv[1],
+        [k, &filter](Cask& c, std::string_view q) {
+            return c.search_text(q, k, filter.get());
+        });
+}
+
+ERL_NIF_TERM nif_cask_search_vector_5(ErlNifEnv* env, int /*argc*/,
+                                       const ERL_NIF_TERM argv[]) {
+    auto* h = checked_cask_handle(env, argv[0]);
+    ErlNifBinary vec_bin{};
+    if (!h || !ensure_binary(env, argv[1], vec_bin)) {
+        return enif_make_badarg(env);
+    }
+    const auto k  = static_cast<std::size_t>(get_positive_int(env, argv[2], 10));
+    const auto ef = static_cast<std::size_t>(get_nonneg_int(env, argv[3], 0));
+    auto filter = parse_optional_filter(env, argv[4]);
+    if (argv[4] != atoms().undefined && !filter) return enif_make_badarg(env);
+    std::vector<float> query;
+    if (!binary_to_f32vec(vec_bin, query)) return enif_make_badarg(env);
+    if (!h->cask->has_search()) return make_error(env, atoms().no_index);
+    auto r = h->cask->search_vector(query, k, ef, filter.get());
+    if (!r) return fault_to_term(env, r.error());
+    return make_ok(env, make_search_hits(env, r->hits));
+}
+
+ERL_NIF_TERM nif_cask_search_hybrid_5(ErlNifEnv* env, int /*argc*/,
+                                       const ERL_NIF_TERM argv[]) {
+    auto* h = checked_cask_handle(env, argv[0]);
+    ErlNifBinary text_bin{};
+    ErlNifBinary vec_bin{};
+    if (!h || !ensure_binary(env, argv[1], text_bin) ||
+        !ensure_binary(env, argv[2], vec_bin)) {
+        return enif_make_badarg(env);
+    }
+    const auto k = static_cast<std::size_t>(get_positive_int(env, argv[3], 10));
+    auto filter = parse_optional_filter(env, argv[4]);
+    if (argv[4] != atoms().undefined && !filter) return enif_make_badarg(env);
+    std::vector<float> query;
+    if (!binary_to_f32vec(vec_bin, query)) return enif_make_badarg(env);
+    if (!h->cask->has_search()) return make_error(env, atoms().no_index);
+    auto r = h->cask->search_hybrid(as_string_view(text_bin), query, k, filter.get());
     if (!r) return fault_to_term(env, r.error());
     return make_ok(env, make_search_hits(env, r->hits));
 }
