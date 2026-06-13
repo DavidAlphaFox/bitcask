@@ -1050,7 +1050,19 @@ WAND 路径无此问题。建议顺序：P2.1 → 基准 → P2.2 → P2.3。
 
 **本批未做（记录，留后续独立 commit）**：测试侧 LCG/LiveChecker 桩重复（建共享测试头，纯测试维护性）；nfkc_casefold_inert 表改离线 Unicode 数据生成（引入构建期工具，altitude）。
 
-### V3 — HNSW 单图 + search_vector（暂缓）
+### V3 — HNSW 单图 + search_vector（✅ 已通过其他迭代完成）
+
+> 原规划范围（自研 HNSW 索引 + search_vector API + search_hybrid RRF + BCVS 快照 + merge 重建）
+> 未作为独立 V3 里程碑推进，而是拆散到 S 系列、V3.9、V4 迭代中逐步落地。功能目标全部达成。
+
+| 原目标 | 实际完成位置 | 状态 |
+|--------|-------------|------|
+| 自研 HNSW 索引（per-node 锁 + live 过滤 + 并发读） | S 系列 | ✅ |
+| search_vector API（NIF + SearchLayer + 死点过滤） | S 系列 | ✅ |
+| search_hybrid + RRF 融合（BM25 + 向量） | S 系列 | ✅ |
+| BCVS 快照持久化 + merge 重建 | S 系列 | ✅ |
+| AVX-512/AVX2 距离内核（runtime dispatch） | V3.9 | ✅ |
+| int8 量化 + VNNI 粗筛 + f32 精排 | V4.1–V4.2 | ✅ |
 
 ### V4 — 单域 merge
 
