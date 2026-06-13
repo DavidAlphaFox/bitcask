@@ -1159,7 +1159,7 @@ WAND 路径无此问题。建议顺序：P2.1 → 基准 → P2.2 → P2.3。
 
 **门禁**：395/396（MetaFilter pre-existing）+ eunit + bench ablation
 
-**V6.5 gate**：若 V6.3.1 排序数组在 `*foo*` 已给 3× 以上加速 → wildcard trie 推 V7
+**V6.5 gate**：若 V6.3.1 排序数组在 `*foo*` 已给 3× 以上加速 → wildcard trie 推 V7。**实测：infix `*1234*` 全扫 141μs（亚毫秒），推 V7+**
 
 ### V6.4 — 格式预留 & 测算（设计文档为主，非功能代码）
 
@@ -1177,8 +1177,8 @@ WAND 路径无此问题。建议顺序：P2.1 → 基准 → P2.2 → P2.3。
 
 | # | 内容 | 状态 |
 |---|------|------|
-| V6.5.1 | wildcard trie/FST/DAWG：设计文档 + 原型。Gate on V6.3.1 排序数组对 `*foo*` 的加速倍数 | ☐ |
-| V6.5.2 | value 压缩（zstd/LZ4）：**仅**限落盘 data file body（不影响 GetResult 零拷贝路径）。与 V6.1 互斥，不可同时做 | ☐ |
+| V6.5.1 | wildcard trie/FST/DAWG：设计文档 + 原型。Gate on V6.3.1 排序数组对 `*foo*` 的加速倍数 | ✅ 推 V7+（中缀全扫 141μs 已亚毫秒，ROI 不足） |
+| V6.5.2 | value 压缩（zstd/LZ4）：**仅**限落盘 data file body（不影响 GetResult 零拷贝路径）。与 V6.1 互斥，不可同时做 | ❌ 取消（与 V6.1 零拷贝互斥） |
 
 ### 明确排除（V7+ 或永久取消）
 
@@ -1187,6 +1187,8 @@ WAND 路径无此问题。建议顺序：P2.1 → 基准 → P2.2 → P2.3。
 | Product Quantization (PQ) codebook | ❌ V7+ | 离线训练管线是独立项目；V6.4.1 留 seam |
 | HNSW 外存 mmap | ❌ V7+ | V3.5 BCVS 已给 46×；100M+ 规模问题是另一类设计 |
 | ord 重编号 | ⚠️ V6.4.3 测量后决策 | format "never reused" 约束正确；若 gap < 2× 正式取消 |
+| wildcard trie/FST/DAWG | ❌ V7+ | V6.5.1 评估：中缀全扫 141μs 已亚毫秒，suffix array/n-gram 收益（141μs→5-20μs）用户无感知，工程 ROI 不足 |
+| value 压缩 zstd/LZ4 | ❌ 取消 | 与 V6.1 零拷贝互斥 |
 | A4-P2 live gate re-open | ❌ V7+ | Index sidecar 持久化是实质 blocker；当前性能不受损 |
 | Live/Roaring bitmap (ord > 100M) | ❌ V7+ | 未到规模 |
 | WAL group-commit 跨线程 | ❌ V7+ | TSan 死锁检测器 64 持锁上限（M6.6），新锁模式需独立评审 |

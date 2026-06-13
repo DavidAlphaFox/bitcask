@@ -387,3 +387,20 @@ void BM_Inverted_WildcardScan(benchmark::State& state) {
     state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations()) * 200000);
 }
 BENCHMARK(BM_Inverted_WildcardScan)->Unit(benchmark::kMicrosecond);
+
+// V6.5.1：中缀 wildcard 全扫基线（`*1234*` 模式，20 万词表）。
+// V6.3.1 sorted vocab 已给 cache 局部性收益，但无法 binary search。
+// 本基准为 suffix array / n-gram 索引优化的对照基线。
+void BM_Inverted_WildcardInfixScan(benchmark::State& state) {
+    auto idx = std::make_unique<InvertedIndex>();
+    for (std::uint64_t i = 0; i < 200000; ++i) {
+        idx->add_doc(i, {{"term" + std::to_string(i), {1, {0}}}});
+    }
+    AllLiveChecker live;
+    for (auto _ : state) {
+        auto results = idx->search_wildcard("*1234*", 10, live);
+        benchmark::DoNotOptimize(results);
+    }
+    state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations()) * 200000);
+}
+BENCHMARK(BM_Inverted_WildcardInfixScan)->Unit(benchmark::kMicrosecond);
