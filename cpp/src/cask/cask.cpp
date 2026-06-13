@@ -1493,7 +1493,19 @@ Cask::NeedsMerge Cask::needs_merge(std::uint32_t now_sec) {
         }
         summary.push_back(merge::summarize(dirname_, f));
     }
-    auto d = merge::decide(summary, opts_.policy, now_sec);
+    // V4:计算索引删除率(全局信号,用于触发 merge)。
+    // dead_doc_rate = (total_ords - live_docs) * 100 / total_ords
+    // total_ords==0 时跳过(无任何写入,谈不上删除率)。
+    int dead_doc_rate = 0;
+    if (search_) {
+        auto idx_info = search_->index_info();
+        if (idx_info.total_ords > 0) {
+            dead_doc_rate = static_cast<int>(
+                (idx_info.total_ords - idx_info.live_docs) * 100
+                / idx_info.total_ords);
+        }
+    }
+    auto d = merge::decide(summary, opts_.policy, now_sec, dead_doc_rate);
     NeedsMerge n;
     n.needs = d.needs_merge;
     for (const auto& f : d.files)         n.files.push_back(f.filename);
@@ -1502,12 +1514,33 @@ Cask::NeedsMerge Cask::needs_merge(std::uint32_t now_sec) {
 }
 
 // 合并执行。files 为空时先 needs_merge 决定要并什么；非空就直接用
-// caller 给的列表。流程：
-//   1. run_merge 实际复制活的 record 到新文件
-//   2. 从 read_files_ 缓存里淘汰被合掉的 fd（必须在 unlink 之前关，
-//      否则在某些平台上文件会通过 /proc/self/fd 短暂残留）
-//   3. unlink 旧 data + hint 文件
-//   4. trim_fstats 把旧 fstats 条目清掉
+// caller 给的列表。
+//
+// === V4 Merge Pipeline Ordering Contract ===
+// 必须严格按以下顺序执行。违反顺序会破坏快照一致性或丢失索引数据：
+//
+//  Phase 1 — Data compaction:
+//    1. run_merge()  重写活 record 到新文件, CAS 更新 KeyDir
+//
+//  Phase 2 — Index rebuild (search_ 存在时):
+//    2. write_keydir_snapshot()  捕获 pre-rebuild ord 水位
+//    3. flush IndexPool          排干待处理索引任务
+//    4. rebuild_index()          全量 BM25 重建(从活文档重分析)
+//    5. save bm25 snapshot + index sidecar
+//    6. rebuild_hnsw + flush     同步重建 HNSW 图
+//    7. save hnsw snapshot       V4:持久化重建后图(下次 open 走快照路径)
+//
+//  Phase 3 — Cleanup:
+//    8. erase read_files_ cache + unlink old data/hint
+//    9. trim_fstats
+//   10. write_keydir_snapshot()  最终状态快照
+//
+// 关键约束:
+//  - Phase 2 的 flush(3)必须在 rebuild_index(4)之前,保证 Index 覆盖全部
+//    已分配 ord,且 IndexPool worker 无在途任务(否则 rebuild 期间 in-flight
+//    task 持旧 ord 可能写到错误位置)
+//  - Phase 2 的 bm25/sidecar/hnsw snap 落盘顺序必须与 close() 一致(A4)
+//  - Phase 3 的 unlink 必须在 Phase 2 之后——否则 rebuild_index 读不到源数据
 std::expected<merge::MergeStats, CaskFault>
 Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
     if (files.empty()) {
@@ -1548,13 +1581,15 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
         (void)search_->save_index_sidecar(
             dirname_ + "/" + kIndexSidecarName, keydir_->peek_next_ord());
 
-        // V3.5:merge 后提交 HNSW 重建任务(物理清除死节点)。异步:由
-        // IndexPool worker 执行(单写者约束),merge 不等待——重建期间
-        // 查询走旧图(死节点仍滤除,语义不变),期间新 put 排在其后由同
-        // 一 worker 顺序消化。hnsw 快照不在此落盘(重建未完,落了也是
-        // 旧图);留待 close 静止点,merge 后未 close 即崩仅损失快路径。
+        // V4:merge 后同步重建 HNSW + 落盘快照。代价是 merge 多等几秒
+        // (HNSW 重建时间),收益是下次 open 走快照路径,省去全量 fold。
+        // 重建仍在 IndexPool worker 内执行(单写者约束);flush 阻塞等待
+        // 完成,save 在此之后才拍到新图(旧图仍可被 in-flight reader 持有,
+        // 引用计数续命)。
         if (meta_config_.vector_dim > 0 && index_pool_) {
             index_pool_->submit(IndexTask{IndexOp::RebuildHnsw});
+            index_pool_->flush();  // 等待重建完成
+            (void)search_->save_vec_snapshot(dirname_ + "/" + kHnswSnapName);
         }
     }
 

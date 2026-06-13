@@ -1846,3 +1846,146 @@ TEST_F(CaskDocValueTest, V36HybridErrors) {
     EXPECT_EQ(e4.error().kind, bitcask::CaskError::kInvalidOption);
     (*c3)->close();
 }
+
+// ── V4:单域 merge 三项变更 ──────────────────────────────────────────────
+
+// V4.1:删除率触发策略。写入 20 篇文档,删除 12 篇(60%),设置
+// deletion_rate_trigger=50 → needs_merge 返回 true。对照组:不删除时
+// 即使 threshold 设置很低,没有碎片文件也不会触发。
+TEST_F(CaskMergeSearchTest, DeletionRateTrigger) {
+    auto opts = make_search_opts();
+    opts.max_file_size = 32;  // 小文件,多次滚动
+    opts.policy.deletion_rate_trigger = 50;  // 50% 死文档即触发
+
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        // 写 20 篇文档,每个 put 因 max_file_size 小而滚动新文件
+        for (std::size_t i = 0; i < 20; ++i) {
+            char k[8], v[16];
+            std::snprintf(k, sizeof k, "k%02zu", i);
+            std::snprintf(v, sizeof v, "doc%02zu text", i);
+            auto val = sv_bytes(std::string(v));
+            auto key = sv_bytes(std::string(k));
+            ASSERT_TRUE((*c)->put(key, val, 1000 + static_cast<std::uint32_t>(i)));
+        }
+        (*c)->close();
+    }
+
+    // 对照组:不删任何文档 → needs_merge 不触发(文件小但无碎片)
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        auto nm = (*c)->needs_merge(3000);
+        // 文件小且碎片低,deletion_rate = 0% < 50%,不应触发
+        // (frag/dead_bytes trigger 也可能不满足,取决于文件大小)
+        EXPECT_FALSE(nm.needs);
+        (*c)->close();
+    }
+
+    // 删除 12 篇(60%)
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        for (std::size_t i = 0; i < 20; i += 2) {
+            // 删除偶数位(0,2,4,...,18) = 10 篇
+            char k[8];
+            std::snprintf(k, sizeof k, "k%02zu", i);
+            ASSERT_TRUE((*c)->remove(sv_bytes(std::string(k)), 2000));
+        }
+        // 额外删 2 篇(k01, k03)凑到 12/20 = 60%
+        for (std::size_t i : {1uz, 3uz}) {
+            char k[8];
+            std::snprintf(k, sizeof k, "k%02zu", i);
+            ASSERT_TRUE((*c)->remove(sv_bytes(std::string(k)), 2001));
+        }
+        (*c)->close();
+    }
+
+    // 删除 60% → needs_merge 应触发(deletion_rate=60% >= 50%)
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        auto nm = (*c)->needs_merge(3000);
+        EXPECT_TRUE(nm.needs) << "deletion_rate=60% should trigger merge";
+        EXPECT_FALSE(nm.files.empty()) << "should have files to merge";
+        (*c)->close();
+    }
+}
+
+// V4.2:merge 后 hnsw.snap 应被保存,重开时走快照路径而非全量 fold。
+// 验证方法:merge 前删除一半节点,merge 后 close,再 open 后图大小
+// 应等于活节点数(不是全部节点数),证明 snap 被使用(而非全量重建)。
+TEST_F(CaskDocValueTest, V4HnswSnapSavedAtMerge) {
+    constexpr std::size_t kDim = 8, kN = 40;
+    auto opts = v31_opts(kDim);
+    auto vecs = v35_make_vecs(kN, kDim, 0xBEEF);
+    auto q = v35_make_vecs(1, kDim, 0xF00D)[0];
+    auto key_of = [](std::size_t i) {
+        char k[8];
+        std::snprintf(k, sizeof k, "hs%02zu", i);
+        return std::string(k);
+    };
+
+    // 写入 40 篇向量文档
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        for (std::size_t i = 0; i < kN; ++i) v35_put(**c, key_of(i), vecs[i]);
+        (*c)->flush_index();
+        (*c)->close();
+    }
+
+    // 删除一半(偶数位)
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        for (std::size_t i = 0; i < kN; i += 2) {
+            ASSERT_TRUE((*c)->remove(sv_bytes(key_of(i))));
+        }
+        (*c)->close();
+    }
+
+    // merge:V4 改为同步 rebuild + save hnsw.snap
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        std::vector<std::string> files;
+        for (const auto& e : std::filesystem::directory_iterator(tmpdir_)) {
+            if (e.path().filename().string().ends_with(".bitcask.data")) {
+                files.push_back(e.path().string());
+            }
+        }
+        ASSERT_GE(files.size(), 1u);
+        auto mr = (*c)->merge(files, 3000);
+        ASSERT_TRUE(mr) << mr.error().detail;
+
+        // merge 后图大小 = 活节点数(同步 rebuild 已完成)
+        EXPECT_EQ((*c)->search()->hnsw_size(), kN / 2);
+        (*c)->close();
+    }
+
+    // 关键验证:重开时 hnsw.snap 存在,图大小 = 活节点数(非全量 fold 重建)
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        // hnsw.snap 被 merge 保存,open 时走快照路径,图大小 = kN/2
+        EXPECT_EQ((*c)->search()->hnsw_size(), kN / 2);
+        auto r = (*c)->search_vector(std::span<const float>(q.data(), kDim),
+                                     10, /*ef=*/256);
+        ASSERT_TRUE(r);
+        // 搜索结果不应包含已删除的偶数位
+        for (const auto& h : r->hits) {
+            auto idx = std::stoul(h.key.substr(2));
+            EXPECT_EQ(idx % 2, 1u) << "deleted key " << h.key << " in results";
+        }
+        (*c)->close();
+    }
+
+    // 验证 hnsw.snap 文件确实存在
+    {
+        namespace fs = std::filesystem;
+        EXPECT_TRUE(fs::exists(tmpdir_ / "hnsw.snap"))
+            << "hnsw.snap should exist after merge";
+    }
+}
