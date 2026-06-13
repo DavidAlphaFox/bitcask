@@ -499,6 +499,27 @@ public:
     [[nodiscard]] std::expected<void, CaskFault> roll_active();
     [[nodiscard]] std::shared_ptr<fileops::DataFile>
     read_file(std::uint32_t file_id);
+
+    // ---- 搜索方法共用基础设施 ----
+
+    // 搜索前置检查 + flush。返回错误则 caller 直接 propagate。
+    [[nodiscard]] std::expected<void, CaskFault> prepare_search();
+
+    // ---- 写入共用基础设施 ----
+
+    // write_and_keydir：写 data record + hint record + keydir put，
+    // 若 keydir put 返回 kAlreadyExists 则 roll_active 后重试一次。
+    // 返回最终使用的 ord / offset / total_size（供 caller 构造 IndexTask）。
+    struct PersistedRecord {
+        std::uint64_t ord;
+        std::uint64_t offset;
+        std::uint32_t total_size;
+        std::uint32_t file_id;
+    };
+    [[nodiscard]] std::expected<PersistedRecord, CaskFault>
+    write_and_keydir(std::span<const std::byte> key,
+                     std::span<const std::byte> encoded,
+                     std::uint32_t tstamp, std::uint64_t ord);
 };
 
 }  // namespace bitcask

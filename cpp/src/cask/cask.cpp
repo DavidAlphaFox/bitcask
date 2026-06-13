@@ -993,6 +993,54 @@ std::shared_ptr<fileops::DataFile> Cask::read_file(std::uint32_t file_id) {
     return sp;
 }
 
+// ---- 搜索 / 写入共用辅助 ---------------------------------------------------
+
+std::expected<void, CaskFault> Cask::prepare_search() {
+    if (!search_) return std::unexpected(err(CaskError::kNoIndex));
+    flush_index();
+    return {};
+}
+
+std::expected<Cask::PersistedRecord, CaskFault>
+Cask::write_and_keydir(std::span<const std::byte> key,
+                       std::span<const std::byte> encoded,
+                       std::uint32_t tstamp, std::uint64_t ord) {
+    auto w = active_data_->write(format::RecordType::kDoc, tstamp, ord,
+                                  key, encoded);
+    if (!w) return std::unexpected(io_fault(w.error().errnum,
+                                             std::string(active_data_->path())));
+    auto h = active_hint_->write(tstamp, w->total_size, w->offset,
+                                  /*tomb*/ false, key);
+    if (!h) return std::unexpected(io_fault(h.error().errnum,
+                                             std::string(active_hint_->path())));
+
+    auto pr = keydir_->put(bytes_to_view(key), active_file_id_,
+                            w->total_size, w->offset, tstamp,
+                            /*now*/ 0, /*newest*/ true, 0, 0, ord);
+    if (pr != keydir::PutResult::kAlreadyExists) {
+        return PersistedRecord{ord, w->offset, w->total_size, active_file_id_};
+    }
+
+    // keydir 认为已存在更新的 entry → roll_active 切新文件后重试一次。
+    if (auto r = roll_active(); !r) return std::unexpected(r.error());
+    const std::uint64_t ord2 = keydir_->alloc_ord();
+    auto w2 = active_data_->write(format::RecordType::kDoc, tstamp, ord2,
+                                   key, encoded);
+    if (!w2) return std::unexpected(io_fault(w2.error().errnum,
+                                              std::string(active_data_->path())));
+    auto h2 = active_hint_->write(tstamp, w2->total_size, w2->offset,
+                                   /*tomb*/ false, key);
+    if (!h2) return std::unexpected(io_fault(h2.error().errnum,
+                                              std::string(active_hint_->path())));
+    auto pr2 = keydir_->put(bytes_to_view(key), active_file_id_,
+                             w2->total_size, w2->offset, tstamp,
+                             0, true, 0, 0, ord2);
+    if (pr2 == keydir::PutResult::kAlreadyExists) {
+        return std::unexpected(err(CaskError::kAlreadyExists));
+    }
+    return PersistedRecord{ord2, w2->offset, w2->total_size, active_file_id_};
+}
+
 // ---- get / put / delete ----------------------------------------------------
 // 写路径有个微妙之处：put 之前要判断 keydir.biggest_file_id() 是不是已经
 // 超过自己的 active_file_id_——如果超了，说明并发 merger 抢先把 file_id
@@ -1146,52 +1194,13 @@ Cask::put(std::span<const std::byte> key,
     parts.text = value;
     codec::encode_doc_value(encoded, parts);
 
-    auto w = active_data_->write(format::RecordType::kDoc, tstamp,
-                                  ord, key,
-                                  std::span<const std::byte>(encoded));
-    if (!w) return std::unexpected(io_fault(w.error().errnum,
-                                             std::string(active_data_->path())));
-    auto h = active_hint_->write(tstamp, w->total_size, w->offset,
-                                  /*tomb*/ false, key);
-    if (!h) return std::unexpected(io_fault(h.error().errnum,
-                                             std::string(active_hint_->path())));
-
-auto pr = keydir_->put(bytes_to_view(key), active_file_id_,
-                            w->total_size, w->offset, tstamp,
-                            /*now*/ 0, /*newest*/ true, 0, 0, ord);
-    if (pr == keydir::PutResult::kAlreadyExists) {
-        if (auto r = roll_active(); !r) return std::unexpected(r.error());
-        const std::uint64_t ord2 = keydir_->alloc_ord();
-        std::vector<std::byte> enc2;
-        enc2.reserve(value.size() + 16);
-        codec::DocValueParts parts2;
-        parts2.text = value;
-        codec::encode_doc_value(enc2, parts2);
-        auto w2 = active_data_->write(format::RecordType::kDoc, tstamp,
-                                        ord2, key,
-                                        std::span<const std::byte>(enc2));
-        if (!w2) return std::unexpected(io_fault(w2.error().errnum));
-        auto h2 = active_hint_->write(tstamp, w2->total_size, w2->offset,
-                                        /*tomb*/ false, key);
-        if (!h2) return std::unexpected(io_fault(h2.error().errnum));
-        auto pr2 = keydir_->put(bytes_to_view(key), active_file_id_,
-                                  w2->total_size, w2->offset, tstamp,
-                                  0, true, 0, 0, ord2);
-        if (pr2 == keydir::PutResult::kAlreadyExists) {
-            return std::unexpected(err(CaskError::kAlreadyExists));
-        }
-        submit_index_task(IndexTask::make(
-            IndexOp::Add, bytes_to_view(key), ord2,
-            std::string_view(reinterpret_cast<const char*>(value.data()),
-                             value.size()),
-            active_file_id_, w2->offset, w2->total_size, tstamp, 0));
-    } else {
-        submit_index_task(IndexTask::make(
-            IndexOp::Add, bytes_to_view(key), ord,
-            std::string_view(reinterpret_cast<const char*>(value.data()),
-                             value.size()),
-            active_file_id_, w->offset, w->total_size, tstamp, 0));
-    }
+    auto persisted = write_and_keydir(key, encoded, tstamp, ord);
+    if (!persisted) return std::unexpected(persisted.error());
+    submit_index_task(IndexTask::make(
+        IndexOp::Add, bytes_to_view(key), persisted->ord,
+        std::string_view(reinterpret_cast<const char*>(value.data()),
+                         value.size()),
+        persisted->file_id, persisted->offset, persisted->total_size, tstamp, 0));
     return {};
 }
 
@@ -1335,67 +1344,17 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
     fill_parts(parts);
     codec::encode_doc_value(encoded, parts);
 
-    auto w = active_data_->write(format::RecordType::kDoc, tstamp,
-                                  ord, key,
-                                  std::span<const std::byte>(encoded));
-    if (!w) return std::unexpected(io_fault(w.error().errnum,
-                                             std::string(active_data_->path())));
-    auto h = active_hint_->write(tstamp, w->total_size, w->offset,
-                                  /*tomb*/ false, key);
-    if (!h) return std::unexpected(io_fault(h.error().errnum,
-                                             std::string(active_hint_->path())));
-
-    auto pr = keydir_->put(bytes_to_view(key), active_file_id_,
-                            w->total_size, w->offset, tstamp,
-                            /*now*/ 0, /*newest*/ true, 0, 0, ord);
-    if (pr == keydir::PutResult::kAlreadyExists) {
-        if (auto r = roll_active(); !r) return std::unexpected(r.error());
-        const std::uint64_t ord2 = keydir_->alloc_ord();
-        std::vector<std::byte> enc2;
-        enc2.reserve(doc.text.size() + doc.meta.size() + 16);
-        codec::DocValueParts parts2;
-        parts2.text = doc.text;
-        if (!doc.meta.empty()) {
-            parts2.meta = doc.meta;
-        }
-        if (!vec_out.empty()) parts2.vector = vec_out;
-        fill_parts(parts2);
-        codec::encode_doc_value(enc2, parts2);
-        auto w2 = active_data_->write(format::RecordType::kDoc, tstamp,
-                                        ord2, key,
-                                        std::span<const std::byte>(enc2));
-        if (!w2) return std::unexpected(io_fault(w2.error().errnum));
-        auto h2 = active_hint_->write(tstamp, w2->total_size, w2->offset,
-                                        /*tomb*/ false, key);
-        if (!h2) return std::unexpected(io_fault(h2.error().errnum));
-        auto pr2 = keydir_->put(bytes_to_view(key), active_file_id_,
-                                  w2->total_size, w2->offset, tstamp,
-                                  0, true, 0, 0, ord2);
-        if (pr2 == keydir::PutResult::kAlreadyExists) {
-            return std::unexpected(err(CaskError::kAlreadyExists));
-        }
-        auto task = IndexTask::make(
-            IndexOp::Add, bytes_to_view(key), ord2,
-            std::string_view(reinterpret_cast<const char*>(doc.text.data()),
-                             doc.text.size()),
-            active_file_id_, w2->offset, w2->total_size, tstamp, 0,
-            task_fields());
-        task.vec.assign(vec_out.begin(), vec_out.end());  // V3.3:归一化向量随任务走
-        // V5:meta blob(结构化 KV 二进制)随任务走,worker 调 Index::set_meta。
-        task.meta.assign(doc.meta.begin(), doc.meta.end());
-        submit_index_task(std::move(task));
-    } else {
-        auto task = IndexTask::make(
-            IndexOp::Add, bytes_to_view(key), ord,
-            std::string_view(reinterpret_cast<const char*>(doc.text.data()),
-                             doc.text.size()),
-            active_file_id_, w->offset, w->total_size, tstamp, 0,
-            task_fields());
-        task.vec.assign(vec_out.begin(), vec_out.end());  // V3.3
-        // V5:同上。
-        task.meta.assign(doc.meta.begin(), doc.meta.end());
-        submit_index_task(std::move(task));
-    }
+    auto persisted = write_and_keydir(key, encoded, tstamp, ord);
+    if (!persisted) return std::unexpected(persisted.error());
+    auto task = IndexTask::make(
+        IndexOp::Add, bytes_to_view(key), persisted->ord,
+        std::string_view(reinterpret_cast<const char*>(doc.text.data()),
+                         doc.text.size()),
+        persisted->file_id, persisted->offset, persisted->total_size, tstamp, 0,
+        task_fields());
+    task.vec.assign(vec_out.begin(), vec_out.end());
+    task.meta.assign(doc.meta.begin(), doc.meta.end());
+    submit_index_task(std::move(task));
     return {};
 }
 
@@ -1403,13 +1362,12 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
 // SearchLayer::search_vector(归一化/live 过滤/ord 翻译都在那边)。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_vector(std::span<const float> query, std::size_t k,
-                    std::size_t ef, const meta::MetaFilter* filter) {
-    if (!search_) return std::unexpected(err(CaskError::kNoIndex));
+                     std::size_t ef, const meta::MetaFilter* filter) {
+    if (auto g = prepare_search(); !g) return std::unexpected(g.error());
     if (meta_config_.vector_dim == 0) {
         return std::unexpected(err(CaskError::kInvalidOption,
             "collection has no vector config"));
     }
-    flush_index();
     auto hits = search_->search_vector(query, k, ef, filter);
     if (!hits) return std::unexpected(err(CaskError::kInvalidOption, hits.error()));
     return TextSearchResult{std::move(*hits)};
@@ -1419,14 +1377,13 @@ Cask::search_vector(std::span<const float> query, std::size_t k,
 // 与 RRF 融合在 SearchLayer::search_hybrid(单路退化/平局序语义见彼处)。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_hybrid(std::string_view text_query,
-                    std::span<const float> vec_query, std::size_t k,
-                    const meta::MetaFilter* filter) {
-    if (!search_) return std::unexpected(err(CaskError::kNoIndex));
+                     std::span<const float> vec_query, std::size_t k,
+                     const meta::MetaFilter* filter) {
+    if (auto g = prepare_search(); !g) return std::unexpected(g.error());
     if (meta_config_.vector_dim == 0) {
         return std::unexpected(err(CaskError::kInvalidOption,
             "collection has no vector config"));
     }
-    flush_index();
     auto hits = search_->search_hybrid(text_query, vec_query, k, filter);
     if (!hits) return std::unexpected(err(CaskError::kInvalidOption, hits.error()));
     return TextSearchResult{std::move(*hits)};
@@ -1436,8 +1393,7 @@ Cask::search_hybrid(std::string_view text_query,
 std::expected<TextSearchResult, CaskFault>
 Cask::search_text(std::string_view query, std::size_t k,
                   const meta::MetaFilter* filter) {
-    if (!search_) return std::unexpected(err(CaskError::kNoIndex));
-    flush_index();
+    if (auto g = prepare_search(); !g) return std::unexpected(g.error());
     auto hits = search_->search_text(query, k, nullptr, filter);
     if (!hits) return std::unexpected(err(CaskError::kIo, hits.error()));
     return TextSearchResult{std::move(*hits)};
@@ -1446,8 +1402,7 @@ Cask::search_text(std::string_view query, std::size_t k,
 // search_phrase：BM25 短语模式搜索。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_phrase(std::string_view query, std::size_t k) {
-    if (!search_) return std::unexpected(err(CaskError::kNoIndex));
-    flush_index();
+    if (auto g = prepare_search(); !g) return std::unexpected(g.error());
     auto hits = search_->search_phrase(query, k);
     if (!hits) return std::unexpected(err(CaskError::kIo, hits.error()));
     return TextSearchResult{std::move(*hits)};
@@ -1456,8 +1411,7 @@ Cask::search_phrase(std::string_view query, std::size_t k) {
 // search_fields：BM25 多字段搜索（S8.6），支持 field:term^boost。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_fields(std::string_view query, std::size_t k) {
-    if (!search_) return std::unexpected(err(CaskError::kNoIndex));
-    flush_index();
+    if (auto g = prepare_search(); !g) return std::unexpected(g.error());
     auto hits = search_->search_fields(query, k);
     if (!hits) return std::unexpected(err(CaskError::kIo, hits.error()));
     return TextSearchResult{std::move(*hits)};
@@ -1466,8 +1420,7 @@ Cask::search_fields(std::string_view query, std::size_t k) {
 // search_near：BM25 近邻搜索（S8.7）。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_near(std::string_view query, std::uint32_t slop, std::size_t k) {
-    if (!search_) return std::unexpected(err(CaskError::kNoIndex));
-    flush_index();
+    if (auto g = prepare_search(); !g) return std::unexpected(g.error());
     auto hits = search_->search_near(query, slop, k);
     if (!hits) return std::unexpected(err(CaskError::kIo, hits.error()));
     return TextSearchResult{std::move(*hits)};
@@ -1476,8 +1429,7 @@ Cask::search_near(std::string_view query, std::uint32_t slop, std::size_t k) {
 // bool_search：BM25 布尔搜索（AND/OR/NOT）。
 std::expected<TextSearchResult, CaskFault>
 Cask::bool_search(std::string_view query, std::size_t k) {
-    if (!search_) return std::unexpected(err(CaskError::kNoIndex));
-    flush_index();
+    if (auto g = prepare_search(); !g) return std::unexpected(g.error());
     auto hits = search_->bool_search(query, k);
     if (!hits) return std::unexpected(err(CaskError::kIo, hits.error()));
     return TextSearchResult{std::move(*hits)};
@@ -1486,8 +1438,7 @@ Cask::bool_search(std::string_view query, std::size_t k) {
 // S8.3：模糊搜索（Levenshtein 编辑距离匹配）。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_fuzzy(std::string_view query, std::size_t k, std::uint32_t max_edit_distance) {
-    if (!search_) return std::unexpected(err(CaskError::kNoIndex));
-    flush_index();
+    if (auto g = prepare_search(); !g) return std::unexpected(g.error());
     auto hits = search_->search_fuzzy(query, k, max_edit_distance);
     if (!hits) return std::unexpected(err(CaskError::kIo, hits.error()));
     return TextSearchResult{std::move(*hits)};
@@ -1496,8 +1447,7 @@ Cask::search_fuzzy(std::string_view query, std::size_t k, std::uint32_t max_edit
 // S8.4：通配符搜索（* / ? 模式匹配）。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_wildcard(std::string_view pattern, std::size_t k) {
-    if (!search_) return std::unexpected(err(CaskError::kNoIndex));
-    flush_index();
+    if (auto g = prepare_search(); !g) return std::unexpected(g.error());
     auto hits = search_->search_wildcard(pattern, k);
     if (!hits) return std::unexpected(err(CaskError::kIo, hits.error()));
     return TextSearchResult{std::move(*hits)};
