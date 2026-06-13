@@ -1,8 +1,7 @@
 # 向量库设计：在 Bitcask 引擎上原生扩展（BM25 + Embedding）
 
 本文是在当前 C++ Bitcask 引擎之上构建**混合检索向量库**的落地设计。
-配合 `doc/cpp-arch.md`（实现地图）、`doc/format.md`（磁盘格式）、
-`doc/vector-graph-db-zh.md`（前期可行性探索）阅读。
+配合 `doc/cpp-arch.md`（实现地图）、`doc/format-zh.md`（磁盘格式）阅读。
 
 > **定位**：不保留 legacy Bitcask 兼容，直接**扩展/改造核心数据结构**，把
 > KV 引擎升级成一个**单域**的向量引擎。同时支持
@@ -474,7 +473,9 @@ D. mark_ready，开服。
 ## 9. 公共 API 草案
 
 ```cpp
-struct CollectionOptions {
+// 实际实现中，这些选项通过 CaskOptions.search_config (SearchLayerConfig) 传入：
+//   vector_dim, vector_metric, analyzer, bm25_params, hnsw M/ef
+struct CaskOptions {  // 概念示意，详见 cask.hpp
   std::uint32_t dim;                 // embedding 维度
   Metric        metric = Metric::Cosine;
   NgramOptions  ngram{ .min_n = 2, .max_n = 3, .analyzer = Analyzer::CharCJK };

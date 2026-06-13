@@ -1,6 +1,6 @@
 # C++ 架构
 
-本文档介绍了 `cpp/` 目录下的 C++ 代码库，并说明各层之间如何协同工作。请结合 `doc/format.md`（磁盘格式规范）一起阅读。
+本文档介绍了 `cpp/` 目录下的 C++ 代码库，并说明各层之间如何协同工作。请结合 `doc/format-zh.md`（磁盘格式规范）一起阅读。
 
 ## 模块布局
 
@@ -20,8 +20,6 @@ cpp/
 │   ├── cask.hpp             # Cask：终端用户 KV+search 门面（open/get/put/delete/search/merge）
 │   ├── meta_file.hpp        # bitcask.meta：模式持久化（KV vs Index）
 │   ├── field_schema.hpp     # FieldSchema：字段名↔id 追加注册表（DocValue v3 字段）
-│   ├── collection.hpp       # Collection：独立文档 + BM25 搜索门面
-│   ├── collection_registry.hpp # CollectionRegistry：命名 collection 缓存
 │   ├── index.hpp            # Index：内存文档侧表（ext2ord/slots/ord2ext/live）
 │   ├── inverted.hpp         # InvertedIndex：BM25 倒排索引（分片锁）
 │   ├── search_layer.hpp     # SearchLayer：Index + InvertedIndex + Analyzer 包装器
@@ -38,7 +36,7 @@ cpp/
 │   ├── keydir/              # keydir.cpp, keydir_registry.cpp, index.cpp
 │   ├── lock/                # file_lock.cpp
 │   ├── merge/               # merger.cpp, merge_policy.cpp
-│   ├── cask/                # cask.cpp, meta_file.cpp, collection.cpp, collection_registry.cpp
+│   ├── cask/                # cask.cpp, meta_file.cpp
 │   ├── search/              # search_layer.cpp
 │   ├── bm25/                # inverted.cpp
 │   └── text/                # analyzer.cpp, jieba_analyzer.cpp
@@ -93,7 +91,7 @@ cpp/
 
 ## 磁盘文件清单
 
-一个 bitcask 实例是一个扁平目录，包含以下文件。详细的字节级规范请参阅 `doc/format.md`（英文）/ `doc/format-zh.md`（中文）。
+一个 bitcask 实例是一个扁平目录，包含以下文件。详细的字节级规范请参阅 `doc/format-zh.md`。
 
 ```
 <dir>/

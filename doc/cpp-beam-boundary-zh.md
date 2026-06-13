@@ -156,7 +156,7 @@ NIF 层不做任何业务逻辑，仅负责类型转换和生命周期管理：
 - **两把锁分离**：writer 拿 `write.lock`，merger 拿 `merge.lock`，互不阻塞
 - **Hint 是加速手段**：坏了就 fallback 到全量扫 data，正确性不依赖 hint
 
-字节级详细规范见 `doc/format.md`（English）/ `doc/format-zh.md`（中文）。
+字节级详细规范见 `doc/format-zh.md`。
 
 ## 脱离 BEAM 独立使用的可行性
 

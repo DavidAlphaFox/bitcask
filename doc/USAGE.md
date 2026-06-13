@@ -271,7 +271,6 @@ do_merge(R) ->
 | 限制 | 解决方案 |
 |------------|------------|
 | `search_text`/`search_phrase` 仅在索引模式下可用（bitcask.meta 中 `mode=kIndex`） | 使用 `{analyzer, ...}` 打开以启用 |
-| Collection 类与 Cask 分离 | 计划统一（见 TASK.md U0-U6） |
 | 源文件上没有 tombstone-v2 反向标记 | 仅支持单进程工作负载；不支持多进程读取者 |
 
 ## 过期
