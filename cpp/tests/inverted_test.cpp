@@ -1474,3 +1474,139 @@ TEST(InvertedIndex, WandSkipTopKEqualsUnprunedPrefix) {
         }
     }
 }
+
+// ===========================================================================
+// V6.3.1：排序词典侧表懒重建回归
+// ===========================================================================
+//
+// 验证 lazy rebuild 协议的核心契约：
+//   ① ensure_vocab 在 dirty 时重建，清 dirty，发布新 shared_ptr
+//   ② add_doc 新增 term 后，相应 shard.vocab_dirty_ 被置 true
+//   ③ 旧 term 不触发 dirty（is_new_term=false → 不写）
+//   ④ load 后所有 shard 的 vocab_dirty_ 为 true（首搜重建）
+//   ⑤ 搜索路径吃 ensure_vocab → 跨 add_doc 边界能找到新 term
+
+TEST(InvertedIndex, SortedVocabSidecarRebuilds) {
+    InvertedIndex idx;
+
+    // 起始：所有 shard vocab_dirty_ = true（Shard 默认构造）。
+    for (std::size_t s = 0; s < 64; ++s) {
+        EXPECT_TRUE(idx.shard_for("dummy_" + std::to_string(s)).vocab_dirty_.load())
+            << "shard=" << s << " 起始应为 dirty";
+    }
+
+    // 加 3 个 term，hash 后大概率落在 3 个不同 shard（"alpha"/"beta"/"gamma"）。
+    idx.add_doc(0, {{"alpha", tp(1, {0})}});
+    idx.add_doc(1, {{"beta",  tp(1, {0})}});
+    idx.add_doc(2, {{"gamma", tp(1, {0})}});
+
+    // 持有"alpha"/"beta"/"gamma"的 shard 必被标脏；其它 shard 仍为 dirty=true
+    // （因为默认构造就是 dirty）。我们断言持有 alpha 的 shard 被标脏。
+    EXPECT_TRUE(idx.shard_for("alpha").vocab_dirty_.load())
+        << "持有 'alpha' 的 shard 应被标脏";
+
+    FakeLiveChecker checker;
+    checker.doc_lens[0] = 1;
+    checker.doc_lens[1] = 1;
+    checker.doc_lens[2] = 1;
+    // 跑 fuzzy 命中 alpha → 持有 alpha 的 shard 走 dirty 路径 rebuild + clean。
+    auto warmup = idx.search_fuzzy({"alpha"}, 10, 1, checker);
+    ASSERT_EQ(warmup.size(), 1u);
+    EXPECT_FALSE(idx.shard_for("alpha").vocab_dirty_.load())
+        << "持有 'alpha' 的 shard 在首搜后应 clean";
+
+    // 旧 term 再 add → 不该标脏（is_new_term=false 路径）。此时 alpha 所在
+    // shard 已 clean；add_doc 不应再标脏。
+    idx.add_doc(3, {{"alpha", tp(1, {0})}});
+    EXPECT_FALSE(idx.shard_for("alpha").vocab_dirty_.load())
+        << "旧 term 'alpha' add_doc 后所在 shard 不应被重标脏";
+
+    // 新 term add → 持有该 term 的 shard 必 dirty。
+    idx.add_doc(4, {{"delta", tp(1, {0})}});
+    EXPECT_TRUE(idx.shard_for("delta").vocab_dirty_.load())
+        << "新 term 'delta' 所在 shard 必被标脏";
+
+    // 搜索应能找到 delta（走 lazy rebuild 路径）。需要 doc 3、doc 4 在 live 表中。
+    checker.doc_lens[3] = 1;
+    checker.doc_lens[4] = 1;
+    auto fuzzy_with_delta = idx.search_fuzzy({"delta"}, 10, 0, checker);
+    EXPECT_EQ(fuzzy_with_delta.size(), 1u)
+        << "lazy rebuild 后搜索能找到 add_doc 时新增的 term";
+
+    // rebuild 后 delta_shard 再次 clean。
+    EXPECT_FALSE(idx.shard_for("delta").vocab_dirty_.load())
+        << "lazy rebuild 后 dirty 应被清";
+
+    // 模糊搜索仍能找到 alpha（rebuild 保留旧 key，doc 0 + doc 3）。
+    auto fuzzy_alpha = idx.search_fuzzy({"alpha"}, 10, 0, checker);
+    EXPECT_EQ(fuzzy_alpha.size(), 2u) << "alpha 应在 doc 0 和 doc 3 各命中一次";
+}
+
+// load → fuzzy 跨边界：load 后所有 shard dirty；fuzzy 遍历 64 个 shard
+// 触发 ensure_vocab，全部 clean。
+TEST(InvertedIndex, SortedVocabSidecarLoadMarksAllDirty) {
+    auto tmp = std::filesystem::temp_directory_path() / "inv_vocab_sidecar.inv";
+    std::filesystem::remove(tmp);
+
+    {
+        InvertedIndex idx;
+        idx.add_doc(0, {{"hello", tp(1, {0})}, {"world", tp(1, {1})}});
+        EXPECT_TRUE(idx.save(tmp.string()));
+    }
+    {
+        InvertedIndex idx2;
+        EXPECT_TRUE(idx2.load(tmp.string()));
+
+        // load 后所有 shard 都应是 dirty。
+        for (std::size_t s = 0; s < 64; ++s) {
+            EXPECT_TRUE(idx2.shard_for("dummy_" + std::to_string(s)).vocab_dirty_.load())
+                << "load 后 shard " << s << " 应为 dirty";
+        }
+
+        FakeLiveChecker checker;
+        checker.doc_lens[0] = 2;
+        // fuzzy 遍历 64 个 shard 触发 ensure_vocab，全部 clean。
+        auto results = idx2.search_fuzzy({"hello"}, 10, 0, checker);
+        ASSERT_EQ(results.size(), 1u);
+
+        std::size_t clean_count = 0;
+        for (std::size_t s = 0; s < 64; ++s) {
+            if (!idx2.shard_for("dummy_" + std::to_string(s)).vocab_dirty_.load()) {
+                ++clean_count;
+            }
+        }
+        EXPECT_EQ(clean_count, 64u) << "fuzzy 遍历 64 个 shard 应清掉所有 dirty";
+    }
+    std::filesystem::remove(tmp);
+}
+
+// V6.3.1 通配符 binary search 路径：prefix 模式命中走区间 + lit 预过滤 + wildcard。
+TEST(InvertedIndex, SortedVocabSidecarWildcardPrefixRebuild) {
+    InvertedIndex idx;
+    idx.add_doc(0, {{"hello",  tp(1, {0})}});
+    idx.add_doc(1, {{"help",   tp(1, {0})}});
+    idx.add_doc(2, {{"helmet", tp(1, {0})}});
+    idx.add_doc(3, {{"world",  tp(1, {0})}});
+
+    FakeLiveChecker checker;
+    checker.doc_lens[0] = 1;
+    checker.doc_lens[1] = 1;
+    checker.doc_lens[2] = 1;
+    checker.doc_lens[3] = 1;
+
+    // 首次搜索触发 lazy rebuild。
+    auto r1 = idx.search_wildcard("hel*", 10, checker);
+    EXPECT_EQ(r1.size(), 3u) << "hel* 应匹配 hello/help/helmet 三词";
+
+    // 加新 term 走 dirty 路径。
+    idx.add_doc(4, {{"helicopter", tp(1, {0})}});
+    checker.doc_lens[4] = 1;
+    auto r2 = idx.search_wildcard("hel*", 10, checker);
+    EXPECT_EQ(r2.size(), 4u) << "lazy rebuild 后应能找到新 term helicopter";
+
+    // 中缀/后缀模式（pattern[0]=='*'）走全扫。
+    auto r3 = idx.search_wildcard("*lo", 10, checker);
+    EXPECT_EQ(r3.size(), 1u) << "*lo 应匹配 hello（精确）";
+    auto r4 = idx.search_wildcard("*lp", 10, checker);
+    EXPECT_EQ(r4.size(), 1u) << "*lp 应匹配 help";
+}

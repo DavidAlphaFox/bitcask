@@ -276,6 +276,41 @@ auto InvertedIndex::shard_for(std::string_view term) const -> const Shard& {
     return shards_[h % kShardCount];
 }
 
+// V6.3.1：懒重建排序词典侧表。Fast path 是 acquire-load dirty + shared_lock
+// 读 vocab_（常驻基线数据规模下零分配）；dirty 时降级到 unique_lock 写锁下
+// 从 shard.inverted 抽 key、sort+unique、装到新 shared_ptr 发布。释放锁前
+// release-store false，与后续 add_doc 的 release-store true 形成 release/acquire
+// 配对——读者之后 acquire-load 必看到 false → 进入 fast path 时 vocab_ 已含
+// 该次 add_doc 新增的 key。
+auto InvertedIndex::ensure_vocab(std::size_t shard_idx) const
+    -> std::shared_ptr<const std::vector<std::string>> {
+    auto& shard = shards_[shard_idx];
+
+    if (!shard.vocab_dirty_.load(std::memory_order_acquire)) {
+        std::shared_lock rlock(shard.vocab_mtx_);
+        return shard.vocab_;
+    }
+
+    std::unique_lock wlock(shard.vocab_mtx_);
+    // Double-check：持写锁时已 barrier 此前所有 release-store=true，relaxed
+    // load 即可看到最新值；若已被并发线程重建则直接取现成快照。
+    if (!shard.vocab_dirty_.load(std::memory_order_relaxed)) {
+        return shard.vocab_;
+    }
+
+    std::vector<std::string> keys;
+    keys.reserve(shard.inverted.size());
+    for (auto it = shard.inverted.begin(); it != shard.inverted.end(); ++it) {
+        keys.push_back(it->first);
+    }
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+
+    shard.vocab_ = std::make_shared<const std::vector<std::string>>(std::move(keys));
+    shard.vocab_dirty_.store(false, std::memory_order_release);
+    return shard.vocab_;
+}
+
 // ---- 写 ----
 
 void InvertedIndex::add_doc(
@@ -299,7 +334,7 @@ void InvertedIndex::add_doc(
         auto& [tf, positions] = data;
         auto& shard = shard_for(term);
         PostingMap::accessor acc;
-        shard.inverted.insert(acc, term);
+        const bool is_new_term = shard.inverted.insert(acc, term);  // true = 新 key
         PostingList& pl = mutable_pl(acc->second);  // P2-min：有 phrase 读者持引用时 CoW
         // S10.10：index_positions_=false 时不存 positions（省内存，短语/近邻失效）。
         if (index_positions_) {
@@ -308,6 +343,11 @@ void InvertedIndex::add_doc(
             pl.items.push_back({ord, tf, doc_len, {}});
         }
         pl.note_appended();  // S10.6：增量封块，在线索引也吃 WAND 块跳跃
+        // V6.3.1：仅当新 key 时标脏——旧 term 的 posting list 增删不影响已排序
+        // 的 vocab_ 集合。无条件置 true 也能正确工作（只是浪费一次重建）。
+        if (is_new_term) {
+            shard.vocab_dirty_.store(true, std::memory_order_release);
+        }
     }
 
     live_doc_count_.fetch_add(1, std::memory_order_relaxed);
@@ -805,27 +845,56 @@ auto InvertedIndex::search_wildcard(
     // （string_view::find 底层是 SIMD 化的 memchr/memcmp）。
     const std::string_view lit = longest_literal(pattern);
 
+    // V6.3.1：模式有「首段字面量」（首字符非通配符）→ 从该段起跑 binary search
+    // 划出候选区间，再在区间内走最长字面量 + wildcard_match 精筛。中缀/后缀
+    // 模式（pattern[0]=='*'）走全扫——排序数组虽 cache 友好但 binary search 失效。
+    std::string prefix;
+    if (!pattern.empty() && pattern[0] != '*') {
+        for (char c : pattern) {
+            if (c == '*' || c == '?') break;
+            prefix.push_back(c);
+        }
+    }
+    // upper_bound 端点用 prefix 的「下一个串」：末字节 +1 即可（例如 "te" → "tf"）。
+    // empty prefix 表示走全扫分支。
+    std::string prefix_upper;
+    if (!prefix.empty()) {
+        prefix_upper = prefix;
+        prefix_upper.back() = static_cast<char>(static_cast<unsigned char>(prefix_upper.back()) + 1);
+    }
+
     // S10.4：并行扫词表匹配 pattern。按 shard 下标分区，每个 shard 至多被一个任务
     // 遍历（互不重叠），与既有「查询无锁读」模型一致（拷贝 plist 不持桶锁）。
+    // V6.3.1：每 shard 取排序 vocab_ 替代 hash_map 全扫 + sort——读路径吃
+    // shared_lock（fast path）零分配，binary search 区间再经 lit + wildcard_match
+    // 二次过滤。
     std::vector<TermPostings> tps = tbb::parallel_reduce(
         tbb::blocked_range<std::size_t>(0, kShardCount),
         std::vector<TermPostings>{},
         [&](const tbb::blocked_range<std::size_t>& range, std::vector<TermPostings> local) {
             for (std::size_t s = range.begin(); s < range.end(); ++s) {
-                // 两阶段：安全收集匹配 key（含 P2.5 字面量预过滤），再逐 key
-                // 经 const_accessor 取值（并发不变量见 collect_term_keys）。
-                auto matched = collect_term_keys(
-                    shards_[s].inverted, [&](const std::string& t) {
-                        if (!lit.empty() && t.find(lit) == std::string::npos) {
-                            return false;
-                        }
-                        return wildcard_match(pattern, t);
-                    });
-                for (auto& term : matched) {
+                auto vocab = ensure_vocab(s);
+                const auto& v = *vocab;
+
+                // 候选区间：prefix 模式用 [lower_bound(prefix), upper_bound(prefix_upper))，
+                // 其它模式（无 prefix）用全 vocab。
+                auto begin = v.begin();
+                auto end   = v.end();
+                if (!prefix.empty()) {
+                    begin = std::lower_bound(v.begin(), v.end(), prefix);
+                    end   = std::upper_bound(v.begin(), v.end(), prefix_upper);
+                }
+
+                // 两阶段：先在排序区间内跑 lit 预过滤 + wildcard_match 收 key；
+                // 再逐 key 经 const_accessor 取值（并发不变量见 collect_term_keys）。
+                for (auto it = begin; it != end; ++it) {
+                    const std::string& t = *it;
+                    if (!lit.empty() && t.find(lit) == std::string::npos) continue;
+                    if (!wildcard_match(pattern, t)) continue;
                     PostingMap::const_accessor acc;
-                    if (!shards_[s].inverted.find(acc, term)) continue;
+                    if (!shards_[s].inverted.find(acc, t)) continue;
                     TermPostings tp;
-                    tp.term = term;
+                    tp.term = t;
                     acc->second->snapshot_flat(tp.fp);
                     local.push_back(std::move(tp));
                 }
@@ -1380,21 +1449,26 @@ auto InvertedIndex::search_fuzzy(
     for (auto& q : query_terms) matchers.emplace_back(q);
 
     for (auto& shard : shards_) {
-        // 两阶段：安全收集模糊命中的 key（任一 query 词编辑距离 ≤ k，含 S10.3
-        // 长度差剪枝），再逐 key 经 const_accessor 取值（不变量见 collect_term_keys）。
-        auto matched = collect_term_keys(
-            shard.inverted, [&](const std::string& term) {
-                for (std::size_t qi = 0; qi < query_terms.size(); ++qi) {
-                    auto& query_term = query_terms[qi];
-                    auto len_diff = term.size() > query_term.size()
-                                        ? term.size() - query_term.size()
-                                        : query_term.size() - term.size();
-                    if (len_diff > max_edit_distance) continue;
-                    if (matchers[qi].within(term, max_edit_distance)) return true;
+        // V6.3.1：用排序 vocab_ 替代 collect_term_keys 的 hash_map 全扫 + sort。
+        // 模糊匹配编辑距离不保 lexicographic 序 → 不能 binary search，只能线性
+        // 扫；但排序 vector 比 hash_map 节点 cache 友好得多（连续 string 数组
+        // 顺次访问，无链表间接跳转），且 O(N log N) sort 折到「首次搜索后惰性」
+        // 一次摊销。
+        auto vocab = ensure_vocab(static_cast<std::size_t>(&shard - shards_.data()));
+        for (const auto& term : *vocab) {
+            bool hit = false;
+            for (std::size_t qi = 0; qi < query_terms.size(); ++qi) {
+                auto& query_term = query_terms[qi];
+                auto len_diff = term.size() > query_term.size()
+                                    ? term.size() - query_term.size()
+                                    : query_term.size() - term.size();
+                if (len_diff > max_edit_distance) continue;
+                if (matchers[qi].within(term, max_edit_distance)) {
+                    hit = true;
+                    break;
                 }
-                return false;
-            });
-        for (auto& term : matched) {
+            }
+            if (!hit) continue;
             PostingMap::const_accessor acc;
             if (!shard.inverted.find(acc, term)) continue;
             TermPostings tp;
@@ -1458,6 +1532,9 @@ void InvertedIndex::finalize_all_postings() {
             if (!shard.inverted.find(acc, key)) continue;
             mutable_pl(acc->second).finalize();
         }
+        // V6.3.1：finalize 不改 key 集合，但 conservative 标脏——下次搜索重建
+        // vocab_ 即可（rebuild 廉价，N log N 一遍）。
+        shard.vocab_dirty_.store(true, std::memory_order_release);
     }
 }
 
@@ -1501,6 +1578,9 @@ auto InvertedIndex::compact(const LiveChecker& live_checker, double dead_ratio_t
                 ++compacted;
             }
         }
+        // V6.3.1：compact 不删 key（保留空 posting list 是有意设计——避免与
+        // 写者抢桶锁），但保守标脏便于下次搜索重建 vocab_。
+        shard.vocab_dirty_.store(true, std::memory_order_release);
     }
     return compacted;
 }
@@ -1882,6 +1962,12 @@ auto InvertedIndex::load(std::string_view path) -> bool {
 
     live_doc_count_.store(N, std::memory_order_relaxed);
     sum_doc_len_.store(sdl, std::memory_order_relaxed);
+
+    // V6.3.1：load 期间各 shard 走 emplace 填入；shards_ 默认构造的 vocab_dirty_
+    // 已为 true，但保险起见显式置一次，覆盖将来构造路径变更。
+    for (auto& shard : shards_) {
+        shard.vocab_dirty_.store(true, std::memory_order_release);
+    }
 
     std::fclose(f);
     return true;

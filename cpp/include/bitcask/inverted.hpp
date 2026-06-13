@@ -21,8 +21,10 @@
 #include <oneapi/tbb/concurrent_hash_map.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -392,6 +394,17 @@ public:
     using PostingMap = tbb::concurrent_hash_map<std::string, std::shared_ptr<PostingList>>;
     struct Shard {
         PostingMap inverted;
+
+        // V6.3.1：排序词典侧表——替代每次查询时的 hash_map 全扫 + sort。
+        // vocab_dirty_ 由 add_doc 置 true（release）；首次搜索检测到 dirty 时
+        // 在 vocab_mtx_ 写锁下重建 vocab_、清 dirty。
+        // 非脏路径：shared_lock 读 vocab_ → 无重建开销。
+        // shard.inverted 与 vocab_ 的不一致窗口由 vocab_dirty_ 兜住：
+        //   写者 add_doc 后 release-store true；
+        //   读者 ensure_vocab 入口 acquire-load，true 才付写锁重建。
+        mutable std::shared_mutex vocab_mtx_;
+        mutable std::shared_ptr<const std::vector<std::string>> vocab_;
+        mutable std::atomic<bool> vocab_dirty_{true};
     };
 
     // 获取内部 shard（用于测试）。
@@ -440,6 +453,10 @@ private:
         std::uint32_t slop,
         const LiveChecker& live_checker,
         const Bm25Params* params_override) const -> std::vector<SearchResult>;
+
+    // V6.3.1：确保指定 shard 的排序词典可用。脏则重建（写锁），否则直接返回快照（读锁）。
+    auto ensure_vocab(std::size_t shard_idx) const
+        -> std::shared_ptr<const std::vector<std::string>>;
 };
 
 }  // namespace bitcask::bm25
