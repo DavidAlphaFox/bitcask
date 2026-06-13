@@ -661,9 +661,9 @@ merge 清理把 unlink 收进 read_cache_mu_ 锁内（封死 ENOENT 假失败窗
 
 | # | 目标 | 改动范围 | 关键内容 | 状态 |
 |---|------|---------|---------|------|
-| **O10.1** | shared_ptr 缓存 | cask.hpp / cask.cpp | read_files_ 值类型、read_file 返回值、全部调用方 | ☐ |
-| **O10.2** | unlink 进锁 | cask.cpp merge 尾部 | erase + unlink 同临界区（冷路径，可持锁做文件系统操作） | ☐ |
-| **O10.3** | 回归 | 全量 | ctest + ASan/UBSan + eunit | ☐ |
+| **O10.1** | shared_ptr 缓存 | cask.hpp / cask.cpp | read_files_ 值类型、read_file 返回值、全部调用方 | ✅ |
+| **O10.2** | unlink 进锁 | cask.cpp merge 尾部 | erase + unlink 同临界区（冷路径，可持锁做文件系统操作） | ✅ |
+| **O10.3** | 回归 | 全量 | ctest + ASan/UBSan + eunit | ✅ |
 
 ### O11 — WAL entry framing（[len][payload][crc32]）
 
@@ -673,9 +673,9 @@ merge 清理把 unlink 收进 read_cache_mu_ 锁内（封死 ENOENT 假失败窗
 
 | # | 目标 | 改动范围 | 关键内容 | 状态 |
 |---|------|---------|---------|------|
-| **O11.1** | 写侧 framing | inverted_wal.cpp | enc_buf_ 前置 4B len 占位 + 末尾 crc32(payload)，一次 fwrite | ☐ |
-| **O11.2** | replay 校验 | inverted_wal.cpp | len 越界/CRC 不符 → 截断至上一完整 entry,返回已回放数 | ☐ |
-| **O11.3** | 损坏注入测试 | inverted_wal_test.cpp | 截尾/翻转字节两类注入，replay 不读坏数据 | ☐ |
+| **O11.1** | 写侧 framing | inverted_wal.cpp | enc_buf_ 前置 4B len 占位 + 末尾 crc32(payload)，一次 fwrite | ✅ |
+| **O11.2** | replay 校验 | inverted_wal.cpp | len 越界/CRC 不符 → 截断至上一完整 entry,返回已回放数 | ✅ |
+| **O11.3** | 损坏注入测试 | inverted_wal_test.cpp | 截尾/翻转字节两类注入，replay 不读坏数据 | ✅ |
 
 ### O12 — merge 后为产物生成 hint ❌（审计误报，核实后不做）
 
@@ -881,8 +881,8 @@ search 路径 ord 恒由 keydir 分配,无复用风险)。
 | M6.0 | 设计文档定稿 + Mixed 多线程护栏基准 + before 基线入档 | ✅ |
 | M6.1 | S1:全局标量原子化(epoch/key_count/key_bytes/biggest_file_id)+ fstats 无锁发布(AtomicFStats deque + grow mutex + size release 发布;CAS-min/max;int64 二补数 wrap 语义保留)| ✅ |
 | M6.2 | S2:entries 16 分片 + 热路径单分片锁(fold 全屏障粗化)。Mixed 8t 0.22M→1.22M(5.4×)、2t 2.66M→11.5M;Get 4t 3.17M→15.2M、8t 2.44M→13.2M;单线程持平(~0.96×)。plain/ASan/TSan 357/357 + eunit 44/44(TSan 全插桩门禁过)。附带:next() 已是单分片锁、A4 save/load 已接分片(S3/S4 主体已随 S2 落地,余验证项) | ✅ |
-| M6.3 | S3:iter next() meta+shard 两段锁细化 | ☐ |
-| M6.4 | S4:A4 快照接分片(save 屏障 / load 分发) | ☐ |
+| M6.3 | S3:iter next() meta+shard 两段锁细化(主体已随 M6.2 落地:next() 单分片锁) | ✅ |
+| M6.4 | S4:A4 快照接分片(save 屏障 / load 分发)(主体已随 M6.2 落地) | ✅ |
 | M6.5 | S5:**kShards 16→256 + 分片锁 rwlock→std::mutex**(两级杠杆逐级实测,设计 doc §10)。Mixed/8t 0.22M→**8.34M(37×)**,Get 负扩展消除,单线程全面无回退;baseline.json 已刷新。红线复盘:Get/4t ✅;「8t≥1t」聚合未达(8.34M vs 24.8M),残差归因 epoch_ 全局 RMW + active-file fstats 真共享 + P/E 混合核,进一步收敛复杂度/收益比差,**有意止步关账**。门禁:plain/ASan/TSan 357/357 + eunit 44/44 | ✅ |
 | M6.6 | **屏障 v2:写者闸门替代"同时持全部分片锁"**(设计 doc §4/§11)。动机:257 把锁撞 TSan 死锁检测器 64 持锁硬上限(sanitizer_deadlock_detector.h:67 CHECK,DeepCopyPreservesOrd 在 detect_deadlocks=1 下必崩)。BarrierGuard(barrier_mu_+gate_mu_/cv+barrier_active_)逐分片排干,任意瞬间 ≤1 把分片锁;屏障期间读者照常并发;iter release 合并拆三阶段(meta_shared→shard 屏障内例外)。detect_deadlocks=1 固化进 tests/CMakeLists ENVIRONMENT。门禁:plain/ASan/TSan(detect_deadlocks=1)371/371 + eunit 44/44;KeyDir 基准 vs baseline 全档 ±10% 内(最大 +6.6%,噪声) | ✅ |
 
