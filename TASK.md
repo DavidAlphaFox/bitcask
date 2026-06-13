@@ -1165,11 +1165,11 @@ WAND 路径无此问题。建议顺序：P2.1 → 基准 → P2.2 → P2.3。
 
 | # | 内容 | 状态 |
 |---|------|------|
-| V6.4.1 | `vec_quantized` flag 接线：写端 stub codeword 布局（magic+version），读端仍报错"需 V7+ codeword 支持" | ☐ |
-| V6.4.2 | 外存预留点设计文档：测 HNSW 100k/1M 向量 cliff + 识别 shard-local epoch 等接入点。纯文档，不写功能代码 | ☐ |
-| V6.4.3 | ord 密度测量：1M/10M 文档下 ord gap 分布。结论：正式取消 or 排 V7 | ☐ |
+| V6.4.1 | `vec_quantized` flag 接线：写端 stub codeword 布局（magic+version），读端仍报错"需 V7+ codeword 支持" | ✅ |
+| V6.4.2 | 外存预留点设计文档：测 HNSW 100k/1M 向量 cliff + 识别 shard-local epoch 等接入点。纯文档，不写功能代码 | ✅ |
+| V6.4.3 | ord 密度测量：1M/10M 文档下 ord gap 分布。结论：正式取消 or 排 V7 | ✅ 正式取消 |
 
-**门禁**：387/387（V6.4.1 有新测试）+ 设计文档入 `doc/`
+**门禁**：396/397（MetaFilter pre-existing）+ 设计文档入 `doc/`
 
 ### V6.5 — 大工程项（V6.3 数据 gate）
 
