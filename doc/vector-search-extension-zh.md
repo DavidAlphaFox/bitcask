@@ -4,10 +4,9 @@
 
 配合以下文档阅读：
 - `doc/vector-db-design-zh.md` —— 总体 V1–V6 里程碑与单域引擎蓝图
-- `doc/vector-graph-db-zh.md` —— 前期可行性探索
-- `doc/collection-fulltext-zh.md` —— 现有 Collection 全文索引的内部机制
+- `doc/hnsw-design-zh.md` —— HNSW 向量索引设计（并发/持久化/RRF/实施表）
 - `doc/cpp-arch.md` —— C++ 模块布局与构建入口
-- `doc/format.md` / `doc/format-zh.md` —— 磁盘格式
+- `doc/format-zh.md` —— 磁盘格式
 
 ---
 
@@ -15,10 +14,10 @@
 
 | 项 | 决策 | 理由 |
 |---|---|---|
-| **目标规模** | ≤1M 向量（每 collection） | 内存 HNSW 单图在该量级下最简单、最准 |
+| **目标规模** | ≤1M 向量（每 cask） | 内存 HNSW 单图在该量级下最简单、最准 |
 | **稠密索引** | HNSW，**单图常驻内存** | 召回最好，merge 时整体重建 |
 | **混合策略** | **RRF**（Reciprocal Rank Fusion）默认 | 零调参，对 BM25 分数与向量距离的分布不敏感 |
-| **库选型** | **usearch**（header-only） | 比 hnswlib 多 mmap/持久化，比 FAISS 轻量 10x；无需 BLAS |
+| **实现** | **自研** HNSW（`hnsw.hpp` / `hnsw.cpp`） | per-node spin lock 并发读、AVX2/AVX-512 距离内核、int8 量化 + VNNI 粗筛 |
 | **距离度量** | cosine / L2 / dot 可配 | 内积用于已归一化向量；cosine 默认 |
 | **元数据过滤** | V1 **查询后过滤**起步 | 100% 召回正确；后续再加 filter-while-search |
 | **量化** | V1 **不引入**（f32） | 百万级内存可承受；接口预留 `vec_quantized` 位 |
@@ -36,12 +35,12 @@
 | **编解码** | ✅ | `encode_doc_value` / `decode_doc_value` 已支持 `[dim:varint][f32×dim]` 的读写（DocValue v3） |
 | **存储** | ✅ | 向量作为 DocValue 的一部分已落盘 |
 | **BM25 倒排** | ✅ | `InvertedIndex` + `SearchLayer::search_text/fields/phrase` 已可用 |
-| **HNSW 索引** | ❌ | 未实现 |
-| **距离度量** | ❌ | 未实现 |
-| **search_vector API** | ❌ | 未实现 |
-| **search_hybrid + RRF** | ❌ | 未实现 |
+| **HNSW 索引** | ✅ | `hnsw.hpp` / `hnsw.cpp`（V3.3–V3.9），per-node 锁 + AVX2/AVX-512 距离内核 |
+| **距离度量** | ✅ | cosine / L2 / dot（`hnsw_kernels.hpp`，运行时 SIMD 分发） |
+| **search_vector API** | ✅ | `cask_search_vector/4,5` NIF + `bitcask:search_vector/2-5` Erlang |
+| **search_hybrid + RRF** | ✅ | `SearchLayer::search_hybrid`（RRF `Σ 1/(60+rank)`） |
 
-**一句话：向量已能存能取，但没有索引与检索能力。**
+**全部已实现。** 向量存储、HNSW 索引、距离度量、混合检索均已落地。
 
 ---
 

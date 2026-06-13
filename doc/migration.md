@@ -91,13 +91,13 @@ C++23 NIF（`cask_cpp`）是唯一可用的模式。`bitcask_legacy.erl` 已被�
 
 Cask 的合并会取消链接已合并文件的 `.data` 和 `.hint` 文件，并调用 `keydir_->trim_fstats()`，使文件统计状态表保持干净。没有单独的延迟删除进程。
 
-## 尚未实现的功能
+## 后续规划
 
-完整的路线图见 `TASK.md`（U0–U6）。
+完整的路线图见 `TASK.md`。
 
-- **统一的 Cask + Collection 架构**：计划中；目前 `Cask` 和 `Collection` 是独立的类。U0–U6 将合并它们。
-- **HNSW 向量搜索**：已设计但尚未实现。
-- **`put_doc` / `upgrade`**：C++ 中可用（`Cask::put_doc`，`Cask::upgrade`）；NIF 暴露部分功能。
+已完成的里程碑：统一架构（U0–U6）、BM25 倒排索引（S1–S10）、HNSW 向量检索（V3）、int8 量化 + VNNI（V4）、元数据过滤（V5）、热路径零拷贝（V6.1）、WAL 批量 flush（V6.2）。
+
+待实现：V6.3 内存与格式体积优化（sorted vocab + TF/FOR 量化）、V6.4 格式预留、V6.5 通配符 trie/FST。
 
 ## 部署
 
