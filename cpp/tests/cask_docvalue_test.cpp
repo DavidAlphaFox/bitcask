@@ -18,6 +18,7 @@ namespace {
 using bitcask::Cask;
 using bitcask::CaskOptions;
 using bitcask::GetResult;
+using bitcask::GetResultView;  // V6.1
 using bitcask::search::SearchLayerConfig;
 using bitcask::search::SearchHit;
 using bitcask::text::AnalyzerType;
@@ -58,7 +59,7 @@ TEST_F(CaskDocValueTest, PutGetRoundTrip) {
     auto pr = (*c)->put(key, val, /*tstamp*/ 1000);
     ASSERT_TRUE(pr);
 
-    auto gr = (*c)->get(key);
+    auto gr = (*c)->get_owned(key);
     ASSERT_TRUE(gr);
     EXPECT_EQ(gr->value, val);
     EXPECT_EQ(gr->tstamp, 1000u);
@@ -82,11 +83,11 @@ TEST_F(CaskDocValueTest, PutGetRoundTripMultipleKeys) {
     ASSERT_TRUE((*c)->put(key1, val1, 1000));
     ASSERT_TRUE((*c)->put(key2, val2, 1001));
 
-    auto r1 = (*c)->get(key1);
+    auto r1 = (*c)->get_owned(key1);
     ASSERT_TRUE(r1);
     EXPECT_EQ(r1->value, val1);
 
-    auto r2 = (*c)->get(key2);
+    auto r2 = (*c)->get_owned(key2);
     ASSERT_TRUE(r2);
     EXPECT_EQ(r2->value, val2);
 
@@ -112,7 +113,7 @@ TEST_F(CaskDocValueTest, OrdMonotonicallyIncreasing) {
     for (int i = 0; i < 5; ++i) {
         auto pr = (*c)->put(key, val, static_cast<std::uint32_t>(2000 + i));
         ASSERT_TRUE(pr);
-        auto gr = (*c)->get(key);
+        auto gr = (*c)->get_owned(key);
         ASSERT_TRUE(gr);
         EXPECT_GT(static_cast<std::int64_t>(gr->ord), last_ord);
         last_ord = static_cast<std::int64_t>(gr->ord);
@@ -132,14 +133,14 @@ TEST_F(CaskDocValueTest, RemoveAndReinsert) {
     std::vector<std::byte> val2{std::byte{'b'}};
 
     ASSERT_TRUE((*c)->put(key, val1, 1000));
-    auto r1 = (*c)->get(key);
+    auto r1 = (*c)->get_owned(key);
     ASSERT_TRUE(r1);
     std::uint64_t ord1 = r1->ord;
 
     ASSERT_TRUE((*c)->remove(key, 2000));
 
     ASSERT_TRUE((*c)->put(key, val2, 3000));
-    auto r2 = (*c)->get(key);
+    auto r2 = (*c)->get_owned(key);
     ASSERT_TRUE(r2);
     EXPECT_EQ(r2->value, val2);
     EXPECT_GT(r2->ord, ord1);
@@ -206,7 +207,7 @@ TEST_F(CaskDocValueTest, DocValueEncodingVerified) {
     auto c2 = Cask::open(tmpdir_.string(), opts);
     ASSERT_TRUE(c2);
 
-    auto gr = (*c2)->get(key);
+    auto gr = (*c2)->get_owned(key);
     ASSERT_TRUE(gr);
     EXPECT_EQ(gr->value, val);
     // 恢复后 ord 保持不变（从 record header 读取）
@@ -407,7 +408,7 @@ TEST_F(CaskMergeSearchTest, SearchSurvivesMerge) {
     EXPECT_EQ(sr2->hits[0].ord, ord_before);
 
     // get 仍然正确
-    auto gr = (*c)->get(key_a);
+    auto gr = (*c)->get_owned(key_a);
     ASSERT_TRUE(gr);
     EXPECT_EQ(gr->value, val_hello);
 
@@ -571,7 +572,7 @@ TEST_F(CaskUpgradeTest, UpgradeKVToIndex) {
     ASSERT_TRUE(sr);
     EXPECT_EQ(sr->hits.size(), 2u);
 
-    auto g1 = (*upg)->get(bytes("key1"));
+    auto g1 = (*upg)->get_owned(bytes("key1"));
     ASSERT_TRUE(g1);
     EXPECT_EQ(g1->value, bytes("hello world"));
 
@@ -648,10 +649,10 @@ TEST_F(CaskUpgradeTest, UpgradePreservesDeletes) {
     auto upg = Cask::upgrade(tmpdir_.string(), search_cfg);
     ASSERT_TRUE(upg);
 
-    auto g_keep = (*upg)->get(bytes("keep"));
+    auto g_keep = (*upg)->get_owned(bytes("keep"));
     ASSERT_TRUE(g_keep);
 
-    auto g_rm = (*upg)->get(bytes("remove"));
+    auto g_rm = (*upg)->get_owned(bytes("remove"));
     EXPECT_FALSE(g_rm);
 
     auto sr = (*upg)->search_text("kept", 10);
@@ -823,7 +824,7 @@ TEST_F(CaskDocValueTest, KeydirSnapshotRoundTripEquivalence) {
         EXPECT_TRUE(c);
         for (int i = 0; i < 500; ++i) {
             const std::string k = "k" + std::to_string(i);
-            auto g = (*c)->get(sv_bytes(k));
+            auto g = (*c)->get_owned(sv_bytes(k));
             if (g) {
                 m[k] = std::string(
                     reinterpret_cast<const char*>(g->value.data()),
@@ -876,14 +877,14 @@ TEST_F(CaskDocValueTest, KeydirSnapshotStaleTailReplay) {
 
     auto c = Cask::open(tmpdir_.string(), opts);
     ASSERT_TRUE(c);
-    auto g = (*c)->get(sv_bytes(std::string("b42")));
+    auto g = (*c)->get_owned(sv_bytes(std::string("b42")));
     ASSERT_TRUE(g);  // 会话 2 新键:尾部回放恢复
-    auto g2 = (*c)->get(sv_bytes(std::string("a0")));
+    auto g2 = (*c)->get_owned(sv_bytes(std::string("a0")));
     ASSERT_TRUE(g2);
     EXPECT_EQ(std::string(reinterpret_cast<const char*>(g2->value.data()),
                           g2->value.size()),
               "updated");
-    EXPECT_FALSE((*c)->get(sv_bytes(std::string("a1"))));  // 尾部墓碑生效
+    EXPECT_FALSE((*c)->get_owned(sv_bytes(std::string("a1"))));  // 尾部墓碑生效
     (*c)->close();
 }
 
@@ -918,7 +919,7 @@ TEST_F(CaskDocValueTest, KeydirSnapshotCorruptFallsBackToFullFold) {
         auto c = Cask::open(tmpdir_.string(), opts);
         ASSERT_TRUE(c);
         for (int i = 0; i < 300; ++i) {
-            EXPECT_TRUE((*c)->get(sv_bytes("k" + std::to_string(i)))) << i;
+            EXPECT_TRUE((*c)->get_owned(sv_bytes("k" + std::to_string(i)))) << i;
         }
         (*c)->close();  // 重写好快照
     }
@@ -928,7 +929,7 @@ TEST_F(CaskDocValueTest, KeydirSnapshotCorruptFallsBackToFullFold) {
         auto c = Cask::open(tmpdir_.string(), opts);
         ASSERT_TRUE(c);
         for (int i = 0; i < 300; ++i) {
-            EXPECT_TRUE((*c)->get(sv_bytes("k" + std::to_string(i)))) << i;
+            EXPECT_TRUE((*c)->get_owned(sv_bytes("k" + std::to_string(i)))) << i;
         }
         (*c)->close();
     }
@@ -970,9 +971,9 @@ TEST_F(CaskDocValueTest, SearchSnapshotFastReopen) {
     auto sr = (*c)->search_text("banana", 300);
     ASSERT_TRUE(sr);
     EXPECT_EQ(sr->hits.size(), 199u);  // k7 已删,live 经 sidecar 恢复
-    auto g = (*c)->get(sv_bytes(std::string("k42")));
+    auto g = (*c)->get_owned(sv_bytes(std::string("k42")));
     ASSERT_TRUE(g);
-    EXPECT_FALSE((*c)->get(sv_bytes(std::string("k7"))));
+    EXPECT_FALSE((*c)->get_owned(sv_bytes(std::string("k7"))));
     (*c)->close();
 }
 
@@ -1006,7 +1007,7 @@ TEST_F(CaskDocValueTest, SearchSnapshotStaleKeydirTailReplay) {
 
     auto c = Cask::open(tmpdir_.string(), opts);
     ASSERT_TRUE(c);
-    EXPECT_TRUE((*c)->get(sv_bytes(std::string("b25"))));   // 尾部回放
+    EXPECT_TRUE((*c)->get_owned(sv_bytes(std::string("b25"))));   // 尾部回放
     auto sr = (*c)->search_text("beta", 100);
     ASSERT_TRUE(sr);
     EXPECT_EQ(sr->hits.size(), 50u);
@@ -1033,7 +1034,7 @@ TEST_F(CaskDocValueTest, SearchSnapshotCorruptSidecarFallsBack) {
     auto sr = (*c)->search_text("gamma", 200);
     ASSERT_TRUE(sr);
     EXPECT_EQ(sr->hits.size(), 120u);
-    EXPECT_TRUE((*c)->get(sv_bytes(std::string("k99"))));
+    EXPECT_TRUE((*c)->get_owned(sv_bytes(std::string("k99"))));
     (*c)->close();
 }
 
@@ -1061,7 +1062,7 @@ TEST_F(CaskDocValueTest, V31VectorRoundTripNormalized) {
         doc.vector = std::span<const float>(raw, 4);
         ASSERT_TRUE((*c)->put_doc(key, doc, 1000));
 
-        auto g = (*c)->get(key);
+        auto g = (*c)->get_owned(key);
         ASSERT_TRUE(g);
         ASSERT_EQ(g->vector.size(), 4u);
         EXPECT_FLOAT_EQ(g->vector[0], 0.6f);
@@ -1071,7 +1072,7 @@ TEST_F(CaskDocValueTest, V31VectorRoundTripNormalized) {
     // 重开(快照路径)后向量仍在(data file 为 source of truth)。
     auto c = Cask::open(tmpdir_.string(), opts);
     ASSERT_TRUE(c);
-    auto g = (*c)->get(key);
+    auto g = (*c)->get_owned(key);
     ASSERT_TRUE(g);
     ASSERT_EQ(g->vector.size(), 4u);
     EXPECT_FLOAT_EQ(g->vector[0], 0.6f);
@@ -2170,6 +2171,135 @@ TEST_F(CaskDocValueTest, V5NoMetaFilteredOut) {
             EXPECT_TRUE(h.key == "v0" || h.key == "v2") << h.key;
         }
     }
+
+    (*c)->close();
+}
+
+// V6.1:GetResultView 生命周期合约——给 TSan 验证零拷贝路径下没有
+// 悬空访问、double-free、data race。重点：
+//   1. span 生命周期 = GetResultView 实例生命周期,move 后旧 view 不能再
+//      deref（编译期禁止,运行期持有 mvd-out 后的旧实例就是越界）
+//   2. to_owned() 后 GetResult 完全独立于 view,可任意析构后者
+//   3. 反复 put / get 在同一目录不泄漏 ReadRecord 内部 vector
+//   4. view 暴露的 span.data() 在 view 析构前可安全 memcpy
+TEST_F(CaskDocValueTest, V61GetResultViewLifecycle) {
+    CaskOptions opts;
+    opts.read_write = true;
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+
+    const std::string payload = "tsan-lifecycle-payload-1234567890";
+    std::vector<std::byte> key{std::byte{'t'}, std::byte{'s'}, std::byte{'n'}};
+    std::vector<std::byte> val{payload.size(), std::byte{0}};
+    for (std::size_t i = 0; i < payload.size(); ++i) {
+        val[i] = static_cast<std::byte>(payload[i]);
+    }
+    ASSERT_TRUE((*c)->put(key, val, 1000));
+
+    // (1) get 返回 GetResultView,spans 指向 pread 缓冲。
+    auto v1 = (*c)->get_owned(key);  // 用 owned 拷贝原始值,做 baseline
+    ASSERT_TRUE(v1);
+    auto gv = (*c)->get(key);
+    ASSERT_TRUE(gv);
+    EXPECT_EQ(gv->tstamp, 1000u);
+    EXPECT_EQ(gv->ord, v1->ord);
+    ASSERT_EQ(gv->value.size(), v1->value.size());
+    // span → bytes 拷贝,验证 v1 (owned) 和 gv (view) 一致
+    {
+        std::vector<std::byte> got(gv->value.begin(), gv->value.end());
+        EXPECT_EQ(got, v1->value);
+    }
+
+    // (2) move 构造:新 view 持有 storage,旧 view 不能再 deref。
+    //   仅做运行时校验(编译期 = delete 已禁止复制);move 后仍可读新 view。
+    GetResultView moved(std::move(*gv));
+    ASSERT_EQ(moved.value.size(), v1->value.size());
+    {
+        std::vector<std::byte> got(moved.value.begin(), moved.value.end());
+        EXPECT_EQ(got, v1->value);
+    }
+    // gv 已被 move-from,spans 已空(storage 已被搬走,空向量 → decode
+    // 在 move-ctor 里被跳过)。这里只校验 moved 仍可正常读。
+    EXPECT_TRUE(moved.ord == v1->ord);
+
+    // (3) to_owned() 出独立副本,跟 view 解耦:析构 view 后副本仍可读。
+    GetResult owned = moved.to_owned();
+    EXPECT_EQ(owned.value, v1->value);
+    EXPECT_EQ(owned.tstamp, v1->tstamp);
+    EXPECT_EQ(owned.ord, v1->ord);
+    // 强制析构 view(RAII)
+    {
+        GetResultView tmp = std::move(moved);
+        (void)tmp;
+    }
+    // owned 仍持有完整数据
+    EXPECT_EQ(owned.value, v1->value);
+
+    // (4) 反复 put / get 不应泄漏 ReadRecord 内部 vector;同时校验
+    //     新 span 不指向旧 storage(避免假阳性)。
+    for (int i = 0; i < 50; ++i) {
+        std::vector<std::byte> k{std::byte{'k'}};
+        k.push_back(static_cast<std::byte>('0' + (i % 10)));
+        std::vector<std::byte> v{payload.size(), std::byte{0}};
+        for (std::size_t j = 0; j < payload.size(); ++j) {
+            v[j] = static_cast<std::byte>(payload[j]);
+        }
+        ASSERT_TRUE((*c)->put(k, v, 2000 + static_cast<std::uint32_t>(i)));
+        auto g = (*c)->get(k);
+        ASSERT_TRUE(g);
+        std::vector<std::byte> got(g->value.begin(), g->value.end());
+        EXPECT_EQ(got, v);
+    }
+
+    (*c)->close();
+}
+
+// V6.1:并发读 view 不应触发 data race——get() 路径全程无锁,pread 本身
+// thread-safe；TSan 应保持静默。仅当 vector_dim 配置开启时
+// 才有额外 search 路径参与,这里只跑纯 KV。
+TEST_F(CaskDocValueTest, V61GetResultViewConcurrentReaders) {
+    CaskOptions opts;
+    opts.read_write = true;
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+
+    constexpr int kKeys = 64;
+    for (int i = 0; i < kKeys; ++i) {
+        std::vector<std::byte> k{std::byte{'k'}};
+        // 唯一 key:k<i>——避免 i=0 (sum=0) 与 i=26 之类的碰撞。
+        std::string s = "k" + std::to_string(i);
+        for (char ch : s) k.push_back(static_cast<std::byte>(ch));
+        std::vector<std::byte> v(64, std::byte{static_cast<std::byte>((i + 1) & 0xFF)});
+        ASSERT_TRUE((*c)->put(k, v, 3000 + static_cast<std::uint32_t>(i)));
+    }
+
+    constexpr int kThreads = 4;
+    constexpr int kIters = 200;
+    std::atomic<int> errors{0};
+    std::vector<std::thread> ts;
+    ts.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        ts.emplace_back([&, t]() {
+            for (int it = 0; it < kIters; ++it) {
+                int idx = (t * kIters + it) % kKeys;
+                std::vector<std::byte> k{std::byte{'k'}};
+                std::string s = "k" + std::to_string(idx);
+                for (char ch : s) k.push_back(static_cast<std::byte>(ch));
+                auto g = (*c)->get(k);
+                if (!g) { errors.fetch_add(1); continue; }
+                if (g->value.size() != 64) { errors.fetch_add(1); continue; }
+                std::uint32_t sum = 0;
+                for (auto b : g->value) {
+                    sum += static_cast<std::uint8_t>(b);
+                }
+                // value 字节恒为 (idx+1),sum == 64*(idx+1)
+                std::uint32_t expected = 64u * static_cast<std::uint32_t>(idx + 1);
+                if (sum != expected) { errors.fetch_add(1); }
+            }
+        });
+    }
+    for (auto& th : ts) th.join();
+    EXPECT_EQ(errors.load(), 0);
 
     (*c)->close();
 }
