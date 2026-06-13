@@ -12,8 +12,10 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <utility>
 
 #include "bitcask/cask.hpp"
+#include "bitcask/inverted_wal.hpp"
 
 namespace fs = std::filesystem;
 using bitcask::Cask;
@@ -309,3 +311,56 @@ static void BM_Cask_SearchHybrid(benchmark::State& state) {
     (*c)->close();
 }
 BENCHMARK(BM_Cask_SearchHybrid)->Unit(benchmark::kMicrosecond);
+
+// V6.2.4: WAL batch flush throughput — batch_size=1 vs batch_size=64.
+// Opens a cask with search (analyzer=Whitespace) enabled so that put()
+// flows through the IndexPool worker and writes the InvertedIndex WAL.
+// batch_size=1 is the legacy immediate-flush path; batch_size=64
+// accumulates entries in batch_buf_ and fwrite+fflush once per 64.
+static void BM_Put_WalBatch(benchmark::State& state) {
+    auto batch_size = static_cast<std::size_t>(state.range(0));
+
+    TempDir td;
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.enable_search = true;
+    bitcask::search::SearchLayerConfig sc;
+    sc.analyzer_config.type = bitcask::text::AnalyzerType::Whitespace;
+    sc.wal_batch_size = batch_size;
+    opts.search_config = sc;
+
+    auto c = Cask::open(td.path(), opts);
+    if (!c) state.SkipWithError("Cask::open failed");
+    auto& cask = **c;
+
+    const std::string text(64, 'x');  // simple text, no special chars
+    std::uint64_t ord = 0;
+
+    for (auto _ : state) {
+        auto key = "key" + std::to_string(ord++);
+        auto r = cask.put(as_bytes(key), as_bytes(text));
+        if (!r) state.SkipWithError("put failed");
+    }
+    state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_Put_WalBatch)->Arg(1)->Arg(64);
+
+// V6.2.4: 隔离 WAL 写入的微基准——绕过 full put path，直测 append_add_doc。
+// 这才是 batch flush 的直接收益面（full put 中 analyzer + index update 主导）。
+static void BM_Wal_AppendOnly(benchmark::State& state) {
+    auto batch_size = static_cast<std::size_t>(state.range(0));
+    TempDir td;
+    std::string wal_path = std::string(td.path()) + "/wal_only.wal";
+
+    bitcask::bm25::WalTermPositions term_data;
+    term_data.emplace("alpha", std::make_pair(std::uint32_t(1), std::vector<std::uint32_t>{0}));
+    term_data.emplace("beta", std::make_pair(std::uint32_t(1), std::vector<std::uint32_t>{1}));
+
+    bitcask::bm25::InvertedWal wal(wal_path, batch_size);
+    std::uint64_t ord = 0;
+    for (auto _ : state) {
+        wal.append_add_doc(ord++, term_data);
+    }
+    state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_Wal_AppendOnly)->Arg(1)->Arg(64);
