@@ -364,6 +364,35 @@ private:
         alignas(64) std::unordered_map<std::string, Entry, StringHash, std::equal_to<>> entries;
     };
     mutable std::array<Shard, kShards> shards_;
+
+    // put() 三阶段拆分的共享上下文。锁随 ctx 移动，raw pointer
+    // 指向的数据结构在对应锁释放前保持有效。
+    struct PutCtx {
+        std::unique_lock<std::mutex> slock;
+        std::unique_lock<std::shared_mutex> mlock;
+        Shard* shard = nullptr;
+        SingleEntry* pending_entry = nullptr;
+        Entry* entries_entry = nullptr;
+        EntryProxy current_proxy{};
+        bool found = false;
+        bool current_is_tombstone = false;
+        bool fold_active = false;
+        std::uint64_t this_epoch = 0;
+        std::uint32_t now_sec = 0;
+    };
+    PutResult put_probe(PutCtx& ctx, std::string_view key,
+                         std::uint32_t old_file_id);
+    PutResult put_insert(PutCtx& ctx, std::string_view key,
+                          std::uint32_t file_id, std::uint32_t total_sz,
+                          std::uint64_t offset, std::uint32_t tstamp,
+                          bool newest_put, std::uint32_t old_file_id,
+                          std::uint64_t ord);
+    PutResult put_overwrite(PutCtx& ctx, std::string_view key,
+                             std::uint32_t file_id, std::uint32_t total_sz,
+                             std::uint64_t offset, std::uint32_t tstamp,
+                             bool newest_put,
+                             std::uint32_t old_file_id, std::uint64_t old_offset,
+                             std::uint64_t ord);
     // pending_/iter 协调状态专用(仅 fold 期间触碰,冷路径)。
     mutable std::shared_mutex meta_mu_;
 

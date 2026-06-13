@@ -367,139 +367,162 @@ PutResult KeyDir::put(std::string_view key,
                        bool newest_put,
                        std::uint32_t old_file_id, std::uint64_t old_offset,
                        std::uint64_t ord) {
+    PutCtx ctx;
+    if (auto r = put_probe(ctx, key, old_file_id); r != PutResult::kOk) return r;
+
+    // 全局 epoch 计数器递增，作为本次写入的时间戳。分片锁内完成。
+    ctx.this_epoch = epoch_.fetch_add(1, std::memory_order_relaxed) + 1;
+    ctx.now_sec = now_sec;
+
+    if (!ctx.found || ctx.current_is_tombstone) {
+        return put_insert(ctx, key, file_id, total_sz, offset, tstamp,
+                          newest_put, old_file_id, ord);
+    }
+    return put_overwrite(ctx, key, file_id, total_sz, offset, tstamp,
+                         newest_put, old_file_id, old_offset, ord);
+}
+
+// ---- put 阶段 1：探测当前状态 ----
+// 获取分片锁 → 屏障闸门 → 探测 entries_ 和 pending_。
+// 返回 kAlreadyExists 表示条件 put 快速失败（key 不存在/墓碑 且 old_file_id != 0）。
+PutResult KeyDir::put_probe(PutCtx& ctx, std::string_view key,
+                             std::uint32_t old_file_id) {
     Shard& sh = shards_[shard_for(key)];
-    std::unique_lock slock(sh.mu);
+    ctx.slock = std::unique_lock<std::mutex>(sh.mu);
+    ctx.shard = &sh;
 
     // 屏障闸门(v2):屏障期间写者退避。★ 等待前必须放分片锁——否则排干
     // 循环与我们互等。被唤醒后重新拿分片锁再查(循环兜住虚假唤醒与
     // 连续屏障)。读路径不检查闸门(屏障期间读者照常并发)。
     while (barrier_active_.load(std::memory_order_acquire)) {
-        slock.unlock();
+        ctx.slock.unlock();
         {
             std::unique_lock<std::mutex> g(gate_mu_);
             gate_cv_.wait(g, [&] {
                 return !barrier_active_.load(std::memory_order_acquire);
             });
         }
-        slock.lock();
+        ctx.slock.lock();
     }
 
     // keyfolders_ 只在屏障内变;闸门检查通过且持分片锁后 relaxed 读即
     // 足够新(论证见文件头)。
-    const bool fold_active = keyfolders_.load(std::memory_order_relaxed) > 0;
+    ctx.fold_active = keyfolders_.load(std::memory_order_relaxed) > 0;
 
-    // ---- 阶段 1：探测当前状态 ----
     // entries 优先（S2 不变量:key ∈ entries ⟹ pending 无其更新版本）。
-    SingleEntry* pending_entry = nullptr;
-    Entry* entries_entry = nullptr;
-    EntryProxy current_proxy{};
-    bool found = false;
-    bool current_is_tombstone = false;
     // pending 分支才需要的 meta 锁;持有期横跨本函数余下部分。
-    std::unique_lock<std::shared_mutex> mlock;
-
     auto it = sh.entries.find(key);
     if (it != sh.entries.end()) {
         auto at = entry_at_epoch(it->second, kMaxEpoch);
         if (at.found) {
-            entries_entry = &it->second;
-            current_is_tombstone = at.is_tombstone;
-            current_proxy = to_proxy(it->first, at.rev, at.is_tombstone);
-            found = true;
+            ctx.entries_entry = &it->second;
+            ctx.current_is_tombstone = at.is_tombstone;
+            ctx.current_proxy = to_proxy(it->first, at.rev, at.is_tombstone);
+            ctx.found = true;
         }
     }
-    if (!found && (fold_active ||
-                   has_pending_.load(std::memory_order_relaxed))) {
-        mlock = std::unique_lock(meta_mu_);  // 锁序:分片 → meta
+    if (!ctx.found && (ctx.fold_active ||
+                       has_pending_.load(std::memory_order_relaxed))) {
+        ctx.mlock = std::unique_lock<std::shared_mutex>(meta_mu_);  // 锁序:分片 → meta
         if (pending_.has_value()) {
             auto p = pending_->find(key);
             if (p != pending_->end() && kMaxEpoch >= p->second.epoch) {
-                pending_entry = &p->second;
-                current_is_tombstone = is_pending_tombstone(*pending_entry);
-                current_proxy = to_proxy(p->first, *pending_entry, current_is_tombstone);
-                found = true;
+                ctx.pending_entry = &p->second;
+                ctx.current_is_tombstone = is_pending_tombstone(*ctx.pending_entry);
+                ctx.current_proxy = to_proxy(p->first, *ctx.pending_entry, ctx.current_is_tombstone);
+                ctx.found = true;
             }
         }
     }
 
     // 条件 put 但 key 不存在 / 已是墓碑：CAS 不可能成功——快速失败。
-    if ((!found || current_is_tombstone) && old_file_id != 0) {
+    if ((!ctx.found || ctx.current_is_tombstone) && old_file_id != 0) {
+        return PutResult::kAlreadyExists;
+    }
+    return PutResult::kOk;
+}
+
+// ---- put 分支 (A)：key 不存在或当前是墓碑 ----
+PutResult KeyDir::put_insert(PutCtx& ctx, std::string_view key,
+                              std::uint32_t file_id, std::uint32_t total_sz,
+                              std::uint64_t offset, std::uint32_t tstamp,
+                              bool newest_put, std::uint32_t old_file_id,
+                              std::uint64_t ord) {
+    Shard& sh = *ctx.shard;
+
+    // merge race 检查：newest_put 路径上如果 file_id < biggest_file_id_，
+    // 说明并发 merger 已经把 file_id 推到更大的值，这次 put 是「向后」
+    // 写入，必须拒绝（caller 拿到 kAlreadyExists 后会 roll_active 切到
+    // 更大的 file_id 重试）。
+    if ((newest_put &&
+         file_id < biggest_file_id_.load(std::memory_order_relaxed)) ||
+        old_file_id != 0) {
         return PutResult::kAlreadyExists;
     }
 
-    // 全局 epoch 计数器递增，作为本次写入的时间戳。分片锁内完成。
-    const std::uint64_t this_epoch =
-        epoch_.fetch_add(1, std::memory_order_relaxed) + 1;
+    SingleEntry s{file_id, total_sz, offset, ctx.this_epoch, tstamp, ord};
 
-    // ---- 分支 (A)：key 不存在或当前是墓碑 ----
-    if (!found || current_is_tombstone) {
-        // merge race 检查：newest_put 路径上如果 file_id < biggest_file_id_，
-        // 说明并发 merger 已经把 file_id 推到更大的值，这次 put 是「向后」
-        // 写入，必须拒绝（caller 拿到 kAlreadyExists 后会 roll_active 切到
-        // 更大的 file_id 重试）。
-        if ((newest_put &&
-             file_id < biggest_file_id_.load(std::memory_order_relaxed)) ||
-            old_file_id != 0) {
-            return PutResult::kAlreadyExists;
-        }
-
-        SingleEntry s{file_id, total_sz, offset, this_epoch, tstamp, ord};
-
-        if (pending_entry != nullptr) {
-            // 之前在 pending 里是墓碑——直接覆盖成活的 entry（mlock 已持）。
-            *pending_entry = s;
-        } else if (entries_entry != nullptr) {
-            // 在 entries_ 里是墓碑（必定是 sibling 链），插一条新 revision
-            // 放到链头标记它复活了。
-            // 注:旧实现这里优先查 pending_.has_value() 分流;S2 改为优先
-            // 升链——维持 entries/pending 不相交不变量（entries 已有的 key
-            // 绝不进 pending）。
-            if (auto* multi = std::get_if<MultiEntry>(entries_entry)) {
-                multi->revisions.insert(multi->revisions.begin(), s);
-            } else {
-                // 理论不可达——SingleEntry 不存墓碑标记。
-                *entries_entry = s;
-            }
-        } else if (mlock.owns_lock()) {
-            // fold 态新 key——分流到 pending（meta unique 已持）。
-            // legacy 这里靠 kh_put_will_resize 判断是否真的要分流（rehash
-            // 才会破坏迭代器），我们简化为「fold 期间一律分流」——正确性
-            // 等价，pending 表略大一点点。
-            if (!pending_.has_value()) {
-                pending_.emplace();
-                pending_start_epoch_ = this_epoch;
-                pending_start_time_  = now_sec;
-                pending_updated_     = 0;
-                has_pending_.store(true, std::memory_order_relaxed);
-            }
-            pending_->insert_or_assign(std::string(key), s);
-            pending_updated_ += 1;
+    if (ctx.pending_entry != nullptr) {
+        // 之前在 pending 里是墓碑——直接覆盖成活的 entry（mlock 已持）。
+        *ctx.pending_entry = s;
+    } else if (ctx.entries_entry != nullptr) {
+        // 在 entries_ 里是墓碑（必定是 sibling 链），插一条新 revision
+        // 放到链头标记它复活了。
+        // 注:旧实现这里优先查 pending_.has_value() 分流;S2 改为优先
+        // 升链——维持 entries/pending 不相交不变量（entries 已有的 key
+        // 绝不进 pending）。
+        if (auto* multi = std::get_if<MultiEntry>(ctx.entries_entry)) {
+            multi->revisions.insert(multi->revisions.begin(), s);
         } else {
-            // 最常见路径：没 fold、key 全新——直接进本分片 entries。
-            sh.entries.insert_or_assign(std::string(key), Entry{s});
+            // 理论不可达——SingleEntry 不存墓碑标记。
+            *ctx.entries_entry = s;
         }
-
-        key_count_.fetch_add(1, std::memory_order_relaxed);
-        key_bytes_.fetch_add(key.size(), std::memory_order_relaxed);
-        if (fold_active) iter_mutation_.store(true, std::memory_order_relaxed);
-
-        const auto sz_i32 = static_cast<std::int32_t>(total_sz);
-        update_fstats(file_id, tstamp, kMaxEpoch,
-                      1, 1, sz_i32, sz_i32, /*should_create*/ true);
-        // CAS-max:并发 put 跨分片推进 biggest_file_id_。
-        std::uint32_t big = biggest_file_id_.load(std::memory_order_relaxed);
-        while (file_id > big &&
-               !biggest_file_id_.compare_exchange_weak(
-                   big, file_id, std::memory_order_relaxed)) {
+    } else if (ctx.mlock.owns_lock()) {
+        // fold 态新 key——分流到 pending（meta unique 已持）。
+        // legacy 这里靠 kh_put_will_resize 判断是否真的要分流（rehash
+        // 才会破坏迭代器），我们简化为「fold 期间一律分流」——正确性
+        // 等价，pending 表略大一点点。
+        if (!pending_.has_value()) {
+            pending_.emplace();
+            pending_start_epoch_ = ctx.this_epoch;
+            pending_start_time_  = ctx.now_sec;
+            pending_updated_     = 0;
+            has_pending_.store(true, std::memory_order_relaxed);
         }
-        return PutResult::kOk;
+        pending_->insert_or_assign(std::string(key), s);
+        pending_updated_ += 1;
+    } else {
+        // 最常见路径：没 fold、key 全新——直接进本分片 entries。
+        sh.entries.insert_or_assign(std::string(key), Entry{s});
     }
 
-    // ---- 分支 (B)/(C)：key 当前是活的，可能要覆盖 ----
+    key_count_.fetch_add(1, std::memory_order_relaxed);
+    key_bytes_.fetch_add(key.size(), std::memory_order_relaxed);
+    if (ctx.fold_active) iter_mutation_.store(true, std::memory_order_relaxed);
+
+    const auto sz_i32 = static_cast<std::int32_t>(total_sz);
+    update_fstats(file_id, tstamp, kMaxEpoch,
+                  1, 1, sz_i32, sz_i32, /*should_create*/ true);
+    // CAS-max:并发 put 跨分片推进 biggest_file_id_。
+    std::uint32_t big = biggest_file_id_.load(std::memory_order_relaxed);
+    while (file_id > big &&
+           !biggest_file_id_.compare_exchange_weak(
+               big, file_id, std::memory_order_relaxed)) {
+    }
+    return PutResult::kOk;
+}
+
+// ---- put 分支 (B)/(C)：key 当前是活的，可能要覆盖 ----
+PutResult KeyDir::put_overwrite(PutCtx& ctx, std::string_view key,
+                                 std::uint32_t file_id, std::uint32_t total_sz,
+                                 std::uint64_t offset, std::uint32_t tstamp,
+                                 bool newest_put,
+                                 std::uint32_t old_file_id, std::uint64_t old_offset,
+                                 std::uint64_t ord) {
     const SingleEntry cur = SingleEntry{
-        current_proxy.file_id, current_proxy.total_sz,
-        current_proxy.offset, current_proxy.epoch,
-        current_proxy.tstamp, current_proxy.ord};
+        ctx.current_proxy.file_id, ctx.current_proxy.total_sz,
+        ctx.current_proxy.offset, ctx.current_proxy.epoch,
+        ctx.current_proxy.tstamp, ctx.current_proxy.ord};
 
     // 条件 put 校验：必须正好替换我们期望的 (file_id, offset)，否则失败。
     // newest_put=true 时即使 (old_file_id, old_offset) 不匹配，只要 file_id
@@ -544,31 +567,31 @@ PutResult KeyDir::put(std::string_view key,
                       0, 1, sz_i32 - cur_sz_i32, sz_i32,
                       /*should_create*/ true);
     }
-    if (fold_active) iter_mutation_.store(true, std::memory_order_relaxed);
+    if (ctx.fold_active) iter_mutation_.store(true, std::memory_order_relaxed);
 
-    SingleEntry next{file_id, total_sz, offset, this_epoch, tstamp, ord};
+    SingleEntry next{file_id, total_sz, offset, ctx.this_epoch, tstamp, ord};
 
-    if (pending_entry != nullptr) {
+    if (ctx.pending_entry != nullptr) {
         // 已经在 pending 里——直接覆盖（pending 自身就是 fold 不可见的；
         // mlock 已持）。
-        *pending_entry = next;
+        *ctx.pending_entry = next;
     } else {
-        assert(entries_entry != nullptr);
-        if (fold_active) {
+        assert(ctx.entries_entry != nullptr);
+        if (ctx.fold_active) {
             // fold 在跑——把旧 revision 留在链里给迭代器看，新 revision
             // 插到链头。SingleEntry 自动升级成 MultiEntry。全程分片内。
-            if (auto* multi = std::get_if<MultiEntry>(entries_entry)) {
+            if (auto* multi = std::get_if<MultiEntry>(ctx.entries_entry)) {
                 multi->revisions.insert(multi->revisions.begin(), next);
             } else {
                 MultiEntry promoted;
                 promoted.revisions.reserve(2);
                 promoted.revisions.push_back(next);
-                promoted.revisions.push_back(*std::get_if<SingleEntry>(entries_entry));
-                *entries_entry = std::move(promoted);
+                promoted.revisions.push_back(*std::get_if<SingleEntry>(ctx.entries_entry));
+                *ctx.entries_entry = std::move(promoted);
             }
         } else {
             // 没 fold 干扰——直接覆盖（如果之前是 MultiEntry 也会被折回 SingleEntry）。
-            *entries_entry = next;
+            *ctx.entries_entry = next;
         }
     }
 
