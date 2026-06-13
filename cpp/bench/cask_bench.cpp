@@ -110,7 +110,7 @@ static void BM_Cask_Get_Hot(benchmark::State& state) {
 
     for (auto _ : state) {
         auto& k = keys[static_cast<std::size_t>(dist(rng))];
-        auto r = cask.get(as_bytes(k));
+        auto r = cask.get_owned(as_bytes(k));
         benchmark::DoNotOptimize(r);
     }
     state.SetItemsProcessed(state.iterations());
