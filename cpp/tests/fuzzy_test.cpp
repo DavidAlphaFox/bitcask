@@ -4,30 +4,13 @@
 #include "bitcask/inverted.hpp"
 #include "bitcask/search_layer.hpp"
 #include "bitcask/analyzer.hpp"
+#include "test_support.hpp"
 
 using namespace bitcask::bm25;
 using namespace bitcask::text;
 using namespace bitcask::search;
 
 namespace {
-
-class FakeLiveChecker : public LiveChecker {
-public:
-    std::unordered_map<std::uint64_t, std::uint32_t> doc_lens;
-
-    [[nodiscard]] bool is_live(std::uint64_t ord) const override {
-        return doc_lens.count(ord) > 0;
-    }
-    [[nodiscard]] std::uint32_t doc_len(std::uint64_t ord) const override {
-        auto it = doc_lens.find(ord);
-        return it != doc_lens.end() ? it->second : 0;
-    }
-};
-
-auto tp(std::uint32_t tf, std::vector<std::uint32_t> positions = {})
-    -> std::pair<std::uint32_t, std::vector<std::uint32_t>> {
-    return {tf, std::move(positions)};
-}
 
 SearchLayerConfig default_config() {
     return SearchLayerConfig{

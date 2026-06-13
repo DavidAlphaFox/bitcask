@@ -4,30 +4,9 @@
 #include "bitcask/inverted.hpp"
 #include "bitcask/inverted_wal.hpp"
 #include "bitcask/query.hpp"
+#include "test_support.hpp"
 
 using namespace bitcask::bm25;
-
-namespace {
-
-auto tp(std::uint32_t tf, std::vector<std::uint32_t> positions = {})
-    -> std::pair<std::uint32_t, std::vector<std::uint32_t>> {
-    return {tf, std::move(positions)};
-}
-
-class FakeLiveChecker : public LiveChecker {
-public:
-    std::unordered_map<std::uint64_t, std::uint32_t> doc_lens;
-
-    [[nodiscard]] bool is_live(std::uint64_t ord) const override {
-        return doc_lens.count(ord) > 0;
-    }
-    [[nodiscard]] std::uint32_t doc_len(std::uint64_t ord) const override {
-        auto it = doc_lens.find(ord);
-        return it != doc_lens.end() ? it->second : 0;
-    }
-};
-
-}  // namespace
 
 TEST(WalCreateAndReplay, Basic) {
     auto tmp = std::filesystem::temp_directory_path() / "wal_basic_test.wal";
