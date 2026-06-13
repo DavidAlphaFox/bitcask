@@ -10,6 +10,8 @@
 
 #include <utf8proc.h>
 
+#include "bitcask/detail/inert_table.hpp"
+
 namespace bitcask::text::detail {
 
 struct Utf8ProcDeleter {
@@ -28,23 +30,6 @@ using Utf8ProcBuf = std::unique_ptr<uint8_t[], Utf8ProcDeleter>;
     auto consumed = utf8proc_iterate(ptr, len, &cp);
     if (consumed < 0 || cp < 0) return {0xFFFD, 1};
     return {static_cast<char32_t>(cp), static_cast<std::size_t>(consumed)};
-}
-
-// P2.5b：NFKC_Casefold 惰性区段表——cp 满足「NFKC_Casefold(cp) == cp 且
-// 组合类为 0 且不参与任何规范组合」（后两条保证整串成员间不存在跨码点
-// 重组，逐码点判定即整串判定）。表的每个成员都由 analyzer_test 的
-// NfkcInertTableOracle 用 utf8proc 逐码点穷举验证（表错即测试红）。
-// 注意刻意排除：全角标点/字母数字（U+FF00 块，NFKC 折叠）、
-// …（U+2026，分解为 ...）、兼容表意文字（U+F900 块）、拉丁带附标区。
-[[nodiscard]] inline bool nfkc_casefold_inert(char32_t cp) noexcept {
-    if (cp >= 0x4E00 && cp <= 0x9FFF) return true;   // CJK 基本区
-    if (cp >= 0x3400 && cp <= 0x4DBF) return true;   // CJK 扩展 A
-    if (cp >= 0x3001 && cp <= 0x3002) return true;   // 、。
-    if (cp >= 0x3008 && cp <= 0x3011) return true;   // 〈〉《》「」『』【】
-    if (cp == 0x2014) return true;                   // ——
-    if (cp >= 0x2018 && cp <= 0x2019) return true;   // ‘ ’
-    if (cp >= 0x201C && cp <= 0x201D) return true;   // “ ”
-    return false;
 }
 
 [[nodiscard]] inline std::string nfkc_fold(std::string_view input) {

@@ -229,6 +229,36 @@ else()
     FetchContent_MakeAvailable(utf8proc)
 endif()
 
+# utf8proc FetchContent 导出的 target 名与上游 CMakeLists 一致。
+# 提前解析，便于下游 gen_inert_table / bitcask_text 共用。
+if(TARGET utf8proc::utf8proc)
+    set(UTF8PROC_TARGET utf8proc::utf8proc)
+else()
+    set(UTF8PROC_TARGET utf8proc)
+endif()
+
+# ---------------------------------------------------------------------------
+# gen_inert_table — build-time code generator for the NFKC inert range table.
+# Enumerates BMP non-ASCII codepoints via utf8proc, keeps those that are
+# NFKC_Casefold-identity with combining-class 0, merges into ranges, and
+# writes include/bitcask/detail/inert_table.hpp. Tests/analyzer_test.cpp's
+# NfkcInert::TableOracleExhaustive re-validates the table at test time, so
+# the generator only needs to pick a CORRECT (not maximally tight) rule.
+# ---------------------------------------------------------------------------
+add_executable(gen_inert_table tools/gen_inert_table.cpp)
+target_link_libraries(gen_inert_table PRIVATE ${UTF8PROC_TARGET})
+
+set(INERT_TABLE_HPP
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/bitcask/detail/inert_table.hpp")
+add_custom_command(
+    OUTPUT "${INERT_TABLE_HPP}"
+    COMMAND gen_inert_table "${INERT_TABLE_HPP}"
+    DEPENDS gen_inert_table
+    COMMENT "Generating NFKC inert range table"
+    VERBATIM
+)
+add_custom_target(generate_inert_table DEPENDS "${INERT_TABLE_HPP}")
+
 # ---------------------------------------------------------------------------
 # cppjieba — jieba 中文分词（header-only，依赖 limonp）。
 # 优先复用 _deps 下手动 clone 的源码；缺失时用 FetchContent 拉取
@@ -274,16 +304,11 @@ add_library(bitcask_text STATIC
     src/text/jieba_analyzer.cpp
 )
 target_include_directories(bitcask_text PUBLIC include)
-# utf8proc FetchContent 导出的 target 名与上游 CMakeLists 一致。
-if(TARGET utf8proc::utf8proc)
-    set(UTF8PROC_TARGET utf8proc::utf8proc)
-else()
-    set(UTF8PROC_TARGET utf8proc)
-endif()
 target_link_libraries(bitcask_text
     PUBLIC  ${UTF8PROC_TARGET}
     PRIVATE bitcask_warnings bitcask_sanitizers cppjieba
 )
+add_dependencies(bitcask_text generate_inert_table)
 
 # NOTE(V1): legacy targets bitcask_keydir / bitcask_merge / bitcask_cask 已从构建
 # 移除——它们绑定旧的 record 格式与 KeyDir，不在向量库 V1 范围内
