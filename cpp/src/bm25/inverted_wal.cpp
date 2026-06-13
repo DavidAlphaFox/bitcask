@@ -49,25 +49,40 @@ void put_bytes(std::vector<std::uint8_t>& b, const void* data, std::size_t size)
 
 }  // namespace
 
-InvertedWal::InvertedWal(std::string_view path) : path_(path) {
+InvertedWal::InvertedWal(std::string_view path, std::size_t batch_size)
+    : path_(path), batch_size_(batch_size) {
     file_ = std::fopen(path_.c_str(), "ab");
 }
 
 InvertedWal::~InvertedWal() {
-    if (file_) std::fclose(file_);
+    if (file_) {
+        flush_batch();           // V6.2:析构前落盘剩余缓冲,避免数据丢失。
+        std::fclose(file_);
+    }
 }
 
 InvertedWal::InvertedWal(InvertedWal&& other) noexcept
-    : path_(std::move(other.path_)), file_(other.file_) {
+    : path_(std::move(other.path_)), file_(other.file_),
+      batch_buf_(std::move(other.batch_buf_)),
+      batch_count_(other.batch_count_),
+      batch_size_(other.batch_size_) {
     other.file_ = nullptr;
+    other.batch_count_ = 0;
 }
 
 InvertedWal& InvertedWal::operator=(InvertedWal&& other) noexcept {
     if (this != &other) {
-        if (file_) std::fclose(file_);
+        if (file_) {
+            flush_batch();
+            std::fclose(file_);
+        }
         path_ = std::move(other.path_);
         file_ = other.file_;
+        batch_buf_ = std::move(other.batch_buf_);
+        batch_count_ = other.batch_count_;
+        batch_size_ = other.batch_size_;
         other.file_ = nullptr;
+        other.batch_count_ = 0;
     }
     return *this;
 }
@@ -123,6 +138,7 @@ void InvertedWal::append_remove_doc(
 // 封口并落盘:回填长度前缀、追加 payload CRC、一次 fwrite。
 // 整条 entry 一次写出,entry 级原子性比逐字段写好;framing 让 replay
 // 能区分「完整 entry」与「崩溃残留的半条」。
+// V6.2：batch_size>1 时改走 batch_buf_ 累积，到阈值 flush_batch 整块落盘。
 void InvertedWal::seal_and_write() {
     const std::size_t payload_len = enc_buf_.size() - kWalLenPrefix;
     const auto len32 = static_cast<std::uint32_t>(payload_len);
@@ -131,12 +147,33 @@ void InvertedWal::seal_and_write() {
         crc_of(enc_buf_.data() + kWalLenPrefix, payload_len);
     put_u32(enc_buf_, crc);
 
-    if (std::fwrite(enc_buf_.data(), 1, enc_buf_.size(), file_) !=
-        enc_buf_.size()) {
+    if (batch_size_ <= 1) {
+        // 即时模式：逐条 fwrite + fflush（默认行为，与旧版完全一致）。
+        if (std::fwrite(enc_buf_.data(), 1, enc_buf_.size(), file_) !=
+            enc_buf_.size()) {
+            return;
+        }
+        // fflush 保留:这是 WAL 对进程崩溃的持久化边界,去掉属于语义变更。
+        std::fflush(file_);
         return;
     }
-    // fflush 保留:这是 WAL 对进程崩溃的持久化边界,去掉属于语义变更。
+
+    // 批量模式：追加到 batch_buf_，满阈值时整块 flush。
+    batch_buf_.insert(batch_buf_.end(), enc_buf_.begin(), enc_buf_.end());
+    ++batch_count_;
+    if (batch_count_ >= batch_size_) {
+        flush_batch();
+    }
+}
+
+// V6.2：把 batch_buf_ 一次性写盘+fflush 并清空。
+// 三处共用：seal_and_write 阈值触发 / 析构 / truncate。
+void InvertedWal::flush_batch() {
+    if (batch_buf_.empty() || !file_) return;
+    std::fwrite(batch_buf_.data(), 1, batch_buf_.size(), file_);
     std::fflush(file_);
+    batch_buf_.clear();
+    batch_count_ = 0;
 }
 
 namespace {
@@ -295,6 +332,10 @@ int InvertedWal::replay(InvertedIndex& target) const {
 
 bool InvertedWal::truncate() {
     if (!file_) return false;
+    // V6.2:截断前丢弃尚未落盘的缓冲——wb 模式重开文件,旧缓冲写到新文件
+    // 没意义(WAL 即将从快照起重新积攒)。
+    batch_buf_.clear();
+    batch_count_ = 0;
     std::fclose(file_);
     file_ = std::fopen(path_.c_str(), "wb");
     return file_ != nullptr;
