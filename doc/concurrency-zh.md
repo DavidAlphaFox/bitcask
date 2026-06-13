@@ -350,3 +350,365 @@ keydir 会当 merge-race 拒掉（`kAlreadyExists`）→ 由主动 roll + put �
 - 在 NFS / 网络盘上跑——`O_EXCL` 在 NFS 上有历史 bug
 - 频繁 open + close 同一个 dir——每次 open 可能触发扫盘（如果 refcount
   归零过），大目录代价高
+
+---
+
+## 锁全局序图（2026 重构补全）
+
+本文档 2026 年重构补全完整的锁层级体系，包括所有模块的互斥锁声明、全局锁序规则、死锁防护机制及关键竞态窗口分析。
+
+### 1. 完整锁层级表
+
+| 模块 | 锁名称 | 类型 | 声明位置 | 说明 |
+|------|--------|------|----------|------|
+| **KeyDir** | barrier_mu_ | std::mutex | cpp/include/bitcask/keydir.hpp:384 | 屏障间互斥，跨整个屏障持有 |
+| **KeyDir** | gate_mu_ | std::mutex | cpp/include/bitcask/keydir.hpp:385 | 写者退避等待的 cv 配套锁 |
+| **KeyDir** | gate_cv_ | std::condition_variable | cpp/include/bitcask/keydir.hpp:386 | 写者退避等待的条件变量 |
+| **KeyDir** | meta_mu_ | std::shared_mutex | cpp/include/bitcask/keydir.hpp:368 | pending_/iter 协调状态专用（仅 fold 期间触碰） |
+| **KeyDir** | shard[i].mu | std::mutex ×256 | cpp/include/bitcask/keydir.hpp:361 | 分片锁（kShards=256），任意时刻至多持 1 把 |
+| **KeyDir** | fstats_grow_mu_ | std::mutex | cpp/include/bitcask/keydir.hpp:419 | 仅新 file_id 槽位构造（罕见） |
+| **Cask** | read_cache_mu_ | std::shared_mutex | (未在 keydir 中) | 独立，不与 KeyDir 或 SearchLayer 锁嵌套 |
+| **KeyDirRegistry** | mutex_ | std::mutex | (未在 keydir 中) | 独立 |
+| **Index** | mutex_ | std::shared_mutex | (未在 keydir 中) | 独立 |
+| **SearchLayer** | fields_mu_ | std::shared_mutex | (未在 keydir 中) | 独立 |
+| **SearchCache** | mutex_ | std::shared_mutex | (未在 keydir 中) | 独立 |
+| **DocTextLru** | mu_ | std::mutex | (未在 keydir 中) | 独立 |
+| **InvertedIndex** | vocab_mtx_[i] | std::shared_mutex ×64 | (未在 keydir 中) | per-shard 按词汇哈希分桶 |
+| **InvertedIndex** | tbb::concurrent_hash_map | bucket locks (内部) | (未在 keydir 中) | TBB 内部哈希表桶锁 |
+| **HnswIndex** | atomic&lt;shared_ptr&gt; | std::atomic | (未在 keydir 中) | 内部，无外部锁嵌套 |
+| **HnswIndex** | per-node spinlock | (内部) | (未在 keydir 中) | 内部，无外部锁嵌套 |
+
+### 2. 锁层级 ASCII 图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        全局锁层级（2026 重构）                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  KeyDir 锁全序（严格遵守）：                                                │
+│                                                                             │
+│     barrier_mu_ ──→ gate_mu_ ──→ meta_mu_ ──→ 单个 shard ──→ fstats_grow_mu_ │
+│        (mutex)         (mutex)     (shared)      (mutex)        (mutex)    │
+│                                                                           │
+│  注：任意时刻至多持 1 把分片锁（TSan 死锁检测器 64 持锁硬上限）             │
+│                                                                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  独立模块锁（不参与全局锁序）：                                            │
+│                                                                             │
+│     Cask::read_cache_mu_      (shared_mutex)                               │
+│     KeyDirRegistry::mutex_    (mutex)                                      │
+│     Index::mutex_             (shared_mutex)                               │
+│     SearchLayer::fields_mu_   (shared_mutex)                               │
+│     SearchCache::mutex_       (shared_mutex)                               │
+│     DocTextLru::mu_           (mutex)                                      │
+│     InvertedIndex::vocab_mtx_[i] (shared_mutex ×64)                        │
+│     HnswIndex::atomic<shared_ptr> (atomic)                                 │
+│     HnswIndex::per-node spinlock (内部)                                    │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  异常路径（均有死锁防护）：                                                 │
+│                                                                             │
+│  ① 热路径：shard → meta（与全序一致）                                      │
+│     - get/put/remove 在持分片锁后嵌套 meta shared/unique                   │
+│     - cpp/src/keydir/keydir.cpp:316, 413, 652                              │
+│                                                                             │
+│  ② 屏障内：meta_shared → shard（反向，仅屏障内合法）                        │
+│     - apply_pending_to_entries_barrier 持 meta shared 期间嵌套分片锁        │
+│     - cpp/src/keydir/keydir.cpp:891-904                                    │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3. 锁获取规则
+
+#### 3.1 KeyDir 内部规则
+
+**标准锁序（必须遵守）：**
+```
+barrier_mu_ → gate_mu_ → meta_mu_ → 单个 shard（≤1 把） → fstats_grow_mu_
+```
+
+**热路径规则（get/put/remove）：**
+- 先拿单个分片锁（shard.mu）
+- fold 态或 pending 存在时，嵌套获取 meta_mu_（shared/unique 视操作而定）
+- 方向：shard → meta（与全序一致）
+- 代码位置：
+  - get: cpp/src/keydir/keydir.cpp:303-326
+  - put: cpp/src/keydir/keydir.cpp:371-423
+  - remove: cpp/src/keydir/keydir.cpp:596-677
+
+**屏障操作规则（start/release/save_snapshot/load_snapshot）：**
+- 通过 BarrierGuard RAII 类自动管理屏障生命周期
+- 屏障期间写者被闸门出清，读者照常并发
+- 屏障内不持分片锁遍历各分片 entries（读-读并发安全）
+- 代码位置：cpp/src/keydir/keydir.cpp:138-166（BarrierGuard）
+
+#### 3.2 跨模块规则
+
+**无跨模块锁嵌套：**
+- 任何模块在持有自己锁的同时，不获取其他模块的锁
+- 模块间协作通过无锁原子变量或函数调用完成
+- 示例：Cask::read_cache_mu_ 独立持有，不与 KeyDir 锁嵌套
+
+**独立模块锁：**
+- KeyDirRegistry::mutex_、Index::mutex_、SearchLayer::fields_mu_ 等均独立
+- 这些锁各自保护不重叠的数据结构，无全局锁序要求
+
+### 4. 文档化的例外情况
+
+#### 例外 ①：热路径 shard→meta 嵌套
+
+**场景：** get/put/remove 在持分片锁后嵌套 meta 锁
+
+**代码位置：**
+- cpp/src/keydir/keydir.cpp:316（get）
+- cpp/src/keydir/keydir.cpp:413（put）
+- cpp/src/keydir/keydir.cpp:652（remove）
+
+**锁获取顺序：**
+```
+shard.mu (unique/shared) → meta_mu_ (shared/unique)
+```
+
+**死锁防护：**
+- 方向与全局锁序一致（shard 在 meta 之前）
+- 任意时刻至多持 1 把分片锁
+- 热路径是标准操作路径，无特殊限制
+
+**正确性保证：**
+- 持分片锁时 meta 获取不会阻塞（meta 锁获取无分片锁依赖）
+- 全局锁序要求 barrier_mu_ → gate_mu_ → meta_mu_，热路径不涉及前两把锁
+
+#### 例外 ②：屏障内 meta_shared→shard 反向嵌套
+
+**场景：** apply_pending_to_entries_barrier 在持 meta shared 期间嵌套分片锁
+
+**代码位置：**
+- cpp/src/keydir/keydir.cpp:891-904
+
+**锁获取顺序（反向）：**
+```
+meta_mu_ (shared) → shard.mu (unique)  [与全序相反！]
+```
+
+**死锁防护证明：**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  例外 ② 无死锁论证                                                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  前提条件：                                                                  │
+│  1. 本阶段仅在屏障内执行（BarrierGuard 已激活）                              │
+│  2. keyfolders_ 已归零（最后一个 folder 的 release）                        │
+│                                                                             │
+│  屏障状态：                                                                  │
+│  - 写者（put/remove）已被闸门出清                                           │
+│    └─ 任何越过闸门的写者必在排干循环前就持有分片锁                          │
+│    └─ 并在排干完成前整体结束（含其嵌套 meta unique 段）                      │
+│  - 其他 meta unique 使用者（start/release 阶段一三/save/load）被 barrier_mu_  │
+│    串行，不与本阶段并发                                                      │
+│                                                                             │
+│  并发者类型：                                                                │
+│  - 唯一的并发者是读者（get/conditional_remove peek）                        │
+│  - 读者路径：shard → meta（只拿 meta shared）                                │
+│  - 本阶段路径：meta → shard（只拿 meta shared）                              │
+│                                                                             │
+│  无环论证：                                                                  │
+│  ① 读者不持 meta unique，只持 meta shared                                   │
+│  ② 本阶段不持 meta unique，只持 meta shared                                 │
+│  ③ shared-shared 兼容，不会互相阻塞                                          │
+│  ④ 屏障内无 meta unique 排队者                                              │
+│  ⑤ 双方的 meta 获取都不可能阻塞                                              │
+│                                                                             │
+│  结论：无法构成「持 shard 等 meta / 持 meta 等 shard」的环 → 无死锁          │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 5. conditional_remove TOCTOU 分析
+
+**实现模式：** 两阶段（peek + remove）
+
+**代码位置：** cpp/src/keydir/keydir.cpp:688-727
+
+#### 5.1 Peek 阶段（只读探测）
+
+**锁获取顺序：**
+```
+shard.mu (unique, 瞬间) → meta_mu_ (shared, 瞬间)
+```
+
+**执行逻辑：**
+1. 持分片锁，查 entries 是否命中
+2. miss 且 fold 态时，嵌套 meta shared 查 pending
+3. 比对 (tstamp, file_id, offset) 是否匹配
+4. 匹配则返回 kOk，否则返回 kAlreadyExists
+5. 释放所有锁
+
+**特点：**
+- 瞬间持有锁，立即释放
+- 无写操作，不修改状态
+
+#### 5.2 Write 阶段（实际删除）
+
+**调用路径：** 返回 kOk 后调用 remove()
+
+**锁获取顺序：**
+```
+shard.mu (unique) → (可选) meta_mu_ (unique)
+```
+
+**执行逻辑：**
+1. 先拿分片锁
+2. 检查屏障闸门（v2）：屏障期间写者退避
+3. 查 entries 命中时：
+   - 无 fold：直接 erase
+   - fold 态：升级 sibling 链插墓碑
+4. entries miss 且 pending 命中时：
+   - 嵌套 meta unique
+   - pending 内原地改墓碑
+
+#### 5.3 竞态窗口分析
+
+**窗口描述：** Peek 阶段释放锁到 Write 阶段开始之间的时间段
+
+**可能的状态变化：**
+1. 目标 key 被其他写者删除（变成墓碑）
+2. 目标 key 被其他写者更新（file_id/offset 变化）
+3. 目标 key 从 entries 移动到 pending（fold 合并）
+4. fold 状态从活跃变为非活跃
+
+**安全性保证：**
+- remove() 内部重新检查 key 的当前状态
+- 若 key 不存在或已是墓碑，直接返回 false（not-found）
+- 若 key 存在但状态不匹配，remove() 仍执行删除操作
+- CAS 语义的「恰好删除特定版本」在两阶段间不保证
+- 但对于 merge 语义足够（merge 跳过已被覆盖的条目即可）
+
+**幂等性：**
+- remove() 对同一 key 多次调用安全
+- 已删除的 key 再次调用返回 false
+- 活跃的 key 被正确删除
+
+**代码证据：**
+- cpp/src/keydir/keydir.cpp:618（remove 内部重新检查）
+- cpp/src/keydir/keydir.cpp:726（conditional_remove 的返回值统一为 kOk）
+
+### 6. 设计约束与历史原因
+
+#### 6.1 TSan 死锁检测器限制
+
+**问题：** 旧实现同时持有全部 kShards+1=257 把锁
+- 撞 TSan 死锁检测器的 64 持锁硬上限
+- 位置：compiler-rt sanitizer_deadlock_detector.h:67 CHECK
+- 测试案例：KeyDir.DeepCopyPreservesOrd 在 TSAN_OPTIONS=detect_deadlocks=1 下崩溃
+
+**解决方案：** 屏障 v2 写者闸门机制
+- BarrierGuard 任意瞬间至多持 1 把分片锁
+- 排干循环逐分片加锁-放锁，写者被闸门出清
+- 读者不受影响，照常并发
+
+**代码证据：**
+- cpp/src/keydir/keydir.cpp:109-136（BarrierGuard 注释）
+- cpp/include/bitcask/keydir.hpp:15-19（锁全序注释）
+
+#### 6.2 分片数量演进
+
+**历史：** 16 → 64 → 256（S5 迭代）
+
+**原因：**
+- 降低分片碰撞概率
+- 减少写者停车传染面
+- 提升并发度
+
+**当前值：** kShards = 256
+
+**代码证据：**
+- cpp/include/bitcask/keydir.hpp:357
+
+#### 6.3 shared_mutex → mutex 切换（S5）
+
+**切换：** 分片锁从 rwlock 改为 mutex
+
+**原因：**
+- 消除写者偏好停车问题
+- 临界区足够短，mutex 性能更好
+- 简化锁语义
+
+**代码证据：**
+- cpp/include/bitcask/keydir.hpp:361（Shard::mu 注释）
+
+#### 6.4 pending/entries 探测顺序变更（S2）
+
+**变更：** 从 pending→entries 改为 entries→pending
+
+**原因：**
+- 堵 release 合并窗口的 TOCTOU
+- 维持 entries/pending 不相交不变量
+- 保证「key ∈ entries ⟹ pending 无其更新版本」
+
+**不变量：**
+```
+key ∈ 某分片 entries  ⟹  pending_ 不会有它的更新版本
+```
+
+**正确性依据：**
+- get/remove 的探测顺序依赖该不变量
+- release 的「先应用后清表」协议依赖该不变量
+
+**代码证据：**
+- cpp/src/keydir/keydir.cpp:286-296（get 查找顺序注释）
+- cpp/src/keydir/keydir.cpp:390-423（put 探测逻辑）
+
+### 7. 验证与测试
+
+#### 7.1 编译时验证
+
+**工具：** Clang Thread Safety Analysis（若启用）
+
+**验证点：**
+- 锁序标注（CAPABILITY/REQUIRES）
+- 分片锁至多一把检查
+- meta_mu_ 读写分离正确性
+
+#### 7.2 运行时验证
+
+**工具：**
+- TSan（Thread Sanitizer）- 竞态检测
+- Helgrind（Valgrind）- 死锁检测
+
+**关键测试案例：**
+- KeyDir.DeepCopyPreservesOrd（屏障 v2 正确性）
+- 并发 fold 与 put/remove 互不阻塞
+- 多 fold 并发场景（keyfolders_ > 1）
+
+**测试命令：**
+```bash
+# ASan/UBSan
+cmake -S . -B _build/asan -DCMAKE_BUILD_TYPE=Debug \
+    -DBITCASK_SANITIZE=address,undefined -DBUILD_TESTING=ON
+cmake --build _build/asan -j
+ctest --test-dir _build/asan --output-on-failure
+
+# TSan
+cmake -S . -B _build/tsan -DCMAKE_BUILD_TYPE=Debug \
+    -DBITCASK_SANITIZE=thread -DBUILD_TESTING=ON
+cmake --build _build/tsan -j
+ctest --test-dir _build/tsan --output-on-failure
+```
+
+#### 7.3 设计文档交叉引用
+
+**相关设计文档：**
+- doc/keydir-sharding-design-zh.md - 分片并发设计
+- doc/put-flow-zh.md - put 完整调用链
+- doc/unified-architecture-plan-zh.md - 统一架构计划
+
+---
+
+**文档版本：** 2026 重构补全版本
+**最后更新：** 2026-06-13
+**维护者：** Bitcask C++ 团队
