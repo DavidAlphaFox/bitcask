@@ -48,6 +48,8 @@ void Index::ensure_capacity_locked(std::uint64_t ord) {
         ord2ext_.resize(want);
         live_.resize(want, false);
         doc_lens_.resize(want, 0);
+        // V5：与 slots_/live_/doc_lens_ 同数组对齐扩，保证 ord 下标直取。
+        meta_blobs_.resize(want);
     }
 }
 
@@ -130,6 +132,25 @@ std::uint32_t Index::doc_len(std::uint64_t ord) const {
     std::shared_lock lk(mutex_);
     if (ord >= doc_lens_.size()) return 0;
     return doc_lens_[ord];
+}
+
+std::span<const std::byte> Index::meta_blob(std::uint64_t ord) const {
+    std::shared_lock lk(mutex_);
+    if (ord >= meta_blobs_.size()) return {};
+    // 空 vector → 空 span（无 meta 的文档，filter 直接判 false 跳过）。
+    const auto& v = meta_blobs_[ord];
+    return std::span<const std::byte>(v.data(), v.size());
+}
+
+void Index::set_meta(std::uint64_t ord, std::span<const std::byte> blob) {
+    std::unique_lock lk(mutex_);
+    ensure_capacity_locked(ord);
+    // 与 put_doc 共锁：调用顺序保证 ord 此前已在 slots_/live_/doc_lens_ 注册。
+    if (blob.empty()) {
+        meta_blobs_[ord].clear();
+    } else {
+        meta_blobs_[ord].assign(blob.begin(), blob.end());
+    }
 }
 
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))

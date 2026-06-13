@@ -75,6 +75,12 @@ public:
     // 线程安全：unique_lock。
     bool remove(std::string_view ext_id, std::uint64_t tomb_ord);
 
+    // V5:存储 ord 的 meta blob(结构化 KV 二进制,可为空)。与 put_doc
+    // 在同一 unique_lock 下调用——保证 meta 与定位/live 同写入原子点,
+    // 后续读路径不必额外同步。blob 由 Index 内部拷贝(caller 可立即
+    // 释放源缓冲)。线程安全:unique_lock。
+    void set_meta(std::uint64_t ord, std::span<const std::byte> blob);
+
     // ---- 读 ----
     // 取 ext_id 当前存活文档的定位；不存在/已删返回 nullopt。
     // 线程安全：shared_lock。
@@ -89,6 +95,12 @@ public:
 
     // LiveChecker::doc_len — 返回 ord 对应文档的 token 数，越界返回 0。
     [[nodiscard]] std::uint32_t doc_len(std::uint64_t ord) const override;
+
+    // V5:取 ord 的原始 meta blob(结构化 KV 二进制)。越界或空 → 空 span,
+    // 让上层 filter 直接判 false 跳过(无 meta = 不通过过滤)。
+    // 线程安全:shared_lock;返回的 span 指向 Index 内部存储,生命周期止于
+    // 下一次 set_meta(同 ord)——caller 不得跨 set_meta 持留此 span。
+    [[nodiscard]] std::span<const std::byte> meta_blob(std::uint64_t ord) const;
 
     // P2.1 批量版本：一次 shared_lock 完成整个数组（逐 posting 版本每条
     // posting 一次锁 + 一次虚调用，热词查询 = 数十万次锁操作且阻断评分
@@ -128,6 +140,9 @@ private:
     // 只有 4B 有用；u32 紧凑数组 = 16 项/line。与 slots_ 同一 unique_lock
     // 下写入，不会发散。
     std::vector<std::uint32_t> doc_lens_;
+    // V5:per-ord 原始 meta blob(结构化 KV 二进制,可为空)。与 slots_/doc_lens_
+    // 同一 unique_lock 下写入,读路径按 ord 下标直取——零拷贝 span。
+    std::vector<std::vector<std::byte>> meta_blobs_;
     std::uint64_t next_ord_  = 0;
     std::uint64_t live_docs_ = 0;
 

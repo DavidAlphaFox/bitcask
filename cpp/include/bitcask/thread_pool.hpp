@@ -70,6 +70,10 @@ struct IndexTask {
     // V3.3:Add 任务的文档向量(已归一化;空 = 无)。worker 转交
     // SearchLayer::on_vector → HNSW insert。
     std::vector<float> vec;
+    // V5:文档结构化 meta blob(可为空)。worker 转交 Index::set_meta,
+    // 与 put_doc 同 unique_lock 路径——filter 读取时 meta 与定位/live
+    // 已原子一致。make() 不接管:caller 在构造后按需 assign。
+    std::vector<std::byte> meta;
 
     [[nodiscard]] std::string_view key() const noexcept {
         return std::string_view(buf).substr(0, key_len);
