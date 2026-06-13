@@ -1,7 +1,7 @@
 # Bitcask 统一架构：详细实施计划
 
-> **目标**：将 Cask（纯 KV）和 Collection（KV + BM25 搜索）统一为一个引擎，
-> 共享存储层和 merge，单一 API 按配置退化/升级为纯 KV 或全文搜索。
+> **状态**：U1–U6 全部完成。Cask 和 Collection 已统一为单一引擎，Collection 类已删除。
+> 搜索能力通过 `{analyzer, ...}` 选项启用，KV 与索引模式共享同一存储层和 merge。
 >
 > **核心原则**：
 > 1. 不考虑向后兼容性

@@ -1,6 +1,6 @@
 # GetResultView 零拷贝设计（V6.1）
 
-> 状态：设计中（V6.1.1 设计文档）。实施后更新 TASK.md。
+> 状态：已实施（V6.1.2–V6.1.5）。get() 返回 GetResultView 零拷贝视图，get_owned() 保留拷贝语义。
 
 ## 1. 问题
 

@@ -1,4 +1,4 @@
-# M6:KeyDir 分片设计(定稿,待实施)
+# M6:KeyDir 分片设计(已实施)
 
 > 动机数据:`BM_KeyDir_Mixed_MultiThreaded`(90% get + 10% put 覆写):
 > 1t 23.6M ops/s → 8t **0.22M ops/s(-100×)**。M5.3 实测结论:锁类型
