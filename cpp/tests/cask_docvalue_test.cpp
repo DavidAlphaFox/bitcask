@@ -2303,3 +2303,71 @@ TEST_F(CaskDocValueTest, V61GetResultViewConcurrentReaders) {
 
     (*c)->close();
 }
+
+// V6.1.4 batch fold:next_batch 一次取最多 max_n 条 entry。
+// 在 5 条数据上验证 3+2+EOI 三段边界 + 内容正确。iter 的顺序
+// 不保证按 key 字典序（实测按 keydir 内部顺序），所以用 map 收集后再核对。
+TEST(V61BatchFold, NextBatchReturnsMultiple) {
+    namespace fs = std::filesystem;
+    const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+    auto tmpdir = fs::temp_directory_path() /
+                  (std::string("bitcask_v61batchfold_") + info->name());
+    std::error_code ec;
+    fs::remove_all(tmpdir, ec);
+    fs::create_directories(tmpdir, ec);
+
+    CaskOptions opts;
+    opts.read_write = true;
+    auto c = Cask::open(tmpdir.string(), opts);
+    ASSERT_TRUE(c);
+    auto& cask = **c;
+
+    // 5 个 key/value（key1..key5 → "v1".."v5"）。
+    std::map<std::vector<std::byte>, std::vector<std::byte>> expected;
+    for (int i = 1; i <= 5; ++i) {
+        std::vector<std::byte> k{std::byte{'k'}, std::byte{'e'}, std::byte{'y'}};
+        for (char ch : std::to_string(i)) k.push_back(static_cast<std::byte>(ch));
+        std::vector<std::byte> v{std::byte{'v'}};
+        for (char ch : std::to_string(i)) v.push_back(static_cast<std::byte>(ch));
+        ASSERT_TRUE(cask.put(k, v, 1000u + static_cast<std::uint32_t>(i)));
+        expected[k] = v;
+    }
+
+    // 启 iter。
+    auto it = cask.make_iter();
+    auto sr = it->start();
+    ASSERT_TRUE(sr);
+    ASSERT_EQ(*sr, bitcask::keydir::StartIterResult::kOk);
+
+    // 用 map 收集 next_batch 返回的内容（顺序无关）。
+    std::map<std::vector<std::byte>, std::vector<std::byte>> got;
+
+    // 第一次：next_batch(3) → 3 条。
+    auto r1 = it->next_batch(3);
+    ASSERT_TRUE(r1);
+    ASSERT_EQ(r1->size(), 3u);
+    for (const auto& e : *r1) {
+        EXPECT_FALSE(e.is_tombstone);
+        got[e.key] = e.value;
+    }
+
+    // 第二次：next_batch(3) → 只剩 2 条（EOI 触发 break）。
+    auto r2 = it->next_batch(3);
+    ASSERT_TRUE(r2);
+    ASSERT_EQ(r2->size(), 2u);
+    for (const auto& e : *r2) {
+        EXPECT_FALSE(e.is_tombstone);
+        got[e.key] = e.value;
+    }
+
+    // 第三次：next_batch(3) → 空 vector = EOI。
+    auto r3 = it->next_batch(3);
+    ASSERT_TRUE(r3);
+    EXPECT_TRUE(r3->empty());
+
+    it->release();
+    cask.close();
+
+    EXPECT_EQ(got, expected);
+    fs::remove_all(tmpdir, ec);
+}
