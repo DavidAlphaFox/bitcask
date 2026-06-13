@@ -500,6 +500,32 @@ public:
     [[nodiscard]] std::shared_ptr<fileops::DataFile>
     read_file(std::uint32_t file_id);
 
+    // ---- open() 拆分出来的私有阶段 ----
+
+    // T2.4:open 阶段一——锁分配(writer / merger / 只读不锁)。
+    // 出错时返回 unexpected,失败路径由 caller 回滚(RAII 自管)。
+    [[nodiscard]] std::expected<void, CaskFault> acquire_open_locks();
+
+    // T2.4:open 阶段二——bitcask.meta 读取或创建(决定 KV / 索引模式、
+    // 向量配置一致性校验)。必须先于 SearchLayer 创建。
+    [[nodiscard]] std::expected<void, CaskFault> check_or_create_meta();
+
+    // T2.4:open 阶段三——SearchLayer + IndexPool 创建(只在 search_config
+    // 配置时启动 worker)。opts 是 caller 的选项快照,内含 search_config。
+    [[nodiscard]] std::expected<void, CaskFault>
+    create_search_infra(const CaskOptions& opts);
+
+    // T2.2:load_keydir_from_disk 阶段一——加载 bm25 快照 / sidecar /
+    // hnsw 快照 / keydir 快照,并按 4-way coverage gate 决定是否允许
+    // 走快路径(snap_loaded=true)。snap_wms 是 keydir 快照的水位表,
+    // 供 fold 阶段计算各文件的 fold_start 偏移。
+    struct RecoverySnapshots {
+        bool snap_loaded = false;
+        std::vector<std::pair<std::uint32_t, std::uint64_t>> snap_wms;
+    };
+    [[nodiscard]] std::expected<RecoverySnapshots, CaskFault>
+    load_recovery_snapshots(search::SearchLayer* search_layer);
+
     // ---- 搜索方法共用基础设施 ----
 
     // 搜索前置检查 + flush。返回错误则 caller 直接 propagate。
@@ -520,6 +546,12 @@ public:
     write_and_keydir(std::span<const std::byte> key,
                      std::span<const std::byte> encoded,
                      std::uint32_t tstamp, std::uint64_t ord);
+
+    // 向量校验 + 可选 L2 归一化。norm_buf 仅在 cosine 指标时填充；
+    // 非 cosine 返回的 span 直接指向 input（零拷贝）。
+    [[nodiscard]] std::expected<std::span<const float>, CaskFault>
+    prepare_vector(std::span<const float> input,
+                   std::vector<float>& norm_buf) const;
 };
 
 }  // namespace bitcask

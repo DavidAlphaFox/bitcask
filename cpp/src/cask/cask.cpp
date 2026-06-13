@@ -398,6 +398,8 @@ Cask::upgrade(std::string_view dirname,
 //      只读模式不拿任何锁
 //   3. 拿 keydir：通过 registry 共享 / 单独 new；首次创建的需要 load_keydir_from_disk
 // 失败路径会回滚已分配的资源（unique_ptr 自带 RAII，锁也是 optional<FileLock> 自管）。
+// 内部按阶段拆为 acquire_open_locks() → check_or_create_meta() →
+// create_search_infra() → keydir 装配,本函数只做编排。
 std::expected<std::unique_ptr<Cask>, CaskFault>
 Cask::open(std::string_view dirname, const CaskOptions& opts,
             keydir::KeyDirRegistry* registry) {
@@ -412,137 +414,16 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
     // 字段名 ↔ id 注册表（#1）：加载已有 + 打开追加句柄。
     cask->field_schema_.open((fs::path(cask->dirname_) / "field.schema").string());
 
-    // 锁分配：
-    //   - 普通 writer 拿 bitcask.write.lock；
-    //   - merger 拿 bitcask.merge.lock（独立文件，跟 writer 不互斥，
-    //     允许周期性 merge_worker 跟主 writer 并行）；
-    //   - 只读 cask 不拿任何锁。
-    // crash recovery 路径：两种锁都做 stale-lock 检查（看 pid 是否还活着）。
-    // merger 额外读一下 write.lock，把 live writer 当前的 active file id 抠
-    // 出来，下面 needs_merge 时排除掉——不能并别人正在写的文件。
-    if (opts.read_write && !opts.merge_only) {
-        auto fl = acquire_writer_lock(cask->dirname_);
-        if (!fl) return std::unexpected(fl.error());
-        cask->write_lock_ = std::move(*fl);
-    } else if (opts.merge_only) {
-        const auto lock_path =
-            (fs::path(cask->dirname_) / "bitcask.merge.lock").string();
-        auto fl = lock::FileLock::acquire(lock_path, /*write*/ true);
-        if (!fl && fl.error().errnum == EEXIST) {
-            if (try_remove_stale_lock(lock_path)) {
-                fl = lock::FileLock::acquire(lock_path, /*write*/ true);
-            }
-        }
-        if (!fl) {
-            if (fl.error().errnum == EEXIST) {
-                return std::unexpected(err(CaskError::kWriteLocked, lock_path));
-            }
-            return std::unexpected(io_fault(fl.error().errnum, lock_path));
-        }
-        const std::string pid_line = std::to_string(::getpid()) + "\n";
-        auto pid_bytes = std::span<const std::byte>(
-            reinterpret_cast<const std::byte*>(pid_line.data()),
-            pid_line.size());
-        (void)fl->write_data(pid_bytes);
-        cask->write_lock_ = std::move(*fl);
-
-        // 拍 live writer 的 active file id 快照，给 needs_merge 用。
-        // 竞态窗口：从我们读 write.lock 到 merger 真的选文件之间，writer
-        // 可能 roll 过去了——这个 race 在 legacy 里也有（见
-        // bitcask_lockops:read_activefile），后果最多是少并掉一个刚 roll 的
-        // 文件，下一轮 merge 自然会处理。
-        if (opts.merge_only) {
-            const auto wlock_path =
-                (fs::path(cask->dirname_) / "bitcask.write.lock").string();
-            auto wl = lock::FileLock::acquire(wlock_path, /*write*/ false);
-            if (wl) {
-                if (auto data = wl->read_data()) {
-                    cask->merger_writer_active_id_ =
-                        parse_active_file_id_from_lock(
-                            std::span<const std::byte>(data->data(), data->size()));
-                }
-                wl->release_quiet();
-            }
-            // If write.lock doesn't exist or can't be parsed, no active
-            // writer is detected (id stays 0).
-        }
+    if (auto r = cask->acquire_open_locks(); !r) {
+        return std::unexpected(r.error());
     }
 
-    // 检查/创建 bitcask.meta（必须在 SearchLayer 创建之前——决定是否需要索引模式）
-    if (meta::meta_exists(cask->dirname_)) {
-        auto mc = meta::read_meta(cask->dirname_);
-        if (!mc) return std::unexpected(err(CaskError::kIo, "read meta failed"));
-        if (opts.enable_search && mc->mode != meta::Mode::kIndex) {
-            return std::unexpected(err(CaskError::kModeMismatch,
-                "directory is KV mode, cannot open with search"));
-        }
-        if (!opts.enable_search && mc->mode == meta::Mode::kIndex) {
-            return std::unexpected(err(CaskError::kModeMismatch,
-                "directory is index mode, cannot open as KV"));
-        }
-        // V3.1:向量配置必须与 meta 完全一致(dim 库内恒定)。
-        const auto want_metric = opts.vector_dim > 0
-                                     ? opts.vector_metric
-                                     : meta::VectorMetric::kNone;
-        if (mc->vector_dim != opts.vector_dim ||
-            mc->vector_metric != want_metric) {
-            return std::unexpected(err(CaskError::kModeMismatch,
-                "vector config mismatch (meta dim/metric vs options)"));
-        }
-        cask->meta_config_ = *mc;
-    } else {
-        if (opts.vector_dim > 0 && !opts.enable_search) {
-            return std::unexpected(err(CaskError::kInvalidOption,
-                "vector_dim requires enable_search"));
-        }
-        meta::MetaConfig mc;
-        mc.mode = opts.enable_search ? meta::Mode::kIndex : meta::Mode::kKV;
-        if (opts.vector_dim > 0) {
-            mc.vector_dim = opts.vector_dim;
-            mc.vector_metric = opts.vector_metric;
-        }
-        auto wr = meta::write_meta(cask->dirname_, mc);
-        if (!wr) return std::unexpected(err(CaskError::kIo, "write meta failed"));
-        cask->meta_config_ = mc;
+    if (auto r = cask->check_or_create_meta(); !r) {
+        return std::unexpected(r.error());
     }
 
-    // 创建 SearchLayer + IndexPool（如果配置了 search_config）
-    if (opts.search_config) {
-        // V3.3:向量配置从 meta 透传进 SearchLayerConfig(dim>0 时
-        // SearchLayer 内部创建 HnswIndex)。以 meta 为准——open 已校验
-        // opts 与 meta 一致。
-        auto scfg = *opts.search_config;
-        scfg.vector_dim = cask->meta_config_.vector_dim;
-        scfg.vector_metric = cask->meta_config_.vector_metric;
-        cask->search_ = std::make_unique<search::SearchLayer>(scfg);
-        cask->index_pool_ = std::make_unique<IndexPool>(1, 10240);
-        cask->index_pool_->start([&search = *cask->search_](const IndexTask& task) {
-            if (task.op == IndexOp::RebuildHnsw) {
-                // V3.5:merge 后图重建(物理清死)。在 worker 执行 →
-                // 与 on_vector 同线程,维持 HNSW 单写者约束。
-                search.rebuild_hnsw();
-                return true;
-            }
-            if (task.op == IndexOp::Delete) {
-                search.on_delete(task.key(), task.ord);
-            } else if (!task.fields.empty()) {
-                search.on_write_fields(task.key(), task.ord, task.fields,
-                                       task.file_id, task.offset, task.total_sz, task.tstamp);
-            } else {
-                search.on_write(task.key(), task.ord, task.text(),
-                                task.file_id, task.offset, task.total_sz, task.tstamp);
-            }
-            // V5:meta blob 跟 on_write 同一 worker 顺序写入——meta 与
-            // 定位/live 对读路径原子可见(filter 直接读 meta_blob())。
-            if (task.op != IndexOp::Delete && !task.meta.empty()) {
-                search.index().set_meta(task.ord, task.meta);
-            }
-            // V3.3:向量接入 HNSW(单写者 = 本 worker 线程)。
-            if (task.op != IndexOp::Delete && !task.vec.empty()) {
-                search.on_vector(task.ord, task.vec);
-            }
-            return true;
-        });
+    if (auto r = cask->create_search_infra(opts); !r) {
+        return std::unexpected(r.error());
     }
 
     // 拿 / 建 keydir。
@@ -579,6 +460,158 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
         cask->keydir_->mark_ready();
     }
     return cask;
+}
+
+// T2.4:open 阶段一——锁分配。语义跟原 open() 内的锁块完全一致:
+//   - read_write → 拿 bitcask.write.lock（acquire_writer_lock 内部含 stale 检测）
+//   - merge_only → 拿 bitcask.merge.lock（独立文件,stale 检测 + 写 pid +
+//     拍 live writer 的 active file id 快照供 needs_merge 排除）
+//   - 只读 → 不拿锁
+// 任何失败路径都返回 unexpected,unique_ptr<cask> 在 caller 析构时按 RAII
+// 回滚已分配的资源（write_lock_/search_/index_pool_ 都是 RAII 自管）。
+std::expected<void, CaskFault> Cask::acquire_open_locks() {
+    if (opts_.read_write && !opts_.merge_only) {
+        auto fl = acquire_writer_lock(dirname_);
+        if (!fl) return std::unexpected(fl.error());
+        write_lock_ = std::move(*fl);
+        return {};
+    }
+    if (!opts_.merge_only) {
+        // 只读模式:不拿任何锁。
+        return {};
+    }
+    // merge_only 路径。
+    const auto lock_path =
+        (fs::path(dirname_) / "bitcask.merge.lock").string();
+    auto fl = lock::FileLock::acquire(lock_path, /*write*/ true);
+    if (!fl && fl.error().errnum == EEXIST) {
+        if (try_remove_stale_lock(lock_path)) {
+            fl = lock::FileLock::acquire(lock_path, /*write*/ true);
+        }
+    }
+    if (!fl) {
+        if (fl.error().errnum == EEXIST) {
+            return std::unexpected(err(CaskError::kWriteLocked, lock_path));
+        }
+        return std::unexpected(io_fault(fl.error().errnum, lock_path));
+    }
+    const std::string pid_line = std::to_string(::getpid()) + "\n";
+    auto pid_bytes = std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(pid_line.data()),
+        pid_line.size());
+    (void)fl->write_data(pid_bytes);
+    write_lock_ = std::move(*fl);
+
+    // 拍 live writer 的 active file id 快照，给 needs_merge 用。
+    // 竞态窗口：从我们读 write.lock 到 merger 真的选文件之间，writer
+    // 可能 roll 过去了——这个 race 在 legacy 里也有（见
+    // bitcask_lockops:read_activefile），后果最多是少并掉一个刚 roll 的
+    // 文件，下一轮 merge 自然会处理。
+    const auto wlock_path =
+        (fs::path(dirname_) / "bitcask.write.lock").string();
+    auto wl = lock::FileLock::acquire(wlock_path, /*write*/ false);
+    if (wl) {
+        if (auto data = wl->read_data()) {
+            merger_writer_active_id_ =
+                parse_active_file_id_from_lock(
+                    std::span<const std::byte>(data->data(), data->size()));
+        }
+        wl->release_quiet();
+    }
+    // If write.lock doesn't exist or can't be parsed, no active
+    // writer is detected (id stays 0).
+    return {};
+}
+
+// T2.4:open 阶段二——bitcask.meta 读取或创建。必须在 SearchLayer 创建
+// 之前——meta 决定 KV / 索引模式以及向量配置,SearchLayer 内部 HnswIndex
+// 创建依赖 meta_config_。vector_dim/metric 不符 → kModeMismatch。
+std::expected<void, CaskFault> Cask::check_or_create_meta() {
+    if (meta::meta_exists(dirname_)) {
+        auto mc = meta::read_meta(dirname_);
+        if (!mc) return std::unexpected(err(CaskError::kIo, "read meta failed"));
+        if (opts_.enable_search && mc->mode != meta::Mode::kIndex) {
+            return std::unexpected(err(CaskError::kModeMismatch,
+                "directory is KV mode, cannot open with search"));
+        }
+        if (!opts_.enable_search && mc->mode == meta::Mode::kIndex) {
+            return std::unexpected(err(CaskError::kModeMismatch,
+                "directory is index mode, cannot open as KV"));
+        }
+        // V3.1:向量配置必须与 meta 完全一致(dim 库内恒定)。
+        const auto want_metric = opts_.vector_dim > 0
+                                     ? opts_.vector_metric
+                                     : meta::VectorMetric::kNone;
+        if (mc->vector_dim != opts_.vector_dim ||
+            mc->vector_metric != want_metric) {
+            return std::unexpected(err(CaskError::kModeMismatch,
+                "vector config mismatch (meta dim/metric vs options)"));
+        }
+        meta_config_ = *mc;
+        return {};
+    }
+    // 首次创建:无 meta 时写一份。vector_dim > 0 隐含 enable_search。
+    if (opts_.vector_dim > 0 && !opts_.enable_search) {
+        return std::unexpected(err(CaskError::kInvalidOption,
+            "vector_dim requires enable_search"));
+    }
+    meta::MetaConfig mc;
+    mc.mode = opts_.enable_search ? meta::Mode::kIndex : meta::Mode::kKV;
+    if (opts_.vector_dim > 0) {
+        mc.vector_dim = opts_.vector_dim;
+        mc.vector_metric = opts_.vector_metric;
+    }
+    auto wr = meta::write_meta(dirname_, mc);
+    if (!wr) return std::unexpected(err(CaskError::kIo, "write meta failed"));
+    meta_config_ = mc;
+    return {};
+}
+
+// T2.4:open 阶段三——SearchLayer + IndexPool 创建。只在 search_config
+// 配置时启动;worker 闭包内的所有 on_* / set_meta / on_vector 路径
+// 严格保持原顺序(单写者 = 本 worker 线程,与 on_vector 同线程维持
+// HNSW 单写者约束)。
+std::expected<void, CaskFault>
+Cask::create_search_infra(const CaskOptions& opts) {
+    if (!opts.search_config) {
+        return {};
+    }
+    // V3.3:向量配置从 meta 透传进 SearchLayerConfig(dim>0 时
+    // SearchLayer 内部创建 HnswIndex)。以 meta 为准——open 已校验
+    // opts 与 meta 一致。
+    auto scfg = *opts.search_config;
+    scfg.vector_dim = meta_config_.vector_dim;
+    scfg.vector_metric = meta_config_.vector_metric;
+    search_ = std::make_unique<search::SearchLayer>(scfg);
+    index_pool_ = std::make_unique<IndexPool>(1, 10240);
+    index_pool_->start([&search = *search_](const IndexTask& task) {
+        if (task.op == IndexOp::RebuildHnsw) {
+            // V3.5:merge 后图重建(物理清死)。在 worker 执行 →
+            // 与 on_vector 同线程,维持 HNSW 单写者约束。
+            search.rebuild_hnsw();
+            return true;
+        }
+        if (task.op == IndexOp::Delete) {
+            search.on_delete(task.key(), task.ord);
+        } else if (!task.fields.empty()) {
+            search.on_write_fields(task.key(), task.ord, task.fields,
+                                   task.file_id, task.offset, task.total_sz, task.tstamp);
+        } else {
+            search.on_write(task.key(), task.ord, task.text(),
+                            task.file_id, task.offset, task.total_sz, task.tstamp);
+        }
+        // V5:meta blob 跟 on_write 同一 worker 顺序写入——meta 与
+        // 定位/live 对读路径原子可见(filter 直接读 meta_blob())。
+        if (task.op != IndexOp::Delete && !task.meta.empty()) {
+            search.index().set_meta(task.ord, task.meta);
+        }
+        // V3.3:向量接入 HNSW(单写者 = 本 worker 线程)。
+        if (task.op != IndexOp::Delete && !task.vec.empty()) {
+            search.on_vector(task.ord, task.vec);
+        }
+        return true;
+    });
+    return {};
 }
 
 // 收尾顺序很关键：
@@ -669,52 +702,10 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
     // (含 per-field WAL 重放),再用成对性门判定 search 状态是否覆盖
     // keydir 快照的跳过区——覆盖才允许尾部回放,否则全量 fold
     // (keydir 已载入的快照态保留无害:全量 fold 幂等覆盖)。
-    std::vector<std::pair<std::uint32_t, std::uint64_t>> snap_wms;
-    bool snap_loaded = false;
-    bool search_snap_ok = false;
-    bool hnsw_snap_ok = false;
-    std::optional<std::uint64_t> sidecar_covers;
-    if (search_layer) {
-        auto sl = search_layer->load_snapshot(dirname_ + "/bm25_snapshot.inv");
-        search_snap_ok = sl.has_value() && *sl;
-        if (search_snap_ok) {
-            sidecar_covers = search_layer->load_index_sidecar(
-                dirname_ + "/" + kIndexSidecarName);
-        }
-        // V3.5:HNSW 图快照(BCVS)。校验失败 → 空图全量重建;成功但
-        // 下方门未过 → 已载入的图保留无害(fold 重放经 insert 水位幂等
-        // 收敛,与 bm25 同款协议)。撤销 V3.3 的"向量集合强制全量 fold"
-        // 特判(hnsw-design §3 偏差 7)。
-        if (meta_config_.vector_dim > 0) {
-            hnsw_snap_ok = search_layer->load_vec_snapshot(
-                dirname_ + "/" + kHnswSnapName);
-        }
-    }
-    if (auto w = keydir_->load_snapshot(dirname_ + "/" + kKeydirSnapName)) {
-        snap_wms = std::move(*w);
-        snap_loaded = true;
-    }
-    if (search_layer && snap_loaded) {
-        // 成对性门:min_field(已索引 ord 水位)+1 ≥ keydir 快照 next_ord
-        // ⟹ 跳过区每个文档在每个字段索引中都已存在(设计 §4 论证)。
-        const auto floor = search_layer->indexed_ord_floor();
-        const auto need = keydir_->peek_next_ord();
-        // P3:三块状态齐备才放行——inverted(bm25 快照+WAL,floor 门)
-        // + Index 侧表(sidecar,covers 标记)+ keydir(快照本体)。
-        bool covered =
-            search_snap_ok && sidecar_covers.has_value() &&
-            (need == 0 ||
-             ((floor != static_cast<std::uint64_t>(-1) && floor + 1 >= need) &&
-              *sidecar_covers >= need));
-        // V3.5:向量集合追加第四块合取项——hnsw 快照健康 ∧ 图水位覆盖
-        // 跳过区(否则跳过区里的向量文档进不了图)。与 floor 门同款保守:
-        // 尾部 ord 若被墓碑/无向量文档占用,门关闭走全量 fold(安全方向)。
-        if (covered && meta_config_.vector_dim > 0 && need != 0) {
-            covered = hnsw_snap_ok &&
-                      search_layer->hnsw_covers_next_ord() >= need;
-        }
-        if (!covered) snap_loaded = false;
-    }
+    auto recovery = load_recovery_snapshots(search_layer);
+    if (!recovery) return std::unexpected(recovery.error());
+    bool snap_loaded = recovery->snap_loaded;
+    const auto& snap_wms = recovery->snap_wms;
     auto wm_of = [&](std::uint32_t fid) -> std::uint64_t {
         for (auto& [id, off] : snap_wms) {
             if (id == fid) return off;
@@ -832,6 +823,61 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
         }
     }
     return {};
+}
+
+// T2.2:load_keydir_from_disk 阶段一——恢复所有磁盘快照(bm25 / sidecar /
+// hnsw / keydir),并按 4-way coverage gate 决定是否放行 keydir 快照
+// 快路径。返回值给 fold 阶段用:snap_loaded 控制是否走快路径,
+// snap_wms 是 keydir 快照携带的「每文件水位」,fold 阶段用它算
+// fold_start(跳过已快照覆盖的字节)。
+std::expected<Cask::RecoverySnapshots, CaskFault>
+Cask::load_recovery_snapshots(search::SearchLayer* search_layer) {
+    RecoverySnapshots recovery;
+    bool search_snap_ok = false;
+    bool hnsw_snap_ok = false;
+    std::optional<std::uint64_t> sidecar_covers;
+    if (search_layer) {
+        auto sl = search_layer->load_snapshot(dirname_ + "/bm25_snapshot.inv");
+        search_snap_ok = sl.has_value() && *sl;
+        if (search_snap_ok) {
+            sidecar_covers = search_layer->load_index_sidecar(
+                dirname_ + "/" + kIndexSidecarName);
+        }
+        // V3.5:HNSW 图快照(BCVS)。校验失败 → 空图全量重建;成功但
+        // 下方门未过 → 已载入的图保留无害(fold 重放经 insert 水位幂等
+        // 收敛,与 bm25 同款协议)。撤销 V3.3 的"向量集合强制全量 fold"
+        // 特判(hnsw-design §3 偏差 7)。
+        if (meta_config_.vector_dim > 0) {
+            hnsw_snap_ok = search_layer->load_vec_snapshot(
+                dirname_ + "/" + kHnswSnapName);
+        }
+    }
+    if (auto w = keydir_->load_snapshot(dirname_ + "/" + kKeydirSnapName)) {
+        recovery.snap_wms = std::move(*w);
+        recovery.snap_loaded = true;
+    }
+    if (search_layer && recovery.snap_loaded) {
+        // 成对性门:min_field(已索引 ord 水位)+1 ≥ keydir 快照 next_ord
+        // ⟹ 跳过区每个文档在每个字段索引中都已存在(设计 §4 论证)。
+        const auto floor = search_layer->indexed_ord_floor();
+        const auto need = keydir_->peek_next_ord();
+        // P3:三块状态齐备才放行——inverted(bm25 快照+WAL,floor 门)
+        // + Index 侧表(sidecar,covers 标记)+ keydir(快照本体)。
+        bool covered =
+            search_snap_ok && sidecar_covers.has_value() &&
+            (need == 0 ||
+             ((floor != static_cast<std::uint64_t>(-1) && floor + 1 >= need) &&
+              *sidecar_covers >= need));
+        // V3.5:向量集合追加第四块合取项——hnsw 快照健康 ∧ 图水位覆盖
+        // 跳过区(否则跳过区里的向量文档进不了图)。与 floor 门同款保守:
+        // 尾部 ord 若被墓碑/无向量文档占用,门关闭走全量 fold(安全方向)。
+        if (covered && meta_config_.vector_dim > 0 && need != 0) {
+            covered = hnsw_snap_ok &&
+                      search_layer->hnsw_covers_next_ord() >= need;
+        }
+        if (!covered) recovery.snap_loaded = false;
+    }
+    return recovery;
 }
 
 // ---- active writer 管理 ----------------------------------------------------
@@ -1039,6 +1085,35 @@ Cask::write_and_keydir(std::span<const std::byte> key,
         return std::unexpected(err(CaskError::kAlreadyExists));
     }
     return PersistedRecord{ord2, w2->offset, w2->total_size, active_file_id_};
+}
+
+std::expected<std::span<const float>, CaskFault>
+Cask::prepare_vector(std::span<const float> input,
+                     std::vector<float>& norm_buf) const {
+    if (input.empty()) return {};
+    if (meta_config_.vector_dim == 0) {
+        return std::unexpected(err(CaskError::kInvalidOption,
+            "collection has no vector config"));
+    }
+    if (input.size() != meta_config_.vector_dim) {
+        return std::unexpected(err(CaskError::kInvalidOption,
+            "vector dim mismatch"));
+    }
+    if (meta_config_.vector_metric ==
+        meta::VectorMetric::kCosineNormalized) {
+        double sq = 0.0;
+        for (float v : input) sq += static_cast<double>(v) * v;
+        if (sq <= 0.0) {
+            return std::unexpected(err(CaskError::kInvalidOption,
+                "zero vector not allowed under cosine metric"));
+        }
+        const float inv = static_cast<float>(1.0 / std::sqrt(sq));
+        norm_buf.clear();
+        norm_buf.reserve(input.size());
+        for (float v : input) norm_buf.push_back(v * inv);
+        return std::span<const float>(norm_buf);
+    }
+    return input;
 }
 
 // ---- get / put / delete ----------------------------------------------------
@@ -1304,32 +1379,9 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
     // V3.1:向量校验 + cosine 写入归一化(存储即归一化值,merge/恢复
     // 不再重算;hnsw-design §1)。归一化缓冲在双编码点(roll 重试)间复用。
     std::vector<float> vec_norm;
-    std::span<const float> vec_out{};
-    if (!doc.vector.empty()) {
-        if (meta_config_.vector_dim == 0) {
-            return std::unexpected(err(CaskError::kInvalidOption,
-                "collection has no vector config"));
-        }
-        if (doc.vector.size() != meta_config_.vector_dim) {
-            return std::unexpected(err(CaskError::kInvalidOption,
-                "vector dim mismatch"));
-        }
-        if (meta_config_.vector_metric ==
-            meta::VectorMetric::kCosineNormalized) {
-            double sq = 0.0;
-            for (float v : doc.vector) sq += static_cast<double>(v) * v;
-            if (sq <= 0.0) {
-                return std::unexpected(err(CaskError::kInvalidOption,
-                    "zero vector not allowed under cosine metric"));
-            }
-            const float inv = static_cast<float>(1.0 / std::sqrt(sq));
-            vec_norm.reserve(doc.vector.size());
-            for (float v : doc.vector) vec_norm.push_back(v * inv);
-            vec_out = vec_norm;
-        } else {
-            vec_out = doc.vector;
-        }
-    }
+    auto vec_result = prepare_vector(doc.vector, vec_norm);
+    if (!vec_result) return std::unexpected(vec_result.error());
+    auto vec_out = *vec_result;
 
     const std::uint64_t ord = keydir_->alloc_ord();
     std::vector<std::byte> encoded;
