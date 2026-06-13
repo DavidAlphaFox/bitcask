@@ -745,7 +745,11 @@ PutResult KeyDir::conditional_remove(std::string_view key,
             return PutResult::kAlreadyExists;
         }
     }
-    // Match — fall through to the same logic as remove().
+    // TOCTOU 窗口：peek 释放锁到 remove() 重新加锁之间，entry 可能被并发
+    // 写者覆盖或删除。安全性：remove() 内部重新检查 key 状态——不存在或已
+    // 是墓碑则返回 false（幂等），存在则直接删除。CAS「精确删除特定版本」
+    // 不保证，但 merge 语义容忍（跳过已被覆盖的条目即可）。
+    // 详见 doc/concurrency-zh.md §5 conditional_remove TOCTOU 分析。
     return remove(key, remove_time) ? PutResult::kOk : PutResult::kOk;
 }
 
