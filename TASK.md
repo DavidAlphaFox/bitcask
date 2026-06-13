@@ -1064,8 +1064,38 @@ WAND 路径无此问题。建议顺序：P2.1 → 基准 → P2.2 → P2.3。
 | AVX-512/AVX2 距离内核（runtime dispatch） | V3.9 | ✅ |
 | int8 量化 + VNNI 粗筛 + f32 精排 | V4.1–V4.2 | ✅ |
 
-### V4 — 单域 merge
+### V4 — 单域 merge ✅
 
-### V5 — 混合检索 + metadata filter
+> 设计:`doc/hnsw-design-zh.md` §5。V3 HNSW 持久化已落地(V3.5),本步补齐
+> merge 路径的删除率触发 + merge 末尾同步重建 HNSW + pipeline 排序契约。
+> ord 重编号取消(违反 format.md "never reused" 约束,需更深设计)。
+
+| # | 内容 | 状态 |
+|---|------|------|
+| V4.1 | merge 策略基础:`deletion_rate_trigger` 字段(PolicyOptions)+ `decide()` 接受 `dead_doc_rate` + `index_info()` 访问器(SearchLayer 暴露 Index 统计) | ✅ |
+| V4.2 | merge 集成:同步 rebuild HNSW + 落盘 `hnsw.snap` + pipeline 排序契约(IndexPool 单消费者 FIFO 保证 on_relocate→RebuildHnsw 有序) + 删除率触发接线(Cask::needs_merge 计算 dead_doc_rate → PolicyOptions) + 测试 | ✅ |
+
+**门禁**:plain/ASan/TSan 383/383 + eunit 44/44
+
+### V5 — 混合检索 + metadata filter ✅
+
+> 结构化元数据方案(engine 可解析 KV 二进制,非 opaque blob + callback)。
+> 设计选择:①结构化 meta(varint len + key + type tag + value)而非 callback
+> ——支持 Erlang NIF filter 表达式解析 ②HNSW filter 合成进 live callback(无 overfetch,
+> Oracle 确认) ③BM25 filter 过取 k×4 后截断 ④无 meta = filter 拒绝(空 blob → false)
+> ⑤所有 search API 加 `const MetaFilter* filter = nullptr` 默认参数,向后兼容。
+
+| # | 内容 | 状态 |
+|---|------|------|
+| V5.1 | `meta_codec.hpp`(462 行):结构化 KV 编解码(`encode_meta`/`decode_meta`)+ `meta_lookup` 二分快速查找 | ✅ |
+| V5.2 | `meta_filter.hpp`(211 行):`MetaFilter` 表达式树(AND/OR)+ `MetaCondition`(8 op:Eq/Neq/Gt/Gte/Lt/Lte/In/Exists)+ `evaluate(blob)` | ✅ |
+| V5.3 | Index meta 存储:`meta_blobs_` 并行数组 + `meta_blob(ord)` + `set_meta(ord,blob)` + `IndexTask.meta` 字段 | ✅ |
+| V5.4 | SearchLayer filter:所有 search 方法加 `const MetaFilter*` 参数;HNSW 合成进 live callback;BM25 过取 k×4 | ✅ |
+| V5.5 | Cask API 透传:search_text/search_vector/search_hybrid 加 filter 参数 + `put_doc` meta → IndexTask | ✅ |
+| V5.6 | 测试:codec 单元测试(114 行)+ 集成测试(文本过滤/向量过滤/无 meta 排除)→ 387/387 通过 | ✅ |
+
+**未做**:V5.7 NIF 层 Erlang filter 表达式解析(中优先级,需单独设计 Erlang term→MetaFilter 转换)
+
+**门禁**:plain 387/387 + eunit 44/44
 
 ### V6 — 性能与规模化
