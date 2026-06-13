@@ -1,38 +1,37 @@
-# C++ Architecture
+# C++ 架构
 
-This document maps the C++ codebase under `cpp/` and explains how the
-layers fit together. Pair this with `doc/format.md` (on-disk spec).
+本文档介绍了 `cpp/` 目录下的 C++ 代码库，并说明各层之间如何协同工作。请结合 `doc/format.md`（磁盘格式规范）一起阅读。
 
-## Module layout
+## 模块布局
 
 ```
 cpp/
-├── include/bitcask/         # public headers (the API surface)
-│   ├── format.hpp           # on-disk format constants (typed records: kDoc/kTombstone + ord)
-│   ├── codec.hpp            # data/hint record encode/decode (23B data header, 18B hint)
+├── include/bitcask/         # 公共头文件（API 接口）
+│   ├── format.hpp           # 磁盘格式常量（带类型记录：kDoc/kTombstone + ord）
+│   ├── codec.hpp            # 数据/提示记录编解码（23B 数据头，18B 提示）
 │   ├── io.hpp               # PosixFile + IoError
-│   ├── data_file.hpp        # DataFile: append/read/fold typed records
-│   ├── hint_file.hpp        # HintFile: write/validate hint records
-│   ├── scanner.hpp          # scan_dir: list .bitcask.data files
-│   ├── keydir.hpp           # KeyDir: in-memory key directory + iterator (MVCC sibling chain)
-│   ├── keydir_registry.hpp  # KeyDirRegistry: named-keydir cache (refcount sharing)
-│   ├── merge_policy.hpp     # decide() rule + per-file thresholds
-│   ├── merger.hpp           # Merger: merge execution (rewrites live records)
-│   ├── cask.hpp             # Cask: end-user KV+search facade (open/get/put/delete/search/merge)
-│   ├── meta_file.hpp        # bitcask.meta: mode persistence (KV vs Index)
-│   ├── field_schema.hpp     # FieldSchema: 字段名↔id append-only 注册表（DocValue v3 fields）
-│   ├── collection.hpp       # Collection: standalone document + BM25 search facade
-│   ├── collection_registry.hpp # CollectionRegistry: named-collection cache
-│   ├── index.hpp            # Index: in-memory document side tables (ext2ord/slots/ord2ext/live)
-│   ├── inverted.hpp         # InvertedIndex: BM25 inverted index (sharded locks)
-│   ├── search_layer.hpp     # SearchLayer: Index + InvertedIndex + Analyzer wrapper
-│   ├── analyzer.hpp         # text::Analyzer abstract base + factory + AnalyzerConfig
-│   ├── ngram_analyzer.hpp   # NgramAnalyzer: CJK bi/tri-gram + Latin whitespace
-│   ├── jieba_analyzer.hpp   # JiebaAnalyzer: Chinese segmentation (cppjieba)
-│   ├── whitespace_analyzer.hpp # WhitespaceAnalyzer: pure whitespace tokenization
-│   ├── cjk_detect.hpp       # CJK character detection utilities
-│   ├── text_utils.hpp      # NFKC normalization + text utilities
-│   └── file_lock.hpp       # FileLock: advisory lock (O_CREAT|O_EXCL)
+│   ├── data_file.hpp        # DataFile：追加/读取/折叠带类型记录
+│   ├── hint_file.hpp        # HintFile：写入/验证提示记录
+│   ├── scanner.hpp          # scan_dir：列出 .bitcask.data 文件
+│   ├── keydir.hpp           # KeyDir：内存键目录 + 迭代器（MVCC 兄弟链）
+│   ├── keydir_registry.hpp  # KeyDirRegistry：命名 keydir 缓存（引用计数共享）
+│   ├── merge_policy.hpp     # decide() 规则 + 每文件阈值
+│   ├── merger.hpp           # Merger：合并执行（重写活跃记录）
+│   ├── cask.hpp             # Cask：终端用户 KV+search 门面（open/get/put/delete/search/merge）
+│   ├── meta_file.hpp        # bitcask.meta：模式持久化（KV vs Index）
+│   ├── field_schema.hpp     # FieldSchema：字段名↔id 追加注册表（DocValue v3 字段）
+│   ├── collection.hpp       # Collection：独立文档 + BM25 搜索门面
+│   ├── collection_registry.hpp # CollectionRegistry：命名 collection 缓存
+│   ├── index.hpp            # Index：内存文档侧表（ext2ord/slots/ord2ext/live）
+│   ├── inverted.hpp         # InvertedIndex：BM25 倒排索引（分片锁）
+│   ├── search_layer.hpp     # SearchLayer：Index + InvertedIndex + Analyzer 包装器
+│   ├── analyzer.hpp         # text::Analyzer 抽象基类 + 工厂 + AnalyzerConfig
+│   ├── ngram_analyzer.hpp   # NgramAnalyzer：CJK 二/三元词 + Latin 空白分词
+│   ├── jieba_analyzer.hpp   # JiebaAnalyzer：中文分词（cppjieba）
+│   ├── whitespace_analyzer.hpp # WhitespaceAnalyzer：纯空白分词
+│   ├── cjk_detect.hpp       # CJK 字符检测工具
+│   ├── text_utils.hpp      # NFKC 标准化 + 文本工具
+│   └── file_lock.hpp       # FileLock：建议锁（O_CREAT|O_EXCL）
 ├── src/
 │   ├── fileops/             # codec.cpp, data_file.cpp, hint_file.cpp, scanner.cpp
 │   ├── io/                  # posix_file.cpp
@@ -43,297 +42,240 @@ cpp/
 │   ├── search/              # search_layer.cpp
 │   ├── bm25/                # inverted.cpp
 │   └── text/                # analyzer.cpp, jieba_analyzer.cpp
-├── nif/                     # erl_nif glue → bitcask_cpp.so
-│   ├── nif_main.cpp         # ErlNifFunc table + on_load (28 NIF 入口)
-│   ├── nif_cask.cpp         # cask_* functions (open/close/get/put/delete/sync/search/merge)
-│   ├── nif_cask_iter.cpp    # cask_fold_* + cask_iterator_* (fold/iterator NIFs)
+├── nif/                     # erl_nif 胶水 → bitcask_cpp.so
+│   ├── nif_main.cpp         # ErlNifFunc 表 + on_load（28 个 NIF 入口）
+│   ├── nif_cask.cpp         # cask_* 函数（open/close/get/put/delete/sync/search/merge）
+│   ├── nif_cask_iter.cpp    # cask_fold_* + cask_iterator_*（fold/iterator NIF）
 │   ├── nif_cask_admin.cpp   # cask_status / cask_needs_merge / cask_is_empty / cask_is_frozen
 │   ├── nif_helpers.cpp/hpp  # 资源句柄 / DocInput 解析 / 错误翻译 / run_search 骨架 / term 构造
 │   ├── nif_options.cpp      # open/2 选项解析（parse_options，单一职责）
-│   ├── atoms.cpp/hpp        # cached ERL_NIF_TERM atoms
-│   ├── resources.cpp/hpp    # ErlNifResourceType registration
-│   ├── term_conv.hpp        # Erlang term ↔ C++ conversion helpers
-│   └── priv_data.hpp        # per-NIF-instance state (registry + resource types)
-├── tests/                   # GoogleTest unit + integration (15 test files, ~167 tests)
-└── bench/                   # Google Benchmark (cask_bench, keydir_bench)
+│   ├── atoms.cpp/hpp        # 缓存的 ERL_NIF_TERM 原子
+│   ├── resources.cpp/hpp    # ErlNifResourceType 注册
+│   ├── term_conv.hpp        # Erlang term ↔ C++ 转换辅助
+│   └── priv_data.hpp        # 每个 NIF 实例的状态（registry + 资源类型）
+├── tests/                   # GoogleTest 单元 + 集成测试（15 个测试文件，约 167 个测试）
+└── bench/                   # Google Benchmark（cask_bench, keydir_bench）
 ```
 
-## Layering
+## 分层结构
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│  Erlang facade (src/bitcask.erl)                           │
-│  bitcask:put/get/delete/search_text/merge/... → NIF call  │
+│  Erlang 门面 (src/bitcask.erl)                           │
+│  bitcask:put/get/delete/search_text/merge/... → NIF 调用  │
 └────────────────────────────┬───────────────────────────────┘
-                             │ NIF (bitcask_cpp_nifs)
+                              │ NIF (bitcask_cpp_nifs)
 ┌────────────────────────────▼───────────────────────────────┐
-│  cpp/nif/  (thin glue, owns Erlang lifetime + atoms)       │
+│  cpp/nif/  (薄胶水，管理 Erlang 生命周期 + atoms)       │
 └────────────────────────────┬───────────────────────────────┘
-                             │
+                              │
 ┌────────────────────────────▼───────────────────────────────┐
-│  Cask (KV + search facade)                                  │
-│  ├─ KeyDir (in-memory hash index + MVCC iterator)           │
-│  ├─ DataFile cache (open fds for pread)                     │
-│  ├─ HintFile (active writer)                               │
-│  ├─ SearchLayer (optional, index mode only)                 │
-│  │   ├─ Index (ext2ord/slots/ord2ext/live side tables)     │
-│  │   ├─ InvertedIndex (BM25 posting lists)                  │
-│  │   └─ Analyzer (ngram/jieba/whitespace)                  │
-│  └─ MetaConfig (bitcask.meta mode persistence)             │
+│  Cask (KV + search 门面)                                  │
+│  ├─ KeyDir（内存哈希索引 + MVCC 迭代器）                   │
+│  ├─ DataFile 缓存（为 pread 保留打开的 fd）                │
+│  ├─ HintFile（活跃写入器）                                │
+│  ├─ SearchLayer（可选，仅索引模式）                        │
+│  │   ├─ Index（ext2ord/slots/ord2ext/live 侧表）         │
+│  │   ├─ InvertedIndex（BM25 倒排列表）                      │
+│  │   └─ Analyzer（ngram/jieba/whitespace）                │
+│  └─ MetaConfig（bitcask.meta 模式持久化）                  │
 └────────────────────────────┬───────────────────────────────┘
-                             │
+                              │
 ┌────────────────────────────▼───────────────────────────────┐
-│  fileops (codec, data_file, hint_file, scanner)             │
+│  fileops (codec, data_file, hint_file, scanner)            │
 │  io (PosixFile, FileLock)                                  │
 │  merge (Merger, PolicyOptions)                             │
 │  text (Analyzer, NgramAnalyzer, JiebaAnalyzer)             │
 └────────────────────────────────────────────────────────────┘
 ```
 
-The whole tree is C++23, no Boost, no abseil, no third-party runtime
-dependencies in the NIF .so. GoogleTest and Google Benchmark are pulled
-via `FetchContent` and only compiled when `BUILD_TESTING` /
-`BITCASK_BUILD_BENCHMARKS` are on.
+整个代码树使用 C++23，不依赖 Boost、abseil 或第三方运行时依赖库（在 NIF .so 中）。GoogleTest 和 Google Benchmark 通过 `FetchContent` 拉取，仅在 `BUILD_TESTING` / `BITCASK_BUILD_BENCHMARKS` 开启时编译。
 
-## On-disk file inventory
+## 磁盘文件清单
 
-A bitcask instance is a single flat directory containing the following files.
-Detailed byte-level spec lives in `doc/format.md` (English) / `doc/format-zh.md` (中文).
+一个 bitcask 实例是一个扁平目录，包含以下文件。详细的字节级规范请参阅 `doc/format.md`（英文）/ `doc/format-zh.md`（中文）。
 
 ```
 <dir>/
-├── bitcask.meta                # binary metadata (mode marker, 18 B)
-├── <tstamp1>.bitcask.data      # append-only data file (can be many)
-├── <tstamp1>.bitcask.hint      # sidecar index for data file (one per data, optional)
+├── bitcask.meta                # 二进制元数据（模式标记，18 B）
+├── <tstamp1>.bitcask.data      # 追加数据文件（可以有多个）
+├── <tstamp1>.bitcask.hint      # 数据文件的附带给定索引（每个数据文件一个，可选）
 ├── <tstamp2>.bitcask.data
 ├── <tstamp2>.bitcask.hint
 ├── ...
-├── field.schema                # field-name→id registry (index mode only)
-├── bitcask.write.lock          # held by the live writer (exclusive)
-├── bitcask.merge.lock          # held by the active merger (exclusive)
-├── bitcask.keydir.snap         # keydir segment snapshot (A4, optional)
-├── bitcask.index.snap          # index side-table snapshot (A4, optional)
-├── <base>.f<N>.inv.snap        # inverted index snapshot per field (index mode, optional)
-└── <base>.f<N>.inv.wal         # inverted index WAL per field (index mode, optional)
+├── field.schema                # 字段名→id 注册表（仅索引模式）
+├── bitcask.write.lock          # 由活跃写入器持有（独占）
+├── bitcask.merge.lock          # 由活跃合并器持有（独占）
+├── bitcask.keydir.snap         # keydir 段快照（A4，可选）
+├── bitcask.index.snap          # index 侧表快照（A4，可选）
+├── <base>.f<N>.inv.snap        # 每字段倒排索引快照（索引模式，可选）
+└── <base>.f<N>.inv.wal         # 每字段倒排索引 WAL（索引模式，可选）
 ```
 
-### File-by-file
+### 文件详解
 
-| File | Count | Lifetime | Purpose |
+| 文件 | 数量 | 生命周期 | 用途 |
 |------|-------|----------|---------|
-| `bitcask.meta` | 1 | persistent | Magic `BCME` + version + mode (0=KV, 1=Index/search). Source: `meta_file.hpp`. |
-| `<tstamp>.bitcask.data` | many | persistent, old files removed by merge | Core data. Sequence of records: `CRC(4)+Type(1)+Tstamp(4)+Ord(8)+KeySz(2)+ValueSz(4)+Key+Value` (23 B header). Append-only; no file-level header. `<tstamp>` = monotonically increasing uint32 file id, never reused. |
-| `<tstamp>.bitcask.hint` | 0..N | persistent, paired 1:1 with data files | Sidecar index: key + offset + total_sz (no value). Speeds up keydir rebuild at open — only reads keys, not values. Terminated by an 18 B sentinel whose `TotalSz` field carries a whole-file CRC32. If the CRC check fails, the hint is ignored and the keydir is rebuilt from the data file instead. |
-| `field.schema` | 0 or 1 | persistent | Index mode only. Append-only field-name→id registry. Each entry: `[NameLen:u16 BE][name]`, id = order of appearance (0-based). DocValue v3 stores field ids instead of inlining names. |
-| `bitcask.write.lock` | 0 or 1 | runtime (created on open RW, unlinked on close) | Exclusive write lock via `O_CREAT|O_EXCL`. Content: `<pid> <active_data_file_path>\n`. Mergers read this to learn the live writer's active file and exclude it from merge candidates. Stale locks auto-reclaimed via `kill(pid, 0)` probe. |
-| `bitcask.merge.lock` | 0 or 1 | runtime (held during merge) | Exclusive merge lock. **Deliberately independent** from write.lock — writer and merger run concurrently without contending. |
-| `bitcask.keydir.snap` | 0 or 1 | persistent | KeyDir segment snapshot (A4 feature). Speeds up open by avoiding full data-file scan. |
-| `bitcask.index.snap` | 0 or 1 | persistent | Index side-table snapshot (A4 feature). Paired with keydir.snap. |
-| `<base>.f<N>.inv.snap` | 0..N | persistent | Inverted index full snapshot per field (index mode only). `<N>` = field id (0=default). Written by `InvertedIndex::save()`, loaded on open. |
-| `<base>.f<N>.inv.wal` | 0..N | persistent | Inverted index WAL per field (index mode only). Append-only log of add_doc/remove_doc since last snapshot. Truncated after snapshot save. |
+| `bitcask.meta` | 1 | 持久化 | 魔术数 `BCME` + 版本 + 模式（0=KV，1=Index/search）。来源：`meta_file.hpp`。 |
+| `<tstamp>.bitcask.data` | 多个 | 持久化，旧文件由 merge 删除 | 核心数据。记录序列：`CRC(4)+Type(1)+Tstamp(4)+Ord(8)+KeySz(2)+ValueSz(4)+Key+Value`（23 B 头）。追加方式，无文件级头。`<tstamp>` = 单调递增的 uint32 文件 id，永不重用。 |
+| `<tstamp>.bitcask.hint` | 0..N | 持久化，与数据文件 1:1 配对 | 附带给定索引：键 + 偏移 + 总大小（无值）。加速打开时的 keydir 重建 —— 只读取键，不读取值。以 18 B 哨兵结束，其 `TotalSz` 字段携带整个文件的 CRC32。如果 CRC 校验失败，则忽略 hint 并从数据文件重建 keydir。 |
+| `field.schema` | 0 或 1 | 持久化 | 仅索引模式。追加式字段名→id 注册表。每个条目：`[NameLen:u16 BE][name]`，id = 出现顺序（从 0 开始）。DocValue v3 存储字段 id 而不是内联名称。 |
+| `bitcask.write.lock` | 0 或 1 | 运行时（以 RW 模式打开时创建，关闭时删除） | 通过 `O_CREAT|O_EXCL` 独占写锁。内容：`<pid> <active_data_file_path>\n`。合并器读取此文件以了解活跃写入器的活动文件并将其从合并候选中排除。过时锁通过 `kill(pid, 0)` 探测自动回收。 |
+| `bitcask.merge.lock` | 0 或 1 | 运行时（合并期间持有） | 独占合并锁。**有意独立**于 write.lock —— 写入器和合并器并发运行，互不竞争。 |
+| `bitcask.keydir.snap` | 0 或 1 | 持久化 | KeyDir 段快照（A4 特性）。通过避免完整数据文件扫描来加速打开。 |
+| `bitcask.index.snap` | 0 或 1 | 持久化 | Index 侧表快照（A4 特性）。与 keydir.snap 配对。 |
+| `<base>.f<N>.inv.snap` | 0..N | 持久化 | 每字段倒排索引完整快照（仅索引模式）。`<N>` = 字段 id（0=default）。由 `InvertedIndex::save()` 写入，打开时加载。 |
+| `<base>.f<N>.inv.wal` | 0..N | 持久化 | 每字段倒排索引 WAL（仅索引模式）。自上次快照以来的 add_doc/remove_doc 追加日志。快照保存后截断。 |
 
-### How operations touch the files
+### 操作如何接触文件
 
-| Operation | Files touched |
+| 操作 | 接触的文件 |
 |-----------|---------------|
-| `put(K,V)` | Append record to active `.data` + append hint to active `.hint` + update in-memory keydir. In index mode: also async-submit IndexTask → `add_doc` → `.inv.wal` append |
-| `get(K)` | Lookup in-memory keydir → `pread(file_id, offset)` from one `.data` file |
-| `delete(K)` | Append tombstone record (`type=kTombstone`) to active `.data` + tombstone hint |
-| `open` | Read `bitcask.meta` → scan all `.data` files (prefer `.hint` for speed, fallback to full data scan) → rebuild in-memory keydir. In index mode: load `.inv.snap` + replay `.inv.wal` |
-| `merge` | Acquire `merge.lock` → read `write.lock` for active file id → pick high-fragmentation candidates → copy live records to new `.data`+`.hint` pair → CAS-update keydir → unlink old files |
-| `close` | Release `write.lock` (unlink) |
+| `put(K,V)` | 追加记录到活跃 `.data` + 追加 hint 到活跃 `.hint` + 更新内存 keydir。索引模式：同时异步提交 IndexTask → `add_doc` → `.inv.wal` 追加 |
+| `get(K)` | 查找内存 keydir → 从一个 `.data` 文件 `pread(file_id, offset)` |
+| `delete(K)` | 追加墓碑记录（`type=kTombstone`）到活跃 `.data` + 墓碑 hint |
+| `open` | 读取 `bitcask.meta` → 扫描所有 `.data` 文件（优先使用 `.hint` 加速，回退到完整数据扫描）→ 重建内存 keydir。索引模式：加载 `.inv.snap` + 回放 `.inv.wal` |
+| `merge` | 获取 `merge.lock` → 读取 `write.lock` 获取活跃文件 id → 选择高碎片化候选 → 复制活跃记录到新的 `.data`+`.hint` 对 → CAS 更新 keydir → 删除旧文件 |
+| `close` | 释放 `write.lock`（删除） |
 
-### Key design points
+### 关键设计要点
 
-- **File ids never reused**: `KeyDirRegistry` persists `biggest_file_id + 1` across open/close.
-- **Append-only**: every put/delete appends a new record; old versions become dead bytes.
-- **Two independent locks**: writer holds `write.lock`, merger holds `merge.lock` — they never block each other.
-- **Hints are optional/defensive**: a corrupt or missing hint just triggers a slower full-scan rebuild from the data file. Correctness never depends on hints.
+- **文件 id 永不重用**：`KeyDirRegistry` 在打开/关闭之间持久化 `biggest_file_id + 1`。
+- **追加方式**：每个 put/delete 追加一个新记录；旧版本成为死字节。
+- **两个独立锁**：写入器持有 `write.lock`，合并器持有 `merge.lock` —— 它们从不互相阻塞。
+- **提示是可选/防御性的**：损坏或缺失的提示只会触发较慢的数据文件完整扫描重建。正确性从不依赖于提示。
 
-## Dual persistence: Data File vs InvertedWal
+## 双持久化：数据文件 vs 倒排 WAL
 
-Bitcask has **two independent persistence paths** that serve different
-purposes. Understanding the distinction is essential before touching the
-write path.
+Bitcask 有**两条独立的持久化路径**，服务不同的目的。在接触写入路径之前，理解这种区别至关重要。
 
-### Path 1: Data File (append-only log) — KV authority
+### 路径 1：数据文件（追加日志）—— KV 权威
 
-Every `put(K,V)` appends a typed record to the active `.data` file. This
-IS the authoritative KV store. On `open`, all `.data` files are scanned
-(preferably via `.hint` sidecars) and the in-memory KeyDir is rebuilt.
-No separate WAL is needed for KV data — the append-only log is the WAL.
+每个 `put(K,V)` 向活跃 `.data` 文件追加一个带类型记录。这就是权威的 KV 存储。在 `open` 时，扫描所有 `.data` 文件（优先通过 `.hint` 附带文件）并重建内存 KeyDir。KV 数据不需要单独的 WAL —— 追加日志本身就是 WAL。
 
-### Path 2: InvertedWal + snapshot — BM25 index recovery
+### 路径 2：倒排 WAL + 快照 —— BM25 索引恢复
 
-The BM25 inverted index (posting lists, term dictionary, positions) is a
-complex in-memory structure inside `InvertedIndex`. Rebuilding it from
-scratch on every restart requires re-reading all data files and
-re-analyzing all text — expensive at scale (e.g. ~2–5 s for 200K docs).
+BM25 倒排索引（倒排列表、词词典、位置）是 `InvertedIndex` 内部的复杂内存结构。每次重启从头重建需要重读所有数据文件并重新分析所有文本 —— 大规模下代价高昂（例如 200K 文档约需 2–5 秒）。
 
-To avoid full rebuilds, the index uses a **snapshot + WAL** pattern:
+为了避免完整重建，索引使用**快照 + WAL** 模式：
 
 ```
 open:
   load_snapshot()    → InvertedIndex::load(.inv.snap)
-  enable_wal()       → open .inv.wal for append
-  replay_wal()       → replay incremental add_doc/remove_doc since snapshot
-                      → truncate WAL after successful replay
+  enable_wal()       → 打开 .inv.wal 用于追加
+  replay_wal()       → 回放自快照以来的增量 add_doc/remove_doc
+                      → 成功回放后截断 WAL
 
-runtime (per put):
+运行时（每次 put）:
   put_doc(K, V)
-    ├─ DataFile::write(kDoc)         ← Path 1 (KV authority, append-only)
-    └─ submit_index_task(Add)        ← async to IndexPool worker
+    ├─ DataFile::write(kDoc)         ← 路径 1（KV 权威，追加）
+    └─ submit_index_task(Add)        ← 异步到 IndexPool worker
          └─ SearchLayer::on_write()
               └─ InvertedIndex::add_doc(ord, terms)
-                   └─ wal_->append_add_doc()  ← Path 2 (index WAL)
+                   └─ wal_->append_add_doc()  ← 路径 2（索引 WAL）
 
-periodic save:
-  InvertedIndex::save(.inv.snap)    ← full state to disk
-  truncate_wal()                     ← snapshot is authoritative, WAL cleared
+周期性保存:
+  InvertedIndex::save(.inv.snap)    ← 完整状态到磁盘
+  truncate_wal()                     ← 快照是权威的，WAL 清空
 
-crash recovery:
-  load_snapshot() + replay_wal()    → index is current up to crash point
+崩溃恢复:
+  load_snapshot() + replay_wal()    → 索引当前到崩溃点
 ```
 
-**Why a separate WAL for the index?** The data file records contain
-DocValue-encoded text — the raw input to the analyzer. But the inverted
-index is a *derived* structure (tokenized, position-indexed, term-sorted).
-The WAL captures the *analyzed result* (ord + term positions) so that
-recovery skips re-analyzing all text. Without the WAL, a restart would
-either lose index entries added since the last snapshot (search results
-stale) or require a full rebuild from data files.
+**为什么索引需要单独的 WAL？** 数据文件记录包含 DocValue 编码的文本 —— 分析器的原始输入。但倒排索引是一个*派生*结构（已分词、位置索引、词排序）。WAL 捕获*分析结果*（ord + 词位置），以便恢复跳过重新分析所有文本。没有 WAL，重启要么丢失自上次快照以来添加的索引条目（搜索结果陈旧），要么需要从数据文件完整重建。
 
-**This mirrors standard search-engine architecture**: Elasticsearch has
-its translog, Lucene has segment-level WAL — all serving the same purpose
-of bridging the gap between in-memory index state and periodic full
-snapshots.
+**这反映了标准搜索引擎架构**：Elasticsearch 有 translog，Lucene 有段级 WAL —— 都服务于相同的目的，即在内存索引状态和周期性完整快照之间建立桥梁。
 
-### WAL batch flush (V6.2)
+### WAL 批量刷新（V6.2）
 
-`InvertedWal` supports configurable `batch_size` (default=1):
+`InvertedWal` 支持可配置的 `batch_size`（默认=1）：
 
-- **batch_size=1** (default): each `append_add_doc` does `fwrite + fflush`
-  immediately. Maximum durability, maximum `fflush` overhead.
-- **batch_size>1**: entries buffer in memory; a single `fwrite + fflush`
-  flushes the whole batch when the threshold is reached. The destructor
-  flushes any remaining buffer.
+- **batch_size=1**（默认）：每个 `append_add_doc` 立即执行 `fwrite + fflush`。最大持久性，最大 `fflush` 开销。
+- **batch_size>1**：条目在内存中缓冲；达到阈值时单个 `fwrite + fflush` 刷新整个批次。析构函数刷新任何剩余缓冲区。
 
-Crash semantics: unflushed buffered entries are lost. This is safe because
-the data file (Path 1) is the KV authority — a missing WAL entry means
-the index won't have that document until the next snapshot save, which is
-the same staleness window as running without WAL.
+崩溃语义：未刷新的缓冲条目会丢失。这是安全的，因为数据文件（路径 1）是 KV 权威 —— 缺失的 WAL 条目意味着索引在下次快照保存之前不会有该文档，这与不运行 WAL 时的陈旧窗口相同。
 
-WAL framing: `[4B payload_len][payload][4B CRC32]`. CRC covers payload
-only. `replay()` validates each entry and auto-truncates corrupted tails
-(half-written last entry from crash residue).
+WAL 帧格式：`[4B payload_len][payload][4B CRC32]`。CRC 仅覆盖 payload。`replay()` 验证每个条目并自动截断损坏的尾部（崩溃残留的半写入最后条目）。
 
-## Concurrency model
+## 并发模型
 
-Three lock layers exist at runtime; understand which one you're under
-before adding code.
+运行时存在三个锁层；在添加代码之前，了解你在哪一层下。
 
-| Layer            | Type                  | Held by               | Protects                        |
+| 层            | 类型                  | 持有者               | 保护对象                        |
 |------------------|-----------------------|-----------------------|---------------------------------|
-| `bitcask.write.lock`  | flock(2) on file | one writer process    | the active data file's tail     |
-| `bitcask.merge.lock`  | flock(2) on file | one merger process    | merge output files              |
-| `KeyDir::mutex_`      | `std::shared_mutex` | every threaded op | in-memory keydir state          |
+| `bitcask.write.lock`  | flock(2) 文件锁 | 一个写入进程    | 活跃数据文件的尾部     |
+| `bitcask.merge.lock`  | flock(2) 文件锁 | 一个合并进程    | 合并输出文件              |
+| `KeyDir::mutex_`      | `std::shared_mutex` | 每个线程操作 | 内存 keydir 状态          |
 
-The two flock files are **independent** — a merger holding `merge.lock` does
-not block a writer holding `write.lock`, and vice versa. This is the M5.1
-two-lock model. The merger reads `write.lock`'s contents to learn which
-file id the live writer is appending to and excludes it from merge candidates.
+两个 flock 文件是**独立的** —— 持有 `merge.lock` 的合并器不会阻塞持有 `write.lock` 的写入器，反之亦然。这是 M5.1 双锁模型。合并器读取 `write.lock` 的内容以了解活跃写入器正在追加到哪个文件 id，并将其从合并候选中排除。
 
-`KeyDir::mutex_` is one `std::shared_mutex` for the whole keydir. Reads
-(get / get_epoch / info / iter::next / deep_copy / biggest_file_id /
-is_ready / conditional_remove peek) take `std::shared_lock`. Writes (put,
-remove, fstats updates, pending freeze, iter start+release) take
-`std::unique_lock`. M5.3 measured ~1.9× the `std::mutex` baseline at 4
-concurrent readers. Per-bucket sharding to push beyond that requires
-breaking up `pending_` / `epoch_` / `fstats_` (all global by design) and
-is deferred to M6.
+`KeyDir::mutex_` 是整个 keydir 的一个 `std::shared_mutex`。读取（get / get_epoch / info / iter::next / deep_copy / biggest_file_id / is_ready / conditional_remove peek）采用 `std::shared_lock`。写入（put、remove、fstats 更新、待定冻结、iter 开始+释放）采用 `std::unique_lock`。M5.3 在 4 个并发读者下测量到约 1.9× 的 `std::mutex` 基线性能。要突破这一限制需要分片，这需要分解 `pending_` / `epoch_` / `fstats_`（设计上都是全局的），推迟到 M6。
 
-**SearchLayer** is NOT thread-safe — single-writer model, same as Cask writes.
+**SearchLayer** 不是线程安全的 —— 单写者模型，与 Cask 写入相同。
 
-**InvertedIndex** uses sharded locks (16 shards by term hash) — different from
-KeyDir's single `shared_mutex`.
+**InvertedIndex** 使用分片锁（按词哈希 16 个分片）—— 与 KeyDir 的单个 `shared_mutex` 不同。
 
-## Iterator semantics (sibling chain + pending hash)
+## 迭代器语义（兄弟链 + 待定哈希）
 
-When at least one `IterHandle` is iterating (`keyfolders_ > 0`):
+当至少一个 `IterHandle` 正在迭代时（`keyfolders_ > 0`）：
 
-1. A new key goes into a separate `pending_` map. Reads consult `pending_`
-   first, then `entries_`. The fold doesn't see `pending_`, so the
-   snapshot stays stable.
-2. An overwrite of an existing key promotes its entry from `SingleEntry`
-   to `MultiEntry` — a sibling chain newest-first. `IterHandle::next`
-   reads at the iterator's `iter_epoch_`, so it sees the revision that
-   was current at fold-start, not subsequent overwrites.
-3. A delete during a fold writes a sibling tombstone (sentinel value:
-   `file_id == kMaxFileId, total_sz == kMaxSize, offset == kMaxOffset`).
+1. 新键进入一个单独的 `pending_` 映射。读取首先查询 `pending_`，然后查询 `entries_`。fold 不会看到 `pending_`，因此快照保持稳定。
+2. 覆盖现有键将其条目从 `SingleEntry` 提升为 `MultiEntry` —— 一个最新的兄弟链。`IterHandle::next` 在迭代器的 `iter_epoch_` 处读取，因此它看到的是 fold 开始时当前的版本，而不是后续的覆盖。
+3. fold 期间的删除写入一个兄弟墓碑（哨兵值：`file_id == kMaxFileId, total_sz == kMaxSize, offset == kMaxOffset`）。
 
-When the last folder releases:
+当最后一个 folder 释放时：
 
-- `pending_` is merged back into `entries_`.
-- All multi-revision entries collapse to single revisions.
-- `iter_generation_` bumps; the `iter_mutation_` flag clears.
+- `pending_` 合并回 `entries_`。
+- 所有多版本条目折叠为单个版本。
+- `iter_generation_` 递增；`iter_mutation_` 标志清除。
 
-This is the bitcask-equivalent of MVCC for in-memory state — readers see a
-consistent snapshot without copying the whole map at iter start.
+这是 bitcask 相当于内存状态的 MVCC —— 读者看到一致的快照，无需在迭代开始时复制整个映射。
 
-## NIF dispatch
+## NIF 调度
 
-The Erlang facade (`src/bitcask.erl`) dispatches ALL operations to the C++ NIF
-(`bitcask_cpp_nifs`). There is no legacy mode — `bitcask_legacy.erl` has been
-deleted.
+Erlang 门面（`src/bitcask.erl`）将所有操作调度到 C++ NIF（`bitcask_cpp_nifs`）。没有遗留模式 —— `bitcask_legacy.erl` 已被删除。
 
-28 NIF functions are registered:
+注册了 28 个 NIF 函数：
 
-| Group | Functions |
+| 组 | 函数 |
 |-------|-----------|
-| Core KV | `cask_open/2`, `cask_close/1`, `cask_get/2`, `cask_put/3`, `cask_delete/2`, `cask_sync/1` |
-| Search | `cask_search_text/3`, `cask_search_phrase/3` |
+| 核心 KV | `cask_open/2`, `cask_close/1`, `cask_get/2`, `cask_put/3`, `cask_delete/2`, `cask_sync/1` |
+| 搜索 | `cask_search_text/3`, `cask_search_phrase/3` |
 | Fold/Iter | `cask_fold_start/3,4`, `cask_fold_next/1`, `cask_fold_next_full/1`, `cask_fold_release/1` |
-| Legacy iter compat | `cask_iterator/3`, `cask_iterator_next/1`, `cask_iterator_release/1` |
-| Admin | `cask_is_empty/1`, `cask_is_frozen/1`, `cask_status/1`, `cask_needs_merge/1` |
-| Merge | `cask_merge/2` |
-| Other | `cask_close_write_file/1` |
+| 遗留迭代器兼容 | `cask_iterator/3`, `cask_iterator_next/1`, `cask_iterator_release/1` |
+| 管理 | `cask_is_empty/1`, `cask_is_frozen/1`, `cask_status/1`, `cask_needs_merge/1` |
+| 合并 | `cask_merge/2` |
+| 其他 | `cask_close_write_file/1` |
 
-## Build entry points
+## 构建入口
 
 ```
-# C++ only (CMake): tests + bench, no Erlang side
+# 仅 C++（CMake）：测试 + 基准，无 Erlang 端
 cmake -S . -B _build/cmake -DBUILD_TESTING=ON
 cmake --build _build/cmake -j
 ctest --test-dir _build/cmake --output-on-failure
 
-# Sanitizers (set one at a time; ASan and TSan are mutually exclusive)
+# Sanitizers（一次设置一种；ASan 和 TSan 互斥）
 cmake -S . -B _build/asan -DCMAKE_BUILD_TYPE=Debug \
     -DBITCASK_SANITIZE=address,undefined -DBUILD_TESTING=ON
 cmake -S . -B _build/tsan -DCMAKE_BUILD_TYPE=Debug \
     -DBITCASK_SANITIZE=thread -DBUILD_TESTING=ON
 
-# Benchmarks (release only — sanitized perf numbers are meaningless)
+# 基准（仅 release —— sanitized 性能数字无意义）
 cmake -S . -B _build/bench -DCMAKE_BUILD_TYPE=Release \
     -DBITCASK_BUILD_BENCHMARKS=ON -DBUILD_TESTING=OFF
 cmake --build _build/bench -j
 _build/bench/cpp/bench/bitcask_bench
 
-# Full build (cmake + rebar3): includes the .so, runs eunit
-cmake --build _build/cmake -j     # produces priv/bitcask_cpp.so
+# 完整构建（cmake + rebar3）：包括 .so，运行 eunit
+cmake --build _build/cmake -j     # 生成 priv/bitcask_cpp.so
 rebar3 as test eunit --dir test
 ```
 
-## Adding a new C++ feature
+## 添加新的 C++ 特性
 
-1. Land a header change in `cpp/include/bitcask/`. Keep the public API
-   small — internal helpers go in anonymous namespaces in the .cpp.
-2. Implement in the matching .cpp under `cpp/src/`. Use `std::expected`
-   for fallible APIs (every layer in this codebase does).
-3. Add unit tests under `cpp/tests/` (one .cpp per area). The tests/
-   CMakeLists wires every test through `bitcask_sanitizers` so they run
-   under ASan/UBSan/TSan in CI.
-4. If the change touches the keydir or cask hot path, add a microbench
-   in `cpp/bench/` and update `cpp/bench/baseline/baseline.json`.
-5. If the change adds a new NIF, register it in `cpp/nif/nif_main.cpp`'s
-   `kNifFuncs` array AND add the Erlang shim in
-   `src/bitcask_cpp_nifs.erl`.
+1. 在 `cpp/include/bitcask/` 中放置头文件更改。保持公共 API 小 —— 内部辅助函数放在 .cpp 的匿名命名空间中。
+2. 在 `cpp/src/` 下的匹配 .cpp 中实现。对可能失败的 API 使用 `std::expected`（本代码库中的每个层都这样做）。
+3. 在 `cpp/tests/` 下添加单元测试（每个区域一个 .cpp）。tests/ CMakeLists 将每个测试通过 `bitcask_sanitizers` 连接，以便它们在 CI 中在 ASan/UBSan/TSan 下运行。
+4. 如果更改涉及 keydir 或 cask 热路径，在 `cpp/bench/` 中添加微基准并更新 `cpp/bench/baseline/baseline.json`。
+5. 如果更改添加新的 NIF，在 `cpp/nif/nif_main.cpp` 的 `kNifFuncs` 数组中注册它并在 `src/bitcask_cpp_nifs.erl` 中添加 Erlang 包装。
