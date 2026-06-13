@@ -273,6 +273,10 @@ SearchLayer::search_hybrid(std::string_view text_query,
     }
 
     // RRF(k=60):按 ord 并桶,逐路累加 1/(60+rank),rank 从 1 起。
+    //
+    // Reciprocal Rank Fusion (RRF): Cormack, Clarke, Buettcher 2009,
+    //   "Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods".
+    //   公式：score = Σ 1/(k + rank_i)，其中 k=60 为经验常数（论文建议值）。
     struct Fused {
         SearchHit hit;
         double score = 0.0;

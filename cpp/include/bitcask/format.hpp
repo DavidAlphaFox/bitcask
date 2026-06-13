@@ -65,6 +65,11 @@ inline constexpr std::uint64_t kTombMaskV2 = 0x8000'0000'0000'0000ull;
 
 // ---------------------------------------------------------------------------
 // kDoc value 打包布局（写在 kDoc record 的 VALUE 段）。设计见 §2.4。
+//
+// DocValue 格式为本项目自定义格式（无公开规范），但设计灵感来源于：
+//   - Apache Lucene 的 stored fields 格式（字段值紧凑打包）
+//   - Tantivy 的 field value 编码（varint 长度前缀 + 字段值）
+//   核心思路：按 Flags 分段、varint 压缩长度、向量段靠前便于 HNSW 重建切片。
 //   [0]      Ver         u8   (布局版本号，当前 = kDocValueVersion = 3)
 //   [1]      Flags       u8   (见下方 kFlag* 位)
 //   [可选] vector 段：  [Dim:varint][ f32×Dim 小端  或  量化码字 ]

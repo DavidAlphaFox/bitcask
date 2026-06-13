@@ -1,5 +1,18 @@
-// BM25 倒排索引（内存工作副本）。
+// === 算法参考文献 ===
+// BM25 排序函数：Robertson & Sparck Jones 1976, "Relevance weighting of search terms".
+//   IDF（Lucene 标准公式）：log(1 + (N - df + 0.5) / (df + 0.5))
+//   TF 归一化：tf * (k1+1) / (tf + k1 * (1 - b + b * dl/avgdl))
 //
+// BM25+ 扩展（δ 参数）：Lv & Zhai 2011, "Lower-bounding term frequencies".
+//   在 TF 归一化项上加 δ = 1.0，缓解标准 BM25 对长文档的过度惩罚。
+//
+// Block-Max WAND： Ding & Suel 2011, "Faster Top-k Document Retrieval Using Block-Max Indexes".
+//   在每个 posting 块维护 max_tf，用上界剪枝跳过无望文档。
+//
+// Document-at-a-time（DAAT）评分：标准 IR 评估模型，对每个文档累加所有查询词的 BM25 分。
+//
+// === BM25 倒排索引（内存工作副本）。
+
 // InvertedIndex 维护 term → PostingList[(ord, tf)] 的内存映射，
 // 以及 BM25 所需的全局统计（N / sum_doc_len / avgdl）。
 //

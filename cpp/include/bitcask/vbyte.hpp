@@ -1,12 +1,15 @@
-// VByte 变长字节编码：将无符号整数压缩为可变长度字节序列。
+// VByte 变长字节编码（Variable Byte Encoding / Varint）。
+// Williams & Zobel 1999, "Compressing integers for fast file access".
 // 每个字节低 7 位为数据，最高位为延续标记（1=最后一个字节，0=还有更多）。
 //
-// VByte 编码算法：
+// 编码示例：
 //   encode(127) → [0xFF]           // 1 byte：127 < 128，最高位设 1 表示结束
 //   encode(128) → [0x00, 0x01]     // 2 bytes：128 >= 128，先输出低 7 位 0x00，继续
 //   encode(300) → [0xAC, 0x02]     // 2 bytes：300 = 44*7 + 0xAC(172)，44 = 0x01<<(7-1)
 //
 // 差值编码（Gap Encoding）：
+//   对已排序的 ord 列表应用差分编码后再 VByte 压缩——相邻 ord 的差值通常远小于
+//   绝对值，压缩率显著提升。
 //   输入：sorted ords [3, 7, 15, 20]（升序）
 //   差值：[3, 4, 8, 5]（第一个是绝对值，后续是相邻ord的差）
 //   VByte([3, 4, 8, 5]) → 压缩字节序列

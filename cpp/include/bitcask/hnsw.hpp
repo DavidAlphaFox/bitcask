@@ -1,5 +1,11 @@
 // HNSW 近似最近邻索引(V3.3:单写者 + 多读者;设计 doc/hnsw-design-zh.md §3)。
 //
+// === 算法参考文献 ===
+// Malkov, Yashunin, "Efficient and robust approximate nearest neighbor search using
+//   Hierarchical Navigable Small World graphs", arXiv:1603.09320, 2016; TPAMI 2018.
+//   关键参数：M（邻居容量，上层 M，L0 层 2M），ef_construction（构建时搜索宽度），
+//   mL = 1/ln(M)（层生成概率参数，控制图的高度与宽度 tradeoff）。
+//
 // 边界(§1):只收向量不算向量;dim 库内恒定(构造时定);cosine 由上游
 // 写入归一化 → 本模块只见 kDot/kL2 两种度量。
 //

@@ -1,4 +1,7 @@
 #pragma once
+//
+// Levenshtein 编辑距离：Levenshtein 1966, "Binary codes capable of correcting
+//   deletions, insertions and reversals". 经典 O(n*m) 动态规划实现，维护完整矩阵。
 
 #include <algorithm>
 #include <cstdint>
