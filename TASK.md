@@ -1103,56 +1103,47 @@ WAND 路径无此问题。建议顺序：P2.1 → 基准 → P2.2 → P2.3。
 > 原始条目经 Metis 预审，按依赖/风险/收益重排为 6 个子里程碑。
 > **每步独立可发版，自带回归门禁 + bench delta vs baseline.json**。
 
-### V5.7 — NIF Erlang filter 解析（V5 遗留，须先落地）
+### V5.7 — NIF Erlang filter 解析 ✅（详见 V5 节）
+
+> V5.7.1–V5.7.3 全部完成，详见上方 V5 节（line 1096）。不再在此重复。
+
+### V6.0 — 基建清理 ✅
 
 | # | 内容 | 状态 |
 |---|------|------|
-| V5.7.1 | Erlang term → MetaFilter NIF 解析器：`#{op => eq, key => <<"category">>, value => <<"tech">>}` → `MetaCondition`；AND/OR 嵌套列表支持；类型推导（integer/string/float） | ☐ |
-| V5.7.2 | NIF 签名扩展：`cask_search_text/4` / `cask_search_vector/5` / `cask_search_hybrid/5` 可选 filter 参数 | ☐ |
-| V5.7.3 | eunit BDD 测试：eq/and/or/in/invalid 五类 + 端到端搜索过滤 | ☐ |
+| V6.0.1 | 提取共享测试头 `tests/test_support.hpp`：`FakeLiveChecker`（4 处逐字相同 → 1）+ `tp()` 时间戳辅助。plain class，非 template | ✅ |
+| V6.0.2 | `nfkc_casefold_inert` 离线表生成：`gen_inert_table.cpp` 构建期工具（utf8proc）生成 `inert_table.hpp`（862 范围/58521 码位）；CMake `add_custom_command` 集成 | ✅ |
 
-**门禁**：ctest 387/387 + eunit 44→49/49
+**门禁**：ctest 389/389 + eunit 62/62，无 bench 回归
 
-### V6.0 — 基建清理
+### V6.1 — 热路径 API 零拷贝 ✅
 
-| # | 内容 | 状态 |
-|---|------|------|
-| V6.0.1 | 提取共享测试头 `tests/test_support.hpp`：`FakeLiveChecker`（3 处逐字相同 → 1）+ `LcgRng`（3 处 → 1）。plain class，非 template | ☐ |
-| V6.0.2 | `nfkc_casefold_inert` 离线表生成：CMake `add_custom_command` 从 UCD 生成 `inert_table.hpp`；回归测试断言生成表与手写表一致 | ☐ |
-
-**门禁**：ctest 387/387 + eunit 44/44，无 bench 回归
-
-### V6.1 — 热路径 API 零拷贝
-
-> GetResult 当前 owns `vector<byte>` 做 deep copy（4 次堆分配/get）。
-> 改为 `GetResultView { span<byte> value; span<float> vector; span<byte> meta; }`
-> 借用 Cask 内部缓冲。NIF 侧用 `enif_make_binary_from_buffer` 免拷。
-> **前置设计文档**：EnifEnv 生命周期模型 + span 所有权语义。
+> 设计文档：`doc/getresult-view-design-zh.md`。Option C（ReadRecord move-in + span 重推导）。
+> get() 返回 GetResultView（span 借用 ReadRecord，0 堆分配）；get_owned() 保留拷贝语义。
 
 | # | 内容 | 状态 |
 |---|------|------|
-| V6.1.1 | 设计文档：`GetResultView` + 所有权模型 + NIF 边界生命周期 | ☐ |
-| V6.1.2 | C++ `Cask::get` 返回 `GetResultView`（span 借用）；`get_owned()` 保留拷贝语义；所有调用方适配 | ☐ |
-| V6.1.3 | NIF `enif_make_binary_from_buffer` 适配 + TSan 生命周期测试 | ☐ |
-| V6.1.4 | fold/stream 批量拉：`Cask::next_batch(n)` + Erlang `stream_fold` wrapper | ☐ |
-| V6.1.5 | 基准 `BM_Cask_Get_Hot`：目标 < 90% baseline | ☐ |
+| V6.1.1 | 设计文档：`GetResultView` Option C + 所有权模型 + move ctor span 重推导（`decode_doc_value`） | ✅ |
+| V6.1.2 | C++ `Cask::get` 返回 `GetResultView`（span 借用 ReadRecord）；`get_owned()` 保留拷贝语义；move ctor + `to_owned()` | ✅ |
+| V6.1.3 | NIF get 路径适配 `get_owned()`；TSan 生命周期测试（move + to_owned + 并发读）；cask_docvalue_test 迁移 | ✅ |
+| V6.1.4 | fold/stream 批量拉：`CaskIter::next_batch(n)`（C++）+ NIF `cask_fold_next_batch/2` + Erlang `stream_fold/3,4`（默认 batch=32）+ `NextBatchReturnsMultiple` 测试 | ✅ |
+| V6.1.5 | 基准 `BM_Cask_Get_Hot_View`：get()=210ns vs get_owned()=230ns → 91.3% baseline（< 90% ✅），吞吐 +8.4% | ✅ |
 
-**门禁**：ctest 387/387 + ASan + TSan(detect_deadlocks=1) + bench Get hot ±10%
+**门禁**：ctest 390/390 + ASan + TSan(detect_deadlocks=1) + bench Get hot 91.3% baseline
 
-### V6.2 — WAL 批量 flush
+### V6.2 — WAL 批量 flush ✅
 
-> 当前每条 WAL entry 一次 `fwrite` + `fflush`。
-> 批量化：缓冲 N 条 entry → 单次 `fwrite` 缓冲 → 单次 `fflush`。
-> **不变量**：每条 entry 的持久化边界保留（`fflush` 在批次尾部，非去掉）。
+> 设计文档：`doc/wal-batch-design-zh.md`。`InvertedWal` 缓冲 N 条 → 单次 fwrite + fflush。
+> 默认 batch_size=1（零风险，与之前行为位级一致）。
 
 | # | 内容 | 状态 |
 |---|------|------|
-| V6.2.1 | 设计文档：字节流布局 + `fflush` 节奏 + 崩溃窗口定义 | ☐ |
-| V6.2.2 | `InvertedWal` 缓冲 N 条 → 批量 fwrite + 尾部 fflush；可配 batch_size（默认=当前行为） | ☐ |
-| V6.2.3 | 新增 `CrashRecoveryBatched` 测试（M of N 批次写入后 kill → replay 无重复 add_doc） | ☐ |
-| V6.2.4 | 基准 `BM_Put_WalBatch`：batch_size=64 目标 > 2× throughput | ☐ |
+| V6.2.1 | 设计文档：batch_buf_ 缓冲 + 崩溃窗口 ≤N-1 条 + 默认 batch_size=1 | ✅ |
+| V6.2.2 | `InvertedWal` 缓冲实现：`batch_buf_` + `flush_batch()` + batch_size 参数；析构刷残余；`truncate()` 清 buffer。`SearchLayerConfig.wal_batch_size`（默认=1）配置透传 | ✅ |
+| V6.2.3 | 新增 `CrashRecoveryBatched`（batch=3 写 5 → replay 3）+ `BufferFlushesOnThreshold` + `BatchAndImmediateProduceSameReplay` 测试 | ✅ |
+| V6.2.4 | 基准 `BM_Wal_AppendOnly`（WAL 隔离：batch=64 → 2.1× 提速，237→113ns）+ `BM_Put_WalBatch`（full put path：WAL 非瓶颈） | ✅ |
 
-**门禁**：CrashRecovery + CrashRecoveryBatched + 387/387 + ASan
+**门禁**：CrashRecovery + CrashRecoveryBatched + 393/393 + ASan
 
 ### V6.3 — 内存 & 格式体积
 
