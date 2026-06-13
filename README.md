@@ -141,20 +141,17 @@ ok
 | 文件 | 内容 |
 |------|------|
 | `doc/USAGE.md` | 教程：打开、合并、配置、搜索 |
-| `doc/format.md` | 磁盘格式字节级规范（带类型记录、DocValue、提示文件、锁） |
+| `doc/format-zh.md` | 磁盘格式字节级规范（带类型记录、DocValue、提示文件、锁） |
 | `doc/cpp-arch.md` | C++ 模块布局、锁策略、构建入口 |
 | `doc/migration.md` | 特性状态与 API 参考 |
-| `doc/format-zh.md` | 磁盘格式（中文） |
 | `doc/concurrency-zh.md` | 并发与共享语义 |
 | `doc/put-flow-zh.md` | put(K,V) 完整调用链 |
-| `doc/collection-fulltext-zh.md` | Collection 全文索引使用与内部机制 |
 | `doc/vector-db-design-zh.md` | 向量库设计方案（V1–V6 蓝图） |
 | `doc/vector-search-extension-zh.md` | 向量搜索扩展：HNSW + RRF 混合检索 |
-| `doc/vector-graph-db-zh.md` | 向量库/图库可行性分析 |
 | `doc/hnsw-design-zh.md` | HNSW 向量索引设计（并发/持久化/RRF/实施表） |
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
-| `doc/unified-architecture-plan-zh.md` | 统一架构计划 |
-| `TASK.md` | 项目路线图（V1–V3.6 已完成，V3.7 规划中） |
+| `doc/unified-architecture-plan-zh.md` | 统一架构计划（已实施） |
+| `TASK.md` | 项目路线图 |
 
 ## 项目状态
 
@@ -165,7 +162,7 @@ ok
 - **Embedder behaviour** — `bitcask_embedder` 回调 + OpenAI 兼容参考实现
 - **Jieba 中文分析器** 已集成（whitespace / ngram / jieba）
 - **带类型记录格式**（`kDoc`/`kTombstone` + 逐次写入序号）为默认格式
-- **统一架构**（Cask + Collection 合并）规划中 — 见 `TASK.md`
+- **统一架构** — Cask 与 Collection 已合并为单一引擎，按配置（`{analyzer, ...}`）启用 KV 或索引模式
 
 ## 许可证
 

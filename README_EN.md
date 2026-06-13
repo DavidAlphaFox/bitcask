@@ -140,20 +140,17 @@ ok
 | File | What it covers |
 |------|----------------|
 | `doc/USAGE.md` | Tutorial: opening, merging, configuring, searching |
-| `doc/format.md` | On-disk byte-level spec (typed records, DocValue, hints, locks) |
-| `doc/cpp-arch.md` | C++ module layout, locking, build entry points |
-| `doc/migration.md` | Feature status and API reference |
-| `doc/format-zh.md` | 磁盘格式（中文） |
+| `doc/format-zh.md` | 磁盘格式字节级规范（带类型记录、DocValue、提示文件、锁） |
+| `doc/cpp-arch.md` | C++ 模块布局、锁策略、构建入口 |
+| `doc/migration.md` | 特性状态与 API 参考 |
 | `doc/concurrency-zh.md` | 并发与共享语义 |
 | `doc/put-flow-zh.md` | put(K,V) 完整调用链 |
-| `doc/collection-fulltext-zh.md` | Collection 全文索引使用与内部机制 |
 | `doc/vector-db-design-zh.md` | 向量库设计方案（V1–V6 蓝图） |
-| `doc/vector-search-extension-zh.md` | 向量搜索扩展：HNSW + RRF 混合检索（动手切片） |
-| `doc/vector-graph-db-zh.md` | 向量库/图库可行性分析 |
-| `doc/unified-architecture-plan-zh.md` | 统一架构计划 |
+| `doc/vector-search-extension-zh.md` | 向量搜索扩展：HNSW + RRF 混合检索 |
 | `doc/hnsw-design-zh.md` | HNSW 向量索引设计（并发/持久化/RRF/实施表） |
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
-| `doc/TASK.md` | Project roadmap (V1–V3.6 done, V3.7 planned) |
+| `doc/unified-architecture-plan-zh.md` | 统一架构计划（已实施） |
+| `TASK.md` | Project roadmap |
 
 ## Project status
 
@@ -164,7 +161,7 @@ ok
 - **Embedder behaviour** — `bitcask_embedder` callback with OpenAI-compatible reference implementation
 - **Jieba Chinese analyzer** integrated (whitespace / n-gram / jieba)
 - **Typed record format** (`kDoc`/`kTombstone` with per-write ordinal) is the default
-- **Unified architecture** (merging Cask + Collection) is planned — see `TASK.md`
+- **Unified architecture** — Cask and Collection are merged into a single engine; KV vs. index mode selected via `{analyzer, ...}` option
 
 ## License
 
