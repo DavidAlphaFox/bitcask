@@ -1099,3 +1099,104 @@ WAND 路径无此问题。建议顺序：P2.1 → 基准 → P2.2 → P2.3。
 **门禁**:plain 387/387 + eunit 44/44
 
 ### V6 — 性能与规模化
+
+> 来源：O9 "暂不做"积压 + `vector-db-design-zh.md` V6 定义 + P2/P4 review 产出。
+> 原始条目经 Metis 预审，按依赖/风险/收益重排为 6 个子里程碑。
+> **每步独立可发版，自带回归门禁 + bench delta vs baseline.json**。
+
+### V5.7 — NIF Erlang filter 解析（V5 遗留，须先落地）
+
+| # | 内容 | 状态 |
+|---|------|------|
+| V5.7.1 | Erlang term → MetaFilter NIF 解析器：`#{op => eq, key => <<"category">>, value => <<"tech">>}` → `MetaCondition`；AND/OR 嵌套列表支持；类型推导（integer/string/float） | ☐ |
+| V5.7.2 | NIF 签名扩展：`cask_search_text/4` / `cask_search_vector/5` / `cask_search_hybrid/5` 可选 filter 参数 | ☐ |
+| V5.7.3 | eunit BDD 测试：eq/and/or/in/invalid 五类 + 端到端搜索过滤 | ☐ |
+
+**门禁**：ctest 387/387 + eunit 44→49/49
+
+### V6.0 — 基建清理
+
+| # | 内容 | 状态 |
+|---|------|------|
+| V6.0.1 | 提取共享测试头 `tests/test_support.hpp`：`FakeLiveChecker`（3 处逐字相同 → 1）+ `LcgRng`（3 处 → 1）。plain class，非 template | ☐ |
+| V6.0.2 | `nfkc_casefold_inert` 离线表生成：CMake `add_custom_command` 从 UCD 生成 `inert_table.hpp`；回归测试断言生成表与手写表一致 | ☐ |
+
+**门禁**：ctest 387/387 + eunit 44/44，无 bench 回归
+
+### V6.1 — 热路径 API 零拷贝
+
+> GetResult 当前 owns `vector<byte>` 做 deep copy（4 次堆分配/get）。
+> 改为 `GetResultView { span<byte> value; span<float> vector; span<byte> meta; }`
+> 借用 Cask 内部缓冲。NIF 侧用 `enif_make_binary_from_buffer` 免拷。
+> **前置设计文档**：EnifEnv 生命周期模型 + span 所有权语义。
+
+| # | 内容 | 状态 |
+|---|------|------|
+| V6.1.1 | 设计文档：`GetResultView` + 所有权模型 + NIF 边界生命周期 | ☐ |
+| V6.1.2 | C++ `Cask::get` 返回 `GetResultView`（span 借用）；`get_owned()` 保留拷贝语义；所有调用方适配 | ☐ |
+| V6.1.3 | NIF `enif_make_binary_from_buffer` 适配 + TSan 生命周期测试 | ☐ |
+| V6.1.4 | fold/stream 批量拉：`Cask::next_batch(n)` + Erlang `stream_fold` wrapper | ☐ |
+| V6.1.5 | 基准 `BM_Cask_Get_Hot`：目标 < 90% baseline | ☐ |
+
+**门禁**：ctest 387/387 + ASan + TSan(detect_deadlocks=1) + bench Get hot ±10%
+
+### V6.2 — WAL 批量 flush
+
+> 当前每条 WAL entry 一次 `fwrite` + `fflush`。
+> 批量化：缓冲 N 条 entry → 单次 `fwrite` 缓冲 → 单次 `fflush`。
+> **不变量**：每条 entry 的持久化边界保留（`fflush` 在批次尾部，非去掉）。
+
+| # | 内容 | 状态 |
+|---|------|------|
+| V6.2.1 | 设计文档：字节流布局 + `fflush` 节奏 + 崩溃窗口定义 | ☐ |
+| V6.2.2 | `InvertedWal` 缓冲 N 条 → 批量 fwrite + 尾部 fflush；可配 batch_size（默认=当前行为） | ☐ |
+| V6.2.3 | 新增 `CrashRecoveryBatched` 测试（M of N 批次写入后 kill → replay 无重复 add_doc） | ☐ |
+| V6.2.4 | 基准 `BM_Put_WalBatch`：batch_size=64 目标 > 2× throughput | ☐ |
+
+**门禁**：CrashRecovery + CrashRecoveryBatched + 387/387 + ASan
+
+### V6.3 — 内存 & 格式体积
+
+> TF 量化 + FOR 块压缩（`InvVersion=6`，删 v5 载入路径）+
+> 词典侧表（排序数组替换并发哈希的全词表扫描）。
+
+| # | 内容 | 状态 |
+|---|------|------|
+| V6.3.1 | 词典侧表：`concurrent_hash_map` term 遍历改为排序 `vector<string>` + binary search（前缀/精确查询基线；`*foo*` 中缀模式仍回退全扫） | ☐ |
+| V6.3.2 | TF 量化（lossless）+ FOR 块压缩；`InvVersion=6`；删 v5 load 路径 | ☐ |
+| V6.3.3 | WAL entry 格式适配新 TF 表示 | ☐ |
+| V6.3.4 | 基准：FuzzyVocabScan 目标 < 50% baseline；on-disk 1M 文档体积 < 70% v5 | ☐ |
+
+**门禁**：387/387 + eunit + bench FuzzyVocabScan ablation + on-disk size 验证
+
+**V6.5 gate**：若 V6.3.1 排序数组在 `*foo*` 已给 3× 以上加速 → wildcard trie 推 V7
+
+### V6.4 — 格式预留 & 测算（设计文档为主，非功能代码）
+
+| # | 内容 | 状态 |
+|---|------|------|
+| V6.4.1 | `vec_quantized` flag 接线：写端 stub codeword 布局（magic+version），读端仍报错"需 V7+ codeword 支持" | ☐ |
+| V6.4.2 | 外存预留点设计文档：测 HNSW 100k/1M 向量 cliff + 识别 shard-local epoch 等接入点。纯文档，不写功能代码 | ☐ |
+| V6.4.3 | ord 密度测量：1M/10M 文档下 ord gap 分布。结论：正式取消 or 排 V7 | ☐ |
+
+**门禁**：387/387（V6.4.1 有新测试）+ 设计文档入 `doc/`
+
+### V6.5 — 大工程项（V6.3 数据 gate）
+
+> 仅在 V6.3 测量证明排序数组不够时才启动。
+
+| # | 内容 | 状态 |
+|---|------|------|
+| V6.5.1 | wildcard trie/FST/DAWG：设计文档 + 原型。Gate on V6.3.1 排序数组对 `*foo*` 的加速倍数 | ☐ |
+| V6.5.2 | value 压缩（zstd/LZ4）：**仅**限落盘 data file body（不影响 GetResult 零拷贝路径）。与 V6.1 互斥，不可同时做 | ☐ |
+
+### 明确排除（V7+ 或永久取消）
+
+| 条目 | 决策 | 理由 |
+|------|------|------|
+| Product Quantization (PQ) codebook | ❌ V7+ | 离线训练管线是独立项目；V6.4.1 留 seam |
+| HNSW 外存 mmap | ❌ V7+ | V3.5 BCVS 已给 46×；100M+ 规模问题是另一类设计 |
+| ord 重编号 | ⚠️ V6.4.3 测量后决策 | format "never reused" 约束正确；若 gap < 2× 正式取消 |
+| A4-P2 live gate re-open | ❌ V7+ | Index sidecar 持久化是实质 blocker；当前性能不受损 |
+| Live/Roaring bitmap (ord > 100M) | ❌ V7+ | 未到规模 |
+| WAL group-commit 跨线程 | ❌ V7+ | TSan 死锁检测器 64 持锁上限（M6.6），新锁模式需独立评审 |
