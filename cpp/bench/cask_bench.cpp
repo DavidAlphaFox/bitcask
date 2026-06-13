@@ -118,6 +118,39 @@ static void BM_Cask_Get_Hot(benchmark::State& state) {
 }
 BENCHMARK(BM_Cask_Get_Hot);
 
+// V6.1.5: 零拷贝 get() benchmark——与上方 get_owned() 对比。
+// 目标：get() (view) 耗时 < 90% get_owned() (owned)。
+static void BM_Cask_Get_Hot_View(benchmark::State& state) {
+    TempDir td;
+    auto c = Cask::open(td.path(), rw_opts());
+    if (!c) state.SkipWithError("Cask::open failed");
+    auto& cask = **c;
+
+    constexpr int kKeyspace = 1024;
+    std::vector<std::string> keys;
+    keys.reserve(kKeyspace);
+    for (int i = 0; i < kKeyspace; ++i) {
+        keys.push_back("k" + std::to_string(i));
+    }
+    const std::string value(128, 'v');
+    for (const auto& k : keys) {
+        auto r = cask.put(as_bytes(k), as_bytes(value));
+        if (!r) state.SkipWithError("populate put failed");
+    }
+
+    std::mt19937 rng(0xCAFE);
+    std::uniform_int_distribution<int> dist(0, kKeyspace - 1);
+
+    for (auto _ : state) {
+        auto& k = keys[static_cast<std::size_t>(dist(rng))];
+        auto r = cask.get(as_bytes(k));  // zero-copy GetResultView
+        benchmark::DoNotOptimize(r);
+    }
+    state.SetItemsProcessed(state.iterations());
+    state.SetBytesProcessed(state.iterations() * static_cast<int64_t>(value.size()));
+}
+BENCHMARK(BM_Cask_Get_Hot_View);
+
 // -----------------------------------------------------------------------------
 // A4:open 冷启动——keydir 段快照 vs 全量 fold(20k 记录)。
 // 两者共用同一份预生成目录;FullFold 变体每轮删快照(close 会重写)。
