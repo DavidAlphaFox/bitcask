@@ -299,6 +299,7 @@ if(Erlang_INCLUDE_DIR)
         nif/nif_cask.cpp
         nif/nif_cask_iter.cpp
         nif/nif_cask_admin.cpp
+        nif/nif_cask_meta.cpp
         nif/nif_helpers.cpp
         nif/nif_options.cpp
         nif/atoms.cpp
