@@ -12,6 +12,7 @@
 #include "bitcask/format.hpp"
 #include "bitcask/merger.hpp"
 #include "bitcask/scanner.hpp"
+#include "bitcask/codec.hpp"   // V6.1: GetResultView::ctor 解码 DocValue
 
 namespace bitcask {
 
@@ -993,7 +994,12 @@ std::shared_ptr<fileops::DataFile> Cask::read_file(std::uint32_t file_id) {
 //   3. 磁盘 record 是墓碑 value → kNotFound
 //      （keydir 里的墓碑已经在第 1 步被过滤；这层兜住「磁盘墓碑但 keydir
 //       还没合并掉」的窗口）
-std::expected<GetResult, CaskFault>
+//
+// V6.1: 返回 zero-copy GetResultView，value/meta/vector 都是 span，借用
+// df->read() 内部 ReadRecord 的 vector<byte> 缓冲。无堆分配。
+//   NIF 即取即用：调用 make_binary_checked 拷到 ErlNifBinary 后即释放。
+//   benchmark / 测试 / 需要持久化 → get_owned()。
+std::expected<GetResultView, CaskFault>
 Cask::get(std::span<const std::byte> key) {
     auto entry = keydir_->get(bytes_to_view(key));
     if (!entry) return std::unexpected(err(CaskError::kNotFound));
@@ -1020,31 +1026,73 @@ Cask::get(std::span<const std::byte> key) {
                 return std::unexpected(err(CaskError::kIo));
         }
     }
-    // 磁盘墓碑：record type 为 kTombstone。语义上仍然是「最新写入」
-    // （记录上的 tstamp 比之前的活 entry 大），但表示删除。在 cask
-    // 层透明过滤掉。
     if (rec->type == format::RecordType::kTombstone) {
         return std::unexpected(err(CaskError::kNotFound));
     }
-    // 解码 DocValue，取 text 段（即原始 value）
-    auto dv = codec::decode_doc_value(std::span<const std::byte>(rec->value));
-    if (!dv) {
-        return std::unexpected(err(CaskError::kIo, "corrupt DocValue"));
-    }
-    GetResult out{
-        std::vector<std::byte>(dv->text.begin(), dv->text.end()),
-        std::vector<std::byte>(dv->meta.begin(), dv->meta.end()),
-        {},
-        rec->tstamp,
-        rec->ord
-    };
-    // V3.1:向量段透传(f32 小端,LE 主机直拷;dim 自描述与 meta 一致性
-    // 由写入端保证,这里按数据为准)。
+
+    return GetResultView(std::move(*rec));
+}
+
+std::expected<GetResult, CaskFault>
+Cask::get_owned(std::span<const std::byte> key) {
+    auto v = get(key);
+    if (!v) return std::unexpected(v.error());
+    return v->to_owned();
+}
+
+// --- GetResultView implementation ---
+
+GetResultView::GetResultView(fileops::ReadRecord&& rec)
+    : storage_(std::move(rec))       // move first (declaration order)
+    , tstamp(storage_.tstamp)
+    , ord(storage_.ord)
+{
+    if (storage_.type != format::RecordType::kDoc) return;  // tombstone等不解码
+    auto dv = codec::decode_doc_value(
+        std::span<const std::byte>(storage_.value));
+    if (!dv) return;  // corrupt DocValue → empty spans
+    value = dv->text;
+    meta  = dv->meta;
     if (dv->has_vector && dv->dim > 0 &&
         dv->vector_raw.size() == dv->dim * sizeof(float)) {
-        out.vector.resize(dv->dim);
-        std::memcpy(out.vector.data(), dv->vector_raw.data(),
-                    dv->vector_raw.size());
+        vector = std::span<const float>(
+            reinterpret_cast<const float*>(dv->vector_raw.data()),
+            dv->dim);
+    }
+}
+
+GetResultView::GetResultView(GetResultView&& other) noexcept
+    : storage_(std::move(other.storage_))
+    , tstamp(other.tstamp)
+    , ord(other.ord)
+{
+    // Re-derive spans from our own storage (other's spans now dangle)
+    if (storage_.type == format::RecordType::kDoc && !storage_.value.empty()) {
+        auto dv = codec::decode_doc_value(
+            std::span<const std::byte>(storage_.value));
+        if (dv) {
+            value = dv->text;
+            meta  = dv->meta;
+            if (dv->has_vector && dv->dim > 0 &&
+                dv->vector_raw.size() == dv->dim * sizeof(float)) {
+                vector = std::span<const float>(
+                    reinterpret_cast<const float*>(dv->vector_raw.data()),
+                    dv->dim);
+            }
+        }
+    }
+}
+
+GetResult GetResultView::to_owned() const {
+    GetResult out{
+        std::vector<std::byte>(value.begin(), value.end()),
+        std::vector<std::byte>(meta.begin(), meta.end()),
+        {},
+        tstamp,
+        ord
+    };
+    if (!vector.empty()) {
+        out.vector.assign(vector.begin(), vector.end());
     }
     return out;
 }

@@ -113,6 +113,34 @@ struct CaskFault {
     std::string detail;
 };
 
+// V6.1 零拷贝 get 结果——span 借用 ReadRecord 缓冲，无堆分配。
+// 声明顺序决定初始化顺序：storage_ 必须在 spans 之前声明。
+// (前置声明 GetResult:to_owned() 返回类型仅在 .cpp 中需要完整定义)
+struct GetResult;
+struct GetResultView {
+private:
+    friend class Cask;
+    fileops::ReadRecord storage_;          // ① 持有 pread 数据，move-in
+
+public:
+    std::span<const std::byte> value{};    // text 段（指向 storage_.value 内部）
+    std::span<const std::byte> meta{};     // meta 段（可为空）
+    std::span<const float> vector{};       // 向量段（空=无向量）
+    std::uint32_t tstamp = 0;
+    std::uint64_t ord = 0;
+
+    /// 拷贝为 owned 版本
+    GetResult to_owned() const;
+
+    // 可移动（std::expected 要求），不可拷贝
+    GetResultView(GetResultView&& other) noexcept;
+    GetResultView(const GetResultView&) = delete;
+    GetResultView& operator=(const GetResultView&) = delete;
+
+private:
+    explicit GetResultView(fileops::ReadRecord&& rec);
+};
+
 struct GetResult {
     std::vector<std::byte> value;  // DocValue 解码后的 text 段（纯 binary）
     std::vector<std::byte> meta;   // DocValue 解码后的 meta 段（可为空）
@@ -243,8 +271,15 @@ public:
     // 线程安全: 是（读路径无锁；read_files_ cache 受 read_cache_mu_ 保护，
     // 底层 DataFile::read 用 pread 是 thread-safe 的）。
     // 锁要求: 无外部锁；内部按需取 read_cache_mu_ + keydir mutex。
-    [[nodiscard]] std::expected<GetResult, CaskFault>
+    // 返回 zero-copy view：value/meta/vector 是指向 pread 缓冲的 span，
+    // 生命周期与 returned GetResultView 绑定——move 走就是 move，复制则
+    // 仍指向同一缓冲。NIF 即取即用，benchmark / 测试需要持久化用 get_owned。
+    [[nodiscard]] std::expected<GetResultView, CaskFault>
     get(std::span<const std::byte> key);
+
+    /// 拷贝语义版本——benchmark 等需要 owned 数据的场景
+    [[nodiscard]] std::expected<GetResult, CaskFault>
+    get_owned(std::span<const std::byte> key);
 
     // 写入。tstamp=0 表示用当前 wall-clock 秒。
     // 线程安全: 否（写路径要求「一个 Cask 同时只有一个写线程」——M5 通过
