@@ -289,14 +289,15 @@ TEST(WalFraming, BitflipDetectedByCrc) {
         wal.append_add_doc(1, terms);
     }
 
-    // 翻转第二条 entry payload 中间一个字节(跳过第一条:4+len+4)。
+    // 翻转第二条 entry payload 中间一个字节(跳过第一条:8B 头+4B len+payload+4B CRC)。
     {
         std::FILE* f = std::fopen(tmp.string().c_str(), "rb+");
         ASSERT_NE(f, nullptr);
+        ASSERT_EQ(std::fseek(f, 8, SEEK_SET), 0);
         std::uint32_t len1 = 0;
         ASSERT_EQ(std::fread(&len1, 1, 4, f), 4u);
         const long second_payload_mid =
-            static_cast<long>(4 + len1 + 4 + 4 + len1 / 2);
+            static_cast<long>(8 + 4 + len1 + 4 + 4 + len1 / 2);
         ASSERT_EQ(std::fseek(f, second_payload_mid, SEEK_SET), 0);
         int ch = std::fgetc(f);
         ASSERT_NE(ch, EOF);
@@ -349,9 +350,9 @@ TEST(CrashRecoveryBatched, BufferedEntriesLostOnCrash) {
 
     // Phase 1: write 5 docs with batch_size=3 in a scope. The destructor
     // will flush the buffer (2 remaining entries) on scope exit, so the
-    // post-destructor file would be 210 bytes. To simulate the crash, we
-    // chop the file back to 126 bytes (3 entries) using resize_file, which
-    // is what the OS would leave behind if the process died before
+    // post-destructor file would be 228 bytes. To simulate the crash, we
+    // chop the file back to 140 bytes (header + 3 entries) using resize_file,
+    // which is what the OS would leave behind if the process died before
     // destructor's flush_batch ran.
     {
         InvertedWal wal(tmp.string(), 3);
@@ -361,24 +362,28 @@ TEST(CrashRecoveryBatched, BufferedEntriesLostOnCrash) {
         wal.append_add_doc(0, terms);
         wal.append_add_doc(1, terms);
         wal.append_add_doc(2, terms);  // flush at count=3
-        // After 3 entries: file on disk has 3 entries; nothing buffered.
-        // Entry layout (one term "alpha" + tp(1,{0})):
-        //   [4B len][1B type][8B ord][4B term_count=1][4B term_len=5][5B
-        //   "alpha"][4B tf=1][4B pos_count=1][4B pos=0][4B crc] = 42B total.
-        //   3 entries = 126 bytes.
-        EXPECT_EQ(std::filesystem::file_size(tmp), 126u);
+        // After 3 entries: file on disk has [8B WAL header] + 3 entries;
+        // nothing buffered.
+        // Entry layout (one term "alpha" + tp(1,{0}), V6.3.3 VByte format):
+        //   [4B len][1B type][8B ord][4B term_count=1]
+        //   [4B term_len=5][5B "alpha"]
+        //   [4B tf_vbyte_len=1][1B tf_vbyte(0x81)]          // tf=1 → 1 byte
+        //   [4B pos_count=1][4B pos_csize=1][1B pos_vbyte(0x80)]  // pos=0 → 1 byte
+        //   [4B crc] = 44B total.
+        //   8B header + 3 entries = 140 bytes.
+        EXPECT_EQ(std::filesystem::file_size(tmp), 140u);
         wal.append_add_doc(3, terms);  // buffered
         wal.append_add_doc(4, terms);  // buffered
-        // With 2 buffered, file size is still 126 (buffer not yet flushed).
-        EXPECT_EQ(std::filesystem::file_size(tmp), 126u);
+        // With 2 buffered, file size is still 140 (buffer not yet flushed).
+        EXPECT_EQ(std::filesystem::file_size(tmp), 140u);
     }
-    // After scope: destructor flushed the 2 buffered entries → 210 bytes.
-    EXPECT_EQ(std::filesystem::file_size(tmp), 210u);
+    // After scope: destructor flushed the 2 buffered entries → 228 bytes.
+    EXPECT_EQ(std::filesystem::file_size(tmp), 228u);
 
-    // Simulate crash: chop the file to 126 bytes (3 entries only). This
-    // emulates the OS file state when the process died before the
+    // Simulate crash: chop the file to 140 bytes (header + 3 entries only).
+    // This emulates the OS file state when the process died before the
     // destructor's flush_batch ran.
-    std::filesystem::resize_file(tmp, 126u);
+    std::filesystem::resize_file(tmp, 140u);
 
     // Replay: should get exactly 3 entries (ords 0,1,2).
     InvertedIndex idx;

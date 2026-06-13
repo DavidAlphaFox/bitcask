@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 
 namespace bitcask::bm25 {
 
@@ -12,6 +13,13 @@ namespace {
 
 constexpr std::uint8_t kWalEntryAddDoc    = 0x01;
 constexpr std::uint8_t kWalEntryRemoveDoc = 0x02;
+
+// V6.3.3:文件头 8 字节 = [magic:u32 = "WAL1"][version:u32 = 1]。
+// magic 用于快速识别 WAL 文件并拒绝旧格式(不考虑向后兼容);
+// version 保留位,便于后续增量升级时不破坏解析。
+constexpr std::uint32_t kWalMagic       = 0x57414C31;  // "WAL1" (大端可读)
+constexpr std::uint32_t kWalVersion     = 1;
+constexpr std::size_t   kWalHeaderSize  = 8;
 
 // O11 framing:每条 entry 落盘为 [PayloadLen:u32][Payload][CRC32:u32]。
 // CRC 覆盖 Payload;replay 据此检测半条/损坏 entry,截断至上一完整条。
@@ -52,6 +60,20 @@ void put_bytes(std::vector<std::uint8_t>& b, const void* data, std::size_t size)
 InvertedWal::InvertedWal(std::string_view path, std::size_t batch_size)
     : path_(path), batch_size_(batch_size) {
     file_ = std::fopen(path_.c_str(), "ab");
+    if (!file_) return;
+
+    // V6.3.3:空文件追加一次 8 字节文件头(magic + version)。
+    // 已有内容的文件保持原状,replay() 会通过 magic 校验判断格式版本。
+    std::fseek(file_, 0, SEEK_END);
+    if (std::ftell(file_) == 0) {
+        const std::uint32_t magic = kWalMagic;
+        const std::uint32_t ver   = kWalVersion;
+        std::fwrite(&magic, 4, 1, file_);
+        std::fwrite(&ver, 4, 1, file_);
+        std::fflush(file_);
+    }
+    // 重新定位到文件尾,后续 append 紧跟文件头/既有 entry。
+    std::fseek(file_, 0, SEEK_END);
 }
 
 InvertedWal::~InvertedWal() {
@@ -99,15 +121,27 @@ void InvertedWal::append_add_doc(
 
     put_u32(enc_buf_, static_cast<std::uint32_t>(term_data.size()));
 
+    // V6.3.3:tf / 位置列表改用 VByte + gap 编码(payload 体积显著缩小)。
+    // 长度前缀 [len:u32][bytes...] 让解码侧无需理解 VByte 边界即可跳到下一字段。
+    std::vector<std::uint8_t> tmp;
     for (auto& [term, data] : term_data) {
         auto& [tf, positions] = data;
         const std::uint32_t term_len = static_cast<std::uint32_t>(term.size());
         put_u32(enc_buf_, term_len);
         put_bytes(enc_buf_, term.data(), term_len);
-        put_u32(enc_buf_, tf);
 
+        // tf 单值 VByte 编码 + 长度前缀。
+        tmp.clear();
+        codec::vbyte_encode(tf, tmp);
+        put_u32(enc_buf_, static_cast<std::uint32_t>(tmp.size()));
+        put_bytes(enc_buf_, tmp.data(), tmp.size());
+
+        // 位置列表 gap+VByte 编码(参考 snapshot v4+ 的 tf_positions 格式)。
         put_u32(enc_buf_, static_cast<std::uint32_t>(positions.size()));
-        put_bytes(enc_buf_, positions.data(), positions.size() * sizeof(std::uint32_t));
+        std::vector<std::uint64_t> pos_u64(positions.begin(), positions.end());
+        tmp = codec::gap_encode(pos_u64);
+        put_u32(enc_buf_, static_cast<std::uint32_t>(tmp.size()));
+        put_bytes(enc_buf_, tmp.data(), tmp.size());
     }
 
     seal_and_write();
@@ -121,7 +155,13 @@ void InvertedWal::append_remove_doc(
     enc_buf_.clear();
     enc_buf_.resize(kWalLenPrefix);  // 长度前缀占位
     put_u8(enc_buf_, kWalEntryRemoveDoc);
-    put_u32(enc_buf_, doc_len);
+
+    // V6.3.3:doc_len / tf 改用 VByte 编码(与 add_doc 保持一致)。
+    std::vector<std::uint8_t> tmp;
+    tmp.clear();
+    codec::vbyte_encode(doc_len, tmp);
+    put_u32(enc_buf_, static_cast<std::uint32_t>(tmp.size()));
+    put_bytes(enc_buf_, tmp.data(), tmp.size());
 
     put_u32(enc_buf_, static_cast<std::uint32_t>(term_freqs.size()));
 
@@ -129,7 +169,11 @@ void InvertedWal::append_remove_doc(
         const std::uint32_t term_len = static_cast<std::uint32_t>(term.size());
         put_u32(enc_buf_, term_len);
         put_bytes(enc_buf_, term.data(), term_len);
-        put_u32(enc_buf_, tf);
+
+        tmp.clear();
+        codec::vbyte_encode(tf, tmp);
+        put_u32(enc_buf_, static_cast<std::uint32_t>(tmp.size()));
+        put_bytes(enc_buf_, tmp.data(), tmp.size());
     }
 
     seal_and_write();
@@ -215,10 +259,19 @@ struct Cursor {
         p += n;
         return true;
     }
+    // V6.3.3:读取 n 字节为 std::vector<uint8_t>(给 VByte/gap 子缓冲用)。
+    // 越界时返回空 vector 并置 fail(与其它 reader 语义一致)。
+    std::vector<std::uint8_t> raw_bytes(std::size_t n) {
+        if (!need(n)) return {};
+        std::vector<std::uint8_t> v(p, p + n);
+        p += n;
+        return v;
+    }
 };
 
 // 解析一条 payload 并应用到 target。返回 false = payload 内部不自洽
 // (CRC 已过却解析失败,理论上只有版本不匹配/写入 bug 才会发生)。
+// V6.3.3:tf/位置/doc_len 全部按 VByte(+gap) 解码,与 append_* 编码端对齐。
 bool apply_entry(const std::uint8_t* data, std::size_t len,
                  InvertedIndex& target) {
     Cursor c{data, data + len};
@@ -237,14 +290,38 @@ bool apply_entry(const std::uint8_t* data, std::size_t len,
             std::string term(term_len, '\0');
             if (!c.bytes(term.data(), term_len)) return false;
 
-            const auto tf = c.u32();
+            // tf: [tf_vbyte_len:u32][tf_vbyte_bytes...] → VByte 单值。
+            const auto tf_vlen = c.u32();
+            if (c.fail || tf_vlen == 0 || tf_vlen > 16) return false;
+            const auto tf_buf = c.raw_bytes(tf_vlen);
+            if (c.fail || tf_buf.empty()) return false;
+            const auto [tf_val, tf_end] = codec::vbyte_decode(tf_buf.data(), 0);
+            if (tf_end != tf_buf.size()) return false;  // 多余字节 = 格式不匹配
+            if (tf_val > std::numeric_limits<std::uint32_t>::max()) return false;
+            const auto tf = static_cast<std::uint32_t>(tf_val);
+
+            // 位置列表: [pos_count:u32][pos_csize:u32][gap+VByte bytes...]。
             const auto pos_count = c.u32();
             if (c.fail || pos_count > (1u << 24)) return false;
-            std::vector<std::uint32_t> positions(pos_count);
-            if (pos_count > 0 &&
-                !c.bytes(positions.data(), pos_count * sizeof(std::uint32_t))) {
-                return false;
+            const auto pos_csize = c.u32();
+            if (c.fail || pos_csize > (1u << 24)) return false;
+            std::vector<std::uint32_t> positions;
+            positions.reserve(pos_count);
+            if (pos_count > 0) {
+                if (pos_csize == 0) return false;  // 有位置却无字节
+                const auto pos_buf = c.raw_bytes(pos_csize);
+                if (c.fail || pos_buf.empty()) return false;
+                const auto pos_u64 = codec::gap_decode(pos_buf);
+                if (pos_u64.size() != pos_count) return false;
+                positions.reserve(pos_u64.size());
+                for (auto v : pos_u64) {
+                    if (v > std::numeric_limits<std::uint32_t>::max()) {
+                        return false;
+                    }
+                    positions.push_back(static_cast<std::uint32_t>(v));
+                }
             }
+
             term_data.emplace(std::move(term),
                               std::make_pair(tf, std::move(positions)));
         }
@@ -254,7 +331,16 @@ bool apply_entry(const std::uint8_t* data, std::size_t len,
     }
 
     if (entry_type == kWalEntryRemoveDoc) {
-        const auto doc_len = c.u32();
+        // doc_len: [vbyte_len:u32][vbyte_bytes...] → VByte 单值。
+        const auto dl_vlen = c.u32();
+        if (c.fail || dl_vlen == 0 || dl_vlen > 16) return false;
+        const auto dl_buf = c.raw_bytes(dl_vlen);
+        if (c.fail || dl_buf.empty()) return false;
+        const auto [dl_val, dl_end] = codec::vbyte_decode(dl_buf.data(), 0);
+        if (dl_end != dl_buf.size()) return false;
+        if (dl_val > std::numeric_limits<std::uint32_t>::max()) return false;
+        const auto doc_len = static_cast<std::uint32_t>(dl_val);
+
         const auto term_count = c.u32();
         if (c.fail || term_count > (1u << 20)) return false;
 
@@ -265,9 +351,16 @@ bool apply_entry(const std::uint8_t* data, std::size_t len,
             if (c.fail || term_len > 65536) return false;
             std::string term(term_len, '\0');
             if (!c.bytes(term.data(), term_len)) return false;
-            const auto tf = c.u32();
-            if (c.fail) return false;
-            term_freqs.emplace(std::move(term), tf);
+
+            const auto tf_vlen = c.u32();
+            if (c.fail || tf_vlen == 0 || tf_vlen > 16) return false;
+            const auto tf_buf = c.raw_bytes(tf_vlen);
+            if (c.fail || tf_buf.empty()) return false;
+            const auto [tf_val, tf_end] = codec::vbyte_decode(tf_buf.data(), 0);
+            if (tf_end != tf_buf.size()) return false;
+            if (tf_val > std::numeric_limits<std::uint32_t>::max()) return false;
+            term_freqs.emplace(std::move(term),
+                               static_cast<std::uint32_t>(tf_val));
         }
         target.remove_doc(doc_len, term_freqs);
         return true;
@@ -284,10 +377,23 @@ int InvertedWal::replay(InvertedIndex& target) const {
     std::FILE* input = std::fopen(path_.c_str(), "rb");
     if (!input) return -1;
 
+    // V6.3.3:校验 8 字节文件头(magic + version)。magic 不匹配视为非 WAL
+    // 文件(旧格式/随机文件),返回 -1 拒绝整文件——不考虑向后兼容。
+    std::uint32_t magic = 0, version = 0;
+    if (std::fread(&magic, 4, 1, input) != 1 ||
+        std::fread(&version, 4, 1, input) != 1) {
+        std::fclose(input);
+        return -1;
+    }
+    if (magic != kWalMagic || version != kWalVersion) {
+        std::fclose(input);
+        return -1;
+    }
+
     int count = 0;
     // 上一条完整 entry 的末尾偏移:检测到损坏/半条时把文件截断到这里,
-    // 后续 append 不会接在垃圾后面。
-    std::uint64_t last_good = 0;
+    // 后续 append 不会接在垃圾后面。从文件头之后(8 字节)开始计。
+    std::uint64_t last_good = kWalHeaderSize;
     bool corrupted = false;
     std::vector<std::uint8_t> payload;
 
@@ -338,7 +444,15 @@ bool InvertedWal::truncate() {
     batch_count_ = 0;
     std::fclose(file_);
     file_ = std::fopen(path_.c_str(), "wb");
-    return file_ != nullptr;
+    if (!file_) return false;
+    // V6.3.3:"wb" 创建的是空文件,必须补写文件头,否则 replay() 会因
+    // magic 不匹配而拒绝整文件。
+    const std::uint32_t magic = kWalMagic;
+    const std::uint32_t ver   = kWalVersion;
+    std::fwrite(&magic, 4, 1, file_);
+    std::fwrite(&ver, 4, 1, file_);
+    std::fflush(file_);
+    return true;
 }
 
 }  // namespace bitcask::bm25
