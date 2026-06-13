@@ -1,4 +1,4 @@
-#include "bitcask/scanner.hpp"
+#include "bitcask/detail/scanner.hpp"
 
 #include <algorithm>
 #include <cerrno>

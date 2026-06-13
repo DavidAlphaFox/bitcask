@@ -23,7 +23,7 @@
 #include <string_view>
 
 #include "bitcask/codec.hpp"
-#include "bitcask/data_file.hpp"  // 复用 DataFileFault；err 路径很相似没必要单开一个
+#include "bitcask/detail/file_fault.hpp"
 #include "bitcask/io.hpp"
 
 namespace bitcask::fileops {

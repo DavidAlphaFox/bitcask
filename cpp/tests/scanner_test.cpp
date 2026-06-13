@@ -9,7 +9,7 @@
 
 #include <gtest/gtest.h>
 
-#include "bitcask/scanner.hpp"
+#include "bitcask/detail/scanner.hpp"
 
 using bitcask::fileops::scan_dir;
 using bitcask::fileops::DataFileEntry;

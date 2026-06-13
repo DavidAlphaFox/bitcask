@@ -14,7 +14,7 @@
 
 #pragma once
 
-#include "bitcask/inverted.hpp"
+#include "bitcask/live_checker.hpp"
 #include "bitcask/string_hash.hpp"
 
 #include <cstdint>

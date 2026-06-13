@@ -51,7 +51,7 @@
 #include <string_view>
 #include <vector>
 
-#include "bitcask/int8_kernels.hpp"
+#include "bitcask/detail/int8_kernels.hpp"
 
 namespace bitcask::vec {
 

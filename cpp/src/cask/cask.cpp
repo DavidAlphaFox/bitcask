@@ -10,8 +10,9 @@
 #include <thread>
 
 #include "bitcask/format.hpp"
+#include "bitcask/keydir_registry.hpp"
 #include "bitcask/merger.hpp"
-#include "bitcask/scanner.hpp"
+#include "bitcask/detail/scanner.hpp"
 #include "bitcask/codec.hpp"   // V6.1: GetResultView::ctor 解码 DocValue
 
 namespace bitcask {

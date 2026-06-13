@@ -36,16 +36,18 @@
 #include "bitcask/file_lock.hpp"
 #include "bitcask/hint_file.hpp"
 #include "bitcask/keydir.hpp"
-#include "bitcask/keydir_registry.hpp"
 #include "bitcask/merge_policy.hpp"
 #include "bitcask/merger.hpp"
 #include "bitcask/meta_file.hpp"
 #include "bitcask/field_schema.hpp"
-#include "bitcask/meta_filter.hpp"  // V5：search 接口的 MetaFilter 参数
+#include "bitcask/meta_filter.hpp"
 #include "bitcask/search_layer.hpp"
 #include "bitcask/thread_pool.hpp"
 
 namespace bitcask {
+
+// 前置声明：registry_ 仅用作裸指针，完整定义在 cask.cpp 内 include。
+namespace keydir { class KeyDirRegistry; }
 
 // --- 配置 --------------------------------------------------------------------
 struct CaskOptions {
