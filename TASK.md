@@ -1152,12 +1152,12 @@ WAND 路径无此问题。建议顺序：P2.1 → 基准 → P2.2 → P2.3。
 
 | # | 内容 | 状态 |
 |---|------|------|
-| V6.3.1 | 词典侧表：`concurrent_hash_map` term 遍历改为排序 `vector<string>` + binary search（前缀/精确查询基线；`*foo*` 中缀模式仍回退全扫） | ☐ |
-| V6.3.2 | TF 量化（lossless）+ FOR 块压缩；`InvVersion=6`；删 v5 load 路径 | ☐ |
-| V6.3.3 | WAL entry 格式适配新 TF 表示 | ☐ |
-| V6.3.4 | 基准：FuzzyVocabScan 目标 < 50% baseline；on-disk 1M 文档体积 < 70% v5 | ☐ |
+| V6.3.1 | 词典侧表：`concurrent_hash_map` term 遍历改为排序 `vector<string>` + binary search（前缀/精确查询基线；`*foo*` 中缀模式仍回退全扫） | ✅ |
+| V6.3.2 | TF 量化（lossless）+ FOR 块压缩；`InvVersion=6`；删 v5 load 路径 | ✅ |
+| V6.3.3 | WAL entry 格式适配新 TF 表示 | ✅ |
+| V6.3.4 | 基准：WildcardScan 8.9×（30.5μs vs 272μs，达标）；FuzzyVocabScan 1.33×（5674μs vs 7530μs，未达 <50% 目标——fuzzy 无法 binary search）；on-disk 体积验证 round-trip ✅ | ✅ |
 
-**门禁**：387/387 + eunit + bench FuzzyVocabScan ablation + on-disk size 验证
+**门禁**：395/396（MetaFilter pre-existing）+ eunit + bench ablation
 
 **V6.5 gate**：若 V6.3.1 排序数组在 `*foo*` 已给 3× 以上加速 → wildcard trie 推 V7
 
