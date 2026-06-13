@@ -512,11 +512,11 @@ TEST(DocValue, VectorSegmentGoldenHex) {
 TEST(MetaFilterCompileCheck, HeaderOnlyRoundtrip) {
     using namespace bitcask::meta;
     std::vector<MetaEntry> entries{
-        {"city",  MetaValue(std::string{"sf"})},
-        {"price", MetaValue(std::int64_t{99})},
-        {"vip",   MetaValue(true)},
-        {"score", MetaValue(3.14)},
+        {"city",    MetaValue(std::string{"sf"})},
         {"nothing", MetaValue(std::monostate{})},
+        {"price",   MetaValue(std::int64_t{99})},
+        {"score",   MetaValue(3.14)},
+        {"vip",     MetaValue(true)},
     };
     std::vector<std::byte> buf;
     const auto wrote = encode_meta(buf, entries);
