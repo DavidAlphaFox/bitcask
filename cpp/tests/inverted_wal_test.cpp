@@ -313,3 +313,116 @@ TEST(WalFraming, BitflipDetectedByCrc) {
 
     std::filesystem::remove(tmp);
 }
+
+// V6.2.3:batch_size>1 时,entry 缓冲到 batch_buf_,满后一次 flush。
+// 写 3 条 batch_size=2 → 第 2 条 flush,第 3 条在析构时 flush。
+// 关闭后重开 replay 验证全部 3 条都在。
+TEST(WalBatch, BufferFlushesOnThreshold) {
+    auto tmp = std::filesystem::temp_directory_path() / "wal_batch_flush.wal";
+    std::filesystem::remove(tmp);
+
+    {
+        InvertedWal wal(tmp.string(), 2);  // batch_size=2
+        ASSERT_TRUE(wal.valid());
+        TermPositions terms;
+        terms.emplace("alpha", tp(1, {0}));
+        wal.append_add_doc(0, terms);
+        wal.append_add_doc(1, terms);  // flush triggered (count=2)
+        wal.append_add_doc(2, terms);  // buffered, flushed on destruct
+    }
+
+    InvertedIndex idx;
+    InvertedWal wal(tmp.string());
+    int count = wal.replay(idx);
+    EXPECT_EQ(count, 3);
+    EXPECT_EQ(idx.live_doc_count(), 3u);
+
+    std::filesystem::remove(tmp);
+}
+
+// V6.2.3:模拟批量模式崩溃——写入 5 条(batch_size=3),前 3 条已 flush,
+// 后 2 条在 batch_buf_ 中尚未写出。模拟崩溃:直接 close FILE 而不 flush_batch。
+// replay 只应回放已 flush 的 3 条。
+TEST(CrashRecoveryBatched, BufferedEntriesLostOnCrash) {
+    auto tmp = std::filesystem::temp_directory_path() / "wal_crash_batch.wal";
+    std::filesystem::remove(tmp);
+
+    // Phase 1: write 5 docs with batch_size=3 in a scope. The destructor
+    // will flush the buffer (2 remaining entries) on scope exit, so the
+    // post-destructor file would be 210 bytes. To simulate the crash, we
+    // chop the file back to 126 bytes (3 entries) using resize_file, which
+    // is what the OS would leave behind if the process died before
+    // destructor's flush_batch ran.
+    {
+        InvertedWal wal(tmp.string(), 3);
+        ASSERT_TRUE(wal.valid());
+        TermPositions terms;
+        terms.emplace("alpha", tp(1, {0}));
+        wal.append_add_doc(0, terms);
+        wal.append_add_doc(1, terms);
+        wal.append_add_doc(2, terms);  // flush at count=3
+        // After 3 entries: file on disk has 3 entries; nothing buffered.
+        // Entry layout (one term "alpha" + tp(1,{0})):
+        //   [4B len][1B type][8B ord][4B term_count=1][4B term_len=5][5B
+        //   "alpha"][4B tf=1][4B pos_count=1][4B pos=0][4B crc] = 42B total.
+        //   3 entries = 126 bytes.
+        EXPECT_EQ(std::filesystem::file_size(tmp), 126u);
+        wal.append_add_doc(3, terms);  // buffered
+        wal.append_add_doc(4, terms);  // buffered
+        // With 2 buffered, file size is still 126 (buffer not yet flushed).
+        EXPECT_EQ(std::filesystem::file_size(tmp), 126u);
+    }
+    // After scope: destructor flushed the 2 buffered entries → 210 bytes.
+    EXPECT_EQ(std::filesystem::file_size(tmp), 210u);
+
+    // Simulate crash: chop the file to 126 bytes (3 entries only). This
+    // emulates the OS file state when the process died before the
+    // destructor's flush_batch ran.
+    std::filesystem::resize_file(tmp, 126u);
+
+    // Replay: should get exactly 3 entries (ords 0,1,2).
+    InvertedIndex idx;
+    InvertedWal wal(tmp.string());
+    int count = wal.replay(idx);
+    EXPECT_EQ(count, 3);
+    EXPECT_EQ(idx.live_doc_count(), 3u);
+    EXPECT_EQ(idx.df("alpha"), 3u);
+
+    std::filesystem::remove(tmp);
+}
+
+// V6.2.3:同样的内容用 batch_size=1 和 batch_size=4 写,replay 结果一致。
+TEST(WalBatch, BatchAndImmediateProduceSameReplay) {
+    auto tmp1 = std::filesystem::temp_directory_path() / "wal_immediate.wal";
+    auto tmp2 = std::filesystem::temp_directory_path() / "wal_batched.wal";
+    std::filesystem::remove(tmp1);
+    std::filesystem::remove(tmp2);
+
+    TermPositions terms;
+    terms.emplace("alpha", tp(1, {0}));
+    terms.emplace("beta", tp(1, {1}));
+
+    for (int i = 0; i < 10; ++i) {
+        {
+            InvertedWal wal(tmp1.string(), 1);
+            wal.append_add_doc(static_cast<std::uint64_t>(i), terms);
+        }
+        {
+            InvertedWal wal(tmp2.string(), 4);
+            wal.append_add_doc(static_cast<std::uint64_t>(i), terms);
+        }
+    }
+
+    InvertedIndex idx1, idx2;
+    InvertedWal wal1(tmp1.string());
+    InvertedWal wal2(tmp2.string());
+    int c1 = wal1.replay(idx1);
+    int c2 = wal2.replay(idx2);
+    EXPECT_EQ(c1, 10);
+    EXPECT_EQ(c2, 10);
+    EXPECT_EQ(idx1.live_doc_count(), idx2.live_doc_count());
+    EXPECT_EQ(idx1.df("alpha"), idx2.df("alpha"));
+
+    std::filesystem::remove(tmp1);
+    std::filesystem::remove(tmp2);
+}
