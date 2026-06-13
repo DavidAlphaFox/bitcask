@@ -960,7 +960,7 @@ std::expected<bool, std::string> SearchLayer::load_snapshot(std::string_view pat
             // S8.9：加载快照后如 WAL 文件存在，启用并重放。
             auto wal_path = base + ".f" + std::to_string(i) + ".inv.wal";
             if (std::ifstream(wal_path).good()) {
-                inv->enable_wal(wal_path);
+                inv->enable_wal(wal_path, config_.wal_batch_size);
                 inv->replay_wal();
             }
             fields_.emplace(std::move(field), std::move(inv));
@@ -1005,7 +1005,8 @@ void SearchLayer::rebuild_index(DocReader doc_reader) {
     fields_.emplace(default_field, std::move(new_inv));
 
     if (had_wal && !snapshot_path_.empty()) {
-        fields_[default_field]->enable_wal(snapshot_path_ + ".f0.inv.wal");
+        fields_[default_field]->enable_wal(snapshot_path_ + ".f0.inv.wal",
+                                            config_.wal_batch_size);
     }
 
     cache_.invalidate();

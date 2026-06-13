@@ -1754,9 +1754,9 @@ auto InvertedIndex::load(std::string_view path) -> bool {
     return true;
 }
 
-void InvertedIndex::enable_wal(std::string_view path) {
+void InvertedIndex::enable_wal(std::string_view path, std::size_t batch_size) {
     wal_path_ = path;
-    wal_ = std::make_unique<InvertedWal>(path);
+    wal_ = std::make_unique<InvertedWal>(path, batch_size);
 }
 
 void InvertedIndex::disable_wal() {

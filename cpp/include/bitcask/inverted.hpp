@@ -378,7 +378,8 @@ public:
         -> std::size_t;
 
     // WAL 支持（S8.9）：启用后 add_doc/remove_doc 自动追加到 WAL 文件。
-    void enable_wal(std::string_view path);
+    // V6.2：batch_size>1 时积攒 entries 缓冲后批量 fwrite+fflush。
+    void enable_wal(std::string_view path, std::size_t batch_size = 1);
     void disable_wal();
     void truncate_wal();
     bool has_wal() const { return wal_ != nullptr; }
