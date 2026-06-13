@@ -372,6 +372,22 @@ TEST(DocValue, DetectsFieldsTruncation) {
     EXPECT_EQ(v.error(), codec::DecodeError::kBufferTooShort);
 }
 
+// V6.4.1: vec_quantized stub 写入后读端拒绝——需 V7+ codeword 支持
+TEST(DocValue, QuantizedStubRejected) {
+    codec::DocValueParts parts;
+    parts.text = as_bytes("hello");
+    parts.vec_quantized = true;
+    float dummy[] = {1.0f, 0.0f, 0.0f, 0.0f};
+    parts.vector = std::span<const float>(dummy, 4);
+
+    std::vector<std::byte> buf;
+    codec::encode_doc_value(buf, parts);
+
+    auto result = codec::decode_doc_value(buf);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), codec::DecodeError::kUnsupportedVersion);
+}
+
 // ---------------------------------------------------------------------------
 // Hint record golden (format unchanged in V1).
 // ---------------------------------------------------------------------------

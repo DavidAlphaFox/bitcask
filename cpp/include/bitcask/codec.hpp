@@ -98,6 +98,7 @@ struct DocValueParts {
     std::optional<std::span<const std::byte>>  text;
     std::optional<std::span<const std::byte>>  meta;
     std::vector<DocField>                      fields;  // 空 = 不写 fields 段
+    bool                                      vec_quantized = false;  // V6.4.1 stub
 };
 
 // 解码后的 kDoc value 视图。各段是 zero-copy span，生命周期跟着输入 buf。

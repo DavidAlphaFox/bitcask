@@ -93,6 +93,10 @@ inline constexpr std::uint8_t kFlagHasMeta      = 0x04;
 inline constexpr std::uint8_t kFlagVecQuantized = 0x08;
 inline constexpr std::uint8_t kFlagHasFields    = 0x10;  // fields 段存在（S8.6）
 
+// V6.4.1 quantized stub magic + version（写端可写 stub，读端拒绝——需 V7+ codeword 支持）
+inline constexpr std::uint32_t kQuantizedMagic   = 0x51434F44;  // "QCOD"
+inline constexpr std::uint32_t kQuantizedVersion = 1;
+
 // ---------------------------------------------------------------------------
 // hint 文件的 CRC chunk 大小（解析时做合理性边界检查）。
 // hint 末尾 EOF sentinel 的 TotalSz 字段实际放的是 running CRC，参见

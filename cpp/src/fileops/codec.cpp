@@ -185,7 +185,11 @@ std::size_t encode_doc_value(std::vector<std::byte>& out, const DocValueParts& p
     const bool has_fields = !parts.fields.empty();
 
     std::uint8_t flags = 0;
-    if (parts.vector) flags |= format::kFlagHasVector;
+    if (parts.vec_quantized) {
+        flags |= format::kFlagVecQuantized;
+    } else if (parts.vector) {
+        flags |= format::kFlagHasVector;
+    }
     if (parts.text)   flags |= format::kFlagHasText;
     if (parts.meta)   flags |= format::kFlagHasMeta;
     if (has_fields)   flags |= format::kFlagHasFields;
@@ -201,7 +205,16 @@ std::size_t encode_doc_value(std::vector<std::byte>& out, const DocValueParts& p
         if (!s.empty()) std::memcpy(out.data() + at, s.data(), s.size());
     };
 
-    if (parts.vector) {
+    if (parts.vec_quantized) {
+        const auto& v = *parts.vector;
+        vbyte_append(out, v.size());
+        auto u32_append = [&out](std::uint32_t val) {
+            out.resize(out.size() + sizeof(std::uint32_t));
+            std::memcpy(out.data() + out.size() - sizeof(std::uint32_t), &val, sizeof(std::uint32_t));
+        };
+        u32_append(format::kQuantizedMagic);
+        u32_append(format::kQuantizedVersion);
+    } else if (parts.vector) {
         const auto& v = *parts.vector;
         vbyte_append(out, v.size());  // Dim（元素个数）
         const std::size_t at = out.size();
@@ -255,12 +268,20 @@ decode_doc_value(std::span<const std::byte> buf) {
         return true;
     };
 
+    if (v.vec_quantized) {
+        // V6.4.1：写端可写 stub 但读端拒绝——需 V7+ codeword 支持
+        std::uint64_t dim = 0;
+        if (!vbyte_read(buf, pos, dim)) {
+            return std::unexpected(DecodeError::kBufferTooShort);
+        }
+        if (buf.size() < pos + sizeof(std::uint32_t) * 2) {
+            return std::unexpected(DecodeError::kBufferTooShort);
+        }
+        pos += sizeof(std::uint32_t) * 2;  // magic + version
+        return std::unexpected(DecodeError::kUnsupportedVersion);
+    }
     if (v.has_vector) {
         // vector 段：[Dim:varint 元素个数][f32×Dim 小端]。Dim 是元素数、非字节数。
-        // 量化布局（vec_quantized）留待后续，V1 不写也不读。
-        if (v.vec_quantized) {
-            return std::unexpected(DecodeError::kUnsupportedVersion);
-        }
         std::uint64_t dim = 0;
         if (!vbyte_read(buf, pos, dim)) {
             return std::unexpected(DecodeError::kBufferTooShort);
