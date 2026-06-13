@@ -26,9 +26,6 @@ public:
                            std::vector<std::string> custom_stop_words = {},
                            std::uint32_t min_token_length = 1);
 
-    [[nodiscard]] auto analyze(std::string_view text) const
-        -> TermFreqMap override;
-
     [[nodiscard]] auto analyze_with_positions(std::string_view text) const
         -> TermPositionsMap override;
 

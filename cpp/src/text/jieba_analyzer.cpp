@@ -266,16 +266,6 @@ auto JiebaAnalyzer::analyze_with_positions(std::string_view text) const
 // analyze
 // ===========================================================================
 
-auto JiebaAnalyzer::analyze(std::string_view text) const -> TermFreqMap {
-    auto tpm = analyze_with_positions(text);
-    TermFreqMap tfs;
-    tfs.reserve(tpm.size());
-    for (auto& [term, data] : tpm) {
-        tfs.emplace(term, data.first);
-    }
-    return tfs;
-}
-
 auto JiebaAnalyzer::analyze_with_offsets(std::string_view text) const -> TermTokenMap {
     TermTokenMap ttm;
     for (auto& tok : collect_tokens(text, /*need_offsets=*/true)) {
@@ -285,3 +275,17 @@ auto JiebaAnalyzer::analyze_with_offsets(std::string_view text) const -> TermTok
 }
 
 }  // namespace bitcask::text
+
+// Jieba 自注册：static init 期间向工厂登记创建器。
+static const bool s_reg_jieba = [] {
+    bitcask::text::AnalyzerFactory::register_creator(
+        bitcask::text::AnalyzerType::Jieba,
+        [](const bitcask::text::AnalyzerConfig& c)
+            -> std::unique_ptr<bitcask::text::Analyzer> {
+            return std::make_unique<bitcask::text::JiebaAnalyzer>(
+                c.dict_path, c.min_n, c.max_n,
+                c.enable_stop_words, c.stop_words,
+                c.min_token_length);
+        });
+    return true;
+}();

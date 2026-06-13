@@ -2,7 +2,6 @@
 
 #include "bitcask/analyzer.hpp"
 #include "bitcask/cjk_detect.hpp"
-#include "bitcask/jieba_analyzer.hpp"
 #include "bitcask/ngram_analyzer.hpp"
 #include "bitcask/stemming_analyzer.hpp"
 #include "bitcask/text_utils.hpp"
@@ -24,38 +23,69 @@
 namespace bitcask::text {
 
 // ===========================================================================
-// 工厂
+// 工厂（注册表模式）
 // ===========================================================================
+
+namespace {
+auto registry() -> std::unordered_map<AnalyzerType, AnalyzerCreator>& {
+    static std::unordered_map<AnalyzerType, AnalyzerCreator> r;
+    return r;
+}
+}  // namespace
+
+void AnalyzerFactory::register_creator(AnalyzerType type, AnalyzerCreator creator) {
+    registry()[type] = creator;
+}
 
 auto AnalyzerFactory::create(const AnalyzerConfig& config)
     -> std::unique_ptr<Analyzer>
 {
-    std::unique_ptr<Analyzer> analyzer;
-    switch (config.type) {
-        case AnalyzerType::Ngram:
-            if (config.min_n < 1 || config.max_n < config.min_n) {
-                return nullptr;
-            }
-            analyzer = std::make_unique<NgramAnalyzer>(
-                config.min_n, config.max_n,
-                config.enable_stop_words, config.stop_words,
-                config.min_token_length);
-            break;
-        case AnalyzerType::Whitespace:
-            analyzer = std::make_unique<WhitespaceAnalyzer>(config.min_token_length);
-            break;
-        case AnalyzerType::Jieba:
-            analyzer = std::make_unique<JiebaAnalyzer>(
-                config.dict_path, config.min_n, config.max_n,
-                config.enable_stop_words, config.stop_words,
-                config.min_token_length);
-            break;
-    }
+    const auto& reg = registry();
+    auto it = reg.find(config.type);
+    if (it == reg.end()) return nullptr;
+    auto analyzer = it->second(config);
     if (analyzer && config.enable_stemming) {
         analyzer = std::make_unique<StemmingAnalyzer>(std::move(analyzer));
     }
     return analyzer;
 }
+
+// Ngram / Whitespace 自注册（定义在同一 TU）。
+static const bool s_reg_ngram = [] {
+    AnalyzerFactory::register_creator(
+        AnalyzerType::Ngram,
+        [](const AnalyzerConfig& c) -> std::unique_ptr<Analyzer> {
+            if (c.min_n < 1 || c.max_n < c.min_n) return nullptr;
+            return std::make_unique<NgramAnalyzer>(
+                c.min_n, c.max_n, c.enable_stop_words, c.stop_words,
+                c.min_token_length);
+        });
+    return true;
+}();
+
+static const bool s_reg_ws = [] {
+    AnalyzerFactory::register_creator(
+        AnalyzerType::Whitespace,
+        [](const AnalyzerConfig& c) -> std::unique_ptr<Analyzer> {
+            return std::make_unique<WhitespaceAnalyzer>(c.min_token_length);
+        });
+    return true;
+}();
+
+// ===========================================================================
+// Analyzer 基类默认实现（Template Method）
+// ===========================================================================
+
+auto Analyzer::analyze(std::string_view text) const -> TermFreqMap {
+    auto tpm = analyze_with_positions(text);
+    TermFreqMap tfs;
+    tfs.reserve(tpm.size());
+    for (auto& [term, data] : tpm) {
+        tfs.emplace(term, data.first);
+    }
+    return tfs;
+}
+
 // ===========================================================================
 
 auto Analyzer::analyze_with_offsets(std::string_view text) const -> TermTokenMap {
@@ -206,16 +236,6 @@ auto NgramAnalyzer::analyze_with_positions(std::string_view text) const -> TermP
     return tpm;
 }
 
-auto NgramAnalyzer::analyze(std::string_view text) const -> TermFreqMap {
-    auto tpm = analyze_with_positions(text);
-    TermFreqMap tfs;
-    tfs.reserve(tpm.size());
-    for (auto& [term, data] : tpm) {
-        tfs.emplace(term, data.first);
-    }
-    return tfs;
-}
-
 // ===========================================================================
 // WhitespaceAnalyzer
 // ===========================================================================
@@ -259,16 +279,6 @@ auto WhitespaceAnalyzer::analyze_with_positions(std::string_view text) const -> 
     }
 
     return tpm;
-}
-
-auto WhitespaceAnalyzer::analyze(std::string_view text) const -> TermFreqMap {
-    auto tpm = analyze_with_positions(text);
-    TermFreqMap tfs;
-    tfs.reserve(tpm.size());
-    for (auto& [term, data] : tpm) {
-        tfs.emplace(term, data.first);
-    }
-    return tfs;
 }
 
 auto WhitespaceAnalyzer::analyze_with_offsets(std::string_view text) const -> TermTokenMap {

@@ -17,9 +17,6 @@ public:
     explicit WhitespaceAnalyzer(std::uint32_t min_token_length)
         : min_token_length_(min_token_length) {}
 
-    [[nodiscard]] auto analyze(std::string_view text) const
-        -> TermFreqMap override;
-
     [[nodiscard]] auto analyze_with_positions(std::string_view text) const
         -> TermPositionsMap override;
 

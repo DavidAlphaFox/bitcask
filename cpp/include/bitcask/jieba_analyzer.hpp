@@ -29,9 +29,6 @@ public:
 
     ~JiebaAnalyzer() override;
 
-    [[nodiscard]] auto analyze(std::string_view text) const
-        -> TermFreqMap override;
-
     [[nodiscard]] auto analyze_with_positions(std::string_view text) const
         -> TermPositionsMap override;
 

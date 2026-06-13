@@ -84,8 +84,11 @@ class Analyzer {
 public:
     virtual ~Analyzer() = default;
 
+    // Template Method：默认实现从 analyze_with_positions 派生 TermFreqMap。
+    // 子类只需实现 analyze_with_positions，无需重复 analyze() 的转换逻辑。
+    // （StemmingAnalyzer 覆写此方法以加入词干化。）
     [[nodiscard]] virtual auto analyze(std::string_view text) const
-        -> TermFreqMap = 0;
+        -> TermFreqMap;
 
     [[nodiscard]] virtual auto analyze_with_positions(std::string_view text) const
         -> TermPositionsMap = 0;
@@ -97,15 +100,22 @@ public:
 };
 
 // --------------------------------------------------------------------------
-// 分词器抽象工厂。
+// 分词器抽象工厂（注册表模式）。
 //
-// 根据配置创建对应 Analyzer 子类实例。新增分词方案时只需：
+// 新增分词方案时只需：
 //   1. 在 AnalyzerType 增加枚举值
 //   2. 编写新的 Analyzer 子类
-//   3. 在 create() 增加分支
+//   3. 在子类的 .cpp 中调 AnalyzerFactory::register_creator 注册
+// 无需修改工厂本身——对扩展开放，对修改关闭（OCP）。
 // --------------------------------------------------------------------------
+// 创建器签名：根据 AnalyzerConfig 构造一个 Analyzer 实例。
+using AnalyzerCreator = std::unique_ptr<Analyzer>(*)(const AnalyzerConfig&);
+
 class AnalyzerFactory {
 public:
+    // 注册创建器。各子类在自身 .cpp 的 static init 期间调用。
+    static void register_creator(AnalyzerType type, AnalyzerCreator creator);
+
     // 根据配置创建分词器实例。配置不合法时返回 nullptr。
     [[nodiscard]] static auto create(const AnalyzerConfig& config)
         -> std::unique_ptr<Analyzer>;
