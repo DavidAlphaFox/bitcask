@@ -218,6 +218,14 @@ public:
     // 线程安全: 否（推进 iter_ + 内部 pread）；同一对象不可并发使用。
     [[nodiscard]] std::expected<std::optional<Entry>, CaskFault> next();
 
+    // 批量取最多 max_n 条 entry；内部循环调 next()。
+    // 返回空 vector 表示迭代结束（EOI），非空表示本次批量结果。
+    // 中途出错返回 unexpected。空 vector 和 nullopt 语义不同：
+    //   empty vector = EOI（正常结束）
+    //   unexpected  = 错误
+    [[nodiscard]] std::expected<std::vector<Entry>, CaskFault>
+    next_batch(std::size_t max_n);
+
     // 线程安全: 否；幂等。同一对象的 start/next/release 串行调用。
     void release() noexcept;
     [[nodiscard]] bool is_iterating() const noexcept { return iter_ != nullptr; }

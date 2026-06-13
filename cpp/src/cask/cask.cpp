@@ -306,6 +306,19 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
     }
 }
 
+std::expected<std::vector<CaskIter::Entry>, CaskFault>
+CaskIter::next_batch(std::size_t max_n) {
+    std::vector<Entry> batch;
+    batch.reserve(max_n);
+    for (std::size_t i = 0; i < max_n; ++i) {
+        auto r = next();
+        if (!r) return std::unexpected(r.error());
+        if (!r->has_value()) break;  // EOI
+        batch.push_back(std::move(**r));
+    }
+    return batch;
+}
+
 void CaskIter::release() noexcept {
     if (iter_) {
         iter_->release();
