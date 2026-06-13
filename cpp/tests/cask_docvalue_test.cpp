@@ -1989,3 +1989,187 @@ TEST_F(CaskDocValueTest, V4HnswSnapSavedAtMerge) {
             << "hnsw.snap should exist after merge";
     }
 }
+
+// ── V5:metadata filter 集成测试 ────────────────────────────────────────
+
+namespace {
+std::vector<std::byte> make_meta_blob(
+    std::initializer_list<std::pair<std::string, bitcask::meta::MetaValue>> kvs) {
+    std::vector<bitcask::meta::MetaEntry> entries;
+    for (auto& [k, v] : kvs) {
+        entries.push_back({k, std::move(v)});
+    }
+    std::vector<std::byte> blob;
+    bitcask::meta::encode_meta(blob, entries);
+    return blob;
+}
+
+void v5_put(Cask& c, const std::string& key, const std::string& text,
+            std::span<const float> vec, std::span<const std::byte> meta) {
+    bitcask::DocInput doc;
+    doc.text = sv_bytes(text);
+    doc.vector = vec;
+    doc.meta = meta;
+    ASSERT_TRUE(c.put_doc(sv_bytes(key), doc, 1000));
+}
+
+std::unique_ptr<bitcask::meta::MetaFilter> make_eq_filter(
+    std::initializer_list<std::pair<std::string, bitcask::meta::MetaValue>> conds) {
+    auto f = std::make_unique<bitcask::meta::MetaFilter>();
+    for (auto& [k, v] : conds) {
+        f->conditions.push_back({k, bitcask::meta::MetaOp::Eq, std::move(v), {}});
+    }
+    return f;
+}
+}  // namespace
+
+// V5.1:文本搜索 + metadata filter
+TEST_F(CaskDocValueTest, V5SearchTextWithMetaFilter) {
+    auto opts = p3_search_opts();
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+
+    auto m_tech = make_meta_blob({{"category", std::string("tech")}, {"year", std::int64_t(2024)}});
+    auto m_sport = make_meta_blob({{"category", std::string("sport")}, {"year", std::int64_t(2023)}});
+    auto m_tech2 = make_meta_blob({{"category", std::string("tech")}, {"year", std::int64_t(2023)}});
+
+    v5_put(**c, "d1", "machine learning algorithms", {}, m_tech);
+    v5_put(**c, "d2", "football world cup final", {}, m_sport);
+    v5_put(**c, "d3", "deep learning neural networks", {}, m_tech2);
+    v5_put(**c, "d4", "basketball playoff game", {}, m_sport);
+    v5_put(**c, "d5", "cloud computing architecture", {}, m_tech);
+    v5_put(**c, "d6", "swimming competition results", {}, m_sport);
+    (*c)->flush_index();
+
+    {
+        auto r = (*c)->search_text("learning", 10);
+        ASSERT_TRUE(r);
+        EXPECT_GE(r->hits.size(), 2u);
+    }
+
+    {
+        auto filter = make_eq_filter({{"category", std::string("tech")}});
+        auto r = (*c)->search_text("learning", 10, filter.get());
+        ASSERT_TRUE(r);
+        ASSERT_EQ(r->hits.size(), 2u);
+        for (auto& h : r->hits) {
+            EXPECT_TRUE(h.key == "d1" || h.key == "d3") << h.key;
+        }
+    }
+
+    {
+        auto filter = make_eq_filter({{"year", std::int64_t(2024)}});
+        auto r = (*c)->search_text("learning", 10, filter.get());
+        ASSERT_TRUE(r);
+        ASSERT_EQ(r->hits.size(), 1u);
+        EXPECT_EQ(r->hits[0].key, "d1");
+    }
+
+    {
+        auto filter = make_eq_filter({{"category", std::string("sport")}});
+        auto r = (*c)->search_text("learning", 10, filter.get());
+        ASSERT_TRUE(r);
+        EXPECT_EQ(r->hits.size(), 0u);
+    }
+
+    (*c)->close();
+}
+
+// V5.2:向量搜索 + metadata filter
+TEST_F(CaskDocValueTest, V5SearchVectorWithMetaFilter) {
+    constexpr std::size_t kDim = 8, kN = 6;
+    auto opts = v31_opts(kDim);
+    auto vecs = v35_make_vecs(kN, kDim, 0xBEE5);
+    auto q = v35_make_vecs(1, kDim, 0xF00D)[0];
+
+    auto m_a = make_meta_blob({{"group", std::string("a")}});
+    auto m_b = make_meta_blob({{"group", std::string("b")}});
+
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+    for (std::size_t i = 0; i < kN; ++i) {
+        auto key = "v" + std::to_string(i);
+        auto& meta = (i % 2 == 0) ? m_a : m_b;
+        v5_put(**c, key, "doc " + key,
+               std::span<const float>(vecs[i].data(), kDim), meta);
+    }
+    (*c)->flush_index();
+
+    {
+        auto r = (*c)->search_vector(std::span<const float>(q.data(), kDim), 6, 256);
+        ASSERT_TRUE(r);
+        EXPECT_EQ(r->hits.size(), 6u);
+    }
+
+    {
+        auto filter = make_eq_filter({{"group", std::string("a")}});
+        auto r = (*c)->search_vector(std::span<const float>(q.data(), kDim), 6, 256, filter.get());
+        ASSERT_TRUE(r);
+        ASSERT_EQ(r->hits.size(), 3u);
+        for (auto& h : r->hits) {
+            auto idx = std::stoul(h.key.substr(1));
+            EXPECT_EQ(idx % 2, 0u) << "expected group a, got " << h.key;
+        }
+    }
+
+    {
+        auto filter = make_eq_filter({{"group", std::string("b")}});
+        auto r = (*c)->search_vector(std::span<const float>(q.data(), kDim), 6, 256, filter.get());
+        ASSERT_TRUE(r);
+        ASSERT_EQ(r->hits.size(), 3u);
+        for (auto& h : r->hits) {
+            auto idx = std::stoul(h.key.substr(1));
+            EXPECT_EQ(idx % 2, 1u) << "expected group b, got " << h.key;
+        }
+    }
+
+    {
+        auto filter = make_eq_filter({{"group", std::string("c")}});
+        auto r = (*c)->search_vector(std::span<const float>(q.data(), kDim), 6, 256, filter.get());
+        ASSERT_TRUE(r);
+        EXPECT_EQ(r->hits.size(), 0u);
+    }
+
+    (*c)->close();
+}
+
+// V5.3:无 meta 的文档在 filter 时被排除
+TEST_F(CaskDocValueTest, V5NoMetaFilteredOut) {
+    constexpr std::size_t kDim = 8;
+    auto opts = v31_opts(kDim);
+    auto vecs = v35_make_vecs(4, kDim, 0xCAFE);
+    auto q = v35_make_vecs(1, kDim, 0xF00D)[0];
+    auto m = make_meta_blob({{"tag", std::string("ok")}});
+
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+    v5_put(**c, "v0", "doc v0", std::span<const float>(vecs[0].data(), kDim), m);
+    bitcask::DocInput doc1;
+    doc1.text = sv_bytes("doc v1");
+    doc1.vector = std::span<const float>(vecs[1].data(), kDim);
+    ASSERT_TRUE((*c)->put_doc(sv_bytes("v1"), doc1, 1000));
+    v5_put(**c, "v2", "doc v2", std::span<const float>(vecs[2].data(), kDim), m);
+    bitcask::DocInput doc3;
+    doc3.text = sv_bytes("doc v3");
+    doc3.vector = std::span<const float>(vecs[3].data(), kDim);
+    ASSERT_TRUE((*c)->put_doc(sv_bytes("v3"), doc3, 1000));
+    (*c)->flush_index();
+
+    {
+        auto r = (*c)->search_vector(std::span<const float>(q.data(), kDim), 10, 256);
+        ASSERT_TRUE(r);
+        EXPECT_EQ(r->hits.size(), 4u);
+    }
+
+    {
+        auto filter = make_eq_filter({{"tag", std::string("ok")}});
+        auto r = (*c)->search_vector(std::span<const float>(q.data(), kDim), 10, 256, filter.get());
+        ASSERT_TRUE(r);
+        ASSERT_EQ(r->hits.size(), 2u);
+        for (auto& h : r->hits) {
+            EXPECT_TRUE(h.key == "v0" || h.key == "v2") << h.key;
+        }
+    }
+
+    (*c)->close();
+}

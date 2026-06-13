@@ -16,6 +16,12 @@
 #include "bitcask/codec.hpp"
 #include "bitcask/format.hpp"
 
+// V5 metadata filter §1：把 meta_codec + meta_filter 两个 header-only 模块
+// 拉进来编译，强制走一遍 encode_meta → meta_lookup → MetaFilter::evaluate。
+// 没有 ASSERT——只是为了确保这两个 header 的所有模板实例化都通过编译。
+#include "bitcask/meta_codec.hpp"
+#include "bitcask/meta_filter.hpp"
+
 using namespace bitcask;
 using namespace bitcask::format;
 
@@ -479,4 +485,112 @@ TEST(DocValue, VectorSegmentGoldenHex) {
     std::memcpy(back, dv->vector_raw.data(), sizeof(back));
     EXPECT_FLOAT_EQ(back[0], 1.0f);
     EXPECT_FLOAT_EQ(back[1], 2.0f);
+}
+
+// ---------------------------------------------------------------------------
+// V5 metadata filter §1：把 meta_codec + meta_filter 两个 header-only 模块
+// 拉进编译并实际走一遍 encode/decode/lookup/evaluate。目的不是测正确性
+// （后续会有专门的 meta_filter_test），而是确保这两个 header 在任何 TU 中
+// 被 include 时所有模板 / std::visit 分支都通过编译。
+// ---------------------------------------------------------------------------
+TEST(MetaFilterCompileCheck, HeaderOnlyRoundtrip) {
+    using namespace bitcask::meta;
+    std::vector<MetaEntry> entries{
+        {"city",  MetaValue(std::string{"sf"})},
+        {"price", MetaValue(std::int64_t{99})},
+        {"vip",   MetaValue(true)},
+        {"score", MetaValue(3.14)},
+        {"nothing", MetaValue(std::monostate{})},
+    };
+    std::vector<std::byte> buf;
+    const auto wrote = encode_meta(buf, entries);
+    EXPECT_EQ(wrote, buf.size());
+
+    auto decoded = decode_meta(buf);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->size(), entries.size());
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        EXPECT_EQ((*decoded)[i].key, entries[i].key);
+    }
+
+    const std::span<const std::byte> sp(buf.data(), buf.size());
+    auto price = meta_lookup(sp, "price");
+    ASSERT_TRUE(std::holds_alternative<std::int64_t>(price));
+    EXPECT_EQ(std::get<std::int64_t>(price), 99);
+
+    auto missing = meta_lookup(sp, "absent");
+    EXPECT_TRUE(std::holds_alternative<std::monostate>(missing));
+
+    MetaFilter f;
+    f.logic = MetaFilter::Logic::And;
+    f.conditions.push_back(
+        {"price", MetaOp::Gt, MetaValue(std::int64_t{10}), {}});
+    f.conditions.push_back(
+        {"vip", MetaOp::Eq, MetaValue(true), {}});
+    EXPECT_TRUE(f.evaluate(sp));
+
+    MetaFilter f2;
+    f2.logic = MetaFilter::Logic::Or;
+    f2.conditions.push_back(
+        {"price", MetaOp::Lt, MetaValue(std::int64_t{10}), {}});
+    EXPECT_FALSE(f2.evaluate(sp));
+
+    // 嵌套子 filter：And { price > 10, child(Or { city=="sf", vip==true }) }
+    auto child = std::make_unique<MetaFilter>();
+    child->logic = MetaFilter::Logic::Or;
+    child->conditions.push_back(
+        {"city", MetaOp::Eq, MetaValue(std::string{"sf"}), {}});
+    child->conditions.push_back(
+        {"vip", MetaOp::Eq, MetaValue(true), {}});
+    MetaFilter root;
+    root.logic = MetaFilter::Logic::And;
+    root.conditions.push_back(
+        {"price", MetaOp::Gt, MetaValue(std::int64_t{10}), {}});
+    root.children.push_back(std::move(child));
+    EXPECT_TRUE(root.evaluate(sp));
+
+    // 类型不匹配的 Eq：stored=int64, value=string → false（visit 类型分支）
+    MetaFilter f3;
+    f3.conditions.push_back(
+        {"price", MetaOp::Eq, MetaValue(std::string{"99"}), {}});
+    EXPECT_FALSE(f3.evaluate(sp));
+
+    // In 操作：types match 时命中、type 不匹配时按 Eq 规则返回 false。
+    MetaFilter f4;
+    MetaCondition in_cond;
+    in_cond.key = "price";
+    in_cond.op  = MetaOp::In;
+    in_cond.values = {MetaValue(std::int64_t{1}),
+                      MetaValue(std::int64_t{99}),
+                      MetaValue(std::int64_t{100})};
+    f4.conditions.push_back(in_cond);
+    EXPECT_TRUE(f4.evaluate(sp));
+
+    MetaFilter f5;
+    MetaCondition in_cond2;
+    in_cond2.key = "price";
+    in_cond2.op  = MetaOp::In;
+    in_cond2.values = {MetaValue(std::string{"x"}),
+                       MetaValue(std::string{"y"})};
+    f5.conditions.push_back(in_cond2);
+    EXPECT_FALSE(f5.evaluate(sp));
+
+    // Exists：忽略 value，看 key 是否出现。
+    MetaFilter f6;
+    MetaCondition ex;
+    ex.key = "city";
+    ex.op  = MetaOp::Exists;
+    f6.conditions.push_back(ex);
+    EXPECT_TRUE(f6.evaluate(sp));
+
+    MetaFilter f7;
+    MetaCondition ex2;
+    ex2.key = "missing";
+    ex2.op  = MetaOp::Exists;
+    f7.conditions.push_back(ex2);
+    EXPECT_FALSE(f7.evaluate(sp));
+
+    // 空 filter：恒 true。
+    MetaFilter empty;
+    EXPECT_TRUE(empty.evaluate(sp));
 }
