@@ -291,7 +291,10 @@ HnswIndex::NodeChunk::NodeChunk(std::size_t dim)
       ords(kChunkSize, 0),
       levels(kChunkSize, 0),
       adj(kChunkSize, nullptr),
-      locks(new std::atomic<std::uint8_t>[kChunkSize]) {
+      locks(new std::atomic<std::uint8_t>[kChunkSize]),
+      qcodes(static_cast<std::size_t>(kChunkSize) * dim),
+      qscales(kChunkSize, 0.0f),
+      qsums(kChunkSize, 0) {
     for (std::uint32_t i = 0; i < kChunkSize; ++i) {
         locks[i].store(0, std::memory_order_relaxed);
     }
@@ -304,6 +307,7 @@ HnswIndex::NodeChunk::~NodeChunk() {
 HnswIndex::HnswIndex(const HnswConfig& cfg)
     : cfg_(cfg),
       dist_(pick_kernel(cfg.metric)),
+      int8_dot_(int8::pick_int8_dot_kernel()),
       inv_log_m_(1.0 / std::log(static_cast<double>(cfg.M))),
       instance_id_(g_instance_seq.fetch_add(1, std::memory_order_relaxed)),
       rng_(cfg.seed) {
@@ -418,6 +422,114 @@ void HnswIndex::search_layer(
     }
 }
 
+// V4.2:int8 粗筛版 greedy_closest,与 f32 版同结构,只换 dist_id →
+// dist_id_int8。粗筛阶段不要求数值精度,目的是把图遍历导到正确区域。
+std::uint32_t HnswIndex::greedy_closest_int8(
+    const std::int8_t* query_codes, float query_scale,
+    std::int32_t query_sum, std::uint32_t start, std::uint32_t layer,
+    std::uint32_t n, std::uint32_t* scratch) const {
+    std::uint32_t cur = start;
+    float cur_d = dist_id_int8(query_codes, query_scale, query_sum, cur);
+    bool improved = true;
+    while (improved) {
+        improved = false;
+        const std::uint32_t cnt = copy_neighbors(cur, layer, scratch);
+        for (std::uint32_t i = 0; i < cnt; ++i) {
+            if (scratch[i] < n) {
+                const char* pc = reinterpret_cast<const char*>(qcodes_of(scratch[i]));
+                _mm_prefetch(pc, _MM_HINT_T0);
+                if (cfg_.dim > 64)  _mm_prefetch(pc + 64, _MM_HINT_T0);
+                if (cfg_.dim > 128) _mm_prefetch(pc + 128, _MM_HINT_T0);
+                if (cfg_.dim > 192) _mm_prefetch(pc + 192, _MM_HINT_T0);
+                if (cfg_.dim > 256) _mm_prefetch(pc + 256, _MM_HINT_T0);
+                if (cfg_.dim > 320) _mm_prefetch(pc + 320, _MM_HINT_T0);
+            }
+        }
+        for (std::uint32_t i = 0; i < cnt; ++i) {
+            const std::uint32_t nid = scratch[i];
+            if (nid >= n) continue;
+            const float d = dist_id_int8(query_codes, query_scale, query_sum,
+                                         nid);
+            if (d < cur_d) {
+                cur_d = d;
+                cur = nid;
+                improved = true;
+            }
+        }
+    }
+    return cur;
+}
+
+// V4.2:int8 粗筛版 search_layer,与 f32 版同结构。预取仍对 f32 向量
+// 段发(冷拉后段距离不需要重读——int8 阶段之后才是 f32 重排)。
+void HnswIndex::search_layer_int8(
+    const std::int8_t* query_codes, float query_scale, std::int32_t query_sum,
+    std::uint32_t entry, std::size_t ef, std::uint32_t layer, std::uint32_t n,
+    std::uint32_t* scratch,
+    std::vector<std::pair<float, std::uint32_t>>& out) const {
+    auto& vt = t_visited;
+    if (vt.owner != instance_id_) {
+        vt.owner = instance_id_;
+        vt.epoch = 0;
+        std::fill(vt.marks.begin(), vt.marks.end(), 0);
+    }
+    if (vt.marks.size() < n) vt.marks.resize(n, 0);
+    if (++vt.epoch == 0) {
+        std::fill(vt.marks.begin(), vt.marks.end(), 0);
+        vt.epoch = 1;
+    }
+    const std::uint32_t ep = vt.epoch;
+    std::uint32_t* visited = vt.marks.data();
+
+    using Cand = std::pair<float, std::uint32_t>;
+    std::priority_queue<Cand, std::vector<Cand>, std::greater<>> cands;
+    std::priority_queue<Cand> top;
+
+    const float d0 = dist_id_int8(query_codes, query_scale, query_sum, entry);
+    cands.push({d0, entry});
+    top.push({d0, entry});
+    visited[entry] = ep;
+
+    while (!cands.empty()) {
+        const auto [d, id] = cands.top();
+        if (d > top.top().first && top.size() >= ef) break;
+        cands.pop();
+        const std::uint32_t cnt = copy_neighbors(id, layer, scratch);
+        for (std::uint32_t i = 0; i < cnt; ++i) {
+            const std::uint32_t nid = scratch[i];
+            if (nid < n && visited[nid] != ep) {
+                const char* pc = reinterpret_cast<const char*>(qcodes_of(nid));
+                _mm_prefetch(pc, _MM_HINT_T0);
+                if (cfg_.dim > 64)  _mm_prefetch(pc + 64, _MM_HINT_T0);
+                if (cfg_.dim > 128) _mm_prefetch(pc + 128, _MM_HINT_T0);
+                if (cfg_.dim > 192) _mm_prefetch(pc + 192, _MM_HINT_T0);
+                if (cfg_.dim > 256) _mm_prefetch(pc + 256, _MM_HINT_T0);
+                if (cfg_.dim > 320) _mm_prefetch(pc + 320, _MM_HINT_T0);
+            }
+        }
+        for (std::uint32_t i = 0; i < cnt; ++i) {
+            const std::uint32_t nid = scratch[i];
+            if (nid >= n) continue;
+            if (visited[nid] == ep) continue;
+            visited[nid] = ep;
+            const float nd = dist_id_int8(query_codes, query_scale, query_sum,
+                                          nid);
+            if (top.size() < ef || nd < top.top().first) {
+                cands.push({nd, nid});
+                top.push({nd, nid});
+                if (top.size() > ef) top.pop();
+            }
+        }
+    }
+
+    out.clear();
+    out.resize(top.size());
+    for (std::size_t i = top.size(); i-- > 0;) {
+        out[i] = top.top();
+        top.pop();
+    }
+}
+
 void HnswIndex::select_neighbors(
     const float* q, std::vector<std::pair<float, std::uint32_t>>& cands,
     std::uint32_t m) const {
@@ -487,6 +599,18 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
     // 1) 写满本节点数据:vec/ord/level + 零初始化邻接块。
     std::memcpy(c->vecs.data() + static_cast<std::size_t>(slot) * cfg_.dim,
                 vec.data(), static_cast<std::size_t>(cfg_.dim) * sizeof(float));
+    // V4.2:同步落 int8 量化副本。int8 路径存在时(VNNI)下游 search 用
+    // 4× 缩的带宽 + VNNI 加速;int8_dot_ == nullptr 时这段写的码不被读,
+    // 浪费一些内存但功能不变(仅 kDot 有意义,kL2 见 search 路径判断)。
+    if (int8_dot_ != nullptr && cfg_.metric == HnswMetric::kDot) {
+        auto qv = int8::quantize(vec.data(), cfg_.dim);
+        std::memcpy(c->qcodes.data() +
+                        static_cast<std::size_t>(slot) * cfg_.dim,
+                    qv.codes.data(),
+                    static_cast<std::size_t>(cfg_.dim) * sizeof(std::int8_t));
+        c->qscales[slot] = qv.scale;
+        c->qsums[slot]   = qv.sum_codes;
+    }
     c->ords[slot] = ord;
     c->levels[slot] = static_cast<std::uint8_t>(level);
     const std::size_t slots =
@@ -600,12 +724,40 @@ std::vector<HnswIndex::Hit> HnswIndex::search(
 
     std::vector<std::uint32_t> scratch(1 + cfg_.M * 2);
     const float* q = query.data();
-    for (std::int32_t l = max_level; l > 0; --l) {
-        cur = greedy_closest(q, cur, static_cast<std::uint32_t>(l), n,
-                             scratch.data());
-    }
+
+    // V4.2:int8 粗筛 + f32 精排。int8 路径只在 VNNI 存在 + kDot 度量下
+    // 启用。粗筛用与 f32 相同的 ef(无扩展),以 int8 VNNI 距离遍历图;
+    // 精排仅对 top k*3 候选做 f32 距离(固定开销 ~30 次距离计算),保证
+    // 召回与纯 f32 一致。
+    const bool use_int8 =
+        (int8_dot_ != nullptr) && (cfg_.metric == HnswMetric::kDot) &&
+        (cfg_.dim >= 64);
+
     std::vector<std::pair<float, std::uint32_t>> found;
-    search_layer(q, cur, ef, 0, n, scratch.data(), found);
+    if (use_int8) {
+        const int8::QVector qq = int8::quantize(q, cfg_.dim);
+        for (std::int32_t l = max_level; l > 0; --l) {
+            cur = greedy_closest_int8(qq.codes.data(), qq.scale, qq.sum_codes,
+                                      cur, static_cast<std::uint32_t>(l), n,
+                                      scratch.data());
+        }
+        search_layer_int8(qq.codes.data(), qq.scale, qq.sum_codes,
+                          cur, ef, 0, n, scratch.data(), found);
+        const std::size_t rerank_n = std::min(found.size(), k * 3);
+        std::partial_sort(found.begin(), found.begin() + rerank_n,
+                          found.end(),
+                          [this, q](const auto& a, const auto& b) {
+                              return dist_id(q, a.second) < dist_id(q, b.second);
+                          });
+        found.resize(rerank_n);
+        for (auto& [d, id] : found) d = dist_id(q, id);
+    } else {
+        for (std::int32_t l = max_level; l > 0; --l) {
+            cur = greedy_closest(q, cur, static_cast<std::uint32_t>(l), n,
+                                 scratch.data());
+        }
+        search_layer(q, cur, ef, 0, n, scratch.data(), found);
+    }
 
     hits.reserve(k);
     for (const auto& [d, id] : found) {
@@ -862,6 +1014,25 @@ bool HnswIndex::load(std::string_view path) {
 
     max_inserted_ord_.store(max_ord, std::memory_order_relaxed);
     entry_meta_.store(em, std::memory_order_relaxed);
+    // V4.2:从 f32 副本重算 int8 量化。BCVS v1 不持久化量化副本——量化是
+    // 确定的(f32 输入 → 同一组 int8 codes),重算开销与全图加载同阶,免去
+    // 格式升级/兼容成本。仅 kDot + VNNI 路径需要;kL2/无 VNNI 跳过。
+    if (int8_dot_ != nullptr && cfg_.metric == HnswMetric::kDot && cnt > 0) {
+        for (std::uint32_t id = 0; id < cnt; ++id) {
+            NodeChunk* c = chunks_[id >> kChunkBits].load(
+                std::memory_order_relaxed);
+            const std::uint32_t slot = id & kChunkMask;
+            const float* v = c->vecs.data() +
+                             static_cast<std::size_t>(slot) * cfg_.dim;
+            auto qv = int8::quantize(v, cfg_.dim);
+            std::memcpy(c->qcodes.data() +
+                            static_cast<std::size_t>(slot) * cfg_.dim,
+                        qv.codes.data(),
+                        static_cast<std::size_t>(cfg_.dim) * sizeof(std::int8_t));
+            c->qscales[slot] = qv.scale;
+            c->qsums[slot]   = qv.sum_codes;
+        }
+    }
     count_.store(cnt, std::memory_order_release);
     return true;
 }

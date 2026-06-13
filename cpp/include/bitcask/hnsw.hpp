@@ -45,6 +45,8 @@
 #include <string_view>
 #include <vector>
 
+#include "bitcask/int8_kernels.hpp"
+
 namespace bitcask::vec {
 
 enum class HnswMetric : std::uint8_t {
@@ -133,6 +135,13 @@ private:
         std::vector<std::uint32_t*> adj;     // 每节点邻接块首指针,永不搬迁
         std::unique_ptr<std::atomic<std::uint8_t>[]> locks;  // per-node 自旋
 
+        // V4.2:int8 量化副本(对称量化,scale = max |v[i]|)。codes 是紧
+        // 排 int8,scale/sum_codes 是每向量一个标量;load/insert 时写入,
+        // 读者两阶段检索的粗筛直接读这段,4× 带宽缩减 + VNNI 指令提速。
+        std::vector<std::int8_t>    qcodes;  // kChunkSize * dim
+        std::vector<float>          qscales; // kChunkSize
+        std::vector<std::int32_t>   qsums;   // kChunkSize(VNNI 偏置补偿)
+
         explicit NodeChunk(std::size_t dim);
         ~NodeChunk();
         NodeChunk(const NodeChunk&) = delete;
@@ -148,6 +157,20 @@ private:
         const NodeChunk* c = chunk_of(id);
         return c->vecs.data() +
                static_cast<std::size_t>(id & kChunkMask) * cfg_.dim;
+    }
+    // V4.2:量化副本访问器。两阶段检索的 int8 粗筛用,与 f32 路径并行
+    // 而不互相干扰;QVector 的 sum_codes 由 quantize() 预算好供 VNNI 偏置
+    // 补偿。
+    [[nodiscard]] const std::int8_t* qcodes_of(std::uint32_t id) const {
+        const NodeChunk* c = chunk_of(id);
+        return c->qcodes.data() +
+               static_cast<std::size_t>(id & kChunkMask) * cfg_.dim;
+    }
+    [[nodiscard]] float qscale_of(std::uint32_t id) const {
+        return chunk_of(id)->qscales[id & kChunkMask];
+    }
+    [[nodiscard]] std::int32_t qsum_of(std::uint32_t id) const {
+        return chunk_of(id)->qsums[id & kChunkMask];
     }
     [[nodiscard]] std::uint64_t ord_of(std::uint32_t id) const {
         return chunk_of(id)->ords[id & kChunkMask];
@@ -167,6 +190,20 @@ private:
         return dist_(q, vec_of(id), cfg_.dim);
     }
 
+    // V4.2:int8 粗筛距离。与 f32 路径同"越小越近"约定(VNNI 内核返回
+    // 正的重建内积,kDot 语义下取负)。查询侧 codes/scale/sum 由调用方
+    // 预算好(quantize() 一次性),db 侧三个标量由 qcodes_of/qscale_of/
+    // qsum_of 读取。
+    [[nodiscard]] float dist_id_int8(const std::int8_t* query_codes,
+                                     float query_scale,
+                                     [[maybe_unused]] std::int32_t query_sum,
+                                     std::uint32_t id) const {
+        const float d = int8_dot_(
+            query_codes, qcodes_of(id),
+            qsum_of(id), query_scale, qscale_of(id), cfg_.dim);
+        return -d;
+    }
+
     // 读者协议:持 id 的自旋锁把 layer 层邻居拷入 out(容量 ≥ 2M),
     // 返回个数。
     std::uint32_t copy_neighbors(std::uint32_t id, std::uint32_t layer,
@@ -180,11 +217,24 @@ private:
                                                std::uint32_t n,
                                                std::uint32_t* scratch) const;
 
+    // V4.2:int8 粗筛版贪心下降,供两阶段 search() 在上层调用。
+    [[nodiscard]] std::uint32_t greedy_closest_int8(
+        const std::int8_t* query_codes, float query_scale,
+        std::int32_t query_sum, std::uint32_t start, std::uint32_t layer,
+        std::uint32_t n, std::uint32_t* scratch) const;
+
     // 标准 search-layer:返回 ≤ef 个 (dist,id),按 dist 升序。
     void search_layer(const float* q, std::uint32_t entry, std::size_t ef,
                       std::uint32_t layer, std::uint32_t n,
                       std::uint32_t* scratch,
                       std::vector<std::pair<float, std::uint32_t>>& out) const;
+
+    // V4.2:int8 粗筛版 search-layer,与 f32 版同结构,只换距离函数。
+    void search_layer_int8(const std::int8_t* query_codes, float query_scale,
+                           std::int32_t query_sum, std::uint32_t entry,
+                           std::size_t ef, std::uint32_t layer, std::uint32_t n,
+                           std::uint32_t* scratch,
+                           std::vector<std::pair<float, std::uint32_t>>& out) const;
 
     // 邻居选择启发式(HNSW 论文 Algorithm 4):候选若离 query 比离任一
     // 已选邻居更近才保留——避免聚簇数据上邻居全挤在同一方向。
@@ -195,6 +245,7 @@ private:
 
     HnswConfig cfg_;
     DistFn dist_;                       // 构造时按 metric+ISA 分发一次
+    int8::Int8DotFn int8_dot_;          // V4.2:int8 粗筛内核;无 VNNI 时 nullptr
     double inv_log_m_;                  // mL = 1/ln(M)
     std::uint64_t instance_id_;         // thread_local visited 的实例区分键
 
