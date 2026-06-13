@@ -112,7 +112,9 @@ Detailed byte-level spec lives in `doc/format.md` (English) / `doc/format-zh.md`
 ├── bitcask.write.lock          # held by the live writer (exclusive)
 ├── bitcask.merge.lock          # held by the active merger (exclusive)
 ├── bitcask.keydir.snap         # keydir segment snapshot (A4, optional)
-└── bitcask.index.snap          # index side-table snapshot (A4, optional)
+├── bitcask.index.snap          # index side-table snapshot (A4, optional)
+├── <base>.f<N>.inv.snap        # inverted index snapshot per field (index mode, optional)
+└── <base>.f<N>.inv.wal         # inverted index WAL per field (index mode, optional)
 ```
 
 ### File-by-file
@@ -127,15 +129,17 @@ Detailed byte-level spec lives in `doc/format.md` (English) / `doc/format-zh.md`
 | `bitcask.merge.lock` | 0 or 1 | runtime (held during merge) | Exclusive merge lock. **Deliberately independent** from write.lock — writer and merger run concurrently without contending. |
 | `bitcask.keydir.snap` | 0 or 1 | persistent | KeyDir segment snapshot (A4 feature). Speeds up open by avoiding full data-file scan. |
 | `bitcask.index.snap` | 0 or 1 | persistent | Index side-table snapshot (A4 feature). Paired with keydir.snap. |
+| `<base>.f<N>.inv.snap` | 0..N | persistent | Inverted index full snapshot per field (index mode only). `<N>` = field id (0=default). Written by `InvertedIndex::save()`, loaded on open. |
+| `<base>.f<N>.inv.wal` | 0..N | persistent | Inverted index WAL per field (index mode only). Append-only log of add_doc/remove_doc since last snapshot. Truncated after snapshot save. |
 
 ### How operations touch the files
 
 | Operation | Files touched |
 |-----------|---------------|
-| `put(K,V)` | Append record to active `.data` + append hint to active `.hint` + update in-memory keydir |
+| `put(K,V)` | Append record to active `.data` + append hint to active `.hint` + update in-memory keydir. In index mode: also async-submit IndexTask → `add_doc` → `.inv.wal` append |
 | `get(K)` | Lookup in-memory keydir → `pread(file_id, offset)` from one `.data` file |
 | `delete(K)` | Append tombstone record (`type=kTombstone`) to active `.data` + tombstone hint |
-| `open` | Read `bitcask.meta` → scan all `.data` files (prefer `.hint` for speed, fallback to full data scan) → rebuild in-memory keydir |
+| `open` | Read `bitcask.meta` → scan all `.data` files (prefer `.hint` for speed, fallback to full data scan) → rebuild in-memory keydir. In index mode: load `.inv.snap` + replay `.inv.wal` |
 | `merge` | Acquire `merge.lock` → read `write.lock` for active file id → pick high-fragmentation candidates → copy live records to new `.data`+`.hint` pair → CAS-update keydir → unlink old files |
 | `close` | Release `write.lock` (unlink) |
 
@@ -145,6 +149,83 @@ Detailed byte-level spec lives in `doc/format.md` (English) / `doc/format-zh.md`
 - **Append-only**: every put/delete appends a new record; old versions become dead bytes.
 - **Two independent locks**: writer holds `write.lock`, merger holds `merge.lock` — they never block each other.
 - **Hints are optional/defensive**: a corrupt or missing hint just triggers a slower full-scan rebuild from the data file. Correctness never depends on hints.
+
+## Dual persistence: Data File vs InvertedWal
+
+Bitcask has **two independent persistence paths** that serve different
+purposes. Understanding the distinction is essential before touching the
+write path.
+
+### Path 1: Data File (append-only log) — KV authority
+
+Every `put(K,V)` appends a typed record to the active `.data` file. This
+IS the authoritative KV store. On `open`, all `.data` files are scanned
+(preferably via `.hint` sidecars) and the in-memory KeyDir is rebuilt.
+No separate WAL is needed for KV data — the append-only log is the WAL.
+
+### Path 2: InvertedWal + snapshot — BM25 index recovery
+
+The BM25 inverted index (posting lists, term dictionary, positions) is a
+complex in-memory structure inside `InvertedIndex`. Rebuilding it from
+scratch on every restart requires re-reading all data files and
+re-analyzing all text — expensive at scale (e.g. ~2–5 s for 200K docs).
+
+To avoid full rebuilds, the index uses a **snapshot + WAL** pattern:
+
+```
+open:
+  load_snapshot()    → InvertedIndex::load(.inv.snap)
+  enable_wal()       → open .inv.wal for append
+  replay_wal()       → replay incremental add_doc/remove_doc since snapshot
+                      → truncate WAL after successful replay
+
+runtime (per put):
+  put_doc(K, V)
+    ├─ DataFile::write(kDoc)         ← Path 1 (KV authority, append-only)
+    └─ submit_index_task(Add)        ← async to IndexPool worker
+         └─ SearchLayer::on_write()
+              └─ InvertedIndex::add_doc(ord, terms)
+                   └─ wal_->append_add_doc()  ← Path 2 (index WAL)
+
+periodic save:
+  InvertedIndex::save(.inv.snap)    ← full state to disk
+  truncate_wal()                     ← snapshot is authoritative, WAL cleared
+
+crash recovery:
+  load_snapshot() + replay_wal()    → index is current up to crash point
+```
+
+**Why a separate WAL for the index?** The data file records contain
+DocValue-encoded text — the raw input to the analyzer. But the inverted
+index is a *derived* structure (tokenized, position-indexed, term-sorted).
+The WAL captures the *analyzed result* (ord + term positions) so that
+recovery skips re-analyzing all text. Without the WAL, a restart would
+either lose index entries added since the last snapshot (search results
+stale) or require a full rebuild from data files.
+
+**This mirrors standard search-engine architecture**: Elasticsearch has
+its translog, Lucene has segment-level WAL — all serving the same purpose
+of bridging the gap between in-memory index state and periodic full
+snapshots.
+
+### WAL batch flush (V6.2)
+
+`InvertedWal` supports configurable `batch_size` (default=1):
+
+- **batch_size=1** (default): each `append_add_doc` does `fwrite + fflush`
+  immediately. Maximum durability, maximum `fflush` overhead.
+- **batch_size>1**: entries buffer in memory; a single `fwrite + fflush`
+  flushes the whole batch when the threshold is reached. The destructor
+  flushes any remaining buffer.
+
+Crash semantics: unflushed buffered entries are lost. This is safe because
+the data file (Path 1) is the KV authority — a missing WAL entry means
+the index won't have that document until the next snapshot save, which is
+the same staleness window as running without WAL.
+
+WAL framing: `[4B payload_len][payload][4B CRC32]`. CRC covers payload
+only. `replay()` validates each entry and auto-truncates corrupted tails
+(half-written last entry from crash residue).
 
 ## Concurrency model
 
