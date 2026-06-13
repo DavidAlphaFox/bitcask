@@ -518,6 +518,11 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
                 search.on_write(task.key(), task.ord, task.text(),
                                 task.file_id, task.offset, task.total_sz, task.tstamp);
             }
+            // V5:meta blob 跟 on_write 同一 worker 顺序写入——meta 与
+            // 定位/live 对读路径原子可见(filter 直接读 meta_blob())。
+            if (task.op != IndexOp::Delete && !task.meta.empty()) {
+                search.index().set_meta(task.ord, task.meta);
+            }
             // V3.3:向量接入 HNSW(单写者 = 本 worker 线程)。
             if (task.op != IndexOp::Delete && !task.vec.empty()) {
                 search.on_vector(task.ord, task.vec);
@@ -1315,6 +1320,8 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
             active_file_id_, w2->offset, w2->total_size, tstamp, 0,
             task_fields());
         task.vec.assign(vec_out.begin(), vec_out.end());  // V3.3:归一化向量随任务走
+        // V5:meta blob(结构化 KV 二进制)随任务走,worker 调 Index::set_meta。
+        task.meta.assign(doc.meta.begin(), doc.meta.end());
         submit_index_task(std::move(task));
     } else {
         auto task = IndexTask::make(
@@ -1324,6 +1331,8 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
             active_file_id_, w->offset, w->total_size, tstamp, 0,
             task_fields());
         task.vec.assign(vec_out.begin(), vec_out.end());  // V3.3
+        // V5:同上。
+        task.meta.assign(doc.meta.begin(), doc.meta.end());
         submit_index_task(std::move(task));
     }
     return {};
@@ -1333,14 +1342,14 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
 // SearchLayer::search_vector(归一化/live 过滤/ord 翻译都在那边)。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_vector(std::span<const float> query, std::size_t k,
-                    std::size_t ef) {
+                    std::size_t ef, const meta::MetaFilter* filter) {
     if (!search_) return std::unexpected(err(CaskError::kNoIndex));
     if (meta_config_.vector_dim == 0) {
         return std::unexpected(err(CaskError::kInvalidOption,
             "collection has no vector config"));
     }
     flush_index();
-    auto hits = search_->search_vector(query, k, ef);
+    auto hits = search_->search_vector(query, k, ef, filter);
     if (!hits) return std::unexpected(err(CaskError::kInvalidOption, hits.error()));
     return TextSearchResult{std::move(*hits)};
 }
@@ -1349,24 +1358,26 @@ Cask::search_vector(std::span<const float> query, std::size_t k,
 // 与 RRF 融合在 SearchLayer::search_hybrid(单路退化/平局序语义见彼处)。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_hybrid(std::string_view text_query,
-                    std::span<const float> vec_query, std::size_t k) {
+                    std::span<const float> vec_query, std::size_t k,
+                    const meta::MetaFilter* filter) {
     if (!search_) return std::unexpected(err(CaskError::kNoIndex));
     if (meta_config_.vector_dim == 0) {
         return std::unexpected(err(CaskError::kInvalidOption,
             "collection has no vector config"));
     }
     flush_index();
-    auto hits = search_->search_hybrid(text_query, vec_query, k);
+    auto hits = search_->search_hybrid(text_query, vec_query, k, filter);
     if (!hits) return std::unexpected(err(CaskError::kInvalidOption, hits.error()));
     return TextSearchResult{std::move(*hits)};
 }
 
 // search_text：BM25 词袋模式搜索。
 std::expected<TextSearchResult, CaskFault>
-Cask::search_text(std::string_view query, std::size_t k) {
+Cask::search_text(std::string_view query, std::size_t k,
+                  const meta::MetaFilter* filter) {
     if (!search_) return std::unexpected(err(CaskError::kNoIndex));
     flush_index();
-    auto hits = search_->search_text(query, k);
+    auto hits = search_->search_text(query, k, nullptr, filter);
     if (!hits) return std::unexpected(err(CaskError::kIo, hits.error()));
     return TextSearchResult{std::move(*hits)};
 }

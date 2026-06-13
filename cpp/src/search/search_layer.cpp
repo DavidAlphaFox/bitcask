@@ -191,7 +191,8 @@ inline void scale_query(float* dst, const float* src, float inv, std::size_t n) 
 
 std::expected<std::vector<SearchHit>, std::string>
 SearchLayer::search_vector(std::span<const float> query, std::size_t k,
-                           std::size_t ef) const {
+                           std::size_t ef,
+                           const meta::MetaFilter* filter) const {
     // V3.5:查询开头取一次图快照指针——与 merge 重建的换指针并发安全
     // (旧图被换出后由本地 shared_ptr 引用计数续命到查询结束)。
     auto hnsw = hnsw_.load(std::memory_order_acquire);
@@ -215,9 +216,22 @@ SearchLayer::search_vector(std::span<const float> query, std::size_t k,
     }
     if (ef == 0) ef = std::max<std::size_t>(k, 64);
 
-    std::function<bool(std::uint64_t)> live = [this](std::uint64_t ord) {
-        return index_.is_live(ord);
-    };
+    // V5:filter 与 is_live 组合为 HNSW live callback——被拒节点从图遍历
+    // 源头就不入候选集,无需 overfetch(k 直接交给 HNSW)。空 meta blob
+    // 的文档一律不通过(无 meta → 视为「不在 filter 集合」)。
+    std::function<bool(std::uint64_t)> live;
+    if (filter) {
+        live = [this, filter](std::uint64_t ord) -> bool {
+            if (!index_.is_live(ord)) return false;
+            auto blob = index_.meta_blob(ord);
+            if (blob.empty()) return false;
+            return filter->evaluate(blob);
+        };
+    } else {
+        live = [this](std::uint64_t ord) -> bool {
+            return index_.is_live(ord);
+        };
+    }
     auto raw = hnsw->search(q, k, ef, &live);
 
     std::vector<SearchHit> hits;
@@ -234,22 +248,26 @@ SearchLayer::search_vector(std::span<const float> query, std::size_t k,
 std::expected<std::vector<SearchHit>, std::string>
 SearchLayer::search_hybrid(std::string_view text_query,
                            std::span<const float> vec_query,
-                           std::size_t k) const {
+                           std::size_t k,
+                           const meta::MetaFilter* filter) const {
     // 两路都空才报错;单路空 = 退化为另一路的 RRF 重打分(hnsw-design §4)。
     if (text_query.empty() && vec_query.empty()) {
         return std::unexpected("hybrid query empty (no text, no vector)");
     }
     const std::size_t kp = std::max<std::size_t>(k * 4, 64);  // K'
 
+    // V5:filter 独立走两条路(text 后过滤 + vec 折 live callback)——只有
+    // 同时通过两路 filter 的文档才进 RRF 融合,符合「filter 收紧 live」语义。
     std::vector<SearchHit> text_hits;
     if (!text_query.empty()) {
-        auto t = search_text(text_query, kp);
+        auto t = search_text(text_query, kp, nullptr, filter);
         if (!t) return std::unexpected(std::move(t.error()));
         text_hits = std::move(*t);
     }
     std::vector<SearchHit> vec_hits;
     if (!vec_query.empty()) {
-        auto v = search_vector(vec_query, kp);
+        // ef=0 + filter → vec 路本身已在 live callback 里过滤;无需 overfetch。
+        auto v = search_vector(vec_query, kp, 0, filter);
         if (!v) return std::unexpected(std::move(v.error()));  // 维度不符等
         vec_hits = std::move(*v);
     }
@@ -456,11 +474,17 @@ void SearchLayer::on_relocate(std::string_view key, std::uint64_t ord,
 
 std::expected<std::vector<SearchHit>, std::string>
 SearchLayer::search_text(std::string_view query, std::size_t k,
-                         const bm25::Bm25Params* params_override) const {
+                         const bm25::Bm25Params* params_override,
+                         const meta::MetaFilter* filter) const {
     auto term_freqs = analyzer_->analyze(query);
     if (term_freqs.empty()) return std::vector<SearchHit>{};
 
-    auto cache_key = CacheKey::make("text", query, k);
+    // V5:filter 非空时 overfetch K'=max(k×4, 64)——BM25 评分排序在
+    // filter 之前,过严 filter 命中数 < k 时需更多候选弥补损耗。无 filter
+    // 仍按 k 请求(避免无谓放大,保持兼容)。
+    const std::size_t k_req = filter ? std::max<std::size_t>(k * 4, 64) : k;
+
+    auto cache_key = CacheKey::make("text", query, k_req);
     auto cached = params_override
                       ? std::optional<std::vector<bm25::SearchResult>>{}
                       : cache_.get(cache_key);
@@ -479,17 +503,24 @@ SearchLayer::search_text(std::string_view query, std::size_t k,
         }
 
         const auto* inv = field_index(kDefaultField);
-        if (inv) results = inv->search(terms, k, index_, params_override);
+        if (inv) results = inv->search(terms, k_req, index_, params_override);
         if (!params_override) cache_.put(cache_key, results, terms);
     }
 
     std::vector<SearchHit> hits;
     hits.reserve(results.size());
     for (auto& r : results) {
+        // V5:filter 后过滤——空 meta 一律不通过(无 meta → 不在 filter 集合)。
+        if (filter) {
+            auto blob = index_.meta_blob(r.ord);
+            if (blob.empty() || !filter->evaluate(blob)) continue;
+        }
         auto ext_id = index_.ord_to_ext(r.ord);
         if (!ext_id) continue;
         hits.push_back(SearchHit{std::move(*ext_id), r.ord, r.score});
     }
+    // overfetch 后截断到调用方请求的 k(filter 通过率高时也仅给 k 条)。
+    if (hits.size() > k) hits.resize(k);
     return hits;
 }
 

@@ -38,6 +38,7 @@
 #include "bitcask/index.hpp"
 #include "bitcask/inverted.hpp"
 #include "bitcask/meta_file.hpp"
+#include "bitcask/meta_filter.hpp"  // V5：filter 表达树 + MetaOp/MetaCondition
 #include "bitcask/search_cache.hpp"
 #include "bitcask/synonym_map.hpp"
 
@@ -118,9 +119,12 @@ public:
 
     // ---- 搜索（词袋模式）----
     // params_override 非空时按查询覆盖默认 BM25 k1/b（S8.5）。
+    // V5:filter 非空时从倒排 overfetch K'=max(k×4, 64) 再过滤截断到 k;
+    // 因为 BM25 评分的得分排序在 filter 之前,需要更多候选弥补过滤损耗。
     [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
     search_text(std::string_view query, std::size_t k,
-                const bm25::Bm25Params* params_override = nullptr) const;
+                const bm25::Bm25Params* params_override = nullptr,
+                const meta::MetaFilter* filter = nullptr) const;
 
     // ---- 搜索（短语模式）----
     [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
@@ -196,9 +200,13 @@ public:
     // ---- V3.3:向量查询(线程安全)----
     // cosine 配置时内部归一化查询向量(零向量返回空);ef=0 → max(k,64)。
     // 结果经 index_.is_live 过滤死文档,翻译为 SearchHit{key,ord,score}。
+    // V5:filter 非空时与 is_live 组合为 HNSW live callback — 拒节点从
+    // 图遍历源头就不入候选集,无需 overfetch。结果可能少于 k(filter
+    // 通过率低时),符合「filter 收紧 live」语义。
     [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
     search_vector(std::span<const float> query, std::size_t k,
-                  std::size_t ef = 0) const;
+                  std::size_t ef = 0,
+                  const meta::MetaFilter* filter = nullptr) const;
 
     // ---- V3.6:RRF 混合检索(hnsw-design §4)----
     // 两路各取 K' = max(k×4, 64):BM25 词袋走 search_text 内核,向量走
@@ -208,10 +216,13 @@ public:
     // RRF 分相等 → ord 小者在前。text_query 空 → 纯向量(BM25 路空);
     // vec_query 空 → 纯文本(RRF 重打分);两路都空 → 错误。vec 维度
     // 不符 → 错误(经 search_vector)。返回 score = RRF 分。
+    // V5:filter 同时作用于两条路(text 路 overfetch 后过滤;vec 路
+    // 折进 HNSW live callback);只有同时通过两路 filter 的文档进 RRF 融合。
     // 线程安全:同两条内核(text 路同 search_text,vec 路同 search_vector)。
     [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
     search_hybrid(std::string_view text_query,
-                  std::span<const float> vec_query, std::size_t k) const;
+                  std::span<const float> vec_query, std::size_t k,
+                  const meta::MetaFilter* filter = nullptr) const;
 
     // ---- 恢复：从磁盘 record 重放活文档 ----
     // 恢复文档到索引（全量 analyze + add_doc）。

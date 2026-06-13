@@ -41,6 +41,7 @@
 #include "bitcask/merger.hpp"
 #include "bitcask/meta_file.hpp"
 #include "bitcask/field_schema.hpp"
+#include "bitcask/meta_filter.hpp"  // V5：search 接口的 MetaFilter 参数
 #include "bitcask/search_layer.hpp"
 #include "bitcask/thread_pool.hpp"
 
@@ -269,8 +270,10 @@ public:
 
     // BM25 文本搜索（词袋模式）。
     // 线程安全: 否（search_ 非线程安全）。
+    // V5:filter 非空时 meta 过滤(后过滤 overfetch k×4 再截断到 k)。
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
-    search_text(std::string_view query, std::size_t k = 10);
+    search_text(std::string_view query, std::size_t k = 10,
+                const meta::MetaFilter* filter = nullptr);
 
     // BM25 文本搜索（短语模式）。
     // 线程安全: 否（search_ 非线程安全）。
@@ -285,20 +288,26 @@ public:
     // max(k,64)。结果按相似度降序(kDot:内积;kL2:-平方距离),
     // 死文档经 live 过滤不出现。
     // 无 search_ → kNoIndex;无向量配置 → kInvalidOption。
+    // V5:filter 与 is_live 组合成 HNSW live callback(无需 overfetch);
+    // 结果可能少于 k。
     // 线程安全: 是(HNSW 读路径线程安全,V3.3)。
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
     search_vector(std::span<const float> query, std::size_t k = 10,
-                  std::size_t ef = 0);
+                  std::size_t ef = 0,
+                  const meta::MetaFilter* filter = nullptr);
 
     // V3.6:RRF 混合检索(hnsw-design §4)。两路各取 K'=max(k×4,64):
     // BM25 走 search_text 内核,向量走 search_vector 内核;融合
     // score = Σ 1/(60+rank),rank 从 1 起;平局 → ord 小者在前。
     // text 空 → 纯向量;vec 空 → 纯文本;两路都空 / 无向量配置 /
     // vec 维度不符 → kInvalidOption;无 search_ → kNoIndex。
+    // V5:filter 同时作用于两路(text 后过滤;vec 折 HNSW live callback),
+    // 仅双路都通过的文档进 RRF 融合。
     // 返回沿用 TextSearchResult,score = RRF 分。
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
     search_hybrid(std::string_view text_query,
-                  std::span<const float> vec_query, std::size_t k = 10);
+                  std::span<const float> vec_query, std::size_t k = 10,
+                  const meta::MetaFilter* filter = nullptr);
 
     // BM25 多字段搜索（S8.6）：支持 `field:term^boost` 语法，跨字段加权合并。
     // 无字段限定的词等价于默认字段词袋搜索。线程安全: 否。
