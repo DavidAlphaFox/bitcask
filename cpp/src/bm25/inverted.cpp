@@ -1508,9 +1508,88 @@ auto InvertedIndex::compact(const LiveChecker& live_checker, double dead_ratio_t
 // ---- 持久化 ----
 
 static constexpr std::uint32_t kInvMagic   = 0x494E5632;
-// v4：positions 落盘改用 gap+VByte 压缩（内存仍是 vector<uint32_t>，短语查询不变）。
-//     v1/2/3 旧快照按原始 uint32 数组读，向后兼容。
-static constexpr std::uint32_t kInvVersion = 5;  // v5:块元数据 +min_dl(impacts)
+// v6：ord 改用 FOR(Frame-of-Reference) 块压缩（128/块），TFs/dls 改用 VByte varint
+//     整组编码；不再支持 v1..v5（旧快照需先经外部工具迁移或不加载）。
+static constexpr std::uint32_t kInvVersion = 6;
+
+// FOR (Frame of Reference) 块压缩：对一块已排序 ord 序列，按 (frame, bits, packed)
+// 三元组编码。frame = 块内最小 ord（升序故 = 第一条），delta[i] = ords[i] - frame；
+// bits = ceil(log2(max_delta+1))（max_delta=0 时 bits=0，无 packed 字节）。
+// 解码：delta[i] = unpack(packed, i, bits); ords[i] = frame + delta[i]。
+namespace {
+
+// 把一个 uint64 值的低 bits 位塞入 dst 的第 bit_pos 位起，返回新 bit_pos。
+// 大端序：值的高位先写；单字节内 0 位 = 最高位。
+inline std::size_t for_pack_u64(std::uint64_t v, std::uint8_t bits,
+                               std::uint8_t* dst, std::size_t bit_pos) {
+    for (int b = static_cast<int>(bits) - 1; b >= 0; --b) {
+        std::size_t i = bit_pos >> 3;
+        std::size_t off = bit_pos & 7;
+        std::uint8_t bit = static_cast<std::uint8_t>((v >> b) & 1);
+        dst[i] |= static_cast<std::uint8_t>(bit << (7 - off));
+        ++bit_pos;
+    }
+    return bit_pos;
+}
+
+// 从 src 第 bit_pos 起读 bits 位，组装为 uint64（值的高位在前）。
+inline std::uint64_t for_unpack_u64(const std::uint8_t* src, std::size_t bit_pos,
+                                    std::uint8_t bits) {
+    std::uint64_t v = 0;
+    for (std::uint8_t b = 0; b < bits; ++b) {
+        std::size_t i = bit_pos >> 3;
+        std::size_t off = bit_pos & 7;
+        std::uint8_t bit = static_cast<std::uint8_t>((src[i] >> (7 - off)) & 1);
+        v = (v << 1) | bit;
+        ++bit_pos;
+    }
+    return v;
+}
+
+inline void for_encode_block(const std::uint64_t* ords, std::size_t count,
+                             std::uint64_t& frame, std::uint8_t& bits,
+                             std::vector<std::uint8_t>& packed) {
+    frame = ords[0];
+    if (count == 1) {
+        bits = 0;
+        packed.clear();
+        return;
+    }
+    std::uint64_t max_delta = ords[count - 1] - frame;
+    if (max_delta == 0) {
+        bits = 0;
+        packed.clear();
+        return;
+    }
+    // ceil(log2(max_delta+1))
+    std::uint8_t need = 0;
+    std::uint64_t m = max_delta;
+    while (m > 0) { ++need; m >>= 1; }
+    bits = need;
+    std::size_t total_bits = static_cast<std::size_t>(bits) * count;
+    std::size_t total_bytes = (total_bits + 7) >> 3;
+    packed.assign(total_bytes, 0);
+    std::size_t pos = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        pos = for_pack_u64(ords[i] - frame, bits, packed.data(), pos);
+    }
+}
+
+inline void for_decode_block(std::uint64_t frame, std::uint8_t bits,
+                             const std::uint8_t* packed,
+                             std::size_t count, std::uint64_t* out) {
+    if (bits == 0) {
+        for (std::size_t i = 0; i < count; ++i) out[i] = frame;
+        return;
+    }
+    std::size_t pos = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        out[i] = frame + for_unpack_u64(packed, pos, bits);
+        pos += bits;
+    }
+}
+
+}  // namespace
 
 auto InvertedIndex::save(std::string_view path) const -> bool {
     auto* f = std::fopen(std::string(path).c_str(), "wb");
@@ -1521,9 +1600,9 @@ auto InvertedIndex::save(std::string_view path) const -> bool {
 
     auto write_u32 = [&](std::uint32_t v) { return std::fwrite(&v, 4, 1, f) == 1; };
     auto write_u64 = [&](std::uint64_t v) { return std::fwrite(&v, 8, 1, f) == 1; };
+    auto write_u8  = [&](std::uint8_t  v) { return std::fwrite(&v, 1, 1, f) == 1; };
 
-    // v4：positions 以 gap+VByte 压缩落盘。格式 = u32 原始个数 + u32 压缩字节数
-    // + 压缩字节流。个数用于 load 时 reserve；压缩字节流由 gap_decode 还原。
+    // positions：沿用 v4+ 的 gap+VByte 压缩（u32 原始个数 + u32 压缩字节数 + 字节流）。
     auto write_positions = [&](const std::vector<std::uint32_t>& positions) -> bool {
         if (!write_u32(static_cast<std::uint32_t>(positions.size()))) return false;
         std::vector<std::uint64_t> tmp(positions.begin(), positions.end());
@@ -1538,6 +1617,8 @@ auto InvertedIndex::save(std::string_view path) const -> bool {
     bool ok = write_u32(kInvMagic) && write_u32(kInvVersion)
               && write_u32(N) && write_u64(sdl);
     if (!ok) { std::fclose(f); return false; }
+
+    constexpr std::size_t kBlock = PostingList::kBlockSize;
 
     for (auto& shard : shards_) {
         std::uint32_t term_count = static_cast<std::uint32_t>(shard.inverted.size());
@@ -1557,39 +1638,75 @@ auto InvertedIndex::save(std::string_view path) const -> bool {
             ok = write_u32(pc);
             if (!ok) { std::fclose(f); return false; }
 
-            // v4 comp=1：ord 现场 VByte gap 编码落盘（内存不再常驻压缩副本）。
-            // items[].ord 升序 → gap_encode 与此前 finalize 写出的 compressed_ords
-            // 逐字节一致；load 回填 items[].ord（comp==1 分支）。
-            std::uint8_t comp = 1;
-            ok = write_u32(comp);
+            // v6：ord 改用 FOR 块压缩（128/块）。
+            std::size_t ord_block_count = (pc + kBlock - 1) / kBlock;
+            ok = write_u32(static_cast<std::uint32_t>(ord_block_count));
             if (!ok) { std::fclose(f); return false; }
-            {
-                std::vector<std::uint64_t> ords;
-                ords.reserve(pl.items.size());
-                for (auto& p : pl.items) ords.push_back(p.ord);
-                auto enc = codec::gap_encode(ords);
-                auto csize = static_cast<std::uint32_t>(enc.size());
-                ok = write_u32(csize);
+            for (std::size_t b = 0; b < ord_block_count; ++b) {
+                std::size_t start = b * kBlock;
+                std::size_t cnt = std::min(kBlock, static_cast<std::size_t>(pc) - start);
+                std::uint64_t frame;
+                std::uint8_t  bits;
+                std::vector<std::uint8_t> packed;
+                std::vector<std::uint64_t> ords_view(cnt);
+                for (std::size_t i = 0; i < cnt; ++i) {
+                    ords_view[i] = pl.items[start + i].ord;
+                }
+                for_encode_block(ords_view.data(), cnt, frame, bits, packed);
+                auto packed_len = static_cast<std::uint32_t>(packed.size());
+                ok = write_u64(frame) && write_u8(bits)
+                     && write_u32(packed_len);
                 if (!ok) { std::fclose(f); return false; }
-                if (csize > 0 && std::fwrite(enc.data(), 1, csize, f) != csize) {
+                if (packed_len > 0 &&
+                    std::fwrite(packed.data(), 1, packed_len, f) != packed_len) {
                     std::fclose(f); return false;
                 }
             }
-            for (auto& posting : pl.items) {
-                ok = write_u32(posting.tf);
+
+            // v6：TFs/dls 改用 VByte varint 整组编码（每个 tf 通常 1-10，占 1B）。
+            // 逐项 tf=0 也合法，VByte 对 0 仍编 1B（0x80），正确。
+            {
+                std::vector<std::uint8_t> tf_buf;
+                tf_buf.reserve(pc);
+                for (auto& posting : pl.items) {
+                    codec::vbyte_encode(posting.tf, tf_buf);
+                }
+                ok = write_u32(static_cast<std::uint32_t>(tf_buf.size()));
                 if (!ok) { std::fclose(f); return false; }
+                if (!tf_buf.empty() &&
+                    std::fwrite(tf_buf.data(), 1, tf_buf.size(), f) != tf_buf.size()) {
+                    std::fclose(f); return false;
+                }
+            }
+            {
+                std::vector<std::uint8_t> dl_buf;
+                dl_buf.reserve(pc);
+                for (auto& posting : pl.items) {
+                    codec::vbyte_encode(posting.dl, dl_buf);
+                }
+                ok = write_u32(static_cast<std::uint32_t>(dl_buf.size()));
+                if (!ok) { std::fclose(f); return false; }
+                if (!dl_buf.empty() &&
+                    std::fwrite(dl_buf.data(), 1, dl_buf.size(), f) != dl_buf.size()) {
+                    std::fclose(f); return false;
+                }
+            }
+
+            // positions：保持 v4+ 的逐 posting gap+VByte 格式不变。
+            for (auto& posting : pl.items) {
                 if (!write_positions(posting.positions)) {
                     std::fclose(f); return false;
                 }
             }
-            // Block-Max WAND 元数据（version=3）
+
+            // Block-Max WAND 元数据：保持 v5 结构。
             std::uint32_t block_count = static_cast<std::uint32_t>(pl.blocks.size());
             ok = write_u32(block_count);
             if (!ok) { std::fclose(f); return false; }
             for (auto& blk : pl.blocks) {
                 ok = write_u64(blk.base_ord) && write_u64(blk.end_ord)
                      && write_u32(blk.max_tf)
-                     && write_u32(blk.min_dl)  // v5 impacts
+                     && write_u32(blk.min_dl)
                      && write_u32(static_cast<std::uint32_t>(blk.start_idx))
                      && write_u32(static_cast<std::uint32_t>(blk.count));
                 if (!ok) { std::fclose(f); return false; }
@@ -1615,43 +1732,26 @@ auto InvertedIndex::load(std::string_view path) -> bool {
         if (std::fread(&v, 8, 1, f) != 1) return 0xFFFFFFFFFFFFFFFF;
         return v;
     };
+    auto read_u8 = [&]() -> std::uint8_t {
+        std::uint8_t v;
+        if (std::fread(&v, 1, 1, f) != 1) return 0xFF;
+        return v;
+    };
 
     auto magic = read_u32();
     auto ver = read_u32();
-
-    // positions 读取：v4 走 gap+VByte 压缩格式（count + comp_size + 字节流），
-    // v1/2/3 走原始 uint32 数组。失败返回 false。
-    auto read_positions = [&](std::vector<std::uint32_t>& out) -> bool {
-        auto posc = read_u32();
-        if (posc == 0xFFFFFFFF) return false;
-        if (ver >= 4) {
-            auto csize = read_u32();
-            if (csize == 0xFFFFFFFF) return false;
-            std::vector<std::uint8_t> comp(csize);
-            if (csize > 0 && std::fread(comp.data(), 1, csize, f) != csize) return false;
-            auto vals = codec::gap_decode(comp);
-            if (vals.size() != posc) return false;  // 个数自洽校验
-            out.resize(posc);
-            for (std::uint32_t i = 0; i < posc; ++i) {
-                out[i] = static_cast<std::uint32_t>(vals[i]);
-            }
-        } else {
-            out.resize(posc);
-            if (posc > 0 && std::fread(out.data(), 4, posc, f) != posc) return false;
-        }
-        return true;
-    };
     if (magic != kInvMagic) {
         std::fclose(f); return false;
     }
-    // 接受 1..kInvVersion 的所有版本（向后兼容）。S9.4 升到 v4 时此处漏列 v3，
-    // 导致 v3 快照被拒——改为范围检查，避免再漏。
-    if (ver < 1 || ver > kInvVersion) {
+    // v6 不再兼容 v1..v5：项目规则「不考虑向后兼容性」，旧快照直接拒绝。
+    if (ver != kInvVersion) {
         std::fclose(f); return false;
     }
 
     auto N = read_u32();
     auto sdl = read_u64();
+
+    constexpr std::size_t kBlock = PostingList::kBlockSize;
 
     for (auto& shard : shards_) {
         auto term_count = read_u32();
@@ -1672,67 +1772,100 @@ auto InvertedIndex::load(std::string_view path) -> bool {
             PostingList pl;
             pl.items.resize(pc);
 
-            if (ver >= 2) {
-                auto comp = read_u32();
-                if (comp == 0xFFFFFFFF) { std::fclose(f); return false; }
-                if (comp == 1) {
-                    auto csize = read_u32();
-                    if (csize == 0xFFFFFFFF) { std::fclose(f); return false; }
-                    std::vector<std::uint8_t> comp_ords(csize);
-                    if (csize > 0) {
-                        if (std::fread(comp_ords.data(), 1, csize, f) != csize) {
-                            std::fclose(f); return false;
-                        }
-                    }
-                    // 回填 items[].ord：内存路径（find/note_appended/compact/
-                    // live_doc_count 及查询热循环）都以 items[].ord 为事实来源，
-                    // 压缩字节只是落盘副本（解码后即丢弃，不常驻）。漏回填会让
-                    // load 后 ord 全 0，后续对既有 term 的 add_doc 即丢失旧 ord。
-                    {
-                        auto ords = codec::gap_decode(comp_ords);
-                        if (ords.size() != pc) { std::fclose(f); return false; }
-                        for (std::uint32_t p = 0; p < pc; ++p) {
-                            pl.items[p].ord = ords[p];
-                        }
-                    }
-                    for (std::uint32_t p = 0; p < pc; ++p) {
-                        pl.items[p].tf = read_u32();
-                        if (!read_positions(pl.items[p].positions)) {
-                            std::fclose(f); return false;
-                        }
-                    }
-                    if (ver >= 3) {
-                        auto block_count = read_u32();
-                        if (block_count == 0xFFFFFFFF) { std::fclose(f); return false; }
-                        pl.blocks.resize(block_count);
-                        for (std::uint32_t b = 0; b < block_count; ++b) {
-                            pl.blocks[b].base_ord = read_u64();
-                            pl.blocks[b].end_ord = read_u64();
-                            pl.blocks[b].max_tf = read_u32();
-                            // v4 及更早无 min_dl,默认成员初始化 =1(回退)。
-                            if (ver >= 5) pl.blocks[b].min_dl = read_u32();
-                            pl.blocks[b].start_idx = read_u32();
-                            pl.blocks[b].count = read_u32();
-                        }
-                    }
-                } else {
-                    for (std::uint32_t p = 0; p < pc; ++p) {
-                        pl.items[p].ord = read_u64();
-                        pl.items[p].tf = read_u32();
-                        if (!read_positions(pl.items[p].positions)) {
-                            std::fclose(f); return false;
-                        }
-                    }
+            // v6：ord 走 FOR 块压缩。
+            auto ord_block_count = read_u32();
+            if (ord_block_count == 0xFFFFFFFF) { std::fclose(f); return false; }
+            if (ord_block_count != ((pc + kBlock - 1) / kBlock)) {
+                std::fclose(f); return false;
+            }
+            for (std::uint32_t b = 0; b < ord_block_count; ++b) {
+                auto frame = read_u64();
+                auto bits  = read_u8();
+                auto packed_len = read_u32();
+                if (frame == 0xFFFFFFFFFFFFFFFF || packed_len == 0xFFFFFFFF) {
+                    std::fclose(f); return false;
                 }
-            } else {
-                for (std::uint32_t p = 0; p < pc; ++p) {
-                    pl.items[p].ord = read_u64();
-                    pl.items[p].tf = read_u32();
-                    if (!read_positions(pl.items[p].positions)) {
-                        std::fclose(f); return false;
-                    }
+                std::size_t start = static_cast<std::size_t>(b) * kBlock;
+                std::size_t cnt = std::min(kBlock, static_cast<std::size_t>(pc) - start);
+                std::vector<std::uint8_t> packed(packed_len);
+                if (packed_len > 0 &&
+                    std::fread(packed.data(), 1, packed_len, f) != packed_len) {
+                    std::fclose(f); return false;
+                }
+                std::vector<std::uint64_t> ords_buf(cnt);
+                for_decode_block(frame, bits, packed.data(), cnt, ords_buf.data());
+                for (std::size_t i = 0; i < cnt; ++i) {
+                    pl.items[start + i].ord = ords_buf[i];
                 }
             }
+
+            // v6：TFs 整组 VByte 解码。
+            {
+                auto tf_csize = read_u32();
+                if (tf_csize == 0xFFFFFFFF) { std::fclose(f); return false; }
+                std::vector<std::uint8_t> tf_buf(tf_csize);
+                if (tf_csize > 0 &&
+                    std::fread(tf_buf.data(), 1, tf_csize, f) != tf_csize) {
+                    std::fclose(f); return false;
+                }
+                std::size_t pos = 0;
+                for (std::uint32_t p = 0; p < pc; ++p) {
+                    auto [val, np] = codec::vbyte_decode(tf_buf.data(), pos);
+                    pl.items[p].tf = static_cast<std::uint32_t>(val);
+                    pos = np;
+                }
+                if (pos != tf_csize) { std::fclose(f); return false; }
+            }
+
+            // v6：dls 整组 VByte 解码。
+            {
+                auto dl_csize = read_u32();
+                if (dl_csize == 0xFFFFFFFF) { std::fclose(f); return false; }
+                std::vector<std::uint8_t> dl_buf(dl_csize);
+                if (dl_csize > 0 &&
+                    std::fread(dl_buf.data(), 1, dl_csize, f) != dl_csize) {
+                    std::fclose(f); return false;
+                }
+                std::size_t pos = 0;
+                for (std::uint32_t p = 0; p < pc; ++p) {
+                    auto [val, np] = codec::vbyte_decode(dl_buf.data(), pos);
+                    pl.items[p].dl = static_cast<std::uint32_t>(val);
+                    pos = np;
+                }
+                if (pos != dl_csize) { std::fclose(f); return false; }
+            }
+
+            // positions：与 v4+ 同——每 posting (u32 个数 + u32 压缩字节数 + 字节流)。
+            for (std::uint32_t p = 0; p < pc; ++p) {
+                auto posc = read_u32();
+                if (posc == 0xFFFFFFFF) { std::fclose(f); return false; }
+                auto csize = read_u32();
+                if (csize == 0xFFFFFFFF) { std::fclose(f); return false; }
+                std::vector<std::uint8_t> comp(csize);
+                if (csize > 0 && std::fread(comp.data(), 1, csize, f) != csize) {
+                    std::fclose(f); return false;
+                }
+                auto vals = codec::gap_decode(comp);
+                if (vals.size() != posc) { std::fclose(f); return false; }
+                pl.items[p].positions.resize(posc);
+                for (std::uint32_t i = 0; i < posc; ++i) {
+                    pl.items[p].positions[i] = static_cast<std::uint32_t>(vals[i]);
+                }
+            }
+
+            // Block-Max WAND 元数据：保持 v5 结构。
+            auto block_count = read_u32();
+            if (block_count == 0xFFFFFFFF) { std::fclose(f); return false; }
+            pl.blocks.resize(block_count);
+            for (std::uint32_t b = 0; b < block_count; ++b) {
+                pl.blocks[b].base_ord = read_u64();
+                pl.blocks[b].end_ord = read_u64();
+                pl.blocks[b].max_tf = read_u32();
+                pl.blocks[b].min_dl = read_u32();
+                pl.blocks[b].start_idx = read_u32();
+                pl.blocks[b].count = read_u32();
+            }
+
             // S10.9：load 后重算缓存的 global max_tf（落盘格式不含此字段，派生量）。
             // 同时重建 add_doc 水位 = 全局最大 ord（落盘亦不含，派生量）；
             // 用 -1 哨兵区分「未索引任何」与「ord=0」。
