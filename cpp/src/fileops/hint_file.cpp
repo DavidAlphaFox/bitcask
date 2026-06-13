@@ -9,12 +9,6 @@
 
 namespace bitcask::fileops {
 
-namespace {
-DataFileFault io_fault(const io::IoError& e) noexcept {
-    return DataFileFault{DataFileError::kIo, e.errnum};
-}
-}  // namespace
-
 std::expected<HintFile, DataFileFault>
 HintFile::open(std::string_view path, Mode mode, bool sync) {
     using io::OpenFlag;

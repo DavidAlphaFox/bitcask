@@ -16,11 +16,6 @@ namespace {
 // fold(tolerate_crc_errors=true) 模式下，连续遇到 CRC 错的 record 上限。
 // legacy 是 20 条——超过就认定文件损坏程度太重，放弃恢复整个文件。
 constexpr int kCrcSkipLimit = 20;
-
-// IoError → DataFileFault 的小适配器；只是把 errno 透传一下。
-DataFileFault io_fault(const io::IoError& e) noexcept {
-    return DataFileFault{DataFileError::kIo, e.errnum};
-}
 }  // namespace
 
 std::expected<DataFile, DataFileFault>

@@ -70,6 +70,11 @@ struct DataFileFault {
     int errnum = 0;  // 仅当 kind == kIo 有意义
 };
 
+/// IoError → DataFileFault 适配器。data_file.cpp 与 hint_file.cpp 共用。
+inline DataFileFault io_fault(const io::IoError& e) noexcept {
+    return DataFileFault{DataFileError::kIo, e.errnum};
+}
+
 class DataFile {
 public:
     enum class Mode { kRead, kAppend, kCreate };
