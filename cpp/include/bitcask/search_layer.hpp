@@ -264,6 +264,10 @@ public:
     [[nodiscard]] index::Index&       index()       { return index_; }
     [[nodiscard]] const index::Index& index() const { return index_; }
 
+    // V4:Index 概要(totlive / total_ords),Cask::needs_merge 据此算
+    // dead_doc_rate。无索引时 = IndexInfo 零值。
+    [[nodiscard]] index::IndexInfo index_info() const { return index_.info(); }
+
 private:
     // 高亮原文 LRU（S9.3）：ord → 原文，带容量上限。只为高亮路径服务；
     // 冷文档被挤出后高亮降级为无片段，不影响 BM25 检索本身。

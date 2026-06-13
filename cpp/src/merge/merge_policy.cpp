@@ -100,7 +100,8 @@ per_file_reasons(const FileStatus& f, const PolicyOptions& opts,
 
 Decision decide(const std::vector<FileStatus>& summary,
                 const PolicyOptions& opts,
-                std::uint32_t now_sec) {
+                std::uint32_t now_sec,
+                int dead_doc_rate) {
     Decision d;
     if (summary.empty()) return d;
 
@@ -112,6 +113,12 @@ Decision decide(const std::vector<FileStatus>& summary,
         [&](const FileStatus& f) {
             return any_trigger_fires(f, opts, cuts.trigger_cutoff);
         });
+    // V4:索引删除率触发(全局信号)。纯函数契约不变,信号作为 int 入参
+    // 由 caller 算好后传进来——此函数仍不依赖 Index/KeyDir。
+    if (!any && opts.deletion_rate_trigger > 0 &&
+        dead_doc_rate >= opts.deletion_rate_trigger) {
+        any = true;
+    }
     if (!any) return d;
 
     d.needs_merge = true;
@@ -125,6 +132,13 @@ Decision decide(const std::vector<FileStatus>& summary,
                         })) {
             d.expired_files.push_back(f);
         }
+    }
+    // V4:删除率触发但无文件通过 per-file 阈值→全部非活跃文件入选。
+    // 否则触发信号成立了但没文件可并,等于空转。
+    if (d.files.empty() && opts.deletion_rate_trigger > 0 &&
+        dead_doc_rate >= opts.deletion_rate_trigger) {
+        d.files = summary;
+        d.needs_merge = true;
     }
     return d;
 }

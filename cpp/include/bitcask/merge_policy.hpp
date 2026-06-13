@@ -39,6 +39,11 @@ struct PolicyOptions {
     int        frag_merge_trigger          = 60;   // 百分比
     std::uint64_t dead_bytes_merge_trigger = 512ULL * 1024ULL * 1024ULL;
 
+    // ---- 索引删除率触发（V4 新增）----
+    // 当 (total_ords - live_docs) / total_ords >= 此百分比时触发 merge。
+    // 0 = 禁用。这是全局信号（非 per-file），由 Cask::needs_merge 从 Index 计算。
+    int        deletion_rate_trigger       = 0;    // 百分比, 0 = 禁用
+
     // ---- per-file 阈值（任一满足该文件入选）----
     int        frag_threshold              = 40;
     std::uint64_t dead_bytes_threshold     = 128ULL * 1024ULL * 1024ULL;
@@ -103,10 +108,14 @@ per_file_reasons(const FileStatus& f, const PolicyOptions& opts,
 // 完整决策。now_sec 是 wall-clock 秒（0 表示无视 expiry，单测可用）；
 // summary 一般由 summarize() 在 fstats 上批量算出来——caller 通常先把
 // 当前 active write file 排除掉再传进来（不能并自己正在写的文件）。
+// dead_doc_rate 是 V4 新增的全局信号（百分比）：(total_ords - live_docs)
+// / total_ords * 100,由 caller 从 Index 计算;deletion_rate_trigger==0
+// 时此参数被忽略,旧行为完全保留。
 [[nodiscard]] Decision
 decide(const std::vector<FileStatus>& summary,
        const PolicyOptions& opts,
-       std::uint32_t now_sec);
+       std::uint32_t now_sec,
+       int dead_doc_rate = 0);
 
 // 应用 max_merge_size 上限：累加文件大小，超过上限就停（严格遵守 legacy
 // 「下一个文件会撑爆，就不要它」的语义）。第一个文件无条件保留——这是
