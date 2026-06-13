@@ -54,6 +54,7 @@ ERL_NIF_TERM nif_cask_fold_start        (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_fold_start4       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_fold_next         (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_fold_next_full    (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_fold_next_batch   (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_fold_release      (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_iterator          (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_iterator_next     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
@@ -98,6 +99,7 @@ ErlNifFunc kNifFuncs[] = {
     {"cask_fold_start",        4, nif_cask_fold_start4,      0},
     {"cask_fold_next",         1, nif_cask_fold_next,        0},
     {"cask_fold_next_full",    1, nif_cask_fold_next_full,   0},
+    {"cask_fold_next_batch",   2, nif_cask_fold_next_batch,  0},
     {"cask_fold_release",      1, nif_cask_fold_release,     0},
     // 迭代：iterator 系列（挂在 CaskHandle 上，同 cask 同时只允许一个）
     {"cask_iterator",          3, nif_cask_iterator,         0},

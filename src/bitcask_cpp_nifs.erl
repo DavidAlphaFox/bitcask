@@ -34,6 +34,7 @@
          cask_fold_start/4,
          cask_fold_next/1,
          cask_fold_next_full/1,
+         cask_fold_next_batch/2,
          cask_fold_release/1,
          cask_iterator/3,
          cask_iterator_next/1,
@@ -103,6 +104,9 @@ cask_fold_start(_R, _MA, _MP) -> erlang:nif_error({error, not_loaded}).
 cask_fold_start(_R, _MA, _MP, _SeeTomb) -> erlang:nif_error({error, not_loaded}).
 cask_fold_next(_IterRef)      -> erlang:nif_error({error, not_loaded}).
 cask_fold_next_full(_IterRef) -> erlang:nif_error({error, not_loaded}).
+-spec cask_fold_next_batch(reference(), pos_integer()) ->
+    {ok, [{binary(), binary()}]} | done | {error, term()}.
+cask_fold_next_batch(_IterRef, _BatchSize) -> erlang:nif_error({error, not_loaded}).
 cask_fold_release(_IterRef)   -> erlang:nif_error({error, not_loaded}).
 cask_iterator(_R, _MA, _MP)   -> erlang:nif_error({error, not_loaded}).
 cask_iterator_next(_R)        -> erlang:nif_error({error, not_loaded}).

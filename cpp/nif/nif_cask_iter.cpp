@@ -123,6 +123,34 @@ ERL_NIF_TERM nif_cask_fold_next_full(ErlNifEnv* env, int /*argc*/, const ERL_NIF
     return enif_make_tuple_from_array(env, tup, 8);
 }
 
+// 批量版：{ok, [{K,V}, ...]} | done | {error, _}。
+// argv[0] = IterRef, argv[1] = BatchSize (int, 1..1024)
+ERL_NIF_TERM nif_cask_fold_next_batch(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
+    auto* ih = cask_iter_handle(env, argv[0]);
+    int batch_size = 0;
+    if (!ih || !ih->iter || !enif_get_int(env, argv[1], &batch_size) || batch_size <= 0) {
+        return enif_make_badarg(env);
+    }
+    if (batch_size > 1024) batch_size = 1024;  // cap
+
+    auto r = ih->iter->next_batch(static_cast<std::size_t>(batch_size));
+    if (!r) return fault_to_term(env, r.error());
+    if (r->empty()) return atoms().done;
+
+    // Build list [{K,V}, ...] in reverse order (enif_make_list_cell prepends)
+    ERL_NIF_TERM list = enif_make_list(env, 0);
+    for (auto it = r->rbegin(); it != r->rend(); ++it) {
+        ERL_NIF_TERM key_bin = make_binary_checked(env, it->key);
+        ERL_NIF_TERM val_bin = make_binary_checked(env, it->value);
+        if (!key_bin || !val_bin) {
+            return make_error(env, atoms().allocation_error);
+        }
+        ERL_NIF_TERM tup = enif_make_tuple2(env, key_bin, val_bin);
+        list = enif_make_list_cell(env, tup, list);
+    }
+    return enif_make_tuple2(env, atoms().ok, list);
+}
+
 // fold 资源 release。idempotent。
 ERL_NIF_TERM nif_cask_fold_release(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
     auto* ih = cask_iter_handle(env, argv[0]);

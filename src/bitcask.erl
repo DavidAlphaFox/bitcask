@@ -34,6 +34,7 @@
          list_keys/1,
          fold_keys/3, fold_keys/6,
          fold/3, fold/6,
+         stream_fold/3, stream_fold/4,
          stream/1, next/1, stop/1, with_stream/2,
          merge/1, merge/2, merge/3,
          needs_merge/1,
@@ -446,6 +447,29 @@ cask_fold6_loop(IterRef, Fun, Acc, SeeTombstonesP) ->
                    end,
             cask_fold6_loop(IterRef, Fun, Acc2, SeeTombstonesP);
         {error, _} = Err -> Err
+    end.
+
+%% stream_fold/3,4 — 批量迭代版 fold，每批 N 条减少 NIF 调用开销。
+%% 默认批量大小=32。回调签名 fun(K, V, Acc) -> Acc'。
+stream_fold(Ref, Fun, Acc0) ->
+    stream_fold(Ref, Fun, Acc0, 32).
+
+stream_fold(Ref, Fun, Acc0, BatchSize) when is_integer(BatchSize), BatchSize > 0 ->
+    case bitcask_cpp_nifs:cask_fold_start(Ref, -1, -1) of
+        {ok, IterRef} ->
+            try stream_fold_loop(IterRef, Fun, Acc0, BatchSize)
+            after bitcask_cpp_nifs:cask_fold_release(IterRef)
+            end;
+        {error, _} = E -> E
+    end.
+
+stream_fold_loop(IterRef, Fun, Acc, BatchSize) ->
+    case bitcask_cpp_nifs:cask_fold_next_batch(IterRef, BatchSize) of
+        done -> Acc;
+        {ok, Pairs} ->
+            Acc2 = lists:foldl(fun({K, V}, A) -> Fun(K, V, A) end, Acc, Pairs),
+            stream_fold_loop(IterRef, Fun, Acc2, BatchSize);
+        {error, _} = E -> E
     end.
 
 %% 单位换算：legacy fold/6 接收的 MaxAge 是「微秒」（来自 bitcask.app.src
