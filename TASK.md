@@ -1093,10 +1093,9 @@ WAND 路径无此问题。建议顺序：P2.1 → 基准 → P2.2 → P2.3。
 | V5.4 | SearchLayer filter:所有 search 方法加 `const MetaFilter*` 参数;HNSW 合成进 live callback;BM25 过取 k×4 | ✅ |
 | V5.5 | Cask API 透传:search_text/search_vector/search_hybrid 加 filter 参数 + `put_doc` meta → IndexTask | ✅ |
 | V5.6 | 测试:codec 单元测试(114 行)+ 集成测试(文本过滤/向量过滤/无 meta 排除)→ 387/387 通过 | ✅ |
+| V5.7 | NIF Erlang filter 解析:`parse_filter_term`(list/map/嵌套→MetaFilter)+ search_text/4 + search_vector/5 + search_hybrid/5 + `cask_encode_meta/1` + 12 eunit BDD 测试 | ✅ |
 
-**未做**:V5.7 NIF 层 Erlang filter 表达式解析(中优先级,需单独设计 Erlang term→MetaFilter 转换)
-
-**门禁**:plain 387/387 + eunit 44/44
+**门禁**:plain 387/387 + eunit 62/62
 
 ### V6 — 性能与规模化
 
