@@ -1610,3 +1610,49 @@ TEST(InvertedIndex, SortedVocabSidecarWildcardPrefixRebuild) {
     auto r4 = idx.search_wildcard("*lp", 10, checker);
     EXPECT_EQ(r4.size(), 1u) << "*lp 应匹配 help";
 }
+
+// V6.3.4：v6 快照 save/load round-trip + 文件头校验。
+// 体积对比在生产规模（1M docs）下验证；此处验证格式正确性与 round-trip。
+TEST(InvertedIndex, V6SnapshotRoundtripWithPositions) {
+    InvertedIndex idx;
+    constexpr std::uint64_t kDocs = 500;
+    constexpr int kTermsPerDoc = 5;
+    for (std::uint64_t d = 0; d < kDocs; ++d) {
+        TermPositions tp;
+        for (int t = 0; t < kTermsPerDoc; ++t) {
+            std::string term = "term" + std::to_string(t);
+            std::uint32_t tf = static_cast<std::uint32_t>((d + t) % 3) + 1;
+            tp.emplace(term, std::make_pair(tf, std::vector<std::uint32_t>{0}));
+        }
+        idx.add_doc(d, tp);
+    }
+    idx.finalize_all_postings();
+
+    auto tmp = std::filesystem::temp_directory_path() / "inv_v6_rt.inv";
+    std::filesystem::remove(tmp);
+    ASSERT_TRUE(idx.save(tmp.string()));
+    EXPECT_GT(std::filesystem::file_size(tmp), 0u);
+
+    // 校验文件头：magic(4B) + version=6(4B)
+    {
+        std::FILE* f = std::fopen(tmp.string().c_str(), "rb");
+        ASSERT_NE(f, nullptr);
+        std::uint32_t magic = 0, ver = 0;
+        ASSERT_EQ(std::fread(&magic, 4, 1, f), 1u);
+        ASSERT_EQ(std::fread(&ver, 4, 1, f), 1u);
+        std::fclose(f);
+        EXPECT_EQ(magic, 0x494E5632u);
+        EXPECT_EQ(ver, 6u);
+    }
+
+    InvertedIndex idx2;
+    ASSERT_TRUE(idx2.load(tmp.string()));
+    FakeLiveChecker checker;
+    for (std::uint64_t d = 0; d < kDocs; ++d) {
+        checker.doc_lens[d] = kTermsPerDoc;
+    }
+    auto results = idx2.search({"term0"}, 10, checker);
+    EXPECT_EQ(results.size(), 10u);
+
+    std::filesystem::remove(tmp);
+}
