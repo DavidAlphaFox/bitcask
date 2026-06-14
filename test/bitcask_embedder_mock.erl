@@ -1,15 +1,48 @@
 %% -------------------------------------------------------------------
 %% bitcask_embedder_mock:
-%%   V3.6 eunit 用确定性 mock embedder —— 门禁测试**不打真实端点**。
+%%   V3.6 eunit 用确定性 mock embedder — 门禁测试不打真实端点。
 %%   固定向量表（与 C++ V36HybridRrfFusion 同语料，两路排名已知，便于
 %%   手算 RRF 真值）+ phash2 哈希兜底（任意文本 → 确定性向量）。
 %%   dim = 4；输出 f32 LE 二进制，与 NIF 跨界格式一致。
+%
+%%   新 API（推荐）：
+%%     {ok, Ctx} = bitcask_embedder:new({custom, bitcask_embedder_mock}, #{}),
+%%     {ok, Vec} = bitcask_embedder:embed(Ctx, Text).
+%%   旧 API（兼容）：
+%%     bitcask_embedder_mock:embed(Text), bitcask_embedder_mock:dim/0.
 %% -------------------------------------------------------------------
 -module(bitcask_embedder_mock).
 
 -behaviour(bitcask_embedder).
 
+%% New context-based API
+-export([init/1, embed/2]).
+
+%% Legacy API (backward compat for existing tests)
 -export([embed/1, dim/0, vec_bin/1]).
+
+%% ===================================================================
+%% Provider behaviour: init/1
+%% ===================================================================
+
+-spec init(map()) -> {ok, bitcask_embedder:ctx()} | {error, term()}.
+init(_Opts) ->
+    {ok, #{
+        module => ?MODULE,
+        dim    => 4,
+        config => #{}
+    }}.
+
+%% ===================================================================
+%% Provider behaviour: embed/2
+%% ===================================================================
+
+embed(_Cfg, Text) when is_binary(Text) ->
+    embed(Text).
+
+%% ===================================================================
+%% Legacy API
+%% ===================================================================
 
 dim() -> 4.
 

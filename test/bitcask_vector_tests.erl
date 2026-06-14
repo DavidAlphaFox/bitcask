@@ -190,8 +190,8 @@ hybrid_survives_reopen_test_() ->
 %%
 %% 开关:export BITCASK_EMBEDDER_LIVE=1 且端点可达时手动跑:
 %%   BITCASK_EMBEDDER_LIVE=1 rebar3 as test eunit --module=bitcask_vector_tests
-%% 端点配置走 bitcask_embedder_openai:embed/3 显式参数(URL/Model 改成
-%% 实际部署;默认值即 hnsw-design §2.1 的部署目标)。
+%% 端点配置走 bitcask_embedder:new(openai, #{...}) 构建上下文
+%% (URL/Model 改成实际部署;默认值即 hnsw-design §2.1 的部署目标)。
 %% ===================================================================
 
 openai_live_test_() ->
@@ -205,8 +205,11 @@ openai_live_test_() ->
                            U -> U
                        end,
                  Model = <<"qwen3-embedding">>,
-                 {ok, Vec} = bitcask_embedder_openai:embed(Url, Model,
-                                                           <<"hello world">>),
+                 {ok, Ctx} = bitcask_embedder:new(openai, #{
+                     url   => Url,
+                     model => Model
+                 }),
+                 {ok, Vec} = bitcask_embedder:embed(Ctx, <<"hello world">>),
                  Dim = byte_size(Vec) div 4,
                  ?assertEqual(0, byte_size(Vec) rem 4),
                  ?assert(Dim > 0),
