@@ -1,31 +1,29 @@
 %% -------------------------------------------------------------------
-%% bitcask_embedder_openai:
-%%   bitcask_embedder 的 provider 实现 — OpenAI 兼容 /v1/embeddings 协议
-%%   （名字示意协议形态，任何兼容端点均可，如 llama.cpp server / vLLM）。
+%% bitcask_embedder_anthropic:
+%%   bitcask_embedder 的 provider 实现 — Anthropic 兼容协议。
 %%
-%%   新 API（推荐）：
-%%     bitcask_embedder:new(openai, #{
-%%         url => "http://...", model => <<"qwen3-embedding">>, dim => 2560
-%%     })
-%%   旧 API（deprecated，保留向后兼容）：
-%%     embed/1 — 从 application env 取配置
-%%     embed/3 — 显式传 Url/Model/Text
+%%   ⚠️ Anthropic 目前尚未公开 embedding API（Claude 系列为 LLM，
+%%   只有 /v1/messages 文本生成端点）。本模块按预期 API 结构写好，
+%%   当 Anthropic 上线 embedding 端点时，填入实际 URL 和响应解析即可。
 %%
-%%   JSON：用 OTP 27+ 内置 json 模块（仓库本机 OTP 28，erl -version 实证）。
+%%   认证风格：x-api-key header + anthropic-version header
+%%   （与 Claude /v1/messages 一致，区别于 OpenAI 的 Bearer token）。
 %%
-%%   输入截断：端点输入上限 32K token。此处做字节级保守截断（粗糙但
-%%   安全：UTF-8 下 1 token ≥ 1 字节，截到 32768 字节必 ≤ 32K token），
-%%   并回退尾部 UTF-8 续延字节避免截出非法编码。
+%%   用法：
+%%       {ok, Ctx} = bitcask_embedder:new(anthropic, #{
+%%           url     => "https://api.anthropic.com/v1/embeddings",
+%%           model   => <<"claude-embed">>,
+%%           dim     => 4096,
+%%           api_key => <<"sk-ant-...">>
+%%       }),
+%%       {ok, Vec} = bitcask_embedder:embed(Ctx, <<"hello">>).
 %% -------------------------------------------------------------------
--module(bitcask_embedder_openai).
+-module(bitcask_embedder_anthropic).
 
 -behaviour(bitcask_embedder).
 
-%% New context-based API
+%% Provider behaviour API
 -export([init/1, embed/2]).
-
-%% Legacy API (deprecated — use bitcask_embedder:new/2 + embed/2 + dim/1)
--export([embed/1, embed/3, dim/0]).
 
 %% 32K token 上限的字节级保守界。
 -define(MAX_INPUT_BYTES, 32768).
@@ -41,7 +39,7 @@ init(Opts) ->
         {undefined, _} -> {error, {missing_opt, url}};
         {_, undefined} -> {error, {missing_opt, model}};
         {Url, Model} ->
-            Dim = maps:get(dim, Opts, 2560),
+            Dim = maps:get(dim, Opts, 4096),
             {ok, #{
                 module => ?MODULE,
                 dim    => Dim,
@@ -75,43 +73,23 @@ embed(#{url := Url, model := Model} = Cfg, Text) when is_binary(Text) ->
     end.
 
 %% ===================================================================
-%% Legacy API (deprecated)
-%% ===================================================================
-
-%% @deprecated Use bitcask_embedder:new(openai, Opts) + bitcask_embedder:embed/2.
--spec embed(binary()) -> {ok, binary()} | {error, term()}.
-embed(Text) when is_binary(Text) ->
-    case {application:get_env(bitcask, embedder_url),
-          application:get_env(bitcask, embedder_model)} of
-        {{ok, Url}, {ok, Model}} -> embed(#{url => Url, model => to_bin(Model)}, Text);
-        _ -> {error, embedder_not_configured}
-    end.
-
-%% @deprecated Use bitcask_embedder:new/2 + bitcask_embedder:embed/2.
--spec embed(string(), binary(), binary()) -> {ok, binary()} | {error, term()}.
-embed(Url, Model, Text) when is_binary(Text) ->
-    embed(#{url => Url, model => to_bin(Model)}, Text).
-
-%% @deprecated Use bitcask_embedder:dim/1.
--spec dim() -> pos_integer().
-dim() ->
-    case application:get_env(bitcask, embedder_dim) of
-        {ok, D} when is_integer(D), D > 0 -> D;
-        _ -> 2560
-    end.
-
-%% ===================================================================
 %% Internal
 %% ===================================================================
 
-%% OpenAI 兼容端点使用 Bearer token 认证。
-build_headers(undefined) -> [];
+%% Anthropic 认证：x-api-key header + anthropic-version header。
+%% 区别于 OpenAI 的 Bearer token。
+build_headers(undefined) ->
+    [{"anthropic-version", "2023-06-01"}];
 build_headers(ApiKey) when is_binary(ApiKey) ->
-    [{"Authorization", "Bearer " ++ binary_to_list(ApiKey)}];
+    [{"x-api-key", binary_to_list(ApiKey)},
+     {"anthropic-version", "2023-06-01"}];
 build_headers(ApiKey) when is_list(ApiKey) ->
-    [{"Authorization", "Bearer " ++ ApiKey}].
+    [{"x-api-key", ApiKey},
+     {"anthropic-version", "2023-06-01"}].
 
-%% 解析 OpenAI 兼容响应：#{<<"data">> := [#{<<"embedding">> := [float()]}]}。
+%% 解析 Anthropic embedding 响应。
+%% 预期格式与 OpenAI 兼容：#{<<"data">> := [#{<<"embedding">> := [float()]}]}。
+%% 待 Anthropic 公布实际 API 后，按实际格式调整此处。
 parse_embedding(RespBody) ->
     try json_decode(RespBody) of
         #{<<"data">> := [#{<<"embedding">> := Floats} | _]} when is_list(Floats) ->
@@ -122,20 +100,18 @@ parse_embedding(RespBody) ->
         _:Reason -> {error, {bad_json, Reason}}
     end.
 
-%% OTP 27+ 内置 json。包一层便于旧 OTP 部署替换实现。
+%% OTP 27+ 内置 json。
 json_encode(Term) -> json:encode(Term).
 json_decode(Bin)  -> json:decode(Bin).
 
 to_bin(B) when is_binary(B) -> B;
 to_bin(L) when is_list(L)   -> list_to_binary(L).
 
-%% 字节级保守截断 + 回退 UTF-8 续延字节，保证截断结果仍是合法 UTF-8 前缀。
+%% 字节级保守截断（与 openai provider 一致）。
 truncate_utf8(Bin, Max) when byte_size(Bin) =< Max -> Bin;
 truncate_utf8(Bin, Max) ->
     strip_partial(binary:part(Bin, 0, Max), 3).
 
-%% 从尾部剥掉未截全的码点:至多 3 个续延字节(10xxxxxx)+ 1 个落单
-%% 首字节(11xxxxxx)。
 strip_partial(<<>>, _) -> <<>>;
 strip_partial(Bin, N) ->
     Sz = byte_size(Bin),
