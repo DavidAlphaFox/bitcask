@@ -91,7 +91,15 @@ open(Dirname) -> open(Dirname, []).
 %%     {dict_path, Path}    — jieba 分词词典路径（jieba 时必填）
 %%     {enable_stop_words, true} — 启用停用词过滤
 %%
+%%   向量模式选项：
+%%     {vector_dim, N}      — 向量维度（必填）
+%%     {vector_metric, M}   — cosine | l2 | dot（默认 cosine）
+%%     {embedder, Ctx}      — bitcask_embedder:ctx()，配置后 put
+%%                            #{text => ...} 自动 embed 生成向量，
+%%                            无需外部计算。显式传 vector 键时跳过。
+%%
 %%   索引模式的 put 可接受 binary 或 #{text => binary(), meta => binary()}。
+%%   配置 embedder 后 put #{text => binary()} 会自动 embed。
 %%   索引模式下调 search_text/search_phrase 进行 BM25 检索。
 %%
 %%   返回:
@@ -100,10 +108,13 @@ open(Dirname) -> open(Dirname, []).
 -spec open(Dirname::string(), Opts::[_]) -> reference() | {error, term()}.
 open(Dirname, Opts) ->
     %% 把 bitcask 应用启动起来——很多默认参数（open_timeout、
-    %% sync_strategy、各种合并阈值）都从 application:get_env 读，
+    %% sync_strategy、各种合并阈值）都从 application:get_env 读,
     %% 没启动 app 就读不到。catch 住失败：测试场景下 app 可能还没装。
     catch application:load(bitcask),
     catch application:start(bitcask),
+    %% {embedder, Ctx} 是 Erlang-only 选项，不下传 NIF。
+    %% 在 open 成功后存入 bitcask_handle ETS，供 put 自动 embed。
+    EmbedderCtx = proplists:get_value(embedder, Opts),
     Base = case proplists:get_bool(read_write, Opts) of
                true  -> [read_write];
                false -> []
@@ -113,7 +124,17 @@ open(Dirname, Opts) ->
                         (V = opt_value(K, Opts)) =/= undefined],
     Extra = maybe_default_dict_path(Extra0),
     case bitcask_cpp_nifs:cask_open(Dirname, Base ++ Extra) of
-        {ok, CaskRef}  -> CaskRef;
+        {ok, CaskRef}  ->
+            %% 配置了 embedder 时存入 ETS，供 put/3 自动 embed。
+            %% embedder 不在 CASK_PASSTHROUGH_OPTS 中，不会下传 NIF。
+            case EmbedderCtx of
+                undefined -> ok;
+                Ctx when is_map(Ctx) ->
+                    try ets:insert(bitcask_handle, {CaskRef, Ctx})
+                    catch _:_ -> ok  %% ETS 表不存在（app 未启动）→ 忽略
+                    end
+            end,
+            CaskRef;
         {error, _} = E -> E
     end.
 
@@ -148,8 +169,21 @@ opt_value(Key, Opts) ->
         V -> V
     end.
 
+%% 从 ETS 查询 Ref 关联的 embedder context。
+%% 返回 {ok, Ctx} | undefined。ETS 表不存在时安全返回 undefined。
+lookup_embedder(Ref) ->
+    try ets:lookup(bitcask_handle, Ref) of
+        [{Ref, Ctx}] when is_map(Ctx) -> {ok, Ctx};
+        [] -> undefined
+    catch
+        _:_ -> undefined
+    end.
+
 %% 关闭 Cask：刷盘、释放 write.lock、清空 keydir。Ref 之后不可再用。
 close(Ref) ->
+    try ets:delete(bitcask_handle, Ref)
+    catch _:_ -> ok  %% ETS 表不存在或 Ref 无 entry → 忽略
+    end,
     bitcask_cpp_nifs:cask_close(Ref).
 
 %% 把当前 active 数据文件的 hint trailer 写完整、释放 bitcask.write.lock，
@@ -169,8 +203,26 @@ get(Ref, Key) ->
     bitcask_cpp_nifs:cask_get(Ref, Key).
 
 %% 写 Key。put(_, _, tombstone) 是历史接口，等价于 delete。
+%%
+%% 自动 embed：当 open 时配置了 {embedder, Ctx}，且 put 的 Value 是
+%% #{text => Text}（有 text 无 vector），会自动调用 embedder 生成向量，
+%% 然后以 #{text => Text, vector => Vec} 写入。显式提供 vector 时跳过。
 put(Ref, Key, tombstone) ->
     bitcask_cpp_nifs:cask_delete(Ref, Key);
+put(Ref, Key, #{text := Text} = Doc) when is_binary(Text) ->
+    case lookup_embedder(Ref) of
+        {ok, Ctx} when not is_map_key(vector, Doc) ->
+            %% 自动 embed：有 embedder + 有 text + 无显式 vector
+            case bitcask_embedder:embed(Ctx, Text) of
+                {ok, Vec} ->
+                    bitcask_cpp_nifs:cask_put(Ref, Key, Doc#{vector => Vec});
+                {error, _} = E ->
+                    E
+            end;
+        _ ->
+            %% 无 embedder，或已显式传 vector — 透传 NIF
+            bitcask_cpp_nifs:cask_put(Ref, Key, Doc)
+    end;
 put(Ref, Key, Value) ->
     bitcask_cpp_nifs:cask_put(Ref, Key, Value).
 

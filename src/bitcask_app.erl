@@ -20,6 +20,10 @@
 -export([start/2, stop/1]).
 
 start(_StartType, _StartArgs) ->
+    %% bitcask_handle: Ref → embedder ctx map。
+    %% public + read_concurrency 让多进程 put 并发安全读 embedder 配置。
+    %% 表由 application master 进程持有，生命周期 = application 生命周期。
+    ets:new(bitcask_handle, [named_table, public, set, {read_concurrency, true}]),
     bitcask_sup:start_link().
 
 stop(_State) ->
