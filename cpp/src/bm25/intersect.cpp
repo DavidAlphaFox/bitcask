@@ -141,17 +141,19 @@ std::uint64_t* exact_match_u64_avx512(const std::uint64_t* a,
                                       std::uint64_t* cur) {
     const __m512i va = _mm512_loadu_si512(a);
     const __m512i vb = _mm512_loadu_si512(b);
-
+    // 对8个int64逐个比较，返回的mask,如果bit设置为1，代表a[i] == b[i]
     __mmask8 cmp = _mm512_cmpeq_epi64_mask(va, vb);
     for (int r = 1; r < 8; ++r) {
         const __m512i ridx = _mm512_load_si512(kRot512[r]);
         const __m512i vbr = _mm512_permutexvar_epi64(ridx, vb);
+        // 循环比较的时候A不动，只移动B，这样设置位掩码，就代表A中该位命中了
         cmp |= _mm512_cmpeq_epi64_mask(va, vbr);
     }
 
     // compressstoreu 按 mask 只写 popcount(cmp) 个元素，预分配缓冲下
     // 无需逐块 resize，也无需 cmp==0 早退分支。
     _mm512_mask_compressstoreu_epi64(cur, cmp, va);
+    //通过std::popcount来计算2进制中的1的个数，然后移动指针
     return cur + std::popcount(static_cast<unsigned>(cmp));
 }
 
