@@ -1,23 +1,89 @@
 %% -------------------------------------------------------------------
 %% bitcask_embedder:
-%%   V3.6 — 外部 embedding 服务的 behaviour 抽象（hnsw-design §1：
-%%   「向量进、近邻出」，引擎只收向量不算向量；推理依赖留在 Erlang 层）。
+%%   Embedder 框架门面 — 运行时构建上下文，支持多 provider。
 %%
-%%   实现模块负责把文本变成定维向量；引擎侧（put 的 doc map vector 键 /
-%%   bitcask:search_vector / bitcask:search_hybrid）只认 f32 LE 二进制。
+%%   V3.6 原始设计：behaviour + application env（静态全局配置）。
+%%   当前版本：context-based API，运行时动态配置，多 provider。
+%%
+%%   用法：
+%%       {ok, Ctx} = bitcask_embedder:new(openai, #{
+%%           url   => "http://localhost:8080/v1/embeddings",
+%%           model => <<"qwen3-embedding">>,
+%%           dim   => 2560
+%%       }),
+%%       {ok, Vec} = bitcask_embedder:embed(Ctx, <<"hello">>),
+%%       Dim       = bitcask_embedder:dim(Ctx).
+%%
+%%   多 provider：
+%%       bitcask_embedder:new(openai,    #{url => ..., model => ..., dim => ...})
+%%       bitcask_embedder:new(anthropic, #{url => ..., model => ..., dim => ...})
+%%       bitcask_embedder:new({custom, my_mod}, #{...})
+%%
+%%   自定义 provider：实现 init/1 + embed/2，通过 {custom, Module} 注册。
 %%
 %%   Vec 格式 = f32 LE 二进制（Dim×4 字节），与 NIF 跨界 / DocValue
-%%   存储格式一致，Erlang 侧构造：
-%%       << <<X:32/float-little>> || X <- Floats >>
-%%
-%%   参考实现：bitcask_embedder_openai（OpenAI 兼容 /v1/embeddings 协议）。
-%%   测试请用确定性 mock（test/bitcask_embedder_mock），不要打真实端点。
+%%   存储格式一致。
 %% -------------------------------------------------------------------
 -module(bitcask_embedder).
 
--callback embed(Text :: binary()) -> {ok, Vec :: binary()} | {error, term()}.
+%% Framework API (new — context-based, runtime dynamic)
+-export([new/2, embed/2, dim/1]).
 
-%% 可选：实现模块声明自己的输出维度（须等于集合 open 时的 vector_dim）。
+-export_type([ctx/0]).
+
+%% -------------------------------------------------------------------
+%% Context type — 普通 map，无需 hrl，跨模块安全。
+%% -------------------------------------------------------------------
+-type ctx() :: #{
+    module := module(),       %% provider 实现模块
+    dim    := pos_integer(),  %% 输出维度
+    config := map()           %% provider-specific 配置（url/model/api_key...）
+}.
+
+%% -------------------------------------------------------------------
+%% Provider behaviour — 自定义 provider 实现这两个回调。
+%%
+%% init/1:  接收用户 Opts map，返回 {ok, ctx()}。
+%%          必须在返回的 ctx 中填入 module/dim/config 三个字段。
+%% embed/2: 接收 ctx 的 config map + Text binary，返回 {ok, Vec} | {error,_}。
+%%          注意：框架调用时只传 config 子 map，不是完整 ctx。
+%% -------------------------------------------------------------------
+-callback init(Opts :: map()) -> {ok, ctx()} | {error, term()}.
+-callback embed(Config :: map(), Text :: binary()) -> {ok, Vec :: binary()} | {error, term()}.
+
+%% -------------------------------------------------------------------
+%% Legacy behaviour (deprecated) — 旧式 embed/1 + dim/0。
+%% 新代码请用 new/2 + embed/2 + dim/1。
+%% 保留是为了平滑迁移现有 mock 和已部署的 callback 模块。
+%% -------------------------------------------------------------------
+-callback embed(Text :: binary()) -> {ok, Vec :: binary()} | {error, term()}.
 -callback dim() -> pos_integer().
 
--optional_callbacks([dim/0]).
+%% 旧回调设为 optional：新 provider 只需实现 init/1 + embed/2。
+-optional_callbacks([dim/0, embed/1]).
+
+%% -------------------------------------------------------------------
+%% Framework: 构建 provider 上下文
+%% -------------------------------------------------------------------
+-spec new(Provider, Opts) -> {ok, ctx()} | {error, term()}
+    when Provider :: openai | anthropic | {custom, module()},
+         Opts    :: map().
+new(openai, Opts) ->
+    bitcask_embedder_openai:init(Opts);
+new(anthropic, Opts) ->
+    bitcask_embedder_anthropic:init(Opts);
+new({custom, Module}, Opts) when is_atom(Module) ->
+    Module:init(Opts).
+
+%% -------------------------------------------------------------------
+%% Framework: 使用上下文 embed
+%% -------------------------------------------------------------------
+-spec embed(ctx(), binary()) -> {ok, binary()} | {error, term()}.
+embed(#{module := M, config := Cfg}, Text) when is_binary(Text) ->
+    M:embed(Cfg, Text).
+
+%% -------------------------------------------------------------------
+%% Framework: 从上下文取维度
+%% -------------------------------------------------------------------
+-spec dim(ctx()) -> pos_integer().
+dim(#{dim := D}) -> D.
