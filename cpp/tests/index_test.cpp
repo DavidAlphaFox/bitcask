@@ -134,3 +134,106 @@ TEST(Index, ReplayWithExplicitOrds) {
     // 之后正常 alloc_ord 接着 next_ord 走。
     EXPECT_EQ(idx.alloc_ord(), 4u);
 }
+
+// ---- 分块数组测试（方案 B）----
+
+TEST(Index, CrossChunkOps) {
+    Index idx;
+    constexpr auto N = bitcask::index::kChunkOrds;
+
+    idx.put_doc("low",  0,     slot(1, 0,  10));
+    idx.put_doc("high", N + 5, slot(2, 100, 20));
+
+    EXPECT_TRUE(idx.is_live(0));
+    EXPECT_TRUE(idx.is_live(N + 5));
+    EXPECT_FALSE(idx.is_live(1));
+    EXPECT_FALSE(idx.is_live(N));
+
+    auto lo = idx.get("low");
+    ASSERT_TRUE(lo.has_value());
+    EXPECT_EQ(lo->loc.file_id, 1u);
+
+    auto hi = idx.get("high");
+    ASSERT_TRUE(hi.has_value());
+    EXPECT_EQ(hi->loc.file_id, 2u);
+
+    EXPECT_EQ(*idx.ord_to_ext(0), "low");
+    EXPECT_EQ(*idx.ord_to_ext(N + 5), "high");
+}
+
+TEST(Index, ChunkBoundaryLastSlot) {
+    Index idx;
+    constexpr auto N = bitcask::index::kChunkOrds;
+
+    idx.put_doc("last0",  N - 1, slot(1, 0, 10));
+    idx.put_doc("first1", N,     slot(2, 0, 10));
+
+    EXPECT_TRUE(idx.is_live(N - 1));
+    EXPECT_TRUE(idx.is_live(N));
+    EXPECT_EQ(*idx.ord_to_ext(N - 1), "last0");
+    EXPECT_EQ(*idx.ord_to_ext(N), "first1");
+}
+
+TEST(Index, CompactChunksFreesDeadChunks) {
+    Index idx;
+    constexpr auto N = bitcask::index::kChunkOrds;
+
+    idx.put_doc("a", 0,     slot(1, 0, 10));
+    idx.put_doc("b", 1,     slot(1, 10, 10));
+    idx.put_doc("c", N,     slot(1, 20, 10));
+    idx.put_doc("d", N + 1, slot(1, 30, 10));
+
+    EXPECT_EQ(idx.info().chunks_allocated, 2u);
+
+    idx.remove("c", idx.alloc_ord());
+    idx.remove("d", idx.alloc_ord());
+
+    auto freed = idx.compact_chunks();
+    EXPECT_EQ(freed, 1u);
+    EXPECT_EQ(idx.info().chunks_freed, 1u);
+
+    EXPECT_TRUE(idx.is_live(0));
+    EXPECT_TRUE(idx.is_live(1));
+    EXPECT_FALSE(idx.is_live(N));
+    EXPECT_FALSE(idx.is_live(N + 1));
+}
+
+TEST(Index, CompactChunksPreservesLiveChunks) {
+    Index idx;
+    constexpr auto N = bitcask::index::kChunkOrds;
+
+    idx.put_doc("a", 0,     slot(1, 0, 10));
+    idx.put_doc("b", N,     slot(1, 10, 10));
+    idx.put_doc("c", N + 1, slot(1, 20, 10));
+
+    idx.remove("c", idx.alloc_ord());
+
+    auto freed = idx.compact_chunks();
+    EXPECT_EQ(freed, 0u);
+
+    EXPECT_TRUE(idx.is_live(0));
+    EXPECT_TRUE(idx.is_live(N));
+}
+
+TEST(Index, ForEachLiveAcrossChunks) {
+    Index idx;
+    constexpr auto N = bitcask::index::kChunkOrds;
+
+    idx.put_doc("a", 0,     slot(1, 0, 10));
+    idx.put_doc("b", N,     slot(1, 10, 10));
+    idx.put_doc("c", N + 1, slot(1, 20, 10));
+
+    std::vector<std::pair<std::uint64_t, std::string>> seen;
+    idx.for_each_live([&](std::uint64_t ord, const std::string& ext,
+                          const DocSlot&) {
+        seen.emplace_back(ord, ext);
+    });
+
+    ASSERT_EQ(seen.size(), 3u);
+    EXPECT_EQ(seen[0].first, 0u);
+    EXPECT_EQ(seen[0].second, "a");
+    EXPECT_EQ(seen[1].first, N);
+    EXPECT_EQ(seen[1].second, "b");
+    EXPECT_EQ(seen[2].first, N + 1);
+    EXPECT_EQ(seen[2].second, "c");
+}

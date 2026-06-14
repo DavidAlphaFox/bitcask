@@ -17,8 +17,10 @@
 #include "bitcask/live_checker.hpp"
 #include "bitcask/string_hash.hpp"
 
+#include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -51,6 +53,20 @@ struct IndexInfo {
     std::uint64_t live_docs  = 0;   // 当前存活文档数（= ext2ord_.size()）
     std::uint64_t total_ords = 0;   // 历史分配 ord 数（含已死）
     std::uint64_t next_ord   = 0;
+    std::uint64_t chunks_allocated = 0;   // 分配过的 chunk 总数
+    std::uint64_t chunks_freed     = 0;   // 被 compact_chunks 释放的 chunk 数
+};
+
+// ---- 分块数组（Tiered Arrays, 方案 B）----
+// slots_ 和 ord2ext_ 按 chunk 分块，live_count == 0 的 chunk 可在 merge 后释放。
+// live_ 和 doc_lens_ 保持平坦（SIMD fill_is_live / fill_doc_lens 需要）。
+// 设计详见 doc/ord-recycling-design-zh.md §5。
+static constexpr std::size_t kChunkOrds = 65536;   // 每 chunk 64K 个 ord
+
+struct Chunk {
+    std::array<DocSlot,     kChunkOrds> slots;      // 32B × 64K = 2 MB
+    std::array<std::string, kChunkOrds> ord2ext;    // ~32B × 64K = 2 MB (SSO)
+    std::uint32_t live_count = 0;                    // chunk 内存活 ord 数；== 0 可释放
 };
 
 class Index : public bm25::LiveChecker {
@@ -110,6 +126,10 @@ public:
     void fill_doc_lens(std::span<const std::uint64_t> ords,
                        std::span<std::uint32_t> out) const override;
 
+    // 释放所有 live_count == 0 的 chunk（merge 后调用）。
+    // 返回释放的 chunk 数。线程安全：unique_lock。
+    std::uint64_t compact_chunks();
+
     // ---- 内省 ----
     [[nodiscard]] IndexInfo info() const;
 
@@ -118,9 +138,11 @@ public:
     template <typename Fn>
     void for_each_live(Fn&& fn) const {
         std::shared_lock lk(mutex_);
-        for (std::uint64_t ord = 0; ord < slots_.size(); ++ord) {
+        for (std::uint64_t ord = 0; ord < live_.size(); ++ord) {
             if (live_[ord]) {
-                fn(ord, ord2ext_[ord], slots_[ord]);
+                const auto ci = ord / kChunkOrds;
+                const auto si = ord % kChunkOrds;
+                fn(ord, chunks_[ci]->ord2ext[si], chunks_[ci]->slots[si]);
             }
         }
     }
@@ -130,23 +152,18 @@ private:
 
     std::unordered_map<std::string, std::uint64_t,
                        StringHash, std::equal_to<>> ext2ord_;  // ext_id → 最新 ord
-    std::vector<DocSlot>     slots_;                          // 下标 = ord
-    std::vector<std::string> ord2ext_;                        // 下标 = ord
-    std::vector<std::uint8_t> live_;                          // 下标 = ord;0/1。非 vector<bool>:
-                                                              // 避免 bit-pack 的位操作与代理引用开销
-    // P2.4：doc_len 的 SoA 读优化副本（下标 = ord）。slots_[ord].doc_len 仍是
-    // API 返回值的来源（get/for_each_live 语义不变），但 BM25 评分的
-    // fill_doc_lens 稀疏 gather 改读本数组：DocSlot 32B/项 → 每条 cache line
-    // 只有 4B 有用；u32 紧凑数组 = 16 项/line。与 slots_ 同一 unique_lock
-    // 下写入，不会发散。
-    std::vector<std::uint32_t> doc_lens_;
-    // V5:per-ord 原始 meta blob(结构化 KV 二进制,可为空)。与 slots_/doc_lens_
-    // 同一 unique_lock 下写入,读路径按 ord 下标直取——零拷贝 span。
-    std::vector<std::vector<std::byte>> meta_blobs_;
-    std::uint64_t next_ord_  = 0;
-    std::uint64_t live_docs_ = 0;
 
-    // 把 ord 下标的数组按需扩到能容纳 ord。caller 持 unique_lock。
+    std::vector<std::unique_ptr<Chunk>> chunks_;               // chunk N 覆盖 [N*64K, (N+1)*64K)
+
+    std::vector<std::uint8_t>  live_;       // 下标 = ord;0/1。平坦保持以兼容 SIMD gather。
+    std::vector<std::uint32_t> doc_lens_;   // P2.4 SoA 副本;平坦保持以兼容 SIMD gather。
+    std::vector<std::vector<std::byte>> meta_blobs_;  // V5 per-ord meta;sparse,保持平坦。
+
+    std::uint64_t next_ord_       = 0;
+    std::uint64_t live_docs_      = 0;
+    std::uint64_t chunks_alloc_   = 0;      // 历史分配 chunk 数（内省用）
+    std::uint64_t chunks_freed_   = 0;      // 被 compact_chunks 释放的 chunk 数
+
     void ensure_capacity_locked(std::uint64_t ord);
 };
 
