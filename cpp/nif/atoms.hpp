@@ -71,6 +71,7 @@ struct Atoms {
     // 索引模式 get/put 的 doc map 键（O2：热路径避免每次重建 atom）
     ERL_NIF_TERM text;
     ERL_NIF_TERM meta;
+    ERL_NIF_TERM fields;
 
     // V3.6:向量选项 / doc map 键。vector = put_doc 的 f32 LE 二进制段;
     // vector_dim/vector_metric = open 选项;cosine/l2/dot = metric 值。

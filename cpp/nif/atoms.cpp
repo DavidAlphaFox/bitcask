@@ -62,6 +62,7 @@ void Atoms::init(ErlNifEnv* env) noexcept {
 
     text               = a("text");
     meta               = a("meta");
+    fields             = a("fields");
 
     vector             = a("vector");
     vector_dim         = a("vector_dim");

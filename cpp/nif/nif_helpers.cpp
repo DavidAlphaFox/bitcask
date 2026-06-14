@@ -53,6 +53,13 @@ CaskIterHandle* cask_iter_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept {
 
 bool parse_doc_map(ErlNifEnv* env, ERL_NIF_TERM map_term, DocInput& doc,
                    std::vector<float>& vec_storage) {
+    // 方案 C：4 个顶层 key，类型严格，零碰撞可能。
+    //   text   — binary，主文本（search_text 搜这个）
+    //   fields — map<binary, binary>，命名字段（search_fields 搜这些）
+    //   vector — binary，f32 LE 向量
+    //   meta   — binary，opaque 元数据
+    // 未知顶层 key → false（badarg），防止旧式扁平字段被静默丢弃。
+
     ERL_NIF_TERM text_val;
     if (enif_get_map_value(env, map_term, atoms().text, &text_val)) {
         ErlNifBinary tb{};
@@ -78,22 +85,44 @@ bool parse_doc_map(ErlNifEnv* env, ERL_NIF_TERM map_term, DocInput& doc,
         }
         doc.vector = vec_storage;
     }
-    // S8.6 多字段：遍历 map，把 text/meta 之外的「atom 键 → binary 值」作为命名字段。
+    // 命名字段：#{<<"title">> => <<"...">>, ...}，key/value 均为 binary。
     // span 指向 NIF binary（put_doc 同步编码完才返回，生命周期安全）。
+    ERL_NIF_TERM fields_val;
+    if (enif_get_map_value(env, map_term, atoms().fields, &fields_val)) {
+        if (!enif_is_map(env, fields_val)) {
+            return false;
+        }
+        ErlNifMapIterator fiter;
+        if (enif_map_iterator_create(env, fields_val, &fiter,
+                                      ERL_NIF_MAP_ITERATOR_FIRST)) {
+            ERL_NIF_TERM fk, fv;
+            while (enif_map_iterator_get_pair(env, &fiter, &fk, &fv)) {
+                ErlNifBinary key_b{}, val_b{};
+                if (!enif_inspect_binary(env, fk, &key_b) ||
+                    !enif_inspect_binary(env, fv, &val_b)) {
+                    enif_map_iterator_destroy(env, &fiter);
+                    return false;
+                }
+                std::string name(reinterpret_cast<const char*>(key_b.data),
+                                  key_b.size);
+                doc.fields.push_back({std::move(name), as_bytes(val_b)});
+                enif_map_iterator_next(env, &fiter);
+            }
+            enif_map_iterator_destroy(env, &fiter);
+        }
+    }
+    // 拒绝未知顶层 key — 只有 text/fields/vector/meta 合法。
     ErlNifMapIterator iter;
-    if (enif_map_iterator_create(env, map_term, &iter, ERL_NIF_MAP_ITERATOR_FIRST)) {
+    if (enif_map_iterator_create(env, map_term, &iter,
+                                  ERL_NIF_MAP_ITERATOR_FIRST)) {
         ERL_NIF_TERM k, v;
         while (enif_map_iterator_get_pair(env, &iter, &k, &v)) {
-            char namebuf[256];
-            int n = enif_get_atom(env, k, namebuf, sizeof(namebuf), ERL_NIF_LATIN1);
-            if (n > 0) {
-                std::string name(namebuf, static_cast<std::size_t>(n - 1));  // 去末尾 NUL
-                if (name != "text" && name != "meta" && name != "vector") {
-                    ErlNifBinary fb{};
-                    if (enif_inspect_binary(env, v, &fb)) {
-                        doc.fields.push_back({std::move(name), as_bytes(fb)});
-                    }
-                }
+            if (!enif_is_identical(k, atoms().text) &&
+                !enif_is_identical(k, atoms().meta) &&
+                !enif_is_identical(k, atoms().vector) &&
+                !enif_is_identical(k, atoms().fields)) {
+                enif_map_iterator_destroy(env, &iter);
+                return false;
             }
             enif_map_iterator_next(env, &iter);
         }
