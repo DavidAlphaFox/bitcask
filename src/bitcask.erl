@@ -13,8 +13,9 @@
 %%     3. 把 fold/6、fold_keys/6 里历史遗留的 µs/ms 单位换算成 cask_cpp 期望
 %%        的「秒」（cask_max_age/1）和「次数」（cask_max_put/1）。
 %%
-%%   open/2 返回的 Ref 本身就是 cask_cpp 资源句柄，BEAM 持有它的强引用；
-%%   GC 时由 cask_resource_dtor 析构。close/1 会立刻释放底层 Cask（不等 GC）。
+%%   open/2 返回 {Ref, EmbedderCtx}：Ref 是 cask_cpp 资源句柄，EmbedderCtx
+%%   是 open 时配置的 embedder context（undefined | map()）。BEAM 持有 Ref 的
+%%   强引用；GC 时由 cask_resource_dtor 析构。close/1 会立刻释放底层 Cask（不等 GC）。
 %%
 %%   KV 模式（默认）：put(Ref, Key, BinaryValue)，不支持 search_*。
 %%   索引模式：open 时带 {analyzer, ngram|whitespace|jieba}，put 可传
@@ -103,38 +104,22 @@ open(Dirname) -> open(Dirname, []).
 %%   索引模式下调 search_text/search_phrase 进行 BM25 检索。
 %%
 %%   返回:
-%%     reference()          — 成功
+%%     {reference(), term()} — 成功：{CaskRef, EmbedderCtx}
 %%     {error, Reason}      — 通常是 write_locked / enoent / mode_mismatch
--spec open(Dirname::string(), Opts::[_]) -> reference() | {error, term()}.
+-spec open(Dirname::string(), Opts::[_]) -> {reference(), term()} | {error, term()}.
 open(Dirname, Opts) ->
-    %% 把 bitcask 应用启动起来——很多默认参数（open_timeout、
-    %% sync_strategy、各种合并阈值）都从 application:get_env 读,
-    %% 没启动 app 就读不到。catch 住失败：测试场景下 app 可能还没装。
     catch application:load(bitcask),
     catch application:start(bitcask),
-    %% {embedder, Ctx} 是 Erlang-only 选项，不下传 NIF。
-    %% 在 open 成功后存入 bitcask_handle ETS，供 put 自动 embed。
     EmbedderCtx = proplists:get_value(embedder, Opts),
     Base = case proplists:get_bool(read_write, Opts) of
                true  -> [read_write];
                false -> []
            end,
-    %% 选项归一化：Opts 显式给的 > app env > 不下传
     Extra0 = [{K, V} || K <- ?CASK_PASSTHROUGH_OPTS,
                         (V = opt_value(K, Opts)) =/= undefined],
     Extra = maybe_default_dict_path(Extra0),
     case bitcask_cpp_nifs:cask_open(Dirname, Base ++ Extra) of
-        {ok, CaskRef}  ->
-            %% 配置了 embedder 时存入 ETS，供 put/3 自动 embed。
-            %% embedder 不在 CASK_PASSTHROUGH_OPTS 中，不会下传 NIF。
-            case EmbedderCtx of
-                undefined -> ok;
-                Ctx when is_map(Ctx) ->
-                    try ets:insert(bitcask_handle, {CaskRef, Ctx})
-                    catch _:_ -> ok  %% ETS 表不存在（app 未启动）→ 忽略
-                    end
-            end,
-            CaskRef;
+        {ok, CaskRef}  -> {CaskRef, EmbedderCtx};
         {error, _} = E -> E
     end.
 
@@ -169,29 +154,19 @@ opt_value(Key, Opts) ->
         V -> V
     end.
 
-%% 从 ETS 查询 Ref 关联的 embedder context。
-%% 返回 {ok, Ctx} | undefined。ETS 表不存在时安全返回 undefined。
-lookup_embedder(Ref) ->
-    try ets:lookup(bitcask_handle, Ref) of
-        [{Ref, Ctx}] when is_map(Ctx) -> {ok, Ctx};
-        [] -> undefined
-    catch
-        _:_ -> undefined
-    end.
+%% 从 handle tuple 提取原始 NIF reference。
+ref({R, _Ctx}) -> R.
 
-%% 关闭 Cask：刷盘、释放 write.lock、清空 keydir。Ref 之后不可再用。
-close(Ref) ->
-    try ets:delete(bitcask_handle, Ref)
-    catch _:_ -> ok  %% ETS 表不存在或 Ref 无 entry → 忽略
-    end,
-    bitcask_cpp_nifs:cask_close(Ref).
+%% 关闭 Cask：刷盘、释放 write.lock、清空 keydir。Handle 之后不可再用。
+close(Handle) ->
+    bitcask_cpp_nifs:cask_close(ref(Handle)).
 
 %% 把当前 active 数据文件的 hint trailer 写完整、释放 bitcask.write.lock，
 %% 但 Ref 仍然可用：下一次 put/delete 会自动重新拿锁、新建 active file。
 %% 这中间的窗口里别的进程可能抢占 writer 角色——这是 legacy 历史行为，
 %% 调用方需要清楚后果。
-close_write_file(Ref) ->
-    bitcask_cpp_nifs:cask_close_write_file(Ref).
+close_write_file(Handle) ->
+    bitcask_cpp_nifs:cask_close_write_file(ref(Handle)).
 
 %% =========================================================================
 %% 单 key 读写
@@ -199,20 +174,21 @@ close_write_file(Ref) ->
 
 %% 读 Key。返回 {ok, Value} | not_found | {error, Reason}。
 %% 过期或被墓碑覆盖的 entry 等同于 not_found。
-get(Ref, Key) ->
-    bitcask_cpp_nifs:cask_get(Ref, Key).
+get(Handle, Key) ->
+    bitcask_cpp_nifs:cask_get(ref(Handle), Key).
 
 %% 写 Key。put(_, _, tombstone) 是历史接口，等价于 delete。
 %%
 %% 自动 embed：当 open 时配置了 {embedder, Ctx}，且 put 的 Value 是
 %% #{text => Text}（有 text 无 vector），会自动调用 embedder 生成向量，
 %% 然后以 #{text => Text, vector => Vec} 写入。显式提供 vector 时跳过。
-put(Ref, Key, tombstone) ->
-    bitcask_cpp_nifs:cask_delete(Ref, Key);
-put(Ref, Key, #{text := Text} = Doc) when is_binary(Text) ->
-    case lookup_embedder(Ref) of
-        {ok, Ctx} when not is_map_key(vector, Doc) ->
-            %% 自动 embed：有 embedder + 有 text + 无显式 vector
+put(Handle, Key, tombstone) ->
+    bitcask_cpp_nifs:cask_delete(ref(Handle), Key);
+put({Ref, Ctx}, Key, #{text := Text} = Doc) when is_binary(Text) ->
+    case Ctx of
+        undefined ->
+            bitcask_cpp_nifs:cask_put(Ref, Key, Doc);
+        _ when not is_map_key(vector, Doc) ->
             case bitcask_embedder:embed(Ctx, Text) of
                 {ok, Vec} ->
                     bitcask_cpp_nifs:cask_put(Ref, Key, Doc#{vector => Vec});
@@ -220,21 +196,20 @@ put(Ref, Key, #{text := Text} = Doc) when is_binary(Text) ->
                     E
             end;
         _ ->
-            %% 无 embedder，或已显式传 vector — 透传 NIF
             bitcask_cpp_nifs:cask_put(Ref, Key, Doc)
     end;
-put(Ref, Key, Value) ->
-    bitcask_cpp_nifs:cask_put(Ref, Key, Value).
+put(Handle, Key, Value) ->
+    bitcask_cpp_nifs:cask_put(ref(Handle), Key, Value).
 
 %% 软删除：写一个墓碑 entry。空间在下一次 merge 时回收。
-delete(Ref, Key) ->
-    bitcask_cpp_nifs:cask_delete(Ref, Key).
+delete(Handle, Key) ->
+    bitcask_cpp_nifs:cask_delete(ref(Handle), Key).
 
 %% fsync 当前 active data file（hintfile 不强制 fsync——hint 丢了
 %% 可以从 data file 重建）。{sync_strategy, o_sync} 模式下 put 已经
 %% O_SYNC 写入，sync 退化为 no-op。
-sync(Ref) ->
-    bitcask_cpp_nifs:cask_sync(Ref).
+sync(Handle) ->
+    bitcask_cpp_nifs:cask_sync(ref(Handle)).
 
 %% =========================================================================
 %% 折叠 / 列举
@@ -250,30 +225,30 @@ sync(Ref) ->
 %% =========================================================================
 
 %% 列出全部活跃 key，顺序未定义。墓碑被过滤。
-list_keys(Ref) ->
-    cask_fold_collect(Ref, fun(K, _V, Acc) -> [K | Acc] end, []).
+list_keys(Handle) ->
+    cask_fold_collect(ref(Handle), fun(K, _V, Acc) -> [K | Acc] end, []).
 
 %% fold_keys/3：回调签名 fun(#bitcask_entry{}, Acc) -> Acc'
-fold_keys(Ref, Fun, Acc0) ->
-    cask_fold_keys_collect(Ref, Fun, Acc0).
+fold_keys(Handle, Fun, Acc0) ->
+    cask_fold_keys_collect(ref(Handle), Fun, Acc0).
 
 %% fold_keys/6：兼容 legacy 6 参版本。
 %%   MaxAge          — 微秒；负数表示无上限
 %%   MaxPut          — 这次 fold 期间允许的写入次数上限；超了则拒绝
 %%   SeeTombstonesP  — true 时墓碑以 {tombstone, BCEntry} 的形式上交回调
-fold_keys(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
-    cask_fold_keys6_collect(Ref, Fun, Acc0,
+fold_keys(Handle, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
+    cask_fold_keys6_collect(ref(Handle), Fun, Acc0,
                             cask_max_age(MaxAge), cask_max_put(MaxPut),
                             SeeTombstonesP).
 
 %% fold/3：回调签名 fun(K, V, Acc) -> Acc'
-fold(Ref, Fun, Acc0) ->
-    cask_fold_collect(Ref, Fun, Acc0).
+fold(Handle, Fun, Acc0) ->
+    cask_fold_collect(ref(Handle), Fun, Acc0).
 
 %% fold/6：MaxAge / MaxPut 含义同 fold_keys/6；SeeTombstones=true 时墓碑
 %% 以 {tombstone, K} 的 key 形态上交，V 是墓碑值（通常是空 binary）。
-fold(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
-    cask_fold6_collect(Ref, Fun, Acc0,
+fold(Handle, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
+    cask_fold6_collect(ref(Handle), Fun, Acc0,
                        cask_max_age(MaxAge), cask_max_put(MaxPut),
                        SeeTombstonesP).
 
@@ -290,13 +265,13 @@ fold(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
 %% 实现细节见 bitcask_stream 模块。
 %% =========================================================================
 
-stream(Ref) -> bitcask_stream:stream(Ref).
+stream(Handle) -> bitcask_stream:stream(ref(Handle)).
 
 next(S) -> bitcask_stream:next(S).
 
 stop(S) -> bitcask_stream:stop(S).
 
-with_stream(Ref, Fun) -> bitcask_stream:with_stream(Ref, Fun).
+with_stream(Handle, Fun) -> bitcask_stream:with_stream(ref(Handle), Fun).
 
 %% =========================================================================
 %% 目录级 merge
@@ -375,30 +350,30 @@ cask_open_opts(Opts) ->
 %% 杂项查询
 %% =========================================================================
 
-needs_merge(Ref) -> needs_merge(Ref, []).
+needs_merge(Handle) -> needs_merge(Handle, []).
 
 %% Opts 在新接口里没有任何作用——保留参数仅为兼容旧调用点。返回值跟
 %% legacy 一样保留 {true, {Files, Expired}} 的二元组，方便 needs_merge 的
 %% 结果直接喂给 merge/3。
-needs_merge(Ref, _Opts) ->
-    case bitcask_cpp_nifs:cask_needs_merge(Ref) of
+needs_merge(Handle, _Opts) ->
+    case bitcask_cpp_nifs:cask_needs_merge(ref(Handle)) of
         false                  -> false;
         {true, Files, Expired} -> {true, {Files, Expired}}
     end.
 
 %% keydir 是否处于 frozen 状态（fold 在跑）。
-is_frozen(Ref) ->
-    bitcask_cpp_nifs:cask_is_frozen(Ref).
+is_frozen(Handle) ->
+    bitcask_cpp_nifs:cask_is_frozen(ref(Handle)).
 
 %% O(1) 估算：keydir 是否为空。打开过空目录之后会返回 true；写过任何 key
 %% 之后立刻 false（即使 key 又被删，估算仍认为非空——这是可以接受的近似）。
-is_empty_estimate(Ref) ->
-    bitcask_cpp_nifs:cask_is_empty(Ref).
+is_empty_estimate(Handle) ->
+    bitcask_cpp_nifs:cask_is_empty(ref(Handle)).
 
 %% 返回 {KeyCount, FilesInfo}，跟 legacy 形状一致。底层 NIF 还会返回
 %% KBytes 和 Epoch，这两个值 facade 层不外露——历史接口就只有 2 元组。
-status(Ref) ->
-    {KCount, _KBytes, _Epoch, Files} = bitcask_cpp_nifs:cask_status(Ref),
+status(Handle) ->
+    {KCount, _KBytes, _Epoch, Files} = bitcask_cpp_nifs:cask_status(ref(Handle)),
     {KCount, Files}.
 
 %% =========================================================================
@@ -503,11 +478,11 @@ cask_fold6_loop(IterRef, Fun, Acc, SeeTombstonesP) ->
 
 %% stream_fold/3,4 — 批量迭代版 fold，每批 N 条减少 NIF 调用开销。
 %% 默认批量大小=32。回调签名 fun(K, V, Acc) -> Acc'。
-stream_fold(Ref, Fun, Acc0) ->
-    stream_fold(Ref, Fun, Acc0, 32).
+stream_fold(Handle, Fun, Acc0) ->
+    stream_fold(Handle, Fun, Acc0, 32).
 
-stream_fold(Ref, Fun, Acc0, BatchSize) when is_integer(BatchSize), BatchSize > 0 ->
-    case bitcask_cpp_nifs:cask_fold_start(Ref, -1, -1) of
+stream_fold(Handle, Fun, Acc0, BatchSize) when is_integer(BatchSize), BatchSize > 0 ->
+    case bitcask_cpp_nifs:cask_fold_start(ref(Handle), -1, -1) of
         {ok, IterRef} ->
             try stream_fold_loop(IterRef, Fun, Acc0, BatchSize)
             after bitcask_cpp_nifs:cask_fold_release(IterRef)
@@ -543,55 +518,50 @@ cask_max_put(N) when is_integer(N) -> N.
 %% =========================================================================
 
 %% 词袋模式搜索，默认返回前 10 条。
-search_text(Ref, Query) ->
-    search_text(Ref, Query, 10).
+search_text(Handle, Query) ->
+    search_text(Handle, Query, 10).
 
-search_text(Ref, Query, K) ->
-    bitcask_cpp_nifs:cask_search_text(Ref, Query, K).
+search_text(Handle, Query, K) ->
+    bitcask_cpp_nifs:cask_search_text(ref(Handle), Query, K).
 
-%% V5:Search + metadata filter。Filter 形态:
-%%   undefined                — 无 filter(等同 search_text/3);
-%%   [CondMap, ...]           — And{conditions};
-%%   #{logic, conditions, children} — 嵌套 MetaFilter;
-%% 失败 → badarg。
-search_text(Ref, Query, K, Filter) ->
-    bitcask_cpp_nifs:cask_search_text(Ref, Query, K, Filter).
+search_text(Handle, Query, K, Filter) ->
+    bitcask_cpp_nifs:cask_search_text(ref(Handle), Query, K, Filter).
 
 %% 短语模式搜索，默认返回前 10 条。
-search_phrase(Ref, Query) ->
-    search_phrase(Ref, Query, 10).
+search_phrase(Handle, Query) ->
+    search_phrase(Handle, Query, 10).
 
-search_phrase(Ref, Query, K) ->
-    bitcask_cpp_nifs:cask_search_phrase(Ref, Query, K).
+search_phrase(Handle, Query, K) ->
+    bitcask_cpp_nifs:cask_search_phrase(ref(Handle), Query, K).
 
 %% 多字段搜索（S8.6）：支持 `field:term^boost` 语法，跨字段加权合并。
 %% 无字段限定的词等价于默认字段词袋搜索。
-search_fields(Ref, Query) ->
-    search_fields(Ref, Query, 10).
+search_fields(Handle, Query) ->
+    search_fields(Handle, Query, 10).
 
-search_fields(Ref, Query, K) ->
-    bitcask_cpp_nifs:cask_search_fields(Ref, Query, K).
+search_fields(Handle, Query, K) ->
+    bitcask_cpp_nifs:cask_search_fields(ref(Handle), Query, K).
 
 %% 近邻搜索（S8.7）：term 按 Query 词序出现且相邻间隙 ≤ Slop。Slop=0 即短语。
-search_near(Ref, Query, Slop) ->
-    search_near(Ref, Query, Slop, 10).
+search_near(Handle, Query, Slop) ->
+    search_near(Handle, Query, Slop, 10).
 
-search_near(Ref, Query, Slop, K) ->
-    bitcask_cpp_nifs:cask_search_near(Ref, Query, Slop, K).
+search_near(Handle, Query, Slop, K) ->
+    bitcask_cpp_nifs:cask_search_near(ref(Handle), Query, Slop, K).
 
 %% 模糊搜索（S8.3）：Levenshtein 编辑距离匹配。
-search_fuzzy(Ref, Query, MaxEdit) ->
-    search_fuzzy(Ref, Query, MaxEdit, 10).
+search_fuzzy(Handle, Query, MaxEdit) ->
+    search_fuzzy(Handle, Query, MaxEdit, 10).
 
-search_fuzzy(Ref, Query, MaxEdit, K) ->
-    bitcask_cpp_nifs:cask_search_fuzzy(Ref, Query, MaxEdit, K).
+search_fuzzy(Handle, Query, MaxEdit, K) ->
+    bitcask_cpp_nifs:cask_search_fuzzy(ref(Handle), Query, MaxEdit, K).
 
 %% 通配符搜索（S8.4）：支持 * 和 ? 通配符。
-search_wildcard(Ref, Pattern) ->
-    search_wildcard(Ref, Pattern, 10).
+search_wildcard(Handle, Pattern) ->
+    search_wildcard(Handle, Pattern, 10).
 
-search_wildcard(Ref, Pattern, K) ->
-    bitcask_cpp_nifs:cask_search_wildcard(Ref, Pattern, K).
+search_wildcard(Handle, Pattern, K) ->
+    bitcask_cpp_nifs:cask_search_wildcard(ref(Handle), Pattern, K).
 
 %% =========================================================================
 %% 向量 / 混合检索（V3.6）
@@ -603,35 +573,33 @@ search_wildcard(Ref, Pattern, K) ->
 %% =========================================================================
 
 %% HNSW 近邻检索。Ef=0 → 引擎默认 max(K, 64)。
-search_vector(Ref, VecBin) ->
-    search_vector(Ref, VecBin, 10).
+search_vector(Handle, VecBin) ->
+    search_vector(Handle, VecBin, 10).
 
-search_vector(Ref, VecBin, K) ->
-    search_vector(Ref, VecBin, K, 0).
+search_vector(Handle, VecBin, K) ->
+    search_vector(Handle, VecBin, K, 0).
 
-search_vector(Ref, VecBin, K, Ef) ->
-    bitcask_cpp_nifs:cask_search_vector(Ref, VecBin, K, Ef).
+search_vector(Handle, VecBin, K, Ef) ->
+    bitcask_cpp_nifs:cask_search_vector(ref(Handle), VecBin, K, Ef).
 
-%% V5:vector 检索 + metadata filter。Filter 形态同上。
-search_vector(Ref, VecBin, K, Ef, Filter) ->
-    bitcask_cpp_nifs:cask_search_vector(Ref, VecBin, K, Ef, Filter).
+search_vector(Handle, VecBin, K, Ef, Filter) ->
+    bitcask_cpp_nifs:cask_search_vector(ref(Handle), VecBin, K, Ef, Filter).
 
 %% RRF 混合检索：BM25 与向量两路各取 K'=max(K×4,64)，按 1/(60+rank) 融合，
 %% 平局 ord 小者在前。TextQuery/VecBin 允许其一为 <<>>（单路退化），
 %% 两路都空 → {error, _}。返回 {ok, [{Key, Ord, RrfScore}]}。
-search_hybrid(Ref, TextQuery, VecBin) ->
-    search_hybrid(Ref, TextQuery, VecBin, 10).
+search_hybrid(Handle, TextQuery, VecBin) ->
+    search_hybrid(Handle, TextQuery, VecBin, 10).
 
-search_hybrid(Ref, TextQuery, VecBin, K) ->
-    bitcask_cpp_nifs:cask_search_hybrid(Ref, TextQuery, VecBin, K).
+search_hybrid(Handle, TextQuery, VecBin, K) ->
+    bitcask_cpp_nifs:cask_search_hybrid(ref(Handle), TextQuery, VecBin, K).
 
-%% V5:hybrid 检索 + metadata filter。Filter 形态同上。
-search_hybrid(Ref, TextQuery, VecBin, K, Filter) ->
-    bitcask_cpp_nifs:cask_search_hybrid(Ref, TextQuery, VecBin, K, Filter).
+search_hybrid(Handle, TextQuery, VecBin, K, Filter) ->
+    bitcask_cpp_nifs:cask_search_hybrid(ref(Handle), TextQuery, VecBin, K, Filter).
 
 %% 设置同义词词典（S8.2）：从文件加载，查询时自动展开。
-set_synonym_map(Ref, FilePath) ->
-    bitcask_cpp_nifs:cask_set_synonym_map(Ref, FilePath).
+set_synonym_map(Handle, FilePath) ->
+    bitcask_cpp_nifs:cask_set_synonym_map(ref(Handle), FilePath).
 
 %% V5:把 map 或 proplist 编码成 put_doc 可用的 meta 二进制 blob。给
 %% 业务方 / 测试一个轻量入口,生产路径下通常自己编码更高效。Value 类型:
