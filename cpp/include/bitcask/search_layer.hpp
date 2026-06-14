@@ -274,6 +274,8 @@ public:
     // 比 rebuild_index 轻（不重读磁盘、不重新分词）；分数无关。返回压实的 list 数。
     std::size_t compact(double dead_ratio_threshold = 0.5);
 
+    std::uint64_t compact_index_chunks() { return index_.compact_chunks(); }
+
     // ---- 访问内部组件（Phase 4 集成用）----
     [[nodiscard]] index::Index&       index()       { return index_; }
     [[nodiscard]] const index::Index& index() const { return index_; }

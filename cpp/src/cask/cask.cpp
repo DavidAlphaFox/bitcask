@@ -1651,6 +1651,8 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
                 return std::string(reinterpret_cast<const char*>(dv->text.data()), dv->text.size());
             });
 
+        search_->compact_index_chunks();
+
         auto snap = dirname_ + "/bm25_snapshot.inv";
         search_->save_snapshot(snap);
         (void)search_->save_index_sidecar(
