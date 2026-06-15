@@ -584,6 +584,13 @@ Cask::create_search_infra(const CaskOptions& opts) {
     scfg.vector_dim = meta_config_.vector_dim;
     scfg.vector_metric = meta_config_.vector_metric;
     search_ = std::make_unique<search::SearchLayer>(scfg);
+    // analyzer 构造失败（无效配置 / 分词器未注册 / 词典加载失败）则 analyzer_
+    // 为空——决不能带病打开，否则首次带 text 的 put 段错误。干净拒绝。
+    if (!search_->has_analyzer()) {
+        search_.reset();
+        return std::unexpected(err(CaskError::kInvalidOption,
+                                   "analyzer creation failed (check analyzer type / dict_path)"));
+    }
     index_pool_ = std::make_unique<IndexPool>(1, 10240);
     index_pool_->start([&search = *search_](const IndexTask& task) {
         // 消费者必须吞掉所有异常:worker_loop 不捕获,抛出会 std::terminate

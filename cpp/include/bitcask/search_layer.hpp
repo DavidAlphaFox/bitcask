@@ -94,6 +94,11 @@ public:
     SearchLayer(const SearchLayer&) = delete;
     SearchLayer& operator=(const SearchLayer&) = delete;
 
+    // analyzer 是否构造成功。analyzer_config 无效 / 分词器未注册 /
+    // 词典加载失败时为 false——caller（Cask::open）必须检查并拒绝打开，
+    // 否则首次带 text 的 put 会解空指针段错误。
+    [[nodiscard]] bool has_analyzer() const noexcept { return analyzer_ != nullptr; }
+
     // ---- 文档写入：建立索引 ----
     // key: 外部 key, ord: 文档序号, text: 文档文本,
     // file_id/offset/total_sz: 存储定位, tstamp: 时间戳
