@@ -16,6 +16,7 @@ inline constexpr std::size_t kMetaReservedSize = 12;
 // V3.1:向量配置占用保留区前 3 字节(旧文件全零 → kNone/0,自然兼容)。
 inline constexpr std::size_t kMetaVecMetricOffset = 6;
 inline constexpr std::size_t kMetaVecDimOffset    = 7;  // u16 LE
+inline constexpr std::size_t kMetaVecQuantOffset  = 9;  // P3b：u8 0/1（旧文件全零=否）
 inline constexpr std::size_t kMetaFileSize = kMetaMagicSize + 1 + 1 + kMetaReservedSize;  // 18 bytes
 
 inline constexpr std::uint8_t kMetaVersion = 1;
@@ -69,6 +70,8 @@ std::expected<MetaConfig, MetaError> read_meta(std::string_view dirname) {
     if ((cfg.vector_metric == VectorMetric::kNone) != (cfg.vector_dim == 0)) {
         return std::unexpected(MetaError{0, "inconsistent vector config"});
     }
+    cfg.vector_quantized =
+        static_cast<std::uint8_t>(header[kMetaVecQuantOffset]) != 0;
     return cfg;
 }
 
@@ -84,6 +87,7 @@ std::expected<void, MetaError> write_meta(std::string_view dirname, const MetaCo
     header[kMetaVecMetricOffset] =
         static_cast<char>(config.vector_metric);
     std::memcpy(header + kMetaVecDimOffset, &config.vector_dim, 2);
+    header[kMetaVecQuantOffset] = static_cast<char>(config.vector_quantized ? 1 : 0);
     header[kMetaVersionOffset] = static_cast<char>(kMetaVersion);
     header[kMetaModeOffset] = static_cast<char>(
         config.mode == Mode::kKV ? 0 : 1);

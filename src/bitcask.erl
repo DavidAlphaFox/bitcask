@@ -69,7 +69,7 @@
     max_merge_size,
     analyzer, dict_path, enable_stop_words,
     min_n, max_n, min_token_length, enable_stemming,
-    vector_dim, vector_metric
+    vector_dim, vector_metric, vector_quantized
 ]).
 
 %% =========================================================================
@@ -107,6 +107,8 @@ open(Dirname) -> open(Dirname, []).
 %%                            {vector_dim,N} 由 embedder 接管（用户值被忽略）。
 %%     {vector_dim, N}      — 仅手动向量路径（不配 embedder）时需要：向量维度。
 %%     {vector_metric, M}   — cosine | l2 | dot（默认 cosine）
+%%     {vector_quantized, true} — 向量落盘 int8 量化（4× 磁盘，有损精度；P3b）。
+%%                            创建即固定，重开须一致，否则 mode_mismatch。
 %%
 %%   MRL：embedder Cfg 里 dim = 模型原生维度，vector_dim = 截断落库维度
 %%   （≤ dim，缺省 = dim）；二者不一致时 embed 请求自动带 dimensions。
@@ -146,7 +148,10 @@ open(Dirname, Opts) ->
             Extra = maybe_default_dict_path(Extra1),
             case bitcask_cpp_nifs:cask_open(Dirname, Base ++ Extra) of
                 {ok, CaskRef}  -> {CaskRef, EmbedderCtx};
-                {error, _} = E -> E
+                {error, _} = E -> E;
+                %% 某些故障（如 mode_mismatch）NIF 以裸 atom 返回——归一成
+                %% {error, Reason}，与 open 的契约一致，避免 caller case_clause。
+                Reason         -> {error, Reason}
             end
     end.
 

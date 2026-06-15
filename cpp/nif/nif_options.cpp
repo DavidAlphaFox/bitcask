@@ -144,6 +144,9 @@ void parse_2tuple_option(ErlNifEnv* env, const ERL_NIF_TERM* tup, CaskOptions& o
         if (enif_get_int(env, val, &v) && v > 0 && v <= 0xFFFF) {
             o.vector_dim = static_cast<std::uint16_t>(v);
         }
+    } else if (key == atoms().vector_quantized) {
+        // P3b:{vector_quantized, true} —— 向量落盘 int8（仅 vector_dim>0 有效）。
+        o.vector_quantized = (val == atoms().atom_true);
     } else if (key == atoms().vector_metric) {
         // V3.6:{vector_metric, cosine|l2|dot};默认 cosine(写入归一化)。
         if      (val == atoms().cosine) o.vector_metric = meta::VectorMetric::kCosineNormalized;

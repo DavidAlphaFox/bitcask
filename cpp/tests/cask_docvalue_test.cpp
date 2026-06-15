@@ -1137,6 +1137,43 @@ TEST_F(CaskDocValueTest, V31VectorRoundTripNormalized) {
     (*c)->close();
 }
 
+// P3b：{vector_quantized} 端到端——put 落盘 int8，get dequant 近似还原，
+// 重开一致 ok / 不一致 mode_mismatch。
+TEST_F(CaskDocValueTest, P3bQuantizedVectorRoundTripAndReopen) {
+    auto opts = v31_opts(4);
+    opts.vector_quantized = true;
+    const float raw[4] = {3.0f, 4.0f, 0.0f, 0.0f};  // 模长5 → cosine 归一化 0.6,0.8,0,0
+    std::vector<std::byte> key{std::byte{'k'}};
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        bitcask::DocInput doc;
+        const std::string text = "hello vec";
+        doc.text = sv_bytes(text);
+        doc.vector = std::span<const float>(raw, 4);
+        ASSERT_TRUE((*c)->put_doc(key, doc, 1000));
+        auto g = (*c)->get_owned(key);
+        ASSERT_TRUE(g);
+        ASSERT_EQ(g->vector.size(), 4u);
+        EXPECT_NEAR(g->vector[0], 0.6f, 0.02f);  // int8 误差 ≤ 一个量化步长
+        EXPECT_NEAR(g->vector[1], 0.8f, 0.02f);
+        (*c)->close();
+    }
+    {  // 重开（quantized 一致）→ 向量仍可读
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        auto g = (*c)->get_owned(key);
+        ASSERT_TRUE(g);
+        ASSERT_EQ(g->vector.size(), 4u);
+        EXPECT_NEAR(g->vector[1], 0.8f, 0.02f);
+        (*c)->close();
+    }
+    // 重开但 vector_quantized 不一致 → mode_mismatch
+    auto cbad = Cask::open(tmpdir_.string(), v31_opts(4));  // quantized=false
+    ASSERT_FALSE(cbad);
+    EXPECT_EQ(cbad.error().kind, bitcask::CaskError::kModeMismatch);
+}
+
 // 校验:dim 不符 / 未配置却带向量 / cosine 下零向量,全部拒绝。
 TEST_F(CaskDocValueTest, V31VectorValidation) {
     std::vector<std::byte> key{std::byte{'k'}};

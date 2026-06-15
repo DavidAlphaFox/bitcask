@@ -94,6 +94,7 @@ struct CaskOptions {
     // V3.1:向量配置(hnsw-design §1)。dim>0 即启用,要求 enable_search;
     // 创建时写入 meta,重开校验不符 → kModeMismatch。库内 dim 恒定。
     std::uint16_t vector_dim = 0;
+    bool          vector_quantized = false;  // P3b：向量落盘 int8 量化（4× 磁盘，有损）
     meta::VectorMetric vector_metric = meta::VectorMetric::kCosineNormalized;
 };
 
@@ -127,6 +128,9 @@ struct GetResultView {
 private:
     friend class Cask;
     fileops::ReadRecord storage_;          // ① 持有 pread 数据，move-in
+    // P3b:量化文档落盘是 int8，无法零拷贝成 f32 span——dequant 进此拥有缓冲，
+    // vector span 指向它。未量化时为空，vector span 直接借 storage_（零拷贝）。
+    std::vector<float> vector_dequant_;
 
 public:
     std::span<const std::byte> value{};    // text 段（指向 storage_.value 内部）
@@ -145,6 +149,9 @@ public:
 
 private:
     explicit GetResultView(fileops::ReadRecord&& rec);
+    // 从 storage_ 解出 value/meta/vector span（量化则 dequant 进 vector_dequant_）。
+    // 两个 ctor 共用，避免漂移。
+    void derive_from_storage();
 };
 
 struct GetResult {

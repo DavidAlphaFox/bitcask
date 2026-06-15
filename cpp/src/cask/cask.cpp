@@ -543,10 +543,12 @@ std::expected<void, CaskFault> Cask::check_or_create_meta() {
         const auto want_metric = opts_.vector_dim > 0
                                      ? opts_.vector_metric
                                      : meta::VectorMetric::kNone;
+        const bool want_quant = opts_.vector_dim > 0 && opts_.vector_quantized;
         if (mc->vector_dim != opts_.vector_dim ||
-            mc->vector_metric != want_metric) {
+            mc->vector_metric != want_metric ||
+            mc->vector_quantized != want_quant) {
             return std::unexpected(err(CaskError::kModeMismatch,
-                "vector config mismatch (meta dim/metric vs options)"));
+                "vector config mismatch (meta dim/metric/quantized vs options)"));
         }
         meta_config_ = *mc;
         return {};
@@ -561,6 +563,7 @@ std::expected<void, CaskFault> Cask::check_or_create_meta() {
     if (opts_.vector_dim > 0) {
         mc.vector_dim = opts_.vector_dim;
         mc.vector_metric = opts_.vector_metric;
+        mc.vector_quantized = opts_.vector_quantized;  // P3b
     }
     auto wr = meta::write_meta(dirname_, mc);
     if (!wr) return std::unexpected(err(CaskError::kIo, "write meta failed"));
@@ -1209,23 +1212,33 @@ Cask::get_owned(std::span<const std::byte> key) {
 
 // --- GetResultView implementation ---
 
-GetResultView::GetResultView(fileops::ReadRecord&& rec)
-    : storage_(std::move(rec))       // move first (declaration order)
-    , tstamp(storage_.tstamp)
-    , ord(storage_.ord)
-{
-    if (storage_.type != format::RecordType::kDoc) return;  // tombstone等不解码
+void GetResultView::derive_from_storage() {
+    if (storage_.type != format::RecordType::kDoc) return;  // tombstone 等不解码
+    if (storage_.value.empty()) return;
     auto dv = codec::decode_doc_value(
         std::span<const std::byte>(storage_.value));
     if (!dv) return;  // corrupt DocValue → empty spans
     value = dv->text;
     meta  = dv->meta;
-    if (dv->has_vector && dv->dim > 0 &&
-        dv->vector_raw.size() == dv->dim * sizeof(float)) {
+    if (dv->vec_quantized) {
+        // P3b:量化 → dequant 进拥有缓冲，span 指向它。
+        vector_dequant_ = codec::doc_vector_f32(*dv);
+        vector = std::span<const float>(vector_dequant_.data(),
+                                        vector_dequant_.size());
+    } else if (dv->has_vector && dv->dim > 0 &&
+               dv->vector_raw.size() == dv->dim * sizeof(float)) {
         vector = std::span<const float>(
             reinterpret_cast<const float*>(dv->vector_raw.data()),
             dv->dim);
     }
+}
+
+GetResultView::GetResultView(fileops::ReadRecord&& rec)
+    : storage_(std::move(rec))       // move first (declaration order)
+    , tstamp(storage_.tstamp)
+    , ord(storage_.ord)
+{
+    derive_from_storage();
 }
 
 GetResultView::GetResultView(GetResultView&& other) noexcept
@@ -1234,20 +1247,7 @@ GetResultView::GetResultView(GetResultView&& other) noexcept
     , ord(other.ord)
 {
     // Re-derive spans from our own storage (other's spans now dangle)
-    if (storage_.type == format::RecordType::kDoc && !storage_.value.empty()) {
-        auto dv = codec::decode_doc_value(
-            std::span<const std::byte>(storage_.value));
-        if (dv) {
-            value = dv->text;
-            meta  = dv->meta;
-            if (dv->has_vector && dv->dim > 0 &&
-                dv->vector_raw.size() == dv->dim * sizeof(float)) {
-                vector = std::span<const float>(
-                    reinterpret_cast<const float*>(dv->vector_raw.data()),
-                    dv->dim);
-            }
-        }
-    }
+    derive_from_storage();
 }
 
 GetResult GetResultView::to_owned() const {
@@ -1425,7 +1425,10 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
     if (!doc.meta.empty()) {
         parts.meta = doc.meta;
     }
-    if (!vec_out.empty()) parts.vector = vec_out;
+    if (!vec_out.empty()) {
+        parts.vector = vec_out;
+        parts.vec_quantized = meta_config_.vector_quantized;  // P3b：落盘 int8
+    }
     fill_parts(parts);
     codec::encode_doc_value(encoded, parts);
 

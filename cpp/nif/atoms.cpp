@@ -68,6 +68,7 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     vector             = a("vector");
     vector_dim         = a("vector_dim");
     vector_metric      = a("vector_metric");
+    vector_quantized   = a("vector_quantized");
     cosine             = a("cosine");
     l2                 = a("l2");
     dot                = a("dot");

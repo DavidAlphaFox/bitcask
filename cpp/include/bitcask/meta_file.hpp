@@ -4,7 +4,10 @@
 //   [0..3]   Magic     "BCME" (4 bytes)
 //   [4]      Version   uint8 = 1
 //   [5]      Mode      uint8 = 0(KV) or 1(Index)
-//   [6..17]  Reserved  12 bytes zeros（future use）
+//   [6]      VecMetric uint8 (V3.1)
+//   [7..8]   VecDim    uint16 LE (V3.1)
+//   [9]      VecQuant  uint8 = 0/1（P3b：向量落盘 int8 量化；旧文件全零=否）
+//   [10..17] Reserved  8 bytes zeros（future use）
 //
 // === 线程模型 ===
 // 所有函数均为纯函数：线程安全、可重入、无锁。
@@ -40,6 +43,7 @@ struct MetaConfig {
     Mode mode = Mode::kKV;
     VectorMetric vector_metric = VectorMetric::kNone;
     std::uint16_t vector_dim = 0;   // 0 = 无向量
+    bool vector_quantized = false;  // P3b：向量落盘 int8 量化（仅 vector_dim>0 有意义）
 };
 
 // meta 文件操作错误
