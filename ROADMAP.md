@@ -62,6 +62,57 @@ byte budget + shared_mutex；put/delete 按键失效、merge 不失效。
 ② int8→f32 dequant 向量。
 **gate**：仅当 derive 成本 ≫ mmap 访问才上。**依赖 P6**。
 
+### P8 — HNSW merge rebuild 阈值门控 ✅
+
+> 详细设计：[`doc/hnsw-merge-gate-design-zh.md`](doc/hnsw-merge-gate-design-zh.md)
+
+merge 现**无条件全量重建 HNSW 图**（重插所有 live 向量）；但查询已用 `is_live` 过滤死
+节点 → 重建**纯物理压实、正确性不依赖**。改为**按死节点比例门控**：死占比 < 阈值跳过
+重建，≥阈值才全量重建。与 **P2（BM25 不重分词）同范式**——向量库 merge 的主要 CPU 省下来。
+
+### P9 — read_files_ fd 预算 LRU ✅
+
+> 详细设计：[`doc/read-handle-lru-design-zh.md`](doc/read-handle-lru-design-zh.md)
+
+`read_files_`（只读文件句柄）每文件常驻一个 fd、**无淘汰** → 大库读过多文件**撞 ulimit**。
+改为按 LRU / 数量上限淘汰只读句柄（与 P6「mmap 后 close fd」互补）。
+
+### P10 — search_hybrid 两路并行 ✅
+
+> 详细设计：[`doc/hybrid-parallel-design-zh.md`](doc/hybrid-parallel-design-zh.md)
+
+`search_text` → `search_vector` 现**串行** + RRF 融合；两路相互独立 → 丢线程池**并行**，
+hybrid 查询延迟近减半（注意 filter / 缓存共享的并发安全）。
+
+### P11 — merge I/O 顺序优化 ✅
+
+> 详细设计：[`doc/merge-io-tuning-design-zh.md`](doc/merge-io-tuning-design-zh.md)
+
+merge 顺序读旧文件 / 写新文件，无 readahead 提示。加 `posix_fadvise(SEQUENTIAL/WILLNEED)`
++ 大缓冲，降低 merge 的 IO stall（低成本）。
+
+### P12 — meta_blobs_ 内存按需 / 有界 ⚠️ 备选
+
+> 详细设计：[`doc/meta-blob-residency-design-zh.md`](doc/meta-blob-residency-design-zh.md)
+
+`Index::meta_blobs_` 每 ord 一份 meta blob **全量常驻**（filter 求值用）；可改有界 LRU 或
+按需读盘。**但 filter 在搜索热路径，按需读盘会拖慢 → 需 gate**，故备选。
+
+### P13 — open 时按需后台 merge（小文件收拢）✅
+
+> 详细设计：[`doc/open-merge-design-zh.md`](doc/open-merge-design-zh.md)
+
+**根因**：每个 read_write 会话首次写都建一个**新** active 文件（file_id 单调、不回退、
+不重开旧文件续写——by design）；多次「open-写-close」累积大量小文件。
+**校正**：合并**不提速单次 get**（keydir O(1)）；真正收益是 **open 成本 / fd / mmap 友好 /
+死空间回收**。
+**方案 A（承诺）**：open（read_write）后按 `needs_merge`（复用 `small_file_threshold` 等
+阈值）门控、**后台**触发 merge（merge_worker / dirty 调度器，**不阻塞 open**），收成少数
+sealed + 新 active。复用现有 merge 全套，主要是触发接线 + `{merge_on_open, off|background}`
+选项。**否决**无条件/同步 merge-on-open（O(data) 启动、毁掉快照快开）。
+**方案 B（备选）**：open 复用上一个未满 sealed 文件续写——从源头止小文件，但需 un-seal、
+破坏 sealed 不可变（与 P6 冲突）、invasive，故仅备选。
+
 ---
 
 ## 已落地（2.1.0，持久化优化 P1–P4）

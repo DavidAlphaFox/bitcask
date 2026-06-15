@@ -73,6 +73,66 @@ merge.
 highlight); ② int8→f32 dequantized vectors.
 **Gate**: only when derive cost ≫ mmap access. **Depends on P6**.
 
+### P8 — HNSW merge-rebuild threshold gating ✅
+
+> Design: [`doc/hnsw-merge-gate-design-zh.md`](doc/hnsw-merge-gate-design-zh.md)
+
+Merge currently **rebuilds the whole HNSW graph unconditionally** (re-inserts every live
+vector); but queries already filter dead nodes via `is_live` → the rebuild is **pure
+physical compaction, not needed for correctness**. Gate it on the **dead-node ratio**:
+skip rebuild below a threshold, full rebuild at/above. **Same pattern as P2** (BM25 no
+re-tokenize) — saves the main CPU cost of a vector-mode merge.
+
+### P9 — read_files_ fd-budget LRU ✅
+
+> Design: [`doc/read-handle-lru-design-zh.md`](doc/read-handle-lru-design-zh.md)
+
+`read_files_` (read-only file handles) keeps one fd resident per file with **no eviction**
+→ large stores hit the ulimit. Evict read handles by LRU / count cap (complements P6's
+"close fd after mmap").
+
+### P10 — search_hybrid two-leg parallelism ✅
+
+> Design: [`doc/hybrid-parallel-design-zh.md`](doc/hybrid-parallel-design-zh.md)
+
+`search_text` → `search_vector` currently run **serially** before RRF fusion; the two legs
+are independent → run them on a thread pool in **parallel**, ~halving hybrid query latency
+(mind filter / cache sharing concurrency).
+
+### P11 — merge I/O sequential tuning ✅
+
+> Design: [`doc/merge-io-tuning-design-zh.md`](doc/merge-io-tuning-design-zh.md)
+
+Merge reads old files / writes new files sequentially with no readahead hint. Add
+`posix_fadvise(SEQUENTIAL/WILLNEED)` + larger buffers to cut merge IO stalls (low cost).
+
+### P12 — meta_blobs_ on-demand / bounded ⚠️ candidate
+
+> Design: [`doc/meta-blob-residency-design-zh.md`](doc/meta-blob-residency-design-zh.md)
+
+`Index::meta_blobs_` keeps every ord's meta blob **fully resident** (for filter eval);
+could switch to a bounded LRU or on-demand disk read. **But filter is on the hot search
+path, so on-demand reads would slow it → needs a gate**, hence candidate.
+
+### P13 — on-open on-demand background merge (small-file consolidation) ✅
+
+> Design: [`doc/open-merge-design-zh.md`](doc/open-merge-design-zh.md)
+
+**Root cause**: every read_write session's first write creates a **new** active file
+(file_id is monotonic, never reused, never reopens an old file for append — by design);
+many "open-write-close" cycles accumulate many small files.
+**Correction**: consolidation does **not** speed individual gets (keydir is O(1)); the real
+wins are **open cost / fd / mmap-friendliness / dead-space reclaim**.
+**Plan A (committed)**: after open (read_write), gate on `needs_merge` (reuse
+`small_file_threshold` etc.) and trigger merge **in the background** (merge_worker / dirty
+scheduler, **never blocking open**), collapsing to a few sealed files + a fresh active.
+Reuses the whole existing merge stack — mostly trigger wiring + a
+`{merge_on_open, off|background}` option. **Rejected**: unconditional/synchronous
+merge-on-open (O(data) startup, defeats snapshot fast-open).
+**Plan B (candidate)**: reopen the last non-full sealed file to append — stops small files
+at the source, but needs un-sealing, breaks the sealed-immutable invariant (conflicts with
+P6), and is invasive; candidate only.
+
 ---
 
 ## Shipped (2.1.0, persistence optimizations P1–P4)

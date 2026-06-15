@@ -1271,3 +1271,14 @@ P3c。**红线**：默认仍 f32+int8（召回优先）；int8-only 是内存受
 
 **读路径分层**：`LRU(派生) 命中? → 否 → mmap(raw, 无 syscall) → decode/dequant/分词 → 回填`。
 mmap = L1 字节层，P7 = L2 计算层，互补不竞争。**备选**：依赖 P6 先落地；raw value 永不缓。
+
+### P8–P13 — 增量优化（P8/P9/P10/P11/P13 承诺，P12 备选）
+
+| # | 内容 | ROI/风险 | 状态 |
+|---|------|---------|------|
+| **P8 HNSW merge rebuild 门控**（= P2 for HNSW）| merge 现**无条件全量 `rebuild_hnsw`**（重插所有 live 向量，O(n log n)，向量库 merge 大头）；但查询已 `is_live` 过滤死节点（`search_layer.cpp:225/232`）→ 重建**纯物理压实、正确性不依赖**。改为**按死节点比例门控**：死占比 < 阈值跳过重建（is_live 兜底），≥阈值才全量重建。与 P2 同范式。详见 `doc/hnsw-merge-gate-design-zh.md`。 | 高 / 低 | ✅ |
+| **P9 read_files_ fd 预算 LRU** | `read_files_` 每文件常驻 fd、无淘汰（`cask.cpp:1072`）→ 大库撞 ulimit。只读句柄按 LRU/数量上限淘汰（与 P6「mmap 后 close fd」互补）。详见 `doc/read-handle-lru-design-zh.md`。 | 中 / 低 | ✅ |
+| **P10 search_hybrid 两路并行** | `search_text`→`search_vector` 现串行（`search_layer.cpp:263/270`）+ RRF；两路独立 → 丢线程池并行，hybrid 延迟近减半。注意 filter/缓存共享并发安全。详见 `doc/hybrid-parallel-design-zh.md`。 | 中 / 中 | ✅ |
+| **P11 merge I/O 顺序优化** | merge 顺序读旧写新、无 readahead 提示。加 `posix_fadvise(SEQUENTIAL/WILLNEED)` + 大缓冲，降 IO stall（顺带 active 写也可 fadvise）。详见 `doc/merge-io-tuning-design-zh.md`。 | 中低 / 低 | ✅ |
+| **P12 meta_blobs_ 内存按需/有界** | `Index::meta_blobs_` 每 ord 全量常驻；改有界 LRU 或按需读盘。**但 filter 在搜索热路径 → 按需读盘拖慢，需 gate。** 详见 `doc/meta-blob-residency-design-zh.md`。 | 中 / 中 | ⚠️ 备选 |
+| **P13 open 时按需后台 merge**（小文件收拢）| 每个写会话首次写建**新** active 文件（file_id 单调不回退、不重开旧文件——by design）→ 多次 open-写-close 累积小文件。**方案 A（承诺）**：open 后按 `needs_merge`（复用 `small_file_threshold` 等）门控、**后台**触发 merge（不阻塞 open），收成少数 sealed + 新 active；复用现有 merge 全套 + `{merge_on_open, off\|background}` 选项。否决无条件/同步 merge-on-open（O(data) 启动）。**方案 B（备选）**：复用上一个未满 sealed 文件续写（需 un-seal、破坏 sealed 不可变/与 P6 冲突）。**校正**：合并不提速单 get（keydir O(1)），收益在 open/fd/mmap/死空间。详见 `doc/open-merge-design-zh.md`。 | 中 / 中 | ✅（方案 A）|
