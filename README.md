@@ -108,7 +108,10 @@ Handle 传给后续调用：
 %% 1) 构建 embedder 上下文（OpenAI 兼容端点，如 llama.cpp server / vLLM）
 1> {ok, Ctx} = bitcask_embedder:new(openai, #{
 1>     url   => "http://localhost:8080/v1/embeddings",
-1>     model => <<"qwen3-embedding">>, dim => 2560}).
+1>     model => <<"qwen3-embedding">>, dim => 2560,
+1>     max_input_bytes    => 32768,   % 可选，按模型上下文窗口设（默认 32768）
+1>     timeout_ms         => 30000,   % 可选，请求总超时（默认 30000）
+1>     connect_timeout_ms => 5000}).  % 可选，建连超时（默认 5000）
 {ok,#{module => bitcask_embedder_openai, dim => 2560, config => #{...}}}
 %% 2) open：vector_dim 必须 == embedder 维度；带上 {embedder, Ctx}
 2> H = bitcask:open("/tmp/vec", [read_write, {analyzer, whitespace},

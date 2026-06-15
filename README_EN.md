@@ -107,7 +107,10 @@ Note `open` returns a `{CaskRef, EmbedderCtx}` tuple; pass it as the handle:
 %% 1) Build an embedder context (OpenAI-compatible endpoint, e.g. llama.cpp / vLLM)
 1> {ok, Ctx} = bitcask_embedder:new(openai, #{
 1>     url   => "http://localhost:8080/v1/embeddings",
-1>     model => <<"qwen3-embedding">>, dim => 2560}).
+1>     model => <<"qwen3-embedding">>, dim => 2560,
+1>     max_input_bytes    => 32768,   % optional, set to the model's context window (default 32768)
+1>     timeout_ms         => 30000,   % optional, request timeout (default 30000)
+1>     connect_timeout_ms => 5000}).  % optional, connect timeout (default 5000)
 {ok,#{module => bitcask_embedder_openai, dim => 2560, config => #{...}}}
 %% 2) open: vector_dim must == embedder dim; pass {embedder, Ctx}
 2> H = bitcask:open("/tmp/vec", [read_write, {analyzer, whitespace},
