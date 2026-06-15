@@ -32,7 +32,7 @@
 //     至多一把锁 + relaxed 原子。
 //   - fold 期间：写已存在 key 在分片内升 sibling 链；新 key 经
 //     meta_mu_ 进 pending_。
-//   - fold 的 start/release/deep_copy/save_snapshot/load_snapshot 走
+//   - fold 的 start/release/save_snapshot/load_snapshot 走
 //     BarrierGuard 写者闸门屏障：置 barrier_active_ 后逐分片加锁-放锁
 //     排干在途写者；写者拿到分片锁后检查闸门退避，**读者照常并发**。
 //
@@ -339,11 +339,6 @@ public:
 
     // 线程安全: 是。锁: meta shared（iter 状态）;计数走 atomic,fstats 无锁。
     [[nodiscard]] KeyDirInfo info() const;
-    // 全量深拷贝；给 keydir_copy NIF 用（虽然 M6 之后不再 export，但内部
-    // 的 merge 有时会用浅快照走类似的路径）。
-    // 线程安全: 是。锁: 写者闸门屏障 + meta shared(屏障内纯读)。
-    // 注意: 大对象，O(n) 拷贝；屏障期间写者退避、读者照常并发。
-    [[nodiscard]] std::shared_ptr<KeyDir> deep_copy() const;
 
 private:
     friend class IterHandle;
@@ -475,8 +470,8 @@ private:
     std::atomic<std::uint32_t> biggest_file_id_{0};
     // pending_.has_value() 的无锁镜像:热路径在持分片锁后 relaxed 读,
     // 避免每次 get/put 都摸 meta_mu_。仅在持 meta_mu_ unique 时修改。
-    // (单独存在的意义:deep_copy 出的副本可能 keyfolders_==0 但 pending_
-    //  仍在——此时写路径仍须分流到 pending,不能只看 keyfolders_。)
+    // (单独存在的意义:release 收尾窗口里 keyfolders_ 可能已归零但 pending_
+    //  仍在应用中——此时写路径仍须分流到 pending,不能只看 keyfolders_。)
     std::atomic<bool> has_pending_{false};
     std::atomic<bool> is_ready_{false};
 

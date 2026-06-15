@@ -128,7 +128,7 @@ struct EntryAt {
 //         的全部修改(keyfolders_/pending_/entries)。
 //
 // 屏障期间**读者(get/next/conditional_remove peek/info)照常并发**:
-//   - 屏障持有者对各分片 entries 的无锁遍历(deep_copy/save/iter start)
+//   - 屏障持有者对各分片 entries 的无锁遍历(save/iter start)
 //     与读者的持锁 find 是读-读并发,天然安全;写者出清由排干循环的
 //     mutex 配对保证 happens-before。
 //   - 唯一的屏障内写路径是 iter release 的阶段二/折叠,均按分片锁协议
@@ -309,7 +309,7 @@ std::optional<EntryProxy> KeyDir::get(std::string_view key,
         return to_proxy(it->first, found.rev, /*tombstone*/ false);
     }
 
-    // entries miss → 只有 fold 态（或 deep_copy 残留 pending）才需要查
+    // entries miss → 只有 fold 态才需要查
     // pending。锁序:分片 → meta,嵌套合法。
     if (keyfolders_.load(std::memory_order_relaxed) > 0 ||
         has_pending_.load(std::memory_order_relaxed)) {
@@ -669,7 +669,7 @@ bool KeyDir::remove(std::string_view key, std::uint32_t remove_time) {
         return true;
     }
 
-    // entries miss → pending（仅 fold 态/deep_copy 残留）。
+    // entries miss → pending（仅 fold 态）。
     // 保持分片锁不放,嵌套 meta unique（锁序分片→meta;堵 merge TOCTOU）。
     if (fold_active || has_pending_.load(std::memory_order_relaxed)) {
         std::unique_lock mlock(meta_mu_);
@@ -974,7 +974,7 @@ void KeyDir::collapse_multi_entries_barrier() {
 }
 
 // =============================================================================
-// 杂项：is_ready / file_id 计数器 / info / deep_copy
+// 杂项：is_ready / file_id 计数器 / info
 // =============================================================================
 
 void KeyDir::mark_ready() {
@@ -1043,67 +1043,6 @@ KeyDirInfo KeyDir::info() const {
     }
     return r;
 }
-
-// 全量深拷贝。给 legacy keydir_copy NIF 用（M6 之后不再 export 给 Erlang，
-// 但 cask 内部某些 merge 路径仍可能用类似的快照）。
-// 拷贝出来的 keydir keyfolders_ 强制清零——副本是「干净的全新 keydir」，
-// 不继承任何活跃 fold 状态，直接可以独立使用。
-// 锁：写者闸门屏障 + meta shared。屏障内全是纯读,写者已出清——遍历
-// 各分片 entries 不需要分片锁（与并发读者是读-读并发,安全）。
-std::shared_ptr<KeyDir> KeyDir::deep_copy() const {
-    auto copy = std::make_shared<KeyDir>();
-    BarrierGuard barrier(*this);
-    std::shared_lock mlock(meta_mu_);
-    for (std::size_t i = 0; i < kShards; ++i) {
-        copy->shards_[i].entries = shards_[i].entries;
-    }
-    copy->pending_ = pending_;
-    copy->has_pending_.store(pending_.has_value(), std::memory_order_relaxed);
-    {
-        const std::size_t fn = fstats_size_.load(std::memory_order_acquire);
-        std::lock_guard<std::mutex> g(copy->fstats_grow_mu_);
-        while (copy->fstats_.size() < fn) copy->fstats_.emplace_back();
-        for (std::size_t i = 0; i < fn; ++i) {
-            const auto& a = fstats_[i];
-            auto& b = copy->fstats_[i];
-            b.live_keys.store(a.live_keys.load(std::memory_order_relaxed),
-                              std::memory_order_relaxed);
-            b.total_keys.store(a.total_keys.load(std::memory_order_relaxed),
-                               std::memory_order_relaxed);
-            b.live_bytes.store(a.live_bytes.load(std::memory_order_relaxed),
-                               std::memory_order_relaxed);
-            b.total_bytes.store(a.total_bytes.load(std::memory_order_relaxed),
-                                std::memory_order_relaxed);
-            b.oldest_tstamp.store(a.oldest_tstamp.load(std::memory_order_relaxed),
-                                  std::memory_order_relaxed);
-            b.newest_tstamp.store(a.newest_tstamp.load(std::memory_order_relaxed),
-                                  std::memory_order_relaxed);
-            b.expiration_epoch.store(
-                a.expiration_epoch.load(std::memory_order_relaxed),
-                std::memory_order_relaxed);
-            b.present.store(a.present.load(std::memory_order_relaxed),
-                            std::memory_order_relaxed);
-        }
-        copy->fstats_size_.store(fn, std::memory_order_release);
-    }
-    copy->key_count_.store(key_count_.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    copy->key_bytes_.store(key_bytes_.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    copy->epoch_.store(epoch_.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    copy->next_ord_.store(next_ord_.load(std::memory_order_relaxed),
-                          std::memory_order_relaxed);
-    copy->biggest_file_id_.store(biggest_file_id_.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    copy->is_ready_.store(is_ready_.load(std::memory_order_relaxed),
-                          std::memory_order_relaxed);
-    copy->iter_generation_ = iter_generation_;
-    copy->keyfolders_.store(0, std::memory_order_relaxed);  // 副本不继承 fold 状态
-    copy->newest_folder_epoch_ = 0;
-    copy->iter_mutation_.store(false, std::memory_order_relaxed);
-    copy->pending_start_epoch_ = pending_start_epoch_;
-    copy->pending_start_time_  = pending_start_time_;
-    copy->pending_updated_     = pending_updated_;
-    return copy;
-}
-
 
 // ============================================================================
 // A4:keydir 段快照(设计 doc/recovery-snapshot-design-zh.md)

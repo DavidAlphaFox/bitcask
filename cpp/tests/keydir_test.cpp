@@ -95,21 +95,6 @@ TEST(KeyDir, PutMultipleKeysDifferentOrd) {
     EXPECT_EQ(kd.get("c")->ord, 3u);
 }
 
-TEST(KeyDir, DeepCopyPreservesOrd) {
-    KeyDir kd;
-    kd.put("k1", 1, 10, 100, 1000, 0, true, 0, 0, 5);
-    kd.alloc_ord();
-    kd.alloc_ord();
-
-    auto copy = kd.deep_copy();
-
-    EXPECT_EQ(copy->get("k1")->ord, 5u);
-
-    auto r = copy->put("k2", 1, 10, 100, 1000, 0, true, 0, 0, 99);
-    EXPECT_EQ(r, PutResult::kOk);
-    EXPECT_EQ(copy->get("k2")->ord, 99u);
-}
-
 TEST(KeyDir, AdvanceOrdAfterPut) {
     KeyDir kd;
 
