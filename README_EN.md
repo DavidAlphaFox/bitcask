@@ -97,8 +97,10 @@ ok
 > Calling any `search_*` on a cask opened **without** an analyzer returns
 > `{error, no_index}`.
 
-**HNSW vector search** — open with `{vector_dim, N}` to enable. Vectors are f32
-little-endian binaries (`<< <<X:32/float-little>> || X <- Floats >>`):
+**HNSW vector search** — vector search requires index mode; open with
+`{analyzer, ...}` + `{vector_dim, N}` (optional `{vector_metric, cosine|l2|dot}`,
+default `cosine`). Vectors are f32 little-endian binaries
+(`<< <<X:32/float-little>> || X <- Floats >>`):
 
 ```erlang
 1> R = bitcask:open("/tmp/vec", [read_write,
@@ -107,8 +109,8 @@ little-endian binaries (`<< <<X:32/float-little>> || X <- Floats >>`):
 3> bitcask:put(R, <<"d1">>, #{text => <<"hello">>, vector => Vec}).
 ok
 4> Q = << <<X:32/float-little>> || X <- [0.9, 0.1, 0.0, 0.0] >>.
-5> bitcask:search_vector(R, Q).          % top-K nearest neighbors
-{ok,[{<<"d1">>,0,0.99499}]}
+5> bitcask:search_vector(R, Q).          % top-K nearest neighbors (cosine similarity)
+{ok,[{<<"d1">>,0,0.99388}]}
 6> bitcask:close(R).
 ok
 ```
@@ -131,7 +133,7 @@ ok
 | `merge/1,2,3`, `needs_merge/1,2`, `status/1` | Merge management |
 | `search_text/2,3`, `search_phrase/2,3`, `search_fields/2,3` | BM25 search (full-text / phrase / `field:term^boost`) |
 | `search_near/3,4`, `search_fuzzy/3,4`, `search_wildcard/2,3` | Proximity / fuzzy (edit-distance) / wildcard search |
-| `search_vector/2,3,4`, `search_hybrid/3,4` | HNSW vector nearest-neighbor / RRF hybrid (BM25+vector) |
+| `search_vector/2,3,4,5`, `search_hybrid/3,4,5` | HNSW vector nearest-neighbor / RRF hybrid (BM25+vector); `/5` takes a trailing meta filter |
 | `set_synonym_map/2` | Load a synonym dictionary |
 | `is_empty_estimate/1`, `is_frozen/1`, `close_write_file/1` | Utilities |
 

@@ -98,8 +98,9 @@ ok
 
 > 在**未指定分析器**的 cask 上调用任何 `search_*` 函数将返回 `{error, no_index}`。
 
-**HNSW 向量搜索** — 用 `{vector_dim, N}` 打开即可启用。向量为 f32 小端序二进制
-（`<< <<X:32/float-little>> || X <- Floats >>`）：
+**HNSW 向量搜索** — 向量搜索需索引模式，用 `{analyzer, ...}` + `{vector_dim, N}`
+（可选 `{vector_metric, cosine|l2|dot}`，默认 `cosine`）打开即可启用。向量为 f32
+小端序二进制（`<< <<X:32/float-little>> || X <- Floats >>`）：
 
 ```erlang
 1> R = bitcask:open("/tmp/vec", [read_write,
@@ -108,8 +109,8 @@ ok
 3> bitcask:put(R, <<"d1">>, #{text => <<"hello">>, vector => Vec}).
 ok
 4> Q = << <<X:32/float-little>> || X <- [0.9, 0.1, 0.0, 0.0] >>.
-5> bitcask:search_vector(R, Q).          % top-K 最近邻
-{ok,[{<<"d1">>,0,0.99499}]}
+5> bitcask:search_vector(R, Q).          % top-K 最近邻（cosine 相似度）
+{ok,[{<<"d1">>,0,0.99388}]}
 6> bitcask:close(R).
 ok
 ```
@@ -132,7 +133,7 @@ ok
 | `merge/1,2,3`, `needs_merge/1,2`, `status/1` | 合并管理 |
 | `search_text/2,3`, `search_phrase/2,3`, `search_fields/2,3` | BM25 检索（全文 / 短语 / `field:term^boost`） |
 | `search_near/3,4`, `search_fuzzy/3,4`, `search_wildcard/2,3` | 近邻 / 模糊（编辑距离）/ 通配符搜索 |
-| `search_vector/2,3,4`, `search_hybrid/3,4` | HNSW 向量近邻 / RRF 混合检索（BM25 + 向量） |
+| `search_vector/2,3,4,5`, `search_hybrid/3,4,5` | HNSW 向量近邻 / RRF 混合检索（BM25 + 向量）；`/5` 末参为 meta filter |
 | `set_synonym_map/2` | 加载同义词词典 |
 | `is_empty_estimate/1`, `is_frozen/1`, `close_write_file/1` | 工具函数 |
 
