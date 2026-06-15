@@ -46,7 +46,9 @@ void SearchCache::put(const CacheKey& key, std::vector<bm25::SearchResult> resul
     if (it != map_.end()) {
         it->second->results = std::move(results);
         it->second->terms = std::move(terms);
-        it->second->last_used = now;  // 独占锁下无并发读者,普通写安全
+        // 经 atomic_ref 写:与 get 的 atomic_ref 访问保持同一对象全程原子。
+        std::atomic_ref<std::uint64_t>(it->second->last_used)
+            .store(now, std::memory_order_relaxed);
         return;
     }
 
@@ -99,8 +101,13 @@ void SearchCache::evict_if_needed() {
     // O(n) 扫描,n ≤ max_entries_(默认 256),仅在 put 溢出时发生。
     while (lru_list_.size() > max_entries_) {
         auto oldest = lru_list_.begin();
+        auto lu = [](const ListNode& n) {
+            return std::atomic_ref<std::uint64_t>(
+                       const_cast<std::uint64_t&>(n.last_used))
+                .load(std::memory_order_relaxed);
+        };
         for (auto it = std::next(oldest); it != lru_list_.end(); ++it) {
-            if (it->last_used < oldest->last_used) oldest = it;
+            if (lu(*it) < lu(*oldest)) oldest = it;
         }
         map_.erase(oldest->key.hash);
         lru_list_.erase(oldest);

@@ -80,7 +80,9 @@ private:
         CacheKey key;
         std::vector<bm25::SearchResult> results;
         std::vector<std::string> terms;   // 该查询的词集（用于 invalidate_terms 交集判定）
-        std::uint64_t last_used = 0;      // 访问序号;get 在共享锁下经 atomic_ref 更新
+        // 访问序号。所有读写一律经 atomic_ref（get 共享锁下并发更新）——
+        // 混用 atomic_ref 与普通访问同一对象是 UB,即便锁已排斥并发重叠。
+        std::uint64_t last_used = 0;
     };
     mutable std::list<ListNode> lru_list_;
 
