@@ -268,7 +268,7 @@ public:
     [[nodiscard]] bool index_positions() const { return index_positions_; }
     // A4-P2:已索引最大 ord 水位(u64(-1)=尚无文档)。快照成对性门用。
     [[nodiscard]] std::uint64_t max_indexed_ord() const {
-        return max_indexed_ord_;
+        return max_indexed_ord_.load(std::memory_order_relaxed);
     }
 
     // ---- 写 ----
@@ -413,7 +413,8 @@ private:
     // load 后的 replay_wal 重放已在快照里的 (ord, term)；用水位把 ord ≤ 水位的
     // 重放整文档丢弃，保证 PostingList::items 严格升序无重复（intersect_u64 /
     // find 二分 / note_appended 封块都依赖该不变量）。-1 = 尚未索引任何文档。
-    std::uint64_t max_indexed_ord_ = static_cast<std::uint64_t>(-1);
+    // atomic:worker 线程写,搜索线程经 max_indexed_ord() 读,跨线程访问。
+    std::atomic<std::uint64_t> max_indexed_ord_{static_cast<std::uint64_t>(-1)};
 
     // WAL（S8.9）。
     std::unique_ptr<InvertedWal> wal_;

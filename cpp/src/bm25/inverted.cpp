@@ -320,11 +320,11 @@ void InvertedIndex::add_doc(
     // replay_wal 重放快照已含的条目），整文档丢弃，避免 items 重复/乱序。
     // 正常追加 ord 单调递增 > 水位，一次比较即过（max_indexed_ord_ 初值 -1
     // 使首个文档 ord=0 也通过）。
-    if (max_indexed_ord_ != static_cast<std::uint64_t>(-1) &&
-        ord <= max_indexed_ord_) {
+    const std::uint64_t wm = max_indexed_ord_.load(std::memory_order_relaxed);
+    if (wm != static_cast<std::uint64_t>(-1) && ord <= wm) {
         return;
     }
-    max_indexed_ord_ = ord;
+    max_indexed_ord_.store(ord, std::memory_order_relaxed);
 
     // v5 impacts:doc_len 先求和——posting 携带索引时 dl,封块算 min_dl。
     auto doc_len = std::uint32_t{0};
@@ -1706,11 +1706,28 @@ auto InvertedIndex::save(std::string_view path) const -> bool {
     constexpr std::size_t kBlock = PostingList::kBlockSize;
 
     for (auto& shard : shards_) {
-        std::uint32_t term_count = static_cast<std::uint32_t>(shard.inverted.size());
+        // 安全遍历:先快照 key,再逐 key 经 const_accessor 取 shared_ptr。
+        // save 在 merge 线程跑,与 put→worker 的 add_doc 并发——裸遍历
+        // concurrent_hash_map 会因懒 rehash 重访/漏访,裸读 plsp 还会撞上
+        // CoW 替换/撕裂(不变量集中见 collect_term_keys)。const_accessor 持
+        // shared_ptr 期间数据 immutable(写者见 use_count>1 则克隆)。
+        auto keys = collect_term_keys(shard.inverted,
+                                      [](const std::string&) { return true; });
+        std::vector<std::pair<const std::string*, std::shared_ptr<PostingList>>> snap;
+        snap.reserve(keys.size());
+        for (const auto& key : keys) {
+            PostingMap::const_accessor acc;
+            if (shard.inverted.find(acc, key)) {
+                snap.emplace_back(&key, acc->second);
+            }
+        }
+
+        std::uint32_t term_count = static_cast<std::uint32_t>(snap.size());
         ok = write_u32(term_count);
         if (!ok) { std::fclose(f); return false; }
 
-        for (auto& [term, plsp] : shard.inverted) {
+        for (auto& [termp, plsp] : snap) {
+            const std::string& term = *termp;
             const PostingList& pl = *plsp;
             auto tlen = static_cast<std::uint32_t>(term.size());
             ok = write_u32(tlen);
@@ -1962,9 +1979,10 @@ auto InvertedIndex::load(std::string_view path) -> bool {
             // 用 -1 哨兵区分「未索引任何」与「ord=0」。
             for (auto& p : pl.items) {
                 if (p.tf > pl.max_tf) pl.max_tf = p.tf;
-                if (max_indexed_ord_ == static_cast<std::uint64_t>(-1) ||
-                    p.ord > max_indexed_ord_) {
-                    max_indexed_ord_ = p.ord;
+                // load 单线程,relaxed 足够。
+                const std::uint64_t wm = max_indexed_ord_.load(std::memory_order_relaxed);
+                if (wm == static_cast<std::uint64_t>(-1) || p.ord > wm) {
+                    max_indexed_ord_.store(p.ord, std::memory_order_relaxed);
                 }
             }
             shard.inverted.emplace(std::move(term), std::make_shared<PostingList>(std::move(pl)));
