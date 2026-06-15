@@ -24,6 +24,7 @@ struct Atoms {
 
     // 当前 cask_* / collection_* NIF 使用的 atom
     ERL_NIF_TERM o_sync;
+    ERL_NIF_TERM puts;       // {sync_strategy, {puts, N}} 组提交
     ERL_NIF_TERM not_found;
     ERL_NIF_TERM already_exists;
     ERL_NIF_TERM out_of_date;

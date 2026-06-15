@@ -54,6 +54,10 @@ struct CaskOptions {
     bool          read_write       = false;
     std::uint64_t max_file_size    = 2ULL * 1024ULL * 1024ULL * 1024ULL;  // 2 GiB
     bool          o_sync           = false;
+    // P4 单写者组提交：每 N 次写（put/remove）后对 active data file fsync 一次，
+    // 兼顾持久性与吞吐（区别于 o_sync 的每条 durable）。0 = 关闭（默认）。
+    // o_sync 为真时本项无意义（已逐条 durable）。
+    std::uint32_t sync_every_n     = 0;
     bool          require_hint_crc = false;  // legacy 默认 false；M5 之后可能改 true
     // tstamp < (now - expiry_secs) 的 record 在 get/fold 中被过滤，
     // 同时进入「过期触发 merge」的候选。0 = 禁用。
@@ -453,6 +457,9 @@ private:
     std::shared_ptr<fileops::DataFile> active_data_;
     std::unique_ptr<fileops::HintFile> active_hint_;
     std::uint32_t active_file_id_ = 0;
+    // P4 组提交计数：自上次 fsync 以来的写次数。写路径单线程（caller 串行），
+    // 无需原子。sync_every_n>0 时由 maybe_group_commit() 维护。
+    std::uint32_t writes_since_sync_ = 0;
 
     // 按 file_id 缓存的 DataFile 读句柄。read 路径懒打开。
     // 多读者并发，read_cache_mu_ 保护 unordered_map 本身；DataFile 内部
@@ -497,6 +504,11 @@ public:
     // 内部辅助
     [[nodiscard]] std::expected<void, CaskFault> load_keydir_from_disk(search::SearchLayer* search_layer);
     [[nodiscard]] std::expected<void, CaskFault> ensure_active_writer();
+
+    // P4：组提交。每次写后调用；sync_every_n>0 且累计写数达阈值时 fsync 一次
+    // active data file 并清零计数。force=true（close/sync 收尾）则只要有未落盘
+    // 写就立即 fsync。o_sync 模式或 sync_every_n==0 时为 no-op。
+    [[nodiscard]] std::expected<void, CaskFault> maybe_group_commit(bool force = false);
     [[nodiscard]] std::expected<void, CaskFault> roll_active_if_needed(std::size_t about_to_write);
     // 无条件 finalize 当前 active writer 并开新一轮（新 file_id）。
     // put() 在 keydir.biggest_file_id 被并发 merger 顶过去时调用——

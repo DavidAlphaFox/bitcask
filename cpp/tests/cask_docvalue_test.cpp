@@ -1078,6 +1078,33 @@ TEST_F(CaskDocValueTest, JiebaIndexModePutDoesNotCrash) {
     SUCCEED();
 }
 
+// P4：单写者组提交（{sync_strategy,{puts,N}} = sync_every_n）。写入在组提交
+// 模式下不丢、不坏，close 的 force-flush 落最后一批；重开全部可读。
+TEST_F(CaskDocValueTest, P4GroupCommitWritesSurviveReopen) {
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.sync_every_n = 3;  // 每 3 次写 fsync 一次
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        for (int i = 0; i < 10; ++i) {  // 10 % 3 = 1 条留给 close force-flush
+            std::vector<std::byte> k{std::byte{'k'}, static_cast<std::byte>('0' + i)};
+            std::vector<std::byte> v{std::byte{'v'}, static_cast<std::byte>('0' + i)};
+            ASSERT_TRUE((*c)->put(k, v, 1000 + i));
+        }
+        (*c)->close();
+    }
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+    for (int i = 0; i < 10; ++i) {
+        std::vector<std::byte> k{std::byte{'k'}, static_cast<std::byte>('0' + i)};
+        auto g = (*c)->get_owned(k);
+        ASSERT_TRUE(g) << "missing key " << i;
+        ASSERT_EQ(g->value.size(), 2u);
+    }
+    (*c)->close();
+}
+
 // 写入归一化 + get 透传 + 重开持久(cosine_normalized 默认度量)。
 TEST_F(CaskDocValueTest, V31VectorRoundTripNormalized) {
     auto opts = v31_opts(4);

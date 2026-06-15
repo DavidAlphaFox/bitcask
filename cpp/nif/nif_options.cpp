@@ -124,7 +124,19 @@ void parse_2tuple_option(ErlNifEnv* env, const ERL_NIF_TERM* tup, CaskOptions& o
         int v = 0;
         if (opt_int(env, val, &v) && v == 2) o.tombstone_version = 2;
     } else if (key == atoms().sync_strategy) {
-        if (val == atoms().o_sync) o.o_sync = true;
+        if (val == atoms().o_sync) {
+            o.o_sync = true;
+        } else {
+            // P4:{sync_strategy, {puts, N}} —— 单写者组提交，每 N 次写 fsync。
+            int arity = 0;
+            const ERL_NIF_TERM* tup = nullptr;
+            int n = 0;
+            if (enif_get_tuple(env, val, &arity, &tup) && arity == 2 &&
+                tup[0] == atoms().puts &&
+                enif_get_int(env, tup[1], &n) && n > 0) {
+                o.sync_every_n = static_cast<std::uint32_t>(n);
+            }
+        }
     } else if (key == atoms().vector_dim) {
         // V3.6:{vector_dim, N},N ∈ [1, 65535]。dim>0 要求索引模式
         // (Cask::open 校验 enable_search,不符 → kInvalidOption)。

@@ -47,7 +47,10 @@ public:
     // ---- 写入 ----
 
     // append 一条 hint record。同时更新 running_crc_。
-    // 线程安全: 否（修改 running_crc_ 与底层 fd 顺序写状态）；caller 串行化。
+    // 写入先进内存缓冲 pending_，攒到阈值（kFlushBytes）才一次 write(2)，把
+    // 写路径的 per-put syscall 减半（hint 可重建：崩溃丢缓冲 → 下次 open
+    // 无 trailer → validate_trailer 失败 → fold(data) 回退，安全语义不变）。
+    // 线程安全: 否（修改 pending_/running_crc_ 与底层 fd 顺序写状态）；caller 串行化。
     [[nodiscard]] std::expected<void, DataFileFault>
     write(std::uint32_t tstamp, std::uint32_t total_sz,
           std::uint64_t offset, bool tombstone,
@@ -85,11 +88,17 @@ private:
     HintFile(io::PosixFile&& f, std::string p, std::uint32_t crc, Mode m) noexcept
         : file_(std::move(f)), path_(std::move(p)), running_crc_(crc), mode_(m) {}
 
+    // 把 pending_ 的内容一次性 write 到 fd 并清空（pending 为空则 no-op）。
+    [[nodiscard]] std::expected<void, DataFileFault> flush_pending();
+
+    // 攒满多少字节就 flush 一次（hint 可重建，丢缓冲只触发 fold(data) 回退）。
+    static constexpr std::size_t kFlushBytes = 64 * 1024;
+
     io::PosixFile file_;
     std::string   path_;
     std::uint32_t running_crc_ = 0;
     Mode          mode_        = Mode::kRead;
-    std::vector<std::byte> write_buf_;  // write()/finalize() 复用的编码缓冲
+    std::vector<std::byte> pending_;  // 攒批写缓冲（write 追加，flush/finalize 落盘）
 };
 
 }  // namespace bitcask::fileops

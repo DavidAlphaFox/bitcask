@@ -1192,3 +1192,21 @@ WAND 路径无此问题。建议顺序：P2.1 → 基准 → P2.2 → P2.3。
 | A4-P2 live gate re-open | ❌ V7+ | Index sidecar 持久化是实质 blocker；当前性能不受损 |
 | Live/Roaring bitmap (ord > 100M) | ❌ V7+ | 未到规模 |
 | WAL group-commit 跨线程 | ❌ V7+ | TSan 死锁检测器 64 持锁上限（M6.6），新锁模式需独立评审 |
+
+---
+
+## V7 — 文件持久化优化（P 系列）
+
+> 来源：持久化路径审计（2026-06）。恢复/WAL/倒排快照已优化，剩余收益集中在
+> 写路径 syscall、merge 重分词、向量落盘体积、单写者组提交四处。每项先
+> standalone 编译+测试再全量 ctest；改磁盘格式必更新黄金 fixture。
+
+| # | 内容 | ROI/风险 | 状态 |
+|---|------|---------|------|
+| **P1 Hint 写缓冲** | hint 可重建（崩溃丢缓冲 → 下次 open 回退 data fold，trailer CRC 判失效）。`HintFile::write` 由每条 `write(2)` 改为内存缓冲，按阈值（64KB）+ roll/finalize flush。写路径 syscall 减半；data 写仍逐条（权威 + offset 即时）。 | 高 / 低 | ✅ |
+| **P2 merge 不重分词** | 倒排 posting 以 ord 为键、跨 merge 稳定；merge 只改 file_id/offset（keydir CAS 已处理），terms 不变。当前 `rebuild_index` 全量重读+重分词兼做「物理清死 posting」。拆分：merge 走 location-only 重映射；死 posting 靠 `is_live` 查询过滤；压实降频为周期/阈值触发。**先核实 posting 不依赖文件位置再动。** | 高 / 中 | 🚧 进行中 |
+| **P3 向量落盘 int8 量化** | data file 向量 f32（2560 维=10KB/doc）→ 落盘 int8（4× 磁盘+读 I/O）。设计见 `doc/vector-ondisk-quant-design-zh.md`。**P3a ✅**：codec int8 编解码（码字 `[Dim][SchemeVer:u8][scale:f32][int8×Dim]`，复用 `vec::int8`）+ `doc_vector_f32` dequant + round-trip fixture，读端接受量化（取代 V6.4.1 stub-reject）；**未碰 open**。**P3b**（open `{vector_quantized}` 接线 + meta 持久化 + HNSW 直接吃 codes）、**P3c**（召回测量定默认）为 follow-on。 | 中高 / 高 | 🚧 P3a ✅ / P3b·P3c 待 |
+| **P4 单写者组提交** | 实测发现 `{seconds,N}` 文档有声明但 C++ 未实现（只认 o_sync）。新增 `{sync_strategy,{puts,N}}`：单写者线程内每 N 次写 fsync 一次（`maybe_group_commit`），close/roll/sync 收尾 force-flush。不引入跨线程锁（区别于已否决的「WAL group-commit 跨线程」）。 | 中 / 中 | ✅ |
+
+**已分析判否**：Ord/Tstamp 变长（破坏 O(1) 随机 offset 独立解码）；hint key 去重
+（hint 须自带 key 重建 keydir）；mmap（与 merge unlink 生命周期冲突）。

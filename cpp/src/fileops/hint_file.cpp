@@ -29,8 +29,18 @@ HintFile::open(std::string_view path, Mode mode, bool sync) {
 // 写入
 // ---------------------------------------------------------------------------
 
-// 追加一条 hint record。同步把刚写的字节也算进 running_crc_——finalize
-// 时会用这个累计值生成 trailer，下次 open 验文件完整性。
+// 把攒批缓冲一次性落盘（空缓冲 no-op）。
+std::expected<void, DataFileFault> HintFile::flush_pending() {
+    if (pending_.empty()) return {};
+    auto w = file_.write(pending_);
+    if (!w) return std::unexpected(io_fault(w.error()));
+    pending_.clear();  // 复用容量
+    return {};
+}
+
+// 追加一条 hint record（先进 pending_ 缓冲，攒满 kFlushBytes 才落盘）。同步把
+// 刚编码的字节算进 running_crc_——finalize 用这个累计值生成 trailer，下次 open
+// 验文件完整性。encode 是 append 语义，直接写进 pending_ 末尾免一次拷贝。
 std::expected<void, DataFileFault>
 HintFile::write(std::uint32_t tstamp, std::uint32_t total_sz,
                 std::uint64_t offset, bool tombstone,
@@ -41,25 +51,25 @@ HintFile::write(std::uint32_t tstamp, std::uint32_t total_sz,
     if (offset > format::kMaxOffsetV2) {
         return std::unexpected(DataFileFault{DataFileError::kTooLarge});
     }
-    write_buf_.clear();  // 复用容量:稳态零分配(encode 是 append 语义)
-    codec::encode_hint_record(write_buf_, tstamp, total_sz, offset, tombstone, key);
+    const std::size_t before = pending_.size();
+    codec::encode_hint_record(pending_, tstamp, total_sz, offset, tombstone, key);
+    running_crc_ = codec::crc32_update(
+        running_crc_,
+        std::span<const std::byte>(pending_.data() + before,
+                                   pending_.size() - before));
 
-    auto w = file_.write(write_buf_);
-    if (!w) return std::unexpected(io_fault(w.error()));
-
-    running_crc_ = codec::crc32_update(running_crc_, write_buf_);
+    if (pending_.size() >= kFlushBytes) {
+        if (auto r = flush_pending(); !r) return r;
+    }
     return {};
 }
 
-// 写 EOF sentinel 并把 running_crc_ 嵌进去。这是 hint 文件的「封口」操作；
-// 没封口的 hint 文件下次 open 会被 validate_trailer() 判失败，cask 会
-// fallback 到 fold(data) 重建——慢但可靠。
+// 写 EOF sentinel 并把 running_crc_ 嵌进去，连同缓冲里剩余 record 一次落盘。
+// 这是 hint 文件的「封口」操作；没封口的 hint 文件下次 open 会被
+// validate_trailer() 判失败，cask 会 fallback 到 fold(data) 重建——慢但可靠。
 std::expected<void, DataFileFault> HintFile::finalize() {
-    write_buf_.clear();
-    codec::encode_hint_eof(write_buf_, running_crc_);
-    auto w = file_.write(write_buf_);
-    if (!w) return std::unexpected(io_fault(w.error()));
-    return {};
+    codec::encode_hint_eof(pending_, running_crc_);  // 追加 sentinel
+    return flush_pending();                          // 缓冲 record + sentinel 一次写
 }
 
 // ---------------------------------------------------------------------------

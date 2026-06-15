@@ -640,6 +640,7 @@ Cask::create_search_infra(const CaskOptions& opts) {
 // 失败全部静默——close 路径上的错误没有合理的恢复动作，硬抛会让 Erlang
 // 进程意外崩溃。
 void Cask::close() noexcept {
+    (void)maybe_group_commit(/*force*/ true);  // P4:落最后一批未 fsync 的写
     if (active_hint_) {
         (void)active_hint_->finalize();
         active_hint_.reset();
@@ -794,20 +795,15 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
                     auto dv = codec::decode_doc_value(std::span<const std::byte>(view.value));
                     // V3.3:带向量的文档即使 text 为空也要恢复(否则
                     // Index 无该 ord,live 过滤会把它当死文档)。
-                    if (dv && (!dv->text.empty() || dv->has_vector)) {
+                    // P3b:量化落盘(vec_quantized)也算带向量。
+                    const bool dv_has_vec = dv && (dv->has_vector || dv->vec_quantized);
+                    if (dv && (!dv->text.empty() || dv_has_vec)) {
                         std::string_view text_sv(
                             reinterpret_cast<const char*>(dv->text.data()),
                             dv->text.size());
-                        // V3.3:vector_raw 是字节流,**未对齐**——memcpy
-                        // 进局部 float 缓冲,严禁 reinterpret_cast 直读
-                        // (UBSan 未对齐前科)。
-                        std::vector<float> vbuf;
-                        if (dv->has_vector && dv->dim > 0 &&
-                            dv->vector_raw.size() == dv->dim * sizeof(float)) {
-                            vbuf.resize(dv->dim);
-                            std::memcpy(vbuf.data(), dv->vector_raw.data(),
-                                        dv->vector_raw.size());
-                        }
+                        // P3b:doc_vector_f32 统一处理 f32 与 int8 量化两种落盘
+                        // （内部 memcpy 未对齐安全 / dequant）。
+                        std::vector<float> vbuf = codec::doc_vector_f32(*dv);
                         search_layer->recover_doc(bytes_to_view(view.key), view.ord,
                                                   text_sv, static_cast<std::uint32_t>(e.tstamp),
                                                   offset, total_size, view.tstamp,
@@ -954,6 +950,24 @@ std::expected<void, CaskFault> Cask::ensure_active_writer() {
     return {};
 }
 
+// P4 单写者组提交。put/remove/put_doc 每次写后调用。o_sync 已逐条 durable、
+// 或 sync_every_n==0、或无 active writer → no-op。累计写数达阈值（或 force）
+// 时对 active data file fsync 一次并清零计数。写路径单线程，计数无需原子。
+// hint 不在此 fsync——它可重建，崩溃回退 fold(data)。
+std::expected<void, CaskFault> Cask::maybe_group_commit(bool force) {
+    if (opts_.o_sync || opts_.sync_every_n == 0 || !active_data_) return {};
+    if (!force) ++writes_since_sync_;
+    const bool flush_now =
+        force ? (writes_since_sync_ > 0) : (writes_since_sync_ >= opts_.sync_every_n);
+    if (!flush_now) return {};
+    if (auto r = active_data_->sync(); !r) {
+        return std::unexpected(io_fault(r.error().errnum,
+                                        std::string(active_data_->path())));
+    }
+    writes_since_sync_ = 0;
+    return {};
+}
+
 // 写入前的预检：要么没 active writer（首次写入或 close_write_file 之后），
 // 要么 active 写满了——两种情况都需要建一个新文件。
 std::expected<void, CaskFault>
@@ -967,6 +981,7 @@ Cask::roll_active_if_needed(std::size_t about_to_write) {
 // 然后丢掉 active data/hint 句柄，新建一个新 file_id 的 active writer。
 // put 在 keydir.biggest_file_id 被并发 merger 顶过去时也走这条路径。
 std::expected<void, CaskFault> Cask::roll_active() {
+    if (auto r = maybe_group_commit(/*force*/ true); !r) return r;  // P4:落旧文件尾批
     if (active_hint_) {
         if (auto r = active_hint_->finalize(); !r) {
             return std::unexpected(io_fault(r.error().errnum,
@@ -1292,6 +1307,7 @@ Cask::put(std::span<const std::byte> key,
         std::string_view(reinterpret_cast<const char*>(value.data()),
                          value.size()),
         persisted->file_id, persisted->offset, persisted->total_size, tstamp, 0));
+    if (auto r = maybe_group_commit(); !r) return std::unexpected(r.error());
     return {};
 }
 
@@ -1345,6 +1361,7 @@ Cask::remove(std::span<const std::byte> key, std::uint32_t tstamp) {
     } else if (search_) {
         search_->on_delete(bytes_to_view(key), ord);
     }
+    if (auto r = maybe_group_commit(); !r) return std::unexpected(r.error());
     return {};
 }
 
@@ -1423,6 +1440,7 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
     task.vec.assign(vec_out.begin(), vec_out.end());
     task.meta.assign(doc.meta.begin(), doc.meta.end());
     submit_index_task(std::move(task));
+    if (auto r = maybe_group_commit(); !r) return std::unexpected(r.error());
     return {};
 }
 
@@ -1531,6 +1549,7 @@ std::expected<void, CaskFault> Cask::sync() {
         if (auto r = active_data_->sync(); !r) {
             return std::unexpected(io_fault(r.error().errnum));
         }
+        writes_since_sync_ = 0;  // P4:全量 fsync 后组提交计数清零
     }
     return {};
 }
@@ -1612,12 +1631,13 @@ Cask::NeedsMerge Cask::needs_merge(std::uint32_t now_sec) {
 //  Phase 1 — Data compaction:
 //    1. run_merge()  重写活 record 到新文件, CAS 更新 KeyDir
 //
-//  Phase 2 — Index rebuild (search_ 存在时):
-//    2. write_keydir_snapshot()  捕获 pre-rebuild ord 水位
+//  Phase 2 — Index maintenance (search_ 存在时):
+//    2. write_keydir_snapshot()  捕获 ord 水位
 //    3. flush IndexPool          排干待处理索引任务
-//    4. rebuild_index()          全量 BM25 重建(从活文档重分析)
+//    4. compact()                P2:阈值压实死 posting(不重读、不重分词;
+//                                定位由 run_merge 的 on_relocate 已更新)
 //    5. save bm25 snapshot + index sidecar
-//    6. rebuild_hnsw + flush     同步重建 HNSW 图
+//    6. rebuild_hnsw + flush     同步重建 HNSW 图(物理清死节点)
 //    7. save hnsw snapshot       V4:持久化重建后图(下次 open 走快照路径)
 //
 //  Phase 3 — Cleanup:
@@ -1626,11 +1646,10 @@ Cask::NeedsMerge Cask::needs_merge(std::uint32_t now_sec) {
 //   10. write_keydir_snapshot()  最终状态快照
 //
 // 关键约束:
-//  - Phase 2 的 flush(3)必须在 rebuild_index(4)之前,保证 Index 覆盖全部
-//    已分配 ord,且 IndexPool worker 无在途任务(否则 rebuild 期间 in-flight
-//    task 持旧 ord 可能写到错误位置)
+//  - Phase 2 的 flush(3)必须在 compact(4)之前,保证 Index 覆盖全部已分配 ord,
+//    且 IndexPool worker 无在途任务(否则在途 task 持旧 ord 可能写错位置)
 //  - Phase 2 的 bm25/sidecar/hnsw snap 落盘顺序必须与 close() 一致(A4)
-//  - Phase 3 的 unlink 必须在 Phase 2 之后——否则 rebuild_index 读不到源数据
+//  - Phase 3 的 unlink 必须在 Phase 2 之后——否则 HNSW rebuild 读不到源数据
 std::expected<merge::MergeStats, CaskFault>
 Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
     if (files.empty()) {
@@ -1653,19 +1672,14 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
         write_keydir_snapshot();
         if (index_pool_) index_pool_->flush();
 
-        search_->rebuild_index(
-            [this](std::uint32_t fid, std::uint64_t off, std::uint32_t sz)
-                -> std::optional<std::string> {
-                auto df = read_file(fid);
-                if (!df) return std::nullopt;
-                auto rec = df->read(off, sz);
-                if (!rec) return std::nullopt;
-                auto dv = codec::decode_doc_value(
-                    std::span<const std::byte>(rec->value.data(), rec->value.size()));
-                if (!dv || !dv->has_text) return std::nullopt;
-                return std::string(reinterpret_cast<const char*>(dv->text.data()), dv->text.size());
-            });
-
+        // P2:merge 不再全量重读+重分词重建倒排。merge::run_merge 已通过
+        // on_relocate 把每条 live 文档的存储定位更新到新文件;倒排 posting 以
+        // 稳定 ord 为键、与文件位置无关;死文档查询时由 is_live 过滤(正确性
+        // 不依赖压实)。这里只按阈值压实死 posting 回收空间——不读数据文件、
+        // 不重分词,省掉 merge 的全量 NLP 重算。死占比 < 阈值的 posting list
+        // 留待后续 merge 累积到阈值再压。
+        constexpr double kMergeCompactDeadRatio = 0.2;
+        search_->compact(kMergeCompactDeadRatio);
         search_->compact_index_chunks();
 
         auto snap = dirname_ + "/bm25_snapshot.inv";

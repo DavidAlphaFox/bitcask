@@ -1,0 +1,88 @@
+# 向量落盘 int8 量化设计（P3 / V7）
+
+> 状态：设计。实现是 follow-on，**gated on 召回测量**（见 §6）。
+> 关联：持久化优化 P 系列（`TASK.md` V7）、`doc/int8-vnni-v4-zh.md`（内存侧 int8）、
+> `doc/hnsw-design-zh.md`。
+
+## 1. 动机
+
+向量集合的 data file 体积被 f32 向量主导：2560 维 = 10 KB/doc。落盘 int8 把每条
+向量压到 `4 + dim` 字节（2564B @ 2560 维）≈ **4× 磁盘 + 读 I/O 缩减**。BM25/KV
+负载不受影响（仅 kDoc 的向量段变化）。
+
+## 2. 现有 seam（已就位，无需新建）
+
+DocValue v3 格式（`format.hpp`）已为量化预留：
+- `kFlagVecQuantized = 0x08`：向量段是码字而非裸 f32。
+- `kQuantizedMagic "QCOD" + kQuantizedVersion=1`：V6.4.1 写端可写 stub，**读端拒绝**
+  （"需 V7+ codeword 支持"）。
+- 向量段定序最前：`[Dim:varint][ f32×Dim 或 量化码字 ]`，便于 HNSW O(1) 切片。
+
+P3 = 把「读端拒绝」换成真正的 int8 编解码。
+
+## 3. 量化方案（复用内存侧，避免双实现）
+
+直接复用 `bitcask::vec::int8`（`detail/int8_kernels.hpp`）的 per-vector 对称量化：
+- `scale = max|v[i]|`，`codes[i] = round(v[i]/scale*127)` ∈ [-127,127]，
+  重建 `v̂[i] = codes[i]*scale/127`。
+- **落盘码字布局**（kFlagVecQuantized 置位时的向量段）：
+  ```
+  [Dim:varint][scale:f32 LE][int8 × Dim]
+  ```
+  大小 = varint(Dim) + 4 + Dim 字节。复用同一量化器 → 落盘 int8 可**直接喂给
+  HNSW**（in-memory 也是 int8），免一次量化。
+
+可选增强（后续）：affine（min/max 偏移）比对称略提精度；先用对称（与内存侧一致）。
+
+## 4. 核心决策：f32 权威问题 ⚠️
+
+f32 当前是三处的 source of truth，int8-only 落盘都会受影响：
+
+| 用途 | int8-only 影响 |
+|------|---------------|
+| HNSW rerank（int8 粗筛 → f32 精排） | **精排失去 f32**：只能 int8 精排，召回略降（int8 cosine 误差 ~1e-3 量级，见 int8-vnni 文档） |
+| 重嵌入 / 迁移 | 原始 f32 不可逆恢复（量化有损） |
+| `get` 返回向量 | 返回 dequant 近似 f32（有损） |
+
+**结论与推荐**：
+- int8 落盘是**有损**的体积/精度权衡，不能默认开。
+- 设计为 **opt-in**：新增 open 选项 `{vector_quantized, true}`（写入侧量化落盘）；
+  默认仍 f32（零行为变化、零兼容风险）。
+- `get` 对量化文档返回 dequant f32 并在文档注明有损。
+- 是否把它设为某类部署的推荐，**取决于 §6 召回测量**。
+
+不做「int8 + 同时存 f32」——那没有体积收益，违背 P3 目标。
+
+## 5. 读写路径改动点
+
+1. `codec::encode_doc_value`：`parts.vector` + `quantize=true` → 写 §3 码字 + 置
+   `kFlagVecQuantized`。
+2. `codec::decode_doc_value`：见 `kFlagVecQuantized` → 读 scale+codes，dequant 成
+   f32 返回（保持上层 `DocValueView.vector` 为 f32 的现有契约），同时透出原始
+   codes/scale 供 HNSW 直接接入（避免 dequant→requant 往返）。
+3. HNSW 接入（`on_vector`）：量化集合下直接用 codes/scale 建图，省一次量化。
+4. open 选项 `{vector_quantized, true}` → `CaskOptions.vector_quantized` →
+   写入 meta（`bitcask.meta`），重开校验一致（不一致 → `mode_mismatch`，同
+   `vector_dim`/`vector_metric`）。
+5. 配 embedder 时与 MRL 正交：先 MRL 截断到 `vector_dim`，再 int8 量化落盘。
+
+## 6. 召回测量 gate（实现前必须做）
+
+用 qwen3-embedding 真实语料（`doc/embedding_endpoint`）+ mock 双轨：
+- 对比 f32 vs int8 落盘的 recall@10 / @100 @ ef64。
+- 阈值建议：recall 跌幅 < 1% → int8 可作为磁盘受限部署的推荐；否则保持 opt-in 小众。
+- 记录 cliff（向量数 vs 召回）。
+
+## 7. fixtures / 兼容
+
+- 项目不考虑向后兼容；但 opt-in 默认关 → 既有 f32 数据零影响。
+- 新增 QCOD 码字的黄金 fixture（encode/decode round-trip + dequant 误差界）。
+- decode 仍只接受 DocValue Ver==3；量化与否由 Flags 区分。
+
+## 8. 分期
+
+- P3a：codec int8 编解码 + round-trip 测试 + fixture（纯格式，不接 open）。
+- P3b：open `{vector_quantized}` 接线 + meta 持久化 + HNSW 直接接入 codes。
+- P3c：§6 召回测量 + 决定默认与文档。
+
+> 本设计完成「start」；P3a-c 是后续实现，P3b 起改 DocValue 写出需先过 P3a fixture。

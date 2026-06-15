@@ -3,6 +3,7 @@
 // cannot silently drift. See doc/vector-db-design-zh.md §2.
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -253,6 +254,71 @@ TEST(DocValue, VectorOnly) {
     EXPECT_EQ(v->dim, 1u);
 }
 
+// P3a：量化向量段往返。encode(f32, vec_quantized) → decode → dequant，
+// 误差在一个量化步长内；体积远小于 f32。
+TEST(DocValue, QuantizedVectorRoundTrip) {
+    std::vector<float> vec = {0.5f, -1.0f, 0.25f, 0.0f, 0.75f, -0.5f, 1.0f, -0.125f};
+    codec::DocValueParts parts;
+    parts.vector = std::span<const float>(vec.data(), vec.size());
+    parts.vec_quantized = true;
+    std::vector<std::byte> out;
+    codec::encode_doc_value(out, parts);
+
+    // 量化段 ≈ varint(dim)+1+4+dim，远小于 f32 的 dim*4。
+    EXPECT_LT(out.size(), 2 + 5 + vec.size() * sizeof(float));
+
+    auto v = codec::decode_doc_value(out);
+    ASSERT_TRUE(v.has_value());
+    EXPECT_TRUE(v->vec_quantized);
+    EXPECT_FALSE(v->has_vector);                    // 量化标志，非裸 f32 标志
+    EXPECT_EQ(v->dim, vec.size());
+    EXPECT_EQ(v->vector_raw.size(), vec.size());    // int8 codes，每元素 1 字节
+    EXPECT_GT(v->vec_scale, 0.0f);
+
+    auto recon = codec::doc_vector_f32(*v);
+    ASSERT_EQ(recon.size(), vec.size());
+    const float step = v->vec_scale / 127.0f;       // 对称 int8 一个量化步长
+    for (std::size_t i = 0; i < vec.size(); ++i) {
+        EXPECT_LE(std::abs(recon[i] - vec[i]), step + 1e-6f) << "i=" << i;
+    }
+}
+
+// P3a：量化向量与 text/meta 段共存，分段定序解出正确。
+TEST(DocValue, QuantizedVectorWithTextMeta) {
+    std::vector<float> vec = {1.0f, 2.0f, 3.0f, 4.0f};
+    codec::DocValueParts parts;
+    parts.vector = std::span<const float>(vec.data(), vec.size());
+    parts.vec_quantized = true;
+    parts.text = as_bytes("hi");
+    parts.meta = as_bytes("m");
+    std::vector<std::byte> out;
+    codec::encode_doc_value(out, parts);
+
+    auto v = codec::decode_doc_value(out);
+    ASSERT_TRUE(v.has_value());
+    EXPECT_TRUE(v->vec_quantized);
+    EXPECT_EQ(v->dim, 4u);
+    EXPECT_TRUE(v->has_text);
+    EXPECT_EQ(v->text.size(), 2u);
+    EXPECT_TRUE(v->has_meta);
+    EXPECT_EQ(v->meta.size(), 1u);
+    EXPECT_EQ(codec::doc_vector_f32(*v).size(), 4u);
+}
+
+// P3a：doc_vector_f32 对未量化向量精确还原。
+TEST(DocValue, DocVectorF32Unquantized) {
+    std::vector<float> vec = {0.6f, 0.8f, 0.0f};
+    codec::DocValueParts parts;
+    parts.vector = std::span<const float>(vec.data(), vec.size());
+    std::vector<std::byte> out;
+    codec::encode_doc_value(out, parts);
+    auto v = codec::decode_doc_value(out);
+    ASSERT_TRUE(v.has_value());
+    auto recon = codec::doc_vector_f32(*v);
+    ASSERT_EQ(recon.size(), 3u);
+    for (std::size_t i = 0; i < 3; ++i) EXPECT_FLOAT_EQ(recon[i], vec[i]);
+}
+
 TEST(DocValue, TextOnly) {
     codec::DocValueParts parts;
     parts.text = as_bytes("plain doc");
@@ -373,7 +439,9 @@ TEST(DocValue, DetectsFieldsTruncation) {
 }
 
 // V6.4.1: vec_quantized stub 写入后读端拒绝——需 V7+ codeword 支持
-TEST(DocValue, QuantizedStubRejected) {
+// P3a：量化向量自 V7 起被读端接受（取代 V6.4.1 的 stub-reject 行为）。
+// 未知 SchemeVer 仍按 kUnsupportedVersion 拒绝——构造一条 ver≠1 的码字验证。
+TEST(DocValue, QuantizedAcceptedAndUnknownSchemeRejected) {
     codec::DocValueParts parts;
     parts.text = as_bytes("hello");
     parts.vec_quantized = true;
@@ -384,8 +452,18 @@ TEST(DocValue, QuantizedStubRejected) {
     codec::encode_doc_value(buf, parts);
 
     auto result = codec::decode_doc_value(buf);
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), codec::DecodeError::kUnsupportedVersion);
+    ASSERT_TRUE(result.has_value());            // P3a：不再拒绝
+    EXPECT_TRUE(result->vec_quantized);
+    EXPECT_EQ(result->dim, 4u);
+    EXPECT_TRUE(result->has_text);
+
+    // 篡改 SchemeVer 字节（紧跟在 Dim varint 之后；此处 dim=4 → varint 单字节，
+    // header 2 字节，故 SchemeVer 在下标 3）→ 未知版本应拒绝。
+    auto bad = buf;
+    bad[3] = static_cast<std::byte>(0xFE);
+    auto bad_res = codec::decode_doc_value(bad);
+    ASSERT_FALSE(bad_res.has_value());
+    EXPECT_EQ(bad_res.error(), codec::DecodeError::kUnsupportedVersion);
 }
 
 // ---------------------------------------------------------------------------

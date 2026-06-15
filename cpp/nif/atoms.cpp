@@ -17,6 +17,7 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     allocation_error  = a("allocation_error");
 
     o_sync            = a("o_sync");
+    puts              = a("puts");
     not_found             = a("not_found");
     already_exists        = a("already_exists");
     out_of_date           = a("out_of_date");

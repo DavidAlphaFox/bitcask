@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstring>
 
+#include "bitcask/detail/int8_kernels.hpp"  // P3a：向量落盘 int8 对称量化
 #include "bitcask/format.hpp"
 #include "bitcask/hw_crc32.hpp"
 
@@ -185,7 +186,7 @@ std::size_t encode_doc_value(std::vector<std::byte>& out, const DocValueParts& p
     const bool has_fields = !parts.fields.empty();
 
     std::uint8_t flags = 0;
-    if (parts.vec_quantized) {
+    if (parts.vec_quantized && parts.vector) {
         flags |= format::kFlagVecQuantized;
     } else if (parts.vector) {
         flags |= format::kFlagHasVector;
@@ -205,15 +206,19 @@ std::size_t encode_doc_value(std::vector<std::byte>& out, const DocValueParts& p
         if (!s.empty()) std::memcpy(out.data() + at, s.data(), s.size());
     };
 
-    if (parts.vec_quantized) {
+    if (parts.vec_quantized && parts.vector) {
+        // P3a：per-vector 对称 int8。[Dim:varint][SchemeVer:u8][scale:f32 LE][int8×Dim]
         const auto& v = *parts.vector;
-        vbyte_append(out, v.size());
-        auto u32_append = [&out](std::uint32_t val) {
-            out.resize(out.size() + sizeof(std::uint32_t));
-            std::memcpy(out.data() + out.size() - sizeof(std::uint32_t), &val, sizeof(std::uint32_t));
-        };
-        u32_append(format::kQuantizedMagic);
-        u32_append(format::kQuantizedVersion);
+        const auto qv = vec::int8::quantize(v.data(), v.size());
+        vbyte_append(out, v.size());  // Dim（元素数）
+        out.push_back(static_cast<std::byte>(format::kQuantizedVersion));
+        out.resize(out.size() + sizeof(float));  // scale f32 LE
+        std::memcpy(out.data() + out.size() - sizeof(float), &qv.scale, sizeof(float));
+        const std::size_t at = out.size();       // int8 codes
+        out.resize(at + qv.codes.size());
+        if (!qv.codes.empty()) {
+            std::memcpy(out.data() + at, qv.codes.data(), qv.codes.size());
+        }
     } else if (parts.vector) {
         const auto& v = *parts.vector;
         vbyte_append(out, v.size());  // Dim（元素个数）
@@ -269,16 +274,26 @@ decode_doc_value(std::span<const std::byte> buf) {
     };
 
     if (v.vec_quantized) {
-        // V6.4.1：写端可写 stub 但读端拒绝——需 V7+ codeword 支持
+        // P3a：[Dim:varint][SchemeVer:u8][scale:f32 LE][int8×Dim]。vector_raw =
+        // int8 codes（零拷贝），配 vec_scale 用 doc_vector_f32() 还原。
         std::uint64_t dim = 0;
         if (!vbyte_read(buf, pos, dim)) {
             return std::unexpected(DecodeError::kBufferTooShort);
         }
-        if (buf.size() < pos + sizeof(std::uint32_t) * 2) {
+        const std::size_t need = 1 + sizeof(float) + static_cast<std::size_t>(dim);
+        if (buf.size() < pos + need) {
             return std::unexpected(DecodeError::kBufferTooShort);
         }
-        pos += sizeof(std::uint32_t) * 2;  // magic + version
-        return std::unexpected(DecodeError::kUnsupportedVersion);
+        const std::uint8_t scheme = static_cast<std::uint8_t>(buf[pos]);
+        pos += 1;
+        if (scheme != format::kQuantizedVersion) {
+            return std::unexpected(DecodeError::kUnsupportedVersion);
+        }
+        std::memcpy(&v.vec_scale, buf.data() + pos, sizeof(float));
+        pos += sizeof(float);
+        v.dim = static_cast<std::uint32_t>(dim);
+        v.vector_raw = buf.subspan(pos, static_cast<std::size_t>(dim));  // int8 codes
+        pos += static_cast<std::size_t>(dim);
     }
     if (v.has_vector) {
         // vector 段：[Dim:varint 元素个数][f32×Dim 小端]。Dim 是元素数、非字节数。
@@ -321,6 +336,27 @@ decode_doc_value(std::span<const std::byte> buf) {
         }
     }
     return v;
+}
+
+std::vector<float> doc_vector_f32(const DocValueView& v) {
+    std::vector<float> out;
+    if (v.vec_quantized) {
+        // dequant：v̂[i] = code[i] * scale / 127。
+        out.resize(v.dim);
+        const auto* codes =
+            reinterpret_cast<const std::int8_t*>(v.vector_raw.data());
+        const float s = v.vec_scale / 127.0f;
+        for (std::uint32_t i = 0; i < v.dim; ++i) {
+            out[i] = static_cast<float>(codes[i]) * s;
+        }
+    } else if (v.has_vector) {
+        out.resize(v.dim);
+        if (v.dim) {
+            std::memcpy(out.data(), v.vector_raw.data(),
+                        static_cast<std::size_t>(v.dim) * sizeof(float));
+        }
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------

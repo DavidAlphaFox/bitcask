@@ -111,8 +111,12 @@ struct DocValueView {
     bool has_meta   = false;
     bool has_fields = false;                // S8.6
     bool vec_quantized = false;
-    std::uint32_t dim = 0;                  // 仅 has_vector 有效
+    std::uint32_t dim = 0;                  // 向量元素数（has_vector 或 vec_quantized 有效）
+    // vector_raw 语义随 vec_quantized 而变：
+    //   未量化：f32 小端字节，长度 == dim*4，LE 主机可直接 memcpy 成 float[]。
+    //   量化：  int8 codes 字节，长度 == dim；配合 vec_scale 用 doc_vector_f32() 还原。
     std::span<const std::byte> vector_raw;
+    float vec_scale = 0.0f;                 // 仅 vec_quantized 有效（重建标度）
     std::span<const std::byte> text;
     std::span<const std::byte> meta;
     std::vector<DocField>      fields;      // 解出的字段（id + zero-copy value span）
@@ -126,6 +130,11 @@ std::size_t encode_doc_value(std::vector<std::byte>& out, const DocValueParts& p
 // 线程安全: 是（纯函数，只读 buf）；不需任何锁。
 [[nodiscard]] std::expected<DocValueView, DecodeError>
 decode_doc_value(std::span<const std::byte> buf);
+
+// 把 DocValueView 的向量段还原成 f32：未量化直接 memcpy，量化则 dequant
+// （v̂ = code*scale/127）。无向量段 → 返回空。给 get / 非 int8 路径用；HNSW
+// int8 路径直接吃 vector_raw(codes)+vec_scale，不走这里。纯函数。
+[[nodiscard]] std::vector<float> doc_vector_f32(const DocValueView& v);
 
 // ---------------------------------------------------------------------------
 // hint 文件 record

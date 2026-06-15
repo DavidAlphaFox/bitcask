@@ -85,7 +85,8 @@ open(Dirname) -> open(Dirname, []).
 %%     read_write           — 写权限；竞争 bitcask.write.lock
 %%     {expiry_secs, N}     — N 秒前的 entry 视作过期
 %%     {max_file_size, N}   — 写满 N 字节切下一个 active data file
-%%     {sync_strategy, X}   — none | o_sync | {seconds, N}
+%%     {sync_strategy, X}   — none（默认，靠 OS 刷盘）| o_sync（每条写 durable）
+%%                            | {puts, N}（单写者组提交：每 N 次写 fsync 一次）
 %%     {tombstone_version, V} — 1 或 2，控制墓碑编码（默认 2）
 %%
 %%   索引模式选项（传入即启用全文搜索）：

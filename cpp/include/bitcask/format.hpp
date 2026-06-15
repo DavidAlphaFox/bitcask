@@ -98,9 +98,12 @@ inline constexpr std::uint8_t kFlagHasMeta      = 0x04;
 inline constexpr std::uint8_t kFlagVecQuantized = 0x08;
 inline constexpr std::uint8_t kFlagHasFields    = 0x10;  // fields 段存在（S8.6）
 
-// V6.4.1 quantized stub magic + version（写端可写 stub，读端拒绝——需 V7+ codeword 支持）
-inline constexpr std::uint32_t kQuantizedMagic   = 0x51434F44;  // "QCOD"
-inline constexpr std::uint32_t kQuantizedVersion = 1;
+// P3a 量化向量码字（kFlagVecQuantized 段，per-vector 对称 int8）。布局：
+//   [Dim:varint 元素数][SchemeVer:u8][scale:f32 小端][int8 × Dim]
+// 重建 v̂[i] = codes[i] * scale / 127（见 detail/int8_kernels.hpp）。大小
+// = varint(Dim) + 1 + 4 + Dim，≈ f32 的 1/4（Dim 大时）。SchemeVer=1=对称 int8；
+// 未来 affine 等新方案 bump 此版本（读端按版本分发，旧端见未知版本拒绝）。
+inline constexpr std::uint8_t kQuantizedVersion = 1;
 
 // ---------------------------------------------------------------------------
 // hint 文件的 CRC chunk 大小（解析时做合理性边界检查）。
