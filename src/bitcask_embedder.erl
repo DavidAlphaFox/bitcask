@@ -9,16 +9,21 @@
 %%       {ok, Ctx} = bitcask_embedder:new(openai, #{
 %%           url   => "http://localhost:8080/v1/embeddings",
 %%           model => <<"qwen3-embedding">>,
-%%           dim   => 2560,
+%%           dim        => 2560,           %% 模型原生维度
+%%           vector_dim => 1024,           %% 可选 MRL 截断维度（≤dim；缺省=dim）
 %%           max_input_bytes    => 32768,  %% 可选；默认 32768
 %%           timeout_ms         => 30000,  %% 可选；默认 30000
 %%           connect_timeout_ms => 5000    %% 可选；默认 5000
 %%       }),
 %%       {ok, Vec} = bitcask_embedder:embed(Ctx, <<"hello">>),
-%%       Dim       = bitcask_embedder:dim(Ctx).
+%%       Dim       = bitcask_embedder:dim(Ctx),         %% 原生维度
+%%       VDim      = bitcask_embedder:vector_dim(Ctx).  %% 落库维度
 %%
 %%   各内置 provider（openai/anthropic）通用可选项（均为正整数，缺省用默认
 %%   值，非正整数 → {error,{bad_opt,Key}}）：
+%%     dim — 模型原生输出维度（provider 默认：openai 2560 / anthropic 4096）。
+%%     vector_dim（默认 = dim）— MRL 截断后的落库/检索维度，须 ≤ dim。与 dim
+%%       不一致时 embed 请求带 dimensions=>vector_dim，由服务端按 MRL 截断+重归一。
 %%     max_input_bytes（默认 32768）— embed 前对输入做字节级保守截断的上限。
 %%       模型上下文有 token 上限，超长输入端点会报错/截断，故在客户端先按
 %%       字节裁剩（UTF-8 下字节数 ≤ N ⟹ token 数 ≤ N）。
@@ -38,17 +43,24 @@
 -module(bitcask_embedder).
 
 %% Framework API (new — context-based, runtime dynamic)
--export([new/2, embed/2, dim/1]).
+-export([new/2, embed/2, dim/1, vector_dim/1]).
 
 -export_type([ctx/0]).
 
 %% -------------------------------------------------------------------
 %% Context type — 普通 map，无需 hrl，跨模块安全。
+%%
+%% MRL（Matryoshka Representation Learning）：
+%%   dim        = 模型**原生**输出维度（模型真实产出的向量长度）。
+%%   vector_dim = MRL 截断目标 = 实际落库 / HNSW 维度（≤ dim；缺省 = dim）。
+%% 二者不一致时，embed 请求会带 dimensions=>vector_dim，让服务端按 MRL
+%% 截断+重归一。落库/检索维度一律以 vector_dim 为准。
 %% -------------------------------------------------------------------
 -type ctx() :: #{
-    module := module(),       %% provider 实现模块
-    dim    := pos_integer(),  %% 输出维度
-    config := map()           %% provider-specific 配置（url/model/api_key...）
+    module     := module(),       %% provider 实现模块
+    dim        := pos_integer(),  %% 模型原生维度
+    vector_dim => pos_integer(),  %% MRL 落库维度（缺省 = dim）
+    config     := map()           %% provider-specific 配置（url/model/api_key...）
 }.
 
 %% -------------------------------------------------------------------
@@ -94,7 +106,14 @@ embed(#{module := M, config := Cfg}, Text) when is_binary(Text) ->
     M:embed(Cfg, Text).
 
 %% -------------------------------------------------------------------
-%% Framework: 从上下文取维度
+%% Framework: 取维度
+%%   dim/1        — 模型原生维度。
+%%   vector_dim/1 — 落库 / 检索维度（MRL 目标；缺省 = dim）。open 用它推出
+%%                  集合的 {vector_dim, N}，put/查询的向量长度也以它为准。
 %% -------------------------------------------------------------------
 -spec dim(ctx()) -> pos_integer().
 dim(#{dim := D}) -> D.
+
+-spec vector_dim(ctx()) -> pos_integer().
+vector_dim(#{vector_dim := V}) -> V;
+vector_dim(#{dim := D})        -> D.

@@ -45,6 +45,8 @@
 -define(DEFAULT_MAX_INPUT_BYTES, 32768).
 -define(DEFAULT_TIMEOUT_MS, 30000).
 -define(DEFAULT_CONNECT_TIMEOUT_MS, 5000).
+%% 模型原生维度默认值（dim）。MRL 落库维度 vector_dim 缺省 = dim。
+-define(DEFAULT_DIM, 2560).
 
 %% ===================================================================
 %% Provider behaviour: init/1
@@ -56,22 +58,41 @@ init(Opts) ->
         {undefined, _} -> {error, {missing_opt, url}};
         {_, undefined} -> {error, {missing_opt, model}};
         {Url, Model} ->
-            case validate_limits(Opts) of
-                {ok, Limits} ->
-                    Dim = maps:get(dim, Opts, 2560),
-                    Base = #{
-                        url     => Url,
-                        model   => to_bin(Model),
-                        api_key => maps:get(api_key, Opts, undefined)
-                    },
-                    {ok, #{
-                        module => ?MODULE,
-                        dim    => Dim,
-                        config => maps:merge(Base, Limits)
-                    }};
+            case validate_dims(Opts, ?DEFAULT_DIM) of
+                {ok, Dim, VDim} ->
+                    case validate_limits(Opts) of
+                        {ok, Limits} ->
+                            Base = #{
+                                url        => Url,
+                                model      => to_bin(Model),
+                                api_key    => maps:get(api_key, Opts, undefined),
+                                dim        => Dim,    %% 供 embed 决定是否发 dimensions
+                                vector_dim => VDim
+                            },
+                            {ok, #{
+                                module     => ?MODULE,
+                                dim        => Dim,
+                                vector_dim => VDim,
+                                config     => maps:merge(Base, Limits)
+                            }};
+                        {error, _} = E ->
+                            E
+                    end;
                 {error, _} = E ->
                     E
             end
+    end.
+
+%% 校验 dim（模型原生维度）与 vector_dim（MRL 落库维度）。vector_dim 缺省 = dim，
+%% 必须为正整数且 ≤ dim（MRL 只能截短，不能扩展）。
+validate_dims(Opts, DefaultDim) ->
+    Dim  = maps:get(dim, Opts, DefaultDim),
+    VDim = maps:get(vector_dim, Opts, Dim),
+    if
+        not (is_integer(Dim) andalso Dim > 0)   -> {error, {bad_opt, dim}};
+        not (is_integer(VDim) andalso VDim > 0) -> {error, {bad_opt, vector_dim}};
+        VDim > Dim -> {error, {vector_dim_exceeds_dim, VDim, Dim}};
+        true -> {ok, Dim, VDim}
     end.
 
 %% 校验三个正整数可选项，返回 {ok, #{Key => Val}}（缺省填默认值）或
@@ -98,14 +119,21 @@ embed(#{url := Url, model := Model} = Cfg, Text) when is_binary(Text) ->
     {ok, _} = application:ensure_all_started(inets),
     MaxIn = maps:get(max_input_bytes, Cfg, ?DEFAULT_MAX_INPUT_BYTES),
     Input = truncate_utf8(Text, MaxIn),
-    Body = json_encode(#{<<"model">> => Model, <<"input">> => Input}),
+    Dim  = maps:get(dim, Cfg, undefined),
+    VDim = maps:get(vector_dim, Cfg, Dim),
+    %% MRL：vector_dim ≠ dim 时发 dimensions，让服务端按 MRL 截断+重归一。
+    Body0 = #{<<"model">> => Model, <<"input">> => Input},
+    Body1 = case is_integer(VDim) andalso VDim =/= Dim of
+                true  -> Body0#{<<"dimensions">> => VDim};
+                false -> Body0
+            end,
     Headers = build_headers(maps:get(api_key, Cfg, undefined)),
-    Req = {Url, Headers, "application/json", iolist_to_binary(Body)},
+    Req = {Url, Headers, "application/json", iolist_to_binary(json_encode(Body1))},
     HttpOpts = [{timeout, maps:get(timeout_ms, Cfg, ?DEFAULT_TIMEOUT_MS)},
                 {connect_timeout, maps:get(connect_timeout_ms, Cfg, ?DEFAULT_CONNECT_TIMEOUT_MS)}],
     case httpc:request(post, Req, HttpOpts, [{body_format, binary}]) of
         {ok, {{_, 200, _}, _Hdrs, RespBody}} ->
-            parse_embedding(RespBody);
+            parse_embedding(RespBody, VDim);
         {ok, {{_, Code, Reason}, _Hdrs, RespBody}} ->
             {error, {http_status, Code, Reason, RespBody}};
         {error, Reason} ->
@@ -150,10 +178,16 @@ build_headers(ApiKey) when is_list(ApiKey) ->
     [{"Authorization", "Bearer " ++ ApiKey}].
 
 %% 解析 OpenAI 兼容响应：#{<<"data">> := [#{<<"embedding">> := [float()]}]}。
-parse_embedding(RespBody) ->
+%% Expect = 期望维度（vector_dim）；返回长度不符 → {error,{dim_mismatch,Got,Expect}}
+%% （服务端不支持 dimensions、忽略了 MRL 截断时在此暴露，而非静默写错维度）。
+parse_embedding(RespBody, Expect) ->
     try json_decode(RespBody) of
         #{<<"data">> := [#{<<"embedding">> := Floats} | _]} when is_list(Floats) ->
-            {ok, << <<X:32/float-little>> || X <- Floats >>};
+            Got = length(Floats),
+            case Expect =:= undefined orelse Got =:= Expect of
+                true  -> {ok, << <<X:32/float-little>> || X <- Floats >>};
+                false -> {error, {dim_mismatch, Got, Expect}}
+            end;
         Other ->
             {error, {unexpected_response, Other}}
     catch
