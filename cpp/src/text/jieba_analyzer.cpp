@@ -276,16 +276,7 @@ auto JiebaAnalyzer::analyze_with_offsets(std::string_view text) const -> TermTok
 
 }  // namespace bitcask::text
 
-// Jieba 自注册：static init 期间向工厂登记创建器。
-static const bool s_reg_jieba = [] {
-    bitcask::text::AnalyzerFactory::register_creator(
-        bitcask::text::AnalyzerType::Jieba,
-        [](const bitcask::text::AnalyzerConfig& c)
-            -> std::unique_ptr<bitcask::text::Analyzer> {
-            return std::make_unique<bitcask::text::JiebaAnalyzer>(
-                c.dict_path, c.min_n, c.max_n,
-                c.enable_stop_words, c.stop_words,
-                c.min_token_length);
-        });
-    return true;
-}();
+// 注：Jieba 工厂注册已移到 analyzer.cpp（工厂同 TU，必被链接）。bitcask_text
+// 是 STATIC 库，本 TU 的自注册曾因无外部符号引用被链接器丢弃 → create(Jieba)
+// 返回 nullptr → put 段错误。移走后由 analyzer.cpp 的 lambda 引用本类构造符号
+// 强制拉入本 TU 并完成注册。
