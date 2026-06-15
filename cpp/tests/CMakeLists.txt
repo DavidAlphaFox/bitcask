@@ -130,6 +130,8 @@ target_link_libraries(bitcask_cask_docvalue_test PRIVATE
     bitcask_warnings
     bitcask_sanitizers
 )
+target_compile_definitions(bitcask_cask_docvalue_test PRIVATE
+    BITCASK_JIEBA_DICT_DIR="${BITCASK_JIEBA_DICT_DIR}")
 
 add_executable(bitcask_inverted_wal_test inverted_wal_test.cpp)
 target_link_libraries(bitcask_inverted_wal_test PRIVATE

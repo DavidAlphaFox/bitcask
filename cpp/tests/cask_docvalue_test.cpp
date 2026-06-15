@@ -1048,6 +1048,36 @@ CaskOptions v31_opts(std::uint16_t dim) {
 }
 }  // namespace
 
+// 回归：Jieba 经工厂(AnalyzerFactory::create)创建的索引路径必须可用。
+// 历史 bug：Jieba 自注册在独立 TU(jieba_analyzer.cpp)，bitcask_text 是
+// STATIC 库且无外部符号引用该 TU → 链接器丢弃 → create(Jieba) 返回 nullptr
+// → SearchLayer::analyzer_ 为空 → 首次带 text 的 put 解空指针段错误。
+// 注册移到工厂同 TU 后修复；此测试经 Cask→IndexPool→SearchLayer 全路径守护。
+#ifndef BITCASK_JIEBA_DICT_DIR
+#define BITCASK_JIEBA_DICT_DIR "_deps/cppjieba-src/dict"
+#endif
+TEST_F(CaskDocValueTest, JiebaIndexModePutDoesNotCrash) {
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.enable_search = true;
+    SearchLayerConfig cfg;
+    cfg.analyzer_config.type = AnalyzerType::Jieba;
+    cfg.analyzer_config.dict_path = BITCASK_JIEBA_DICT_DIR;
+    opts.search_config = cfg;
+
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);   // analyzer 为空时 open 现在干净失败，不再带病打开
+    const std::string text =
+        "BM25 全文检索 — 用 {analyzer, ...} 打开即可启用。\n"
+        "每次 put 自动索引；返回 {ok, [{Key, Ord, Score}, ...]}，按分数降序：";
+    bitcask::DocInput doc;
+    doc.text = sv_bytes(text);
+    std::vector<std::byte> key{std::byte{'d'}, std::byte{'1'}};
+    ASSERT_TRUE((*c)->put_doc(key, doc, 1000));
+    (*c)->close();   // flush IndexPool worker（曾在此路径段错误）
+    SUCCEED();
+}
+
 // 写入归一化 + get 透传 + 重开持久(cosine_normalized 默认度量)。
 TEST_F(CaskDocValueTest, V31VectorRoundTripNormalized) {
     auto opts = v31_opts(4);
