@@ -9,10 +9,21 @@
 %%       {ok, Ctx} = bitcask_embedder:new(openai, #{
 %%           url   => "http://localhost:8080/v1/embeddings",
 %%           model => <<"qwen3-embedding">>,
-%%           dim   => 2560
+%%           dim   => 2560,
+%%           max_input_bytes    => 32768,  %% 可选；默认 32768
+%%           timeout_ms         => 30000,  %% 可选；默认 30000
+%%           connect_timeout_ms => 5000    %% 可选；默认 5000
 %%       }),
 %%       {ok, Vec} = bitcask_embedder:embed(Ctx, <<"hello">>),
 %%       Dim       = bitcask_embedder:dim(Ctx).
+%%
+%%   各内置 provider（openai/anthropic）通用可选项（均为正整数，缺省用默认
+%%   值，非正整数 → {error,{bad_opt,Key}}）：
+%%     max_input_bytes（默认 32768）— embed 前对输入做字节级保守截断的上限。
+%%       模型上下文有 token 上限，超长输入端点会报错/截断，故在客户端先按
+%%       字节裁剩（UTF-8 下字节数 ≤ N ⟹ token 数 ≤ N）。
+%%     timeout_ms（默认 30000）— 单次 embedding 请求的总超时（毫秒）。
+%%     connect_timeout_ms（默认 5000）— 建连超时（毫秒）。
 %%
 %%   多 provider：
 %%       bitcask_embedder:new(openai,    #{url => ..., model => ..., dim => ...})

@@ -14,7 +14,10 @@
 %%           url     => "https://api.anthropic.com/v1/embeddings",
 %%           model   => <<"claude-embed">>,
 %%           dim     => 4096,
-%%           api_key => <<"sk-ant-...">>
+%%           api_key => <<"sk-ant-...">>,
+%%           max_input_bytes    => 32768,  %% 可选，按模型上下文窗口设；默认 32768
+%%           timeout_ms         => 30000,  %% 可选，请求总超时；默认 30000
+%%           connect_timeout_ms => 5000    %% 可选，建连超时；默认 5000
 %%       }),
 %%       {ok, Vec} = bitcask_embedder:embed(Ctx, <<"hello">>).
 %% -------------------------------------------------------------------
@@ -25,9 +28,14 @@
 %% Provider behaviour API
 -export([init/1, embed/2]).
 
-%% 32K token 上限的字节级保守界。
--define(MAX_INPUT_BYTES, 32768).
--define(HTTP_TIMEOUT_MS, 30000).
+%% 可选项默认值（均为正整数；可在 new/2 的 Opts 里覆盖，缺省用这些）：
+%%   max_input_bytes    — embed 前输入的字节级保守上限，约对应 32K token
+%%                        （UTF-8 下字节数 ≤ N ⟹ token 数 ≤ N）。
+%%   timeout_ms         — 单次 embedding 请求的总超时（毫秒）。
+%%   connect_timeout_ms — 建连超时（毫秒）。
+-define(DEFAULT_MAX_INPUT_BYTES, 32768).
+-define(DEFAULT_TIMEOUT_MS, 30000).
+-define(DEFAULT_CONNECT_TIMEOUT_MS, 5000).
 
 %% ===================================================================
 %% Provider behaviour: init/1
@@ -39,17 +47,38 @@ init(Opts) ->
         {undefined, _} -> {error, {missing_opt, url}};
         {_, undefined} -> {error, {missing_opt, model}};
         {Url, Model} ->
-            Dim = maps:get(dim, Opts, 4096),
-            {ok, #{
-                module => ?MODULE,
-                dim    => Dim,
-                config => #{
-                    url     => Url,
-                    model   => to_bin(Model),
-                    api_key => maps:get(api_key, Opts, undefined)
-                }
-            }}
+            case validate_limits(Opts) of
+                {ok, Limits} ->
+                    Dim = maps:get(dim, Opts, 4096),
+                    Base = #{
+                        url     => Url,
+                        model   => to_bin(Model),
+                        api_key => maps:get(api_key, Opts, undefined)
+                    },
+                    {ok, #{
+                        module => ?MODULE,
+                        dim    => Dim,
+                        config => maps:merge(Base, Limits)
+                    }};
+                {error, _} = E ->
+                    E
+            end
     end.
+
+%% 校验三个正整数可选项，返回 {ok, #{Key => Val}}（缺省填默认值）或
+%% {error, {bad_opt, Key}}。
+validate_limits(Opts) ->
+    Specs = [{max_input_bytes,    ?DEFAULT_MAX_INPUT_BYTES},
+             {timeout_ms,         ?DEFAULT_TIMEOUT_MS},
+             {connect_timeout_ms, ?DEFAULT_CONNECT_TIMEOUT_MS}],
+    lists:foldl(
+        fun({Key, Def}, {ok, Acc}) ->
+                case maps:get(Key, Opts, Def) of
+                    V when is_integer(V), V > 0 -> {ok, Acc#{Key => V}};
+                    _ -> {error, {bad_opt, Key}}
+                end;
+           (_, {error, _} = E) -> E
+        end, {ok, #{}}, Specs).
 
 %% ===================================================================
 %% Provider behaviour: embed/2
@@ -58,11 +87,13 @@ init(Opts) ->
 -spec embed(map(), binary()) -> {ok, binary()} | {error, term()}.
 embed(#{url := Url, model := Model} = Cfg, Text) when is_binary(Text) ->
     {ok, _} = application:ensure_all_started(inets),
-    Input = truncate_utf8(Text, ?MAX_INPUT_BYTES),
+    MaxIn = maps:get(max_input_bytes, Cfg, ?DEFAULT_MAX_INPUT_BYTES),
+    Input = truncate_utf8(Text, MaxIn),
     Body = json_encode(#{<<"model">> => Model, <<"input">> => Input}),
     Headers = build_headers(maps:get(api_key, Cfg, undefined)),
     Req = {Url, Headers, "application/json", iolist_to_binary(Body)},
-    HttpOpts = [{timeout, ?HTTP_TIMEOUT_MS}, {connect_timeout, 5000}],
+    HttpOpts = [{timeout, maps:get(timeout_ms, Cfg, ?DEFAULT_TIMEOUT_MS)},
+                {connect_timeout, maps:get(connect_timeout_ms, Cfg, ?DEFAULT_CONNECT_TIMEOUT_MS)}],
     case httpc:request(post, Req, HttpOpts, [{body_format, binary}]) of
         {ok, {{_, 200, _}, _Hdrs, RespBody}} ->
             parse_embedding(RespBody);
