@@ -207,11 +207,24 @@ WAL 帧格式：`[4B payload_len][payload][4B CRC32]`。CRC 仅覆盖 payload。
 
 两个 flock 文件是**独立的** —— 持有 `merge.lock` 的合并器不会阻塞持有 `write.lock` 的写入器，反之亦然。这是 M5.1 双锁模型。合并器读取 `write.lock` 的内容以了解活跃写入器正在追加到哪个文件 id，并将其从合并候选中排除。
 
-`KeyDir::mutex_` 是整个 keydir 的一个 `std::shared_mutex`。读取（get / get_epoch / info / iter::next / deep_copy / biggest_file_id / is_ready / conditional_remove peek）采用 `std::shared_lock`。写入（put、remove、fstats 更新、待定冻结、iter 开始+释放）采用 `std::unique_lock`。M5.3 在 4 个并发读者下测量到约 1.9× 的 `std::mutex` 基线性能。要突破这一限制需要分片，这需要分解 `pending_` / `epoch_` / `fstats_`（设计上都是全局的），推迟到 M6。
+> **注**：下一段描述的「整个 keydir 一个 `std::shared_mutex`」是 M5 的基线。
+> M6 起 KeyDir 已分片为 256 个分片锁 + meta_mu_ + 写者闸门屏障；完整锁全序、
+> 死锁防护与例外论证见 [`concurrency-zh.md` 锁全局序图](concurrency-zh.md) 与
+> [`keydir-sharding-design-zh.md`](keydir-sharding-design-zh.md)。
 
-**SearchLayer** 不是线程安全的 —— 单写者模型，与 Cask 写入相同。
+`KeyDir::mutex_`（M5 基线）是整个 keydir 的一个 `std::shared_mutex`。读取（get / get_epoch / info / iter::next / biggest_file_id / is_ready / conditional_remove peek）采用 `std::shared_lock`。写入（put、remove、fstats 更新、待定冻结、iter 开始+释放）采用 `std::unique_lock`。M5.3 在 4 个并发读者下测量到约 1.9× 的 `std::mutex` 基线性能；M6 的分片实现突破了这一限制。
 
-**InvertedIndex** 使用分片锁（按词哈希 16 个分片）—— 与 KeyDir 的单个 `shared_mutex` 不同。
+**索引层是异步单写者**：索引模式下 `put/delete` 把任务入队到 `IndexPool`
+的有界队列（满则 push 阻塞做背压），由**单一 worker 线程**串行执行所有索引
+变更（`on_write`/`on_delete`/`on_vector`/`set_meta`/`add_doc`）。搜索在调用
+线程上跑，与 worker 并发——读路径靠「锁内拷贝、不逃逸指针、安全遍历 tbb 表、
+跨线程标量原子、消费者异常兜底」等不变量保证安全，详见
+[`concurrency-zh.md` §6](concurrency-zh.md)。
+
+**SearchLayer** 自身非线程安全：写经 IndexPool 单 worker 串行，读可与之并发。
+
+**InvertedIndex** 线程安全：内部按词哈希分片锁 + `tbb::concurrent_hash_map`
+桶锁 + posting list 的 CoW —— 与 KeyDir 的分片锁是各自独立的体系。
 
 ## 迭代器语义（兄弟链 + 待定哈希）
 
