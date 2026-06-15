@@ -425,7 +425,9 @@ LRU(get 共享锁并发,顺带修掉「返回内部指针,解锁后可被 evict 
    put/remove 已持有的 unique_lock 内(经 update_fstats_locked),
    原子化不减少任何锁获取;info() 停顿由同锁的 entries 状态读主导。
    顺手删除了零调用方的带锁公开 update_fstats。赢面仍是 M6 分片。
-2. **deep_copy() 标记 deprecated**(持锁拷整个 entries_,秒级停顿)。
+2. ~~deep_copy() 标记 deprecated~~ **已删除**:全树唯一调用方是它自己的
+   单测,M6 后不再 export 给 Erlang,生产无人用(持锁拷整个 entries_、
+   秒级停顿)→ 连函数带测试一并移除。
 3. **M6 分片障碍清单**(已逐项确认,无硬阻塞):epoch_ 保持全局;
    pending_ 单表 hash 路由;fstats 见 1;fold 保持全局单 fold;
    唯一需认真 MVCC 推演的是 merge_pending_and_collapse 的 per-shard 化。

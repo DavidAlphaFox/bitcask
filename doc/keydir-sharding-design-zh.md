@@ -52,8 +52,8 @@ put 热路径自此**零锁字共享**(分片锁字 + 纯 relaxed 原子)。
 meta**(kShards=256 后即 257 把)。S5 把 kShards 推到 256 后撞上 TSan
 死锁检测器的 **64 持锁硬上限**——compiler-rt
 `sanitizer_deadlock_detector.h:67` 的
-`CHECK_LT(dtls->getNumLocks(), kMaxLT)`,实测
-`KeyDir.DeepCopyPreservesOrd` 在 `TSAN_OPTIONS=detect_deadlocks=1` 下
+`CHECK_LT(dtls->getNumLocks(), kMaxLT)`,实测屏障类全量遍历操作
+(save_snapshot / 全量 fold)在 `TSAN_OPTIONS=detect_deadlocks=1` 下
 必崩(CHECK failed)。该方案废弃,重构为**写者闸门屏障**:任意瞬间至多
 持 1 把分片锁,语义不变,且屏障期间读者照常并发(旧方案的全独占锁顺带
 挡住了读者,是过强的副作用)。
@@ -86,7 +86,7 @@ meta**(kShards=256 后即 257 把)。S5 把 kShards 推到 256 后撞上 TSan
 
 ### 4.2 各屏障调用方(读者无缝论证)
 
-1. **deep_copy / save_snapshot / iter start(keys_snapshot 构建)**:
+1. **save_snapshot / iter start(keys_snapshot 构建)**:
    屏障内全是**纯读**,写者已出清 → 遍历各分片 entries **不需要任何
    分片锁**(unordered_map 并发只读安全;与读者的持锁 find 是读-读
    并发)。meta 状态读取(save 的 keyfolders_ 检查、start 的 freeze
@@ -112,7 +112,7 @@ meta**(kShards=256 后即 257 把)。S5 把 kShards 推到 256 后撞上 TSan
 
 - get:meta shared(仅当 frozen,先查 pending)→ shard shared。
 - conditional_remove(merge CAS):shard unique,逻辑不变。
-- deep_copy/save_snapshot(A4):写者闸门屏障(§4 屏障 v2;冷路径/
+- save_snapshot(A4):写者闸门屏障(§4 屏障 v2;冷路径/
   静止点);info 仅 meta shared。
 - load_snapshot(A4):open 期单线程,entries 按 hash 分发进各分片;
   BCKS 格式不变(磁盘上无分片概念,重分片自由)。
@@ -193,8 +193,8 @@ after = S2(16 分片)落地后。
    分发,BCKS 磁盘格式不变)——S4 主体随 S2 落地。
 5. iter_mutation_ 是写-only 诊断位,做成 atomic<bool> 而非挂 meta_mu_,
    避免 sibling 升链热分支为它单独抢 meta。
-6. 新增 has_pending_ 原子镜像:deep_copy 副本可能 keyfolders_==0 但
-   pending_ 仍在,写路径不能只看 keyfolders_。
+6. 新增 has_pending_ 原子镜像:release 收尾窗口里 keyfolders_ 可能已归零
+   但 pending_ 仍在应用中,写路径不能只看 keyfolders_。
 7. 热原子按缓存行分组:epoch_/next_ord_/key_count_/key_bytes_(写热行)
    与 keyfolders_/biggest_file_id_/has_pending_/is_ready_(读热行)隔离,
    Shard 内 map 头与锁字分行。
@@ -232,7 +232,7 @@ fstats 槽位 per-shard 化。
 ## 11. 屏障 v2(写者闸门)实测(2026-06-12,本机)
 
 动机回顾(§4.0):旧全屏障同时持 257 把锁,TSan 死锁检测器
-(detect_deadlocks=1)64 持锁上限 CHECK 崩溃,KeyDir.DeepCopyPreservesOrd
+(detect_deadlocks=1)64 持锁上限 CHECK 崩溃,屏障类全量遍历操作
 必现。重构后任意瞬间 ≤1 把分片锁。
 
 门禁结果(全部通过):
@@ -240,7 +240,7 @@ fstats 槽位 per-shard 化。
 | 门禁 | 结果 |
 |---|---|
 | plain ctest | 371/371 |
-| TSan `bitcask_keydir_test`(detect_deadlocks=1,原崩溃环境) | 8/8 通过,DeepCopyPreservesOrd OK |
+| TSan `bitcask_keydir_test`(detect_deadlocks=1,原崩溃环境) | 8/8 通过,DeepCopyPreservesOrd OK(该测试已于 2026-06-15 随 deep_copy 删除) |
 | TSan 全量 ctest(detect_deadlocks=1 已固化进 ENVIRONMENT) | 371/371 |
 | ASan(address,undefined)全量 ctest | 371/371 |
 | eunit(plain .so,ldd 0 tsan) | 44/44 |
