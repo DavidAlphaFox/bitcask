@@ -952,6 +952,7 @@ std::expected<bool, std::string> SearchLayer::load_snapshot(std::string_view pat
         mf.get();  // 吃掉换行
         std::unique_lock fields_lk(fields_mu_);
         fields_.clear();
+        ord_field_lens_.clear();  // 旧 ord 多字段统计随快照失效,清掉防残留。
         for (std::size_t i = 0; i < count; ++i) {
             std::string field;
             if (!std::getline(mf, field)) {
@@ -977,6 +978,7 @@ std::expected<bool, std::string> SearchLayer::load_snapshot(std::string_view pat
         return std::unexpected(std::string("failed to load snapshot from ") + base);
     }
     fields_.clear();
+    ord_field_lens_.clear();  // 旧 ord 多字段统计随快照失效,清掉防残留。
     fields_.emplace(std::string(kDefaultField), std::move(inv_fallback));
     return true;
 }
@@ -985,6 +987,7 @@ void SearchLayer::rebuild_index(DocReader doc_reader) {
     // 阶段2a：仍按默认字段重建（多字段从 DocValue 取字段在阶段4打通）。
     auto new_inv = std::make_unique<bm25::InvertedIndex>(config_.bm25_params, config_.index_positions);
     doc_texts_.clear();
+    ord_field_lens_.clear();  // 否则旧 ord 的多字段统计跨重建残留→无界增长。
 
     index_.for_each_live([&](std::uint64_t ord,
                               const std::string& /*ext_id*/,

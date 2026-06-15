@@ -871,6 +871,13 @@ bool HnswIndex::load(std::string_view path) {
     assert(count_.load(std::memory_order_relaxed) == 0 &&
            "HnswIndex::load: 仅限空图(open 期)调用");
 
+    // 防御性释放残留 chunk:契约要求空图调用,但失败后在同一实例重试 load,
+    // 下方分配循环会覆盖旧 chunk 指针而泄漏(assert 在 release 被编译掉)。
+    // open 期单线程,relaxed 即可(发布序见上方注释)。
+    for (auto& slot : chunks_) {
+        delete slot.exchange(nullptr, std::memory_order_relaxed);
+    }
+
     std::FILE* f = std::fopen(std::string(path).c_str(), "rb");
     if (!f) return false;
     std::fseek(f, 0, SEEK_END);
