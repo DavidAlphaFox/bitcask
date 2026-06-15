@@ -482,8 +482,9 @@ private:
     // T2.4: Index Pool（搜索模式开启时创建，用于 T3 异步索引）
     std::unique_ptr<IndexPool> index_pool_;
 
-    // T3: 提交索引任务到 IndexPool，带背压控制。
-    // 队列超过 80% 水位（8192/10240）时自旋等待。
+    // T3: 提交索引任务到 IndexPool（异步索引）。背压由 IndexPool 的有界
+    // 队列提供：队列满（capacity 10240）时 submit 内部的 push 阻塞写线程，
+    // 自然限速，避免任务无限堆积撑爆内存。
     void submit_index_task(IndexTask task);
 
     // A4:落 keydir 段快照(best-effort;close/merge 末尾调)。

@@ -692,8 +692,8 @@ void Cask::write_keydir_snapshot() noexcept {
     (void)keydir_->save_snapshot(dirname_ + "/" + kKeydirSnapName, wms);
 }
 
-// T3: 提交索引任务到 IndexPool，带背压控制。
-// 队列超过 80% 水位（8192/10240）时自旋等待，让 put 路径减速以避免内存溢出。
+// T3: 提交索引任务到 IndexPool。背压由有界队列提供：队列满（10240）时
+// index_pool_->submit 的 push 阻塞写线程，让 put 路径自然减速、避免内存溢出。
 void Cask::submit_index_task(IndexTask task) {
     if (!index_pool_) return;
     index_pool_->submit(std::move(task));
