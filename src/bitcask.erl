@@ -50,7 +50,8 @@
            search_fuzzy/3, search_fuzzy/4,
            search_wildcard/2, search_wildcard/3,
            search_vector/2, search_vector/3, search_vector/4, search_vector/5,
-           search_hybrid/3, search_hybrid/4, search_hybrid/5,
+           search_hybrid/2, search_hybrid/3, search_hybrid/4, search_hybrid/5,
+           embed/2,
            encode_meta/1,
            set_synonym_map/2]).
 
@@ -93,14 +94,24 @@ open(Dirname) -> open(Dirname, []).
 %%     {enable_stop_words, true} — 启用停用词过滤
 %%
 %%   向量模式选项：
-%%     {vector_dim, N}      — 向量维度（必填）
+%%     {embedder, {Provider, Cfg}} — 推荐。Provider = openai | anthropic |
+%%                            {custom, Mod}；Cfg 同 bitcask_embedder:new/2
+%%                            （url/model/dim/vector_dim/max_input_bytes/
+%%                            timeout_ms/...）。open 内部建 ctx，并自动把集合
+%%                            维度设为 embedder 的 vector_dim（MRL 落库维度），
+%%                            无需再写 {vector_dim,N}。配置后：put #{text=>...}
+%%                            自动 embed；search_vector({text,_}) /
+%%                            search_hybrid(.,auto,.) 自动 embed 查询；
+%%                            bitcask:embed/2 直接编码。embedder 在场时
+%%                            {vector_dim,N} 由 embedder 接管（用户值被忽略）。
+%%     {vector_dim, N}      — 仅手动向量路径（不配 embedder）时需要：向量维度。
 %%     {vector_metric, M}   — cosine | l2 | dot（默认 cosine）
-%%     {embedder, Ctx}      — bitcask_embedder:ctx()，配置后 put
-%%                            #{text => ...} 自动 embed 生成向量，
-%%                            无需外部计算。显式传 vector 键时跳过。
 %%
-%%   索引模式的 put 可接受 binary 或 #{text => binary(), meta => binary()}。
-%%   配置 embedder 后 put #{text => binary()} 会自动 embed。
+%%   MRL：embedder Cfg 里 dim = 模型原生维度，vector_dim = 截断落库维度
+%%   （≤ dim，缺省 = dim）；二者不一致时 embed 请求自动带 dimensions。
+%%
+%%   索引模式的 put 可接受 binary 或 #{text=>binary(), vector=>binary(),
+%%   meta=>binary()}。配 embedder 后 put #{text=>...} 自动 embed（显式 vector 跳过）。
 %%   索引模式下调 search_text/search_phrase 进行 BM25 检索。
 %%
 %%   返回:
@@ -110,17 +121,49 @@ open(Dirname) -> open(Dirname, []).
 open(Dirname, Opts) ->
     catch application:load(bitcask),
     catch application:start(bitcask),
-    EmbedderCtx = proplists:get_value(embedder, Opts),
-    Base = case proplists:get_bool(read_write, Opts) of
-               true  -> [read_write];
-               false -> []
-           end,
-    Extra0 = [{K, V} || K <- ?CASK_PASSTHROUGH_OPTS,
-                        (V = opt_value(K, Opts)) =/= undefined],
-    Extra = maybe_default_dict_path(Extra0),
-    case bitcask_cpp_nifs:cask_open(Dirname, Base ++ Extra) of
-        {ok, CaskRef}  -> {CaskRef, EmbedderCtx};
-        {error, _} = E -> E
+    case resolve_embedder(Opts) of
+        {error, _} = E -> E;
+        {ok, EmbedderCtx, EmbVecDim} ->
+            Base = case proplists:get_bool(read_write, Opts) of
+                       true  -> [read_write];
+                       false -> []
+                   end,
+            %% vector_dim 单独处理：配了 embedder → 由 embedder 推出（MRL 落库
+            %% 维度，权威，覆盖用户显式值）；否则取用户显式 {vector_dim,N}（手动
+            %% 向量路径）。
+            PassNoVDim = ?CASK_PASSTHROUGH_OPTS -- [vector_dim],
+            Extra0 = [{K, V} || K <- PassNoVDim,
+                                (V = opt_value(K, Opts)) =/= undefined],
+            VDim = case EmbVecDim of
+                       undefined -> opt_value(vector_dim, Opts);
+                       _         -> EmbVecDim
+                   end,
+            Extra1 = case VDim of
+                         undefined -> Extra0;
+                         _         -> [{vector_dim, VDim} | Extra0]
+                     end,
+            Extra = maybe_default_dict_path(Extra1),
+            case bitcask_cpp_nifs:cask_open(Dirname, Base ++ Extra) of
+                {ok, CaskRef}  -> {CaskRef, EmbedderCtx};
+                {error, _} = E -> E
+            end
+    end.
+
+%% 解析 embedder 选项。新形 {Provider, ConfigMap}：内部调 bitcask_embedder:new
+%% 建 ctx，并从中推出 vector_dim（= MRL 落库维度）作为集合维度，免去外部
+%% 先 new、再单独写 {vector_dim,N}。无 embedder → {ok, undefined, undefined}。
+%% 返回 {ok, Ctx, VectorDim} | {error, Reason}。
+resolve_embedder(Opts) ->
+    case proplists:get_value(embedder, Opts) of
+        undefined ->
+            {ok, undefined, undefined};
+        {Provider, Cfg} when is_map(Cfg) ->
+            case bitcask_embedder:new(Provider, Cfg) of
+                {ok, Ctx}      -> {ok, Ctx, bitcask_embedder:vector_dim(Ctx)};
+                {error, _} = E -> E
+            end;
+        _Other ->
+            {error, {bad_embedder, expected_provider_config_tuple}}
     end.
 
 %% analyzer=jieba 且未显式指定 dict_path 时，默认指向 priv/dict
@@ -563,38 +606,75 @@ search_wildcard(Handle, Pattern) ->
 search_wildcard(Handle, Pattern, K) ->
     bitcask_cpp_nifs:cask_search_wildcard(ref(Handle), Pattern, K).
 
+%% 用句柄里 open 时配置的 embedder 把文本编码成向量。无 embedder → 报错。
+%% 配合 search_vector/search_hybrid 的自动 embed 与 put #{text} 自动 embed。
+-spec embed(Handle::term(), Text::binary()) -> {ok, binary()} | {error, term()}.
+embed({_Ref, undefined}, _Text) ->
+    {error, no_embedder};
+embed({_Ref, Ctx}, Text) when is_binary(Text) ->
+    bitcask_embedder:embed(Ctx, Text).
+
 %% =========================================================================
 %% 向量 / 混合检索（V3.6）
 %%
-%% 必须在向量集合（open 时带 {vector_dim, N}，且为索引模式）上调用。
+%% 必须在向量集合（open 时配 embedder 或带 {vector_dim, N}，且为索引模式）调用。
 %% VecBin = f32 LE 二进制（Dim×4 字节），与 put 的 doc map vector 键同格式：
 %%   << <<X:32/float-little>> || X <- Floats >>
-%% embedding 由调用方提供（bitcask_embedder behaviour），引擎只收向量。
+%% 自动 embed：search_vector 传 {text, Bin} 作为查询、search_hybrid 向量位传
+%% 原子 auto，引擎用句柄的 embedder 把文本编码成查询向量（需 open 配 embedder）。
 %% =========================================================================
 
 %% HNSW 近邻检索。Ef=0 → 引擎默认 max(K, 64)。
-search_vector(Handle, VecBin) ->
-    search_vector(Handle, VecBin, 10).
+%% 查询可传 VecBin（f32 二进制）或 {text, Bin}（自动 embed）。
+search_vector(Handle, Query) ->
+    search_vector(Handle, Query, 10).
 
-search_vector(Handle, VecBin, K) ->
-    search_vector(Handle, VecBin, K, 0).
+search_vector(Handle, Query, K) ->
+    search_vector(Handle, Query, K, 0).
 
+search_vector(Handle, {text, Text}, K, Ef) ->
+    case embed(Handle, Text) of
+        {ok, V}        -> search_vector(Handle, V, K, Ef);
+        {error, _} = E -> E
+    end;
 search_vector(Handle, VecBin, K, Ef) ->
     bitcask_cpp_nifs:cask_search_vector(ref(Handle), VecBin, K, Ef).
 
+search_vector(Handle, {text, Text}, K, Ef, Filter) ->
+    case embed(Handle, Text) of
+        {ok, V}        -> search_vector(Handle, V, K, Ef, Filter);
+        {error, _} = E -> E
+    end;
 search_vector(Handle, VecBin, K, Ef, Filter) ->
     bitcask_cpp_nifs:cask_search_vector(ref(Handle), VecBin, K, Ef, Filter).
 
 %% RRF 混合检索：BM25 与向量两路各取 K'=max(K×4,64)，按 1/(60+rank) 融合，
 %% 平局 ord 小者在前。TextQuery/VecBin 允许其一为 <<>>（单路退化），
 %% 两路都空 → {error, _}。返回 {ok, [{Key, Ord, RrfScore}]}。
-search_hybrid(Handle, TextQuery, VecBin) ->
+%%
+%% 自动 embed：/2 (默认 K) 或向量位传原子 auto（/4、/5 带 K/Filter）→ 用句柄
+%% embedder 把 TextQuery 编码成查询向量，文本同时用于 BM25 两路。需 open 配了
+%% embedder。（无 auto/3：search_hybrid(H,Text) 已覆盖默认 K 的自动 embed。）
+search_hybrid(Handle, TextQuery) ->
+    search_hybrid(Handle, TextQuery, auto, 10).
+
+search_hybrid(Handle, TextQuery, VecBin) when is_binary(VecBin) ->
     search_hybrid(Handle, TextQuery, VecBin, 10).
 
-search_hybrid(Handle, TextQuery, VecBin, K) ->
+search_hybrid(Handle, TextQuery, auto, K) ->
+    case embed(Handle, TextQuery) of
+        {ok, V}        -> search_hybrid(Handle, TextQuery, V, K);
+        {error, _} = E -> E
+    end;
+search_hybrid(Handle, TextQuery, VecBin, K) when is_binary(VecBin) ->
     bitcask_cpp_nifs:cask_search_hybrid(ref(Handle), TextQuery, VecBin, K).
 
-search_hybrid(Handle, TextQuery, VecBin, K, Filter) ->
+search_hybrid(Handle, TextQuery, auto, K, Filter) ->
+    case embed(Handle, TextQuery) of
+        {ok, V}        -> search_hybrid(Handle, TextQuery, V, K, Filter);
+        {error, _} = E -> E
+    end;
+search_hybrid(Handle, TextQuery, VecBin, K, Filter) when is_binary(VecBin) ->
     bitcask_cpp_nifs:cask_search_hybrid(ref(Handle), TextQuery, VecBin, K, Filter).
 
 %% 设置同义词词典（S8.2）：从文件加载，查询时自动展开。
