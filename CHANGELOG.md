@@ -41,6 +41,14 @@ API 参考：[`doc/api-zh.md`](doc/api-zh.md)。
   请求带 `dimensions`，并校验响应维度。
 - **结构化元数据 + 过滤**：`encode_meta/1`；`eq`/`gte`/`lte`/`in` 条件 +
   `and`/`or` + 嵌套，作用于 `search_text/4`、`search_vector/5`、`search_hybrid/5`。
+- **P3 — 向量落盘 int8 量化**（opt-in `{vector_quantized, true}`）：向量按 per-vector
+  对称 int8 码字落盘（磁盘 `~4×` 小），写入 `bitcask.meta` 并重开校验一致；
+  `get`/恢复透明 dequant。默认仍 f32——合成 dim=2560 实测 recall@10=0.987 /
+  @100=0.995（@10 跌 ~1.3%），故 int8 作磁盘受限部署的 opt-in。设计+测量见
+  `doc/vector-ondisk-quant-design-zh.md`。
+- **P4 — 单写者组提交**（`{sync_strategy, {puts, N}}`）：每 N 次写对 active data
+  file fsync 一次（close/roll/sync 收尾 force-flush），介于 `none` 与逐条
+  `o_sync` 之间。无跨线程锁。
 - **流式迭代**：`stream/1` + `next/1` + `stop/1` + `with_stream/2`，及
   `stream_fold/3,4`。
 - **双语文档**：API 参考（`doc/api-zh.md` / `doc/api-en.md`）、并发/锁全序、磁盘
@@ -64,6 +72,15 @@ API 参考：[`doc/api-zh.md`](doc/api-zh.md)。
 - **CRC32**：PCLMULQDQ 硬件加速（SSE4.2 + CLMUL），zlib 兜底。
 - **模糊匹配**：Myers 位并行编辑距离（约 11× 于 DP 基线）。
 
+### 性能——持久化与写路径
+- **P1 — Hint 写缓冲**：hint record 攒进 64 KiB 内存缓冲，按阈值 / 文件 roll /
+  close 才落盘，取代每 put 一次 `write(2)`——写路径 syscall 约减半。hint 可重建，
+  崩溃丢缓冲尾巴只回退 `fold(data)`（安全语义不变）。
+- **P2 — merge 不重分词**：merge 后不再全量重建 BM25 索引（原会重读+重分词所有
+  live 文档）。posting 以稳定 `ord` 为键，`merge` 已通过 `on_relocate` 重映射定位、
+  死文档由 `is_live` 过滤，故 merge 改为按阈值 `compact`（清死 posting，不读盘、
+  不跑 NLP）。
+
 ### 变更
 - `bitcask:open/2` 改用 `{embedder, {Provider, Cfg}}` 配置 embedder，并自动从
   embedder 的 `vector_dim` 推出集合维度（无需单独写 `{vector_dim, N}`）。
@@ -82,6 +99,10 @@ API 参考：[`doc/api-zh.md`](doc/api-zh.md)。
   安全遍历并发表；`max_indexed_ord_` 原子化；`IndexPool` 消费者 try/catch（避免
   `flush` 挂起 / `std::terminate`）；HNSW `load` 释放残留 chunk；重建/加载快照时
   清理 `ord_field_lens_`。
+- **`{sync_strategy, {seconds, N}}`** 文档有声明但 C++ NIF 从未实现（静默等同
+  `none`）；以已实现的 `{sync_strategy, {puts, N}}` 取代（P4）。
+- **`bitcask:open/2` 模式不一致 `case_clause` 崩溃**：NIF 把部分故障（如
+  `mode_mismatch`）以裸 atom 返回，`open/2` 未处理——现归一为 `{error, Reason}`。
 
 ### 不兼容的变化
 1. **磁盘格式**：新的带类型记录格式（`kDoc`/`kTombstone` + 逐次写入序号、可选

@@ -49,6 +49,15 @@ API reference: [`doc/api-en.md`](doc/api-en.md).
 - **Structured metadata + filters**: `encode_meta/1`; `eq`/`gte`/`lte`/`in`
   conditions with `and`/`or` and nesting on `search_text/4`, `search_vector/5`,
   `search_hybrid/5`.
+- **P3 — on-disk int8 vector quantization** (opt-in `{vector_quantized, true}`):
+  stores vectors as per-vector symmetric int8 codewords (`~4×` smaller on disk),
+  persisted in `bitcask.meta` and validated on reopen; `get`/recovery dequantize
+  transparently. Default stays f32 — measured recall@10 = 0.987 / @100 = 0.995 on
+  synthetic dim=2560 (~1.3% @10 drop), so int8 is opt-in for disk-constrained
+  deployments. Design + measurement: `doc/vector-ondisk-quant-design-zh.md`.
+- **P4 — single-writer group commit** (`{sync_strategy, {puts, N}}`): fsync the
+  active data file once every N writes (close/roll/sync force-flush), a middle
+  ground between `none` and per-record `o_sync`. No cross-thread lock.
 - **Streaming iteration**: `stream/1` + `next/1` + `stop/1` + `with_stream/2`,
   and `stream_fold/3,4`.
 - **Bilingual docs**: API reference (`doc/api-en.md` / `doc/api-zh.md`),
@@ -76,6 +85,17 @@ the widest available instruction set; a scalar fallback always exists.
 - **Fuzzy matching**: Myers bit-parallel edit distance (~11× faster than the DP
   baseline).
 
+### Performance — persistence & write path
+- **P1 — hint write buffering**: hint records accumulate in a 64 KiB in-memory
+  buffer and flush on threshold / file roll / close, instead of one `write(2)`
+  per put — roughly halves write-path syscalls. Hint is rebuildable, so a crash
+  that loses the buffered tail just falls back to `fold(data)` (unchanged safety).
+- **P2 — merge without re-tokenization**: post-merge the BM25 index is no longer
+  fully rebuilt (which re-read and re-analyzed every live document). Postings key
+  on the stable `ord`; `merge` already remaps storage locations via `on_relocate`
+  and dead docs are filtered by `is_live`, so merge now only runs a
+  threshold-gated `compact` (drop dead postings, no disk read, no NLP).
+
 ### Changed
 - `bitcask:open/2` now configures the embedder via `{embedder, {Provider, Cfg}}`
   and auto-derives the collection dimension from the embedder's `vector_dim`
@@ -98,6 +118,12 @@ the widest available instruction set; a scalar fallback always exists.
   the concurrent map safely; `max_indexed_ord_` made atomic; `IndexPool` consumer
   wrapped in try/catch (no `flush` hang / `std::terminate`); HNSW `load` releases
   pre-existing chunks; `ord_field_lens_` cleared on rebuild/snapshot load.
+- **`{sync_strategy, {seconds, N}}`** was documented but never implemented in the
+  C++ NIF (silently behaved as `none`); replaced by the implemented
+  `{sync_strategy, {puts, N}}` (P4).
+- **`bitcask:open/2` `case_clause` crash** on mode-mismatch: the NIF returns some
+  faults (e.g. `mode_mismatch`) as a bare atom, which `open/2` didn't handle —
+  now normalized to `{error, Reason}`.
 
 ### Breaking changes
 1. **On-disk format**: new typed-record format (`kDoc`/`kTombstone` + per-write
