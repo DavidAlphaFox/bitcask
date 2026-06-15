@@ -98,44 +98,50 @@ ok
 
 > 在**未指定分析器**的 cask 上调用任何 `search_*` 函数将返回 `{error, no_index}`。
 
-**HNSW 向量搜索** — 向量搜索需索引模式（`{analyzer, ...}`）+ 向量配置
-（`{vector_dim, N}`，可选 `{vector_metric, cosine|l2|dot}`，默认 `cosine`）。
-**推荐流程：open 时配置 embedder，之后 `put #{text => ...}` 自动 embed 入库，
-无需外部计算向量。** 注意 `open` 返回 `{CaskRef, EmbedderCtx}` 元组，整体当
-Handle 传给后续调用：
+**HNSW 向量搜索** — 向量搜索需索引模式（`{analyzer, ...}`）。**推荐流程：open
+时把 embedder 作为 `{Provider, Cfg}` 传入，open 内部建 ctx 并自动把集合维度设为
+embedder 的 `vector_dim`——无需外部 `new`、也无需单独写 `{vector_dim, N}`。** 之后
+`put #{text => ...}` / 查询都自动 embed。`open` 返回 `{CaskRef, EmbedderCtx}`
+元组，整体当 Handle 传给后续调用：
 
 ```erlang
-%% 1) 构建 embedder 上下文（OpenAI 兼容端点，如 llama.cpp server / vLLM）
-1> {ok, Ctx} = bitcask_embedder:new(openai, #{
-1>     url   => "http://localhost:8080/v1/embeddings",
-1>     model => <<"qwen3-embedding">>, dim => 2560,
-1>     max_input_bytes    => 32768,   % 可选，按模型上下文窗口设（默认 32768）
-1>     timeout_ms         => 30000,   % 可选，请求总超时（默认 30000）
-1>     connect_timeout_ms => 5000}).  % 可选，建连超时（默认 5000）
-{ok,#{module => bitcask_embedder_openai, dim => 2560, config => #{...}}}
-%% 2) open：vector_dim 必须 == embedder 维度；带上 {embedder, Ctx}
-2> H = bitcask:open("/tmp/vec", [read_write, {analyzer, whitespace},
-2>     {vector_dim, 2560}, {embedder, Ctx}]).
-{#Ref<0.1.2.3>, #{module => bitcask_embedder_openai, dim => 2560, ...}}
-%% 3) put 只给 text → 自动 embed 入库
-3> bitcask:put(H, <<"d1">>, #{text => <<"the quick brown fox">>}).
+%% 1) open 直接配 embedder（Provider = openai | anthropic | {custom,Mod}）。
+%%    OpenAI 兼容端点，如 llama.cpp server / vLLM。
+1> H = bitcask:open("/tmp/vec", [read_write, {analyzer, whitespace},
+1>     {embedder, {openai, #{
+1>         url => "http://localhost:8080/v1/embeddings",
+1>         model => <<"qwen3-embedding">>,
+1>         dim => 2560,                    % 模型原生维度
+1>         vector_dim => 1024,             % 可选 MRL 截断维度（≤dim；缺省=dim）
+1>         max_input_bytes => 32768,       % 可选（默认 32768）
+1>         timeout_ms => 30000,            % 可选（默认 30000）
+1>         connect_timeout_ms => 5000}}]). % 可选（默认 5000）
+{#Ref<0.1.2.3>, #{module => bitcask_embedder_openai, dim => 2560,
+                  vector_dim => 1024, config => #{...}}}
+%% 2) put 只给 text → 自动 embed 入库
+2> bitcask:put(H, <<"d1">>, #{text => <<"the quick brown fox">>}).
 ok
-%% 4) 查询：把查询文本 embed 成向量，再 search_vector（cosine 相似度，分数示意）
-4> {ok, Q} = bitcask_embedder:embed(Ctx, <<"fast brown animal">>).
-5> bitcask:search_vector(H, Q).
-{ok,[{<<"d1">>,0,0.83}]}
-%% 5) 混合检索：文本 + 向量两路 RRF 融合
-6> bitcask:search_hybrid(H, <<"fast brown animal">>, Q).
+%% 3) 混合检索：向量位省略 / 传 auto → 用句柄 embedder 自动 embed 查询文本
+3> bitcask:search_hybrid(H, <<"fast brown animal">>).
 {ok,[{<<"d1">>,0,0.0328}]}
-7> bitcask:close(H).
+%% 4) 纯向量检索：查询传 {text, _} → 自动 embed（分数为 cosine 相似度，示意）
+4> bitcask:search_vector(H, {text, <<"fast brown animal">>}).
+{ok,[{<<"d1">>,0,0.83}]}
+%% 5) 需要原始向量时用 embed/2 门面
+5> {ok, Q} = bitcask:embed(H, <<"fast brown animal">>).
+6> bitcask:close(H).
 ok
 ```
 
-> **低层路径（不用 embedder）**：open 省略 `{embedder, Ctx}`，`put` 用
-> `#{text => T, vector => V}` 自带 f32 小端序向量
-> （`V = << <<X:32/float-little>> || X <- Floats >>`），查询也自己构造向量二进制。
-> 例如 `vector_dim=4`、库里存 `[1,0,0,0]`、查 `[0.9,0.1,0,0]`，
-> `search_vector` 返回 `{ok,[{<<"d1">>,0,0.99388}]}`（cosine = 0.9/√0.82）。
+> **MRL（Matryoshka）**：`dim` 永远是模型原生维度；`vector_dim` 是 MRL 截断后的
+> 落库/检索维度（≤ dim，缺省 = dim）。二者不一致时 embed 请求自动带
+> `dimensions => vector_dim`，由服务端按 MRL 截断+重归一（端点需支持）。
+>
+> **低层路径（不用 embedder）**：open 省略 `embedder`、改写 `{vector_dim, N}`；`put`
+> 用 `#{text => T, vector => V}` 自带 f32 小端序向量
+> （`V = << <<X:32/float-little>> || X <- Floats >>`），查询传向量二进制。
+> 例如 `vector_dim=4`、库里 `[1,0,0,0]`、查 `[0.9,0.1,0,0]` →
+> `search_vector(H, V)` 返回 `{ok,[{<<"d1">>,0,0.99388}]}`（cosine = 0.9/√0.82）。
 
 ## API 概览
 
@@ -148,7 +154,8 @@ ok
 | `merge/1,2,3`, `needs_merge/1,2`, `status/1` | 合并管理 |
 | `search_text/2,3`, `search_phrase/2,3`, `search_fields/2,3` | BM25 检索（全文 / 短语 / `field:term^boost`） |
 | `search_near/3,4`, `search_fuzzy/3,4`, `search_wildcard/2,3` | 近邻 / 模糊（编辑距离）/ 通配符搜索 |
-| `search_vector/2,3,4,5`, `search_hybrid/3,4,5` | HNSW 向量近邻 / RRF 混合检索（BM25 + 向量）；`/5` 末参为 meta filter |
+| `search_vector/2,3,4,5`, `search_hybrid/2,3,4,5` | HNSW 向量近邻 / RRF 混合检索（BM25 + 向量）；查询传 `{text,_}`（vector）或 `auto`（hybrid）自动 embed；`/5` 末参为 meta filter |
+| `embed/2` | 用句柄 embedder 把文本编码成向量（`{ok, Vec}`/`{error, no_embedder}`） |
 | `set_synonym_map/2` | 加载同义词词典 |
 | `is_empty_estimate/1`, `is_frozen/1`, `close_write_file/1` | 工具函数 |
 

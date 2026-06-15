@@ -97,44 +97,52 @@ ok
 > Calling any `search_*` on a cask opened **without** an analyzer returns
 > `{error, no_index}`.
 
-**HNSW vector search** — requires index mode (`{analyzer, ...}`) plus vector
-config (`{vector_dim, N}`, optional `{vector_metric, cosine|l2|dot}`, default
-`cosine`). **Recommended flow: configure an embedder at open time, then
-`put #{text => ...}` auto-embeds into a vector — no external computation.**
-Note `open` returns a `{CaskRef, EmbedderCtx}` tuple; pass it as the handle:
+**HNSW vector search** — requires index mode (`{analyzer, ...}`). **Recommended
+flow: pass the embedder as `{Provider, Cfg}` at open time; open builds the ctx
+internally and auto-sets the collection dimension to the embedder's `vector_dim`
+— no external `new`, no separate `{vector_dim, N}`.** Then `put #{text => ...}`
+and queries auto-embed. `open` returns a `{CaskRef, EmbedderCtx}` tuple; pass it
+as the handle:
 
 ```erlang
-%% 1) Build an embedder context (OpenAI-compatible endpoint, e.g. llama.cpp / vLLM)
-1> {ok, Ctx} = bitcask_embedder:new(openai, #{
-1>     url   => "http://localhost:8080/v1/embeddings",
-1>     model => <<"qwen3-embedding">>, dim => 2560,
-1>     max_input_bytes    => 32768,   % optional, set to the model's context window (default 32768)
-1>     timeout_ms         => 30000,   % optional, request timeout (default 30000)
-1>     connect_timeout_ms => 5000}).  % optional, connect timeout (default 5000)
-{ok,#{module => bitcask_embedder_openai, dim => 2560, config => #{...}}}
-%% 2) open: vector_dim must == embedder dim; pass {embedder, Ctx}
-2> H = bitcask:open("/tmp/vec", [read_write, {analyzer, whitespace},
-2>     {vector_dim, 2560}, {embedder, Ctx}]).
-{#Ref<0.1.2.3>, #{module => bitcask_embedder_openai, dim => 2560, ...}}
-%% 3) put with just text → auto-embed on write
-3> bitcask:put(H, <<"d1">>, #{text => <<"the quick brown fox">>}).
+%% 1) Configure the embedder directly at open (Provider = openai|anthropic|{custom,Mod}).
+%%    OpenAI-compatible endpoint, e.g. llama.cpp server / vLLM.
+1> H = bitcask:open("/tmp/vec", [read_write, {analyzer, whitespace},
+1>     {embedder, {openai, #{
+1>         url => "http://localhost:8080/v1/embeddings",
+1>         model => <<"qwen3-embedding">>,
+1>         dim => 2560,                    % model's native dimension
+1>         vector_dim => 1024,             % optional MRL truncation (<=dim; default=dim)
+1>         max_input_bytes => 32768,       % optional (default 32768)
+1>         timeout_ms => 30000,            % optional (default 30000)
+1>         connect_timeout_ms => 5000}}]). % optional (default 5000)
+{#Ref<0.1.2.3>, #{module => bitcask_embedder_openai, dim => 2560,
+                  vector_dim => 1024, config => #{...}}}
+%% 2) put with just text → auto-embed on write
+2> bitcask:put(H, <<"d1">>, #{text => <<"the quick brown fox">>}).
 ok
-%% 4) query: embed the query text, then search_vector (cosine sim; score illustrative)
-4> {ok, Q} = bitcask_embedder:embed(Ctx, <<"fast brown animal">>).
-5> bitcask:search_vector(H, Q).
-{ok,[{<<"d1">>,0,0.83}]}
-%% 5) hybrid: fuse text + vector via RRF
-6> bitcask:search_hybrid(H, <<"fast brown animal">>, Q).
+%% 3) hybrid: omit the vector / pass auto → the handle's embedder embeds the query text
+3> bitcask:search_hybrid(H, <<"fast brown animal">>).
 {ok,[{<<"d1">>,0,0.0328}]}
-7> bitcask:close(H).
+%% 4) pure vector: pass {text, _} as the query → auto-embed (score is cosine sim, illustrative)
+4> bitcask:search_vector(H, {text, <<"fast brown animal">>}).
+{ok,[{<<"d1">>,0,0.83}]}
+%% 5) use the embed/2 facade when you need the raw vector
+5> {ok, Q} = bitcask:embed(H, <<"fast brown animal">>).
+6> bitcask:close(H).
 ok
 ```
 
-> **Low-level path (no embedder)**: omit `{embedder, Ctx}` at open and `put`
-> with `#{text => T, vector => V}` carrying your own f32 little-endian vector
-> (`V = << <<X:32/float-little>> || X <- Floats >>`); build the query vector
-> yourself too. E.g. with `vector_dim=4`, doc `[1,0,0,0]`, query `[0.9,0.1,0,0]`,
-> `search_vector` returns `{ok,[{<<"d1">>,0,0.99388}]}` (cosine = 0.9/√0.82).
+> **MRL (Matryoshka)**: `dim` is always the model's native dimension; `vector_dim`
+> is the MRL-truncated stored/query dimension (≤ dim, default = dim). When they
+> differ, the embed request automatically carries `dimensions => vector_dim` so the
+> server truncates + renormalizes per MRL (endpoint must support it).
+>
+> **Low-level path (no embedder)**: omit `embedder`, pass `{vector_dim, N}` instead;
+> `put` with `#{text => T, vector => V}` carrying your own f32 little-endian vector
+> (`V = << <<X:32/float-little>> || X <- Floats >>`), and pass a vector binary as the
+> query. E.g. `vector_dim=4`, doc `[1,0,0,0]`, query `[0.9,0.1,0,0]` →
+> `search_vector(H, V)` returns `{ok,[{<<"d1">>,0,0.99388}]}` (cosine = 0.9/√0.82).
 
 ## API highlights
 
@@ -147,7 +155,8 @@ ok
 | `merge/1,2,3`, `needs_merge/1,2`, `status/1` | Merge management |
 | `search_text/2,3`, `search_phrase/2,3`, `search_fields/2,3` | BM25 search (full-text / phrase / `field:term^boost`) |
 | `search_near/3,4`, `search_fuzzy/3,4`, `search_wildcard/2,3` | Proximity / fuzzy (edit-distance) / wildcard search |
-| `search_vector/2,3,4,5`, `search_hybrid/3,4,5` | HNSW vector nearest-neighbor / RRF hybrid (BM25+vector); `/5` takes a trailing meta filter |
+| `search_vector/2,3,4,5`, `search_hybrid/2,3,4,5` | HNSW vector NN / RRF hybrid (BM25+vector); pass `{text,_}` (vector) or `auto` (hybrid) to auto-embed the query; `/5` takes a trailing meta filter |
+| `embed/2` | Encode text to a vector via the handle's embedder (`{ok, Vec}`/`{error, no_embedder}`) |
 | `set_synonym_map/2` | Load a synonym dictionary |
 | `is_empty_estimate/1`, `is_frozen/1`, `close_write_file/1` | Utilities |
 
