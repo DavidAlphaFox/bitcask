@@ -31,7 +31,7 @@ rebar3 do xref, dialyzer
 ```sh
 cmake -S . -B _build/cmake -DBUILD_TESTING=ON
 cmake --build _build/cmake -j
-ctest --test-dir _build/cmake --output-on-failure   # 380+ GoogleTests
+ctest --test-dir _build/cmake --output-on-failure   # 400+ GoogleTests
 ```
 
 Sanitizer（一次只能开一种——ASan 和 TSan 互斥）：
@@ -163,6 +163,7 @@ ok
 - **Jieba 中文分析器** 已集成（whitespace / ngram / jieba）
 - **带类型记录格式**（`kDoc`/`kTombstone` + 逐次写入序号）为默认格式
 - **统一架构** — Cask 与 Collection 已合并为单一引擎，按配置（`{analyzer, ...}`）启用 KV 或索引模式
+- **并发加固**（2026-06 审计）— 索引读路径与异步索引 worker 并发安全：`meta_blob`/搜索缓存锁内拷贝不逃逸、倒排索引快照安全遍历、跨线程标量原子化、IndexPool 消费者异常兜底；详见 [`doc/concurrency-zh.md` §6](doc/concurrency-zh.md)
 
 ## 许可证
 

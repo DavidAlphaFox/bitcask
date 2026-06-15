@@ -29,7 +29,7 @@ Erlang ≥ 22.0 required.
 ```sh
 cmake -S . -B _build/cmake -DBUILD_TESTING=ON
 cmake --build _build/cmake -j
-ctest --test-dir _build/cmake --output-on-failure   # 300+ GoogleTests
+ctest --test-dir _build/cmake --output-on-failure   # 400+ GoogleTests
 ```
 
 Sanitizers (one at a time — ASan and TSan are mutually exclusive):
@@ -162,6 +162,7 @@ ok
 - **Jieba Chinese analyzer** integrated (whitespace / n-gram / jieba)
 - **Typed record format** (`kDoc`/`kTombstone` with per-write ordinal) is the default
 - **Unified architecture** — Cask and Collection are merged into a single engine; KV vs. index mode selected via `{analyzer, ...}` option
+- **Concurrency hardening** (2026-06 audit) — search read path is safe against the async index worker: `meta_blob`/search-cache copy under lock without escaping pointers, inverted-index snapshot uses safe iteration, cross-thread scalars are atomic, IndexPool consumer is exception-safe; see [`doc/concurrency-zh.md` §6](doc/concurrency-zh.md)
 
 ## License
 
