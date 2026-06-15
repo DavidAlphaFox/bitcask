@@ -112,11 +112,12 @@ public:
     // LiveChecker::doc_len — 返回 ord 对应文档的 token 数，越界返回 0。
     [[nodiscard]] std::uint32_t doc_len(std::uint64_t ord) const override;
 
-    // V5:取 ord 的原始 meta blob(结构化 KV 二进制)。越界或空 → 空 span,
+    // V5:取 ord 的原始 meta blob(结构化 KV 二进制)。越界或空 → 空 vector,
     // 让上层 filter 直接判 false 跳过(无 meta = 不通过过滤)。
-    // 线程安全:shared_lock;返回的 span 指向 Index 内部存储,生命周期止于
-    // 下一次 set_meta(同 ord)——caller 不得跨 set_meta 持留此 span。
-    [[nodiscard]] std::span<const std::byte> meta_blob(std::uint64_t ord) const;
+    // 线程安全:shared_lock。返回**拷贝**而非 span——读路径无锁并发,而
+    // set_meta(worker 线程)会重分配底层 vector;若返回内部 span 会在锁外
+    // 被并发 set_meta 释放(use-after-free)。锁内拷贝杜绝逃逸。
+    [[nodiscard]] std::vector<std::byte> meta_blob(std::uint64_t ord) const;
 
     // P2.1 批量版本：一次 shared_lock 完成整个数组（逐 posting 版本每条
     // posting 一次锁 + 一次虚调用，热词查询 = 数十万次锁操作且阻断评分

@@ -151,12 +151,12 @@ std::uint32_t Index::doc_len(std::uint64_t ord) const {
     return doc_lens_[ord];
 }
 
-std::span<const std::byte> Index::meta_blob(std::uint64_t ord) const {
+std::vector<std::byte> Index::meta_blob(std::uint64_t ord) const {
     std::shared_lock lk(mutex_);
     if (ord >= meta_blobs_.size()) return {};
-    // 空 vector → 空 span（无 meta 的文档，filter 直接判 false 跳过）。
-    const auto& v = meta_blobs_[ord];
-    return std::span<const std::byte>(v.data(), v.size());
+    // 锁内拷贝返回:并发 set_meta 会重分配 meta_blobs_[ord],返回内部指针/span
+    // 会在锁外悬垂。空 vector → 空返回（无 meta 的文档,filter 直接判 false）。
+    return meta_blobs_[ord];
 }
 
 void Index::set_meta(std::uint64_t ord, std::span<const std::byte> blob) {
