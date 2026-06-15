@@ -2,6 +2,8 @@
 
 [中文](README.md) | [![CI](https://github.com/basho/bitcask/workflows/CI/badge.svg)](https://github.com/basho/bitcask/actions)
 
+📖 **API reference**: [English](doc/api-en.md) · [中文](doc/api-zh.md) · 📝 [Changelog](CHANGELOG_EN.md)
+
 Bitcask is a log-structured hash table for fast key/value data, written in C++23
 with an Erlang NIF interface. On-disk format uses typed records (`kDoc`/`kTombstone`)
 with per-write ordinal numbers and optional DocValue encoding (text + vector + metadata).

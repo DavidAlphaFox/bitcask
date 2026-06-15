@@ -61,7 +61,22 @@ on-disk meta), `{bad_embedder, _}`, `{bad_opt, _}`.
 |--------|---------|-------------|
 | `{embedder, {Provider, Cfg}}` | **Recommended.** open builds the ctx via `bitcask_embedder:new(Provider, Cfg)` and auto-derives the collection dimension from the embedder's `vector_dim`. Enables auto-embed on `put`/queries. | `Provider = openai \| anthropic \| {custom, Mod}`; `Cfg` is a map. Pre-built ctx maps are **rejected** (`{error, {bad_embedder, _}}`). When present, `{vector_dim, N}` is taken over by the embedder. |
 | `{vector_dim, N}` | Vector dimension — manual-vector path only (no embedder) | `N > 0`; must match on-disk meta on reopen |
-| `{vector_metric, M}` | `cosine` \| `l2` \| `dot` | default `cosine`; cosine rejects zero vectors |
+| `{vector_metric, M}` | Distance/similarity metric — see below | `cosine` (default) \| `l2` \| `dot`; **fixed at creation** (reopen with a different metric → `mode_mismatch`) |
+
+**`vector_metric` in detail.** Picks how the HNSW index compares vectors. For all
+three, the returned `Score` is ordered so that **higher = more similar/closer**
+(results are sorted descending by `Score`):
+
+| Metric | What it computes | `Score` returned | Notes / constraints |
+|--------|------------------|------------------|---------------------|
+| `cosine` (default) | cosine similarity | cosine similarity in `[-1, 1]` (1 = identical direction) | Stored **and** query vectors are L2-normalized by the engine (idempotent on re-write), so magnitude is ignored. A **zero vector is rejected** (`{error, _}`) since it has no direction. Implemented internally as `dot` over normalized vectors. |
+| `dot` | raw inner product | the dot product (unbounded) | **No normalization** — vector magnitude affects the score. Use when your embeddings are already normalized or when magnitude is meaningful. |
+| `l2` | squared Euclidean distance | **negative** squared distance (`=< 0`; closer ⇒ nearer 0) | Negated so the "higher is better" ordering holds uniformly. |
+
+Guidance: most text-embedding models (incl. qwen3-embedding, which returns
+L2-normalized vectors) → use `cosine` (or `dot`, equivalent on normalized inputs).
+Use `l2` only when absolute geometric distance is what you want. The metric is
+written into the collection meta at first open and cannot change afterwards.
 
 ### `close(Handle) -> ok`
 Flush, release the writer lock, drop the keydir refcount. The handle is unusable

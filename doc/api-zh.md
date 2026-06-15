@@ -60,7 +60,20 @@ reference。后续所有调用都传整个元组。未配 embedder 时 `Embedder
 |------|------|------|
 | `{embedder, {Provider, Cfg}}` | **推荐。** open 内部经 `bitcask_embedder:new(Provider, Cfg)` 建 ctx，并自动用 embedder 的 `vector_dim` 作为集合维度；启用 `put`/查询的自动 embed。 | `Provider = openai \| anthropic \| {custom, Mod}`；`Cfg` 是 map。预建 ctx map 会被**拒绝**（`{error, {bad_embedder, _}}`）。在场时 `{vector_dim, N}` 由 embedder 接管。 |
 | `{vector_dim, N}` | 向量维度——仅手动向量路径（不配 embedder）需要 | `N > 0`；重开须与磁盘 meta 一致 |
-| `{vector_metric, M}` | `cosine` \| `l2` \| `dot` | 默认 `cosine`；cosine 拒绝零向量 |
+| `{vector_metric, M}` | 距离/相似度度量——见下 | `cosine`（默认）\| `l2` \| `dot`；**创建时固定**（重开换度量 → `mode_mismatch`） |
+
+**`vector_metric` 详解。** 决定 HNSW 如何比较向量。三种度量返回的 `Score` 都统一为
+**越大 = 越相似/越近**（结果按 `Score` 降序）：
+
+| 度量 | 计算的是 | 返回的 `Score` | 说明 / 限制 |
+|------|---------|---------------|------------|
+| `cosine`（默认） | 余弦相似度 | 余弦相似度 ∈ `[-1, 1]`（1 = 方向完全一致） | 入库**与**查询向量都由引擎做 L2 归一化（重写幂等），忽略模长。**零向量被拒绝**（`{error, _}`，无方向）。内部实现为归一化后的 `dot`。 |
+| `dot` | 原始内积 | 内积值（无界） | **不归一化**——模长影响分数。适合向量已归一化、或模长本身有意义的场景。 |
+| `l2` | 平方欧氏距离 | **负**的平方距离（`=< 0`；越近越趋于 0） | 取负以统一「越大越好」的排序。 |
+
+选型建议：多数文本 embedding 模型（含 qwen3-embedding，输出已 L2 归一化）→ 用
+`cosine`（或 `dot`，归一化输入下等价）。只有当你要的是绝对几何距离时才用 `l2`。
+度量在首次 open 写入集合 meta，之后不可更改。
 
 ### `close(Handle) -> ok`
 刷盘、释放写锁、keydir 引用计数减一。之后句柄不可再用。

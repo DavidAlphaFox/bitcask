@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/basho/bitcask/workflows/CI/badge.svg)](https://github.com/basho/bitcask/actions)
 
-[English](README_EN.md)
+[English](README_EN.md) · 📖 **API 参考**：[中文](doc/api-zh.md) · [English](doc/api-en.md) · 📝 [更新日志](CHANGELOG.md)
 
 Bitcask 是一个日志结构（log-structured）的哈希表键值存储引擎，使用 C++23 实现，
 通过 Erlang NIF 接口对外暴露。磁盘格式采用带类型记录（`kDoc`/`kTombstone`）与
