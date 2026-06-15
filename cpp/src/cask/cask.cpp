@@ -586,29 +586,37 @@ Cask::create_search_infra(const CaskOptions& opts) {
     search_ = std::make_unique<search::SearchLayer>(scfg);
     index_pool_ = std::make_unique<IndexPool>(1, 10240);
     index_pool_->start([&search = *search_](const IndexTask& task) {
-        if (task.op == IndexOp::RebuildHnsw) {
-            // V3.5:merge 后图重建(物理清死)。在 worker 执行 →
-            // 与 on_vector 同线程,维持 HNSW 单写者约束。
-            search.rebuild_hnsw();
-            return true;
-        }
-        if (task.op == IndexOp::Delete) {
-            search.on_delete(task.key(), task.ord);
-        } else if (!task.fields.empty()) {
-            search.on_write_fields(task.key(), task.ord, task.fields,
-                                   task.file_id, task.offset, task.total_sz, task.tstamp);
-        } else {
-            search.on_write(task.key(), task.ord, task.text(),
-                            task.file_id, task.offset, task.total_sz, task.tstamp);
-        }
-        // V5:meta blob 跟 on_write 同一 worker 顺序写入——meta 与
-        // 定位/live 对读路径原子可见(filter 直接读 meta_blob())。
-        if (task.op != IndexOp::Delete && !task.meta.empty()) {
-            search.index().set_meta(task.ord, task.meta);
-        }
-        // V3.3:向量接入 HNSW(单写者 = 本 worker 线程)。
-        if (task.op != IndexOp::Delete && !task.vec.empty()) {
-            search.on_vector(task.ord, task.vec);
+        // 消费者必须吞掉所有异常:worker_loop 不捕获,抛出会 std::terminate
+        // 整个进程,且即便不崩,pending_ 也无法递减→每次搜索走的 flush()
+        // 永久挂起。索引更新失败按 best-effort 丢弃(返回 true 让 pending_
+        // 正常递减、worker 存活)。
+        try {
+            if (task.op == IndexOp::RebuildHnsw) {
+                // V3.5:merge 后图重建(物理清死)。在 worker 执行 →
+                // 与 on_vector 同线程,维持 HNSW 单写者约束。
+                search.rebuild_hnsw();
+                return true;
+            }
+            if (task.op == IndexOp::Delete) {
+                search.on_delete(task.key(), task.ord);
+            } else if (!task.fields.empty()) {
+                search.on_write_fields(task.key(), task.ord, task.fields,
+                                       task.file_id, task.offset, task.total_sz, task.tstamp);
+            } else {
+                search.on_write(task.key(), task.ord, task.text(),
+                                task.file_id, task.offset, task.total_sz, task.tstamp);
+            }
+            // V5:meta blob 跟 on_write 同一 worker 顺序写入——meta 与
+            // 定位/live 对读路径原子可见(filter 直接读 meta_blob())。
+            if (task.op != IndexOp::Delete && !task.meta.empty()) {
+                search.index().set_meta(task.ord, task.meta);
+            }
+            // V3.3:向量接入 HNSW(单写者 = 本 worker 线程)。
+            if (task.op != IndexOp::Delete && !task.vec.empty()) {
+                search.on_vector(task.ord, task.vec);
+            }
+        } catch (...) {
+            // best-effort:丢弃本次更新,保活 worker 与 flush()。
         }
         return true;
     });
