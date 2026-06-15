@@ -147,6 +147,53 @@ bad_vector_binary_test_() ->
         end)
     end}.
 
+%% 新流程：open 用 {embedder,{Provider,Cfg}} 内部 new + 自动取 vector_dim；
+%% put #{text} 自动 embed；search_hybrid/2 与 search_vector({text,_}) 自动 embed
+%% 查询；bitcask:embed/2 门面。
+embedder_open_auto_embed_test_() ->
+    {"open 配 embedder 自动建 ctx+取 vector_dim；put/查询/embed 全自动",
+     fun() ->
+        with_dir(fun(D) ->
+            EOpts = [read_write, {analyzer, whitespace},
+                     {embedder, {{custom, bitcask_embedder_mock}, #{}}}],
+            R = bitcask:open(D, EOpts),
+            %% 句柄携带 ctx；vector_dim 由 embedder 推出（mock dim=4），无需显式。
+            ?assertMatch({_Ref, #{module := bitcask_embedder_mock}}, R),
+            %% put 只给 text → 自动 embed 入库。
+            ok = bitcask:put(R, <<"d1">>, #{text => <<"x y y">>}),
+            ok = bitcask:put(R, <<"d4">>, #{text => <<"z z z">>}),
+            %% embed 门面。
+            ?assertMatch({ok, Q} when is_binary(Q), bitcask:embed(R, <<"x">>)),
+            %% search_hybrid 省略向量 → 自动 embed（文本两路）。
+            ?assertMatch({ok, [{<<"d1">>, _, _} | _]},
+                         bitcask:search_hybrid(R, <<"x">>)),
+            ?assertMatch({ok, [{<<"d1">>, _, _} | _]},
+                         bitcask:search_hybrid(R, <<"x">>, auto, 5)),
+            %% search_vector 传 {text,_} → 自动 embed 查询。
+            ?assertMatch({ok, [{<<"d1">>, _, _} | _]},
+                         bitcask:search_vector(R, {text, <<"x x x">>})),
+            bitcask:close(R)
+        end),
+        %% 无 embedder 的集合调 embed/2 → {error, no_embedder}。
+        with_dir(fun(D) ->
+            R = bitcask:open(D, ?IDX),
+            ?assertEqual({error, no_embedder}, bitcask:embed(R, <<"x">>)),
+            bitcask:close(R)
+        end)
+    end}.
+
+%% embedder 选项只接受新形 {Provider, Cfg}；传旧式预建 ctx（map）应拒绝。
+embedder_rejects_prebuilt_ctx_test_() ->
+    {"open 的 embedder 只支持 {Provider,Cfg}，预建 ctx map 被拒",
+     fun() ->
+        with_dir(fun(D) ->
+            {ok, Ctx} = bitcask_embedder:new({custom, bitcask_embedder_mock}, #{}),
+            R = bitcask:open(D, [read_write, {analyzer, whitespace},
+                                 {embedder, Ctx}]),
+            ?assertMatch({error, {bad_embedder, _}}, R)
+        end)
+    end}.
+
 hybrid_requires_vector_config_test_() ->
     {"无向量配置集合调 hybrid/search_vector → {error,_};双空 → {error,_}",
      fun() ->
