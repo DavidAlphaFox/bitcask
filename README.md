@@ -63,8 +63,8 @@ rebar3 shell        # 先编译，再启动 REPL
 **键值模式** — 纯二进制值：
 
 ```erlang
-1> R = bitcask:open("/tmp/db", [read_write]).
-#Ref<0.1234.5678.90>
+1> R = bitcask:open("/tmp/db", [read_write]).   % 返回 {CaskRef, EmbedderCtx}
+{#Ref<0.1234.5678.90>,undefined}
 2> bitcask:put(R, <<"k">>, <<"hello">>).
 ok
 3> bitcask:get(R, <<"k">>).
@@ -79,7 +79,7 @@ ok
 ```erlang
 %% 分析器: whitespace（英文） | ngram（CJK n-gram） | jieba（中文分词）
 1> R = bitcask:open("/tmp/idx", [read_write, {analyzer, whitespace}]).
-#Ref<0.9876.5432.10>
+{#Ref<0.9876.5432.10>,undefined}
 2> bitcask:put(R, <<"d1">>, <<"the quick brown fox">>).
 ok
 3> bitcask:put(R, <<"d2">>, <<"a lazy brown dog">>).
@@ -98,29 +98,41 @@ ok
 
 > 在**未指定分析器**的 cask 上调用任何 `search_*` 函数将返回 `{error, no_index}`。
 
-**HNSW 向量搜索** — 向量搜索需索引模式，用 `{analyzer, ...}` + `{vector_dim, N}`
-（可选 `{vector_metric, cosine|l2|dot}`，默认 `cosine`）打开即可启用。向量为 f32
-小端序二进制（`<< <<X:32/float-little>> || X <- Floats >>`）：
+**HNSW 向量搜索** — 向量搜索需索引模式（`{analyzer, ...}`）+ 向量配置
+（`{vector_dim, N}`，可选 `{vector_metric, cosine|l2|dot}`，默认 `cosine`）。
+**推荐流程：open 时配置 embedder，之后 `put #{text => ...}` 自动 embed 入库，
+无需外部计算向量。** 注意 `open` 返回 `{CaskRef, EmbedderCtx}` 元组，整体当
+Handle 传给后续调用：
 
 ```erlang
-1> R = bitcask:open("/tmp/vec", [read_write,
-1>     {analyzer, whitespace}, {vector_dim, 4}]).
-2> Vec = << <<X:32/float-little>> || X <- [1.0, 0.0, 0.0, 0.0] >>.
-3> bitcask:put(R, <<"d1">>, #{text => <<"hello">>, vector => Vec}).
+%% 1) 构建 embedder 上下文（OpenAI 兼容端点，如 llama.cpp server / vLLM）
+1> {ok, Ctx} = bitcask_embedder:new(openai, #{
+1>     url   => "http://localhost:8080/v1/embeddings",
+1>     model => <<"qwen3-embedding">>, dim => 2560}).
+{ok,#{module => bitcask_embedder_openai, dim => 2560, config => #{...}}}
+%% 2) open：vector_dim 必须 == embedder 维度；带上 {embedder, Ctx}
+2> H = bitcask:open("/tmp/vec", [read_write, {analyzer, whitespace},
+2>     {vector_dim, 2560}, {embedder, Ctx}]).
+{#Ref<0.1.2.3>, #{module => bitcask_embedder_openai, dim => 2560, ...}}
+%% 3) put 只给 text → 自动 embed 入库
+3> bitcask:put(H, <<"d1">>, #{text => <<"the quick brown fox">>}).
 ok
-4> Q = << <<X:32/float-little>> || X <- [0.9, 0.1, 0.0, 0.0] >>.
-5> bitcask:search_vector(R, Q).          % top-K 最近邻（cosine 相似度）
-{ok,[{<<"d1">>,0,0.99388}]}
-6> bitcask:close(R).
+%% 4) 查询：把查询文本 embed 成向量，再 search_vector（cosine 相似度，分数示意）
+4> {ok, Q} = bitcask_embedder:embed(Ctx, <<"fast brown animal">>).
+5> bitcask:search_vector(H, Q).
+{ok,[{<<"d1">>,0,0.83}]}
+%% 5) 混合检索：文本 + 向量两路 RRF 融合
+6> bitcask:search_hybrid(H, <<"fast brown animal">>, Q).
+{ok,[{<<"d1">>,0,0.0328}]}
+7> bitcask:close(H).
 ok
 ```
 
-**混合检索（BM25 + 向量 RRF）** — 融合文本与向量相关性：
-
-```erlang
-1> bitcask:search_hybrid(R, <<"hello">>, Q).   % RRF 融合，k=10
-{ok,[...]}
-```
+> **低层路径（不用 embedder）**：open 省略 `{embedder, Ctx}`，`put` 用
+> `#{text => T, vector => V}` 自带 f32 小端序向量
+> （`V = << <<X:32/float-little>> || X <- Floats >>`），查询也自己构造向量二进制。
+> 例如 `vector_dim=4`、库里存 `[1,0,0,0]`、查 `[0.9,0.1,0,0]`，
+> `search_vector` 返回 `{ok,[{<<"d1">>,0,0.99388}]}`（cosine = 0.9/√0.82）。
 
 ## API 概览
 

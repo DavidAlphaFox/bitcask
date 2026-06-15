@@ -61,8 +61,8 @@ rebar3 shell        # runs `rebar3 compile` first, then starts the REPL
 **Key/value mode** — plain binary values:
 
 ```erlang
-1> R = bitcask:open("/tmp/db", [read_write]).
-#Ref<0.1234.5678.90>
+1> R = bitcask:open("/tmp/db", [read_write]).   % returns {CaskRef, EmbedderCtx}
+{#Ref<0.1234.5678.90>,undefined}
 2> bitcask:put(R, <<"k">>, <<"hello">>).
 ok
 3> bitcask:get(R, <<"k">>).
@@ -77,7 +77,7 @@ indexes the value; results are `{ok, [{Key, Ord, Score}, ...]}` sorted by score:
 ```erlang
 %% analyzer: whitespace (English) | ngram (CJK n-gram) | jieba (Chinese segmentation)
 1> R = bitcask:open("/tmp/idx", [read_write, {analyzer, whitespace}]).
-#Ref<0.9876.5432.10>
+{#Ref<0.9876.5432.10>,undefined}
 2> bitcask:put(R, <<"d1">>, <<"the quick brown fox">>).
 ok
 3> bitcask:put(R, <<"d2">>, <<"a lazy brown dog">>).
@@ -97,30 +97,41 @@ ok
 > Calling any `search_*` on a cask opened **without** an analyzer returns
 > `{error, no_index}`.
 
-**HNSW vector search** — vector search requires index mode; open with
-`{analyzer, ...}` + `{vector_dim, N}` (optional `{vector_metric, cosine|l2|dot}`,
-default `cosine`). Vectors are f32 little-endian binaries
-(`<< <<X:32/float-little>> || X <- Floats >>`):
+**HNSW vector search** — requires index mode (`{analyzer, ...}`) plus vector
+config (`{vector_dim, N}`, optional `{vector_metric, cosine|l2|dot}`, default
+`cosine`). **Recommended flow: configure an embedder at open time, then
+`put #{text => ...}` auto-embeds into a vector — no external computation.**
+Note `open` returns a `{CaskRef, EmbedderCtx}` tuple; pass it as the handle:
 
 ```erlang
-1> R = bitcask:open("/tmp/vec", [read_write,
-1>     {analyzer, whitespace}, {vector_dim, 4}]).
-2> Vec = << <<X:32/float-little>> || X <- [1.0, 0.0, 0.0, 0.0] >>.
-3> bitcask:put(R, <<"d1">>, #{text => <<"hello">>, vector => Vec}).
+%% 1) Build an embedder context (OpenAI-compatible endpoint, e.g. llama.cpp / vLLM)
+1> {ok, Ctx} = bitcask_embedder:new(openai, #{
+1>     url   => "http://localhost:8080/v1/embeddings",
+1>     model => <<"qwen3-embedding">>, dim => 2560}).
+{ok,#{module => bitcask_embedder_openai, dim => 2560, config => #{...}}}
+%% 2) open: vector_dim must == embedder dim; pass {embedder, Ctx}
+2> H = bitcask:open("/tmp/vec", [read_write, {analyzer, whitespace},
+2>     {vector_dim, 2560}, {embedder, Ctx}]).
+{#Ref<0.1.2.3>, #{module => bitcask_embedder_openai, dim => 2560, ...}}
+%% 3) put with just text → auto-embed on write
+3> bitcask:put(H, <<"d1">>, #{text => <<"the quick brown fox">>}).
 ok
-4> Q = << <<X:32/float-little>> || X <- [0.9, 0.1, 0.0, 0.0] >>.
-5> bitcask:search_vector(R, Q).          % top-K nearest neighbors (cosine similarity)
-{ok,[{<<"d1">>,0,0.99388}]}
-6> bitcask:close(R).
+%% 4) query: embed the query text, then search_vector (cosine sim; score illustrative)
+4> {ok, Q} = bitcask_embedder:embed(Ctx, <<"fast brown animal">>).
+5> bitcask:search_vector(H, Q).
+{ok,[{<<"d1">>,0,0.83}]}
+%% 5) hybrid: fuse text + vector via RRF
+6> bitcask:search_hybrid(H, <<"fast brown animal">>, Q).
+{ok,[{<<"d1">>,0,0.0328}]}
+7> bitcask:close(H).
 ok
 ```
 
-**Hybrid search (BM25 + Vector RRF)** — combines text and vector relevance:
-
-```erlang
-1> bitcask:search_hybrid(R, <<"hello">>, Q).   % RRF fusion, k=10
-{ok,[...]}
-```
+> **Low-level path (no embedder)**: omit `{embedder, Ctx}` at open and `put`
+> with `#{text => T, vector => V}` carrying your own f32 little-endian vector
+> (`V = << <<X:32/float-little>> || X <- Floats >>`); build the query vector
+> yourself too. E.g. with `vector_dim=4`, doc `[1,0,0,0]`, query `[0.9,0.1,0,0]`,
+> `search_vector` returns `{ok,[{<<"d1">>,0,0.99388}]}` (cosine = 0.9/√0.82).
 
 ## API highlights
 
