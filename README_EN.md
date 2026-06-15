@@ -164,6 +164,7 @@ ok
 
 | File | What it covers |
 |------|----------------|
+| `doc/api-en.md` / `doc/api-zh.md` | **API reference**: capabilities, parameter meaning & constraints, return values (EN/中) |
 | `doc/USAGE.md` | Tutorial: opening, merging, configuring, searching |
 | `doc/format-zh.md` | 磁盘格式字节级规范（带类型记录、DocValue、提示文件、锁） |
 | `doc/cpp-arch.md` | C++ 模块布局、锁策略、构建入口 |

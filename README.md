@@ -163,6 +163,7 @@ ok
 
 | 文件 | 内容 |
 |------|------|
+| `doc/api-zh.md` / `doc/api-en.md` | **API 参考**：能力、参数含义与限制、返回值（中/英） |
 | `doc/USAGE.md` | 教程：打开、合并、配置、搜索 |
 | `doc/format-zh.md` | 磁盘格式字节级规范（带类型记录、DocValue、提示文件、锁） |
 | `doc/cpp-arch.md` | C++ 模块布局、锁策略、构建入口 |
