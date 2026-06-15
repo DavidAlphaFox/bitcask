@@ -222,10 +222,7 @@ private:
                 }
                 break;
             }
-            if (!consumer(task)) {
-                pending_.fetch_sub(1, std::memory_order_release);
-                break;
-            }
+            consumer(task);
             pending_.fetch_sub(1, std::memory_order_release);
         }
     }
