@@ -6,10 +6,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <random>
 #include <thread>
 #include <vector>
 
+#include "bitcask/detail/int8_kernels.hpp"  // P3c：落盘 int8 量化召回测量
 #include "bitcask/hnsw.hpp"
 
 using bitcask::vec::HnswConfig;
@@ -84,7 +86,53 @@ double measure_recall(std::size_t n, std::size_t dim, std::size_t nq,
     return static_cast<double>(hit) / static_cast<double>(nq * k);
 }
 
+// P3c：落盘 int8 量化对召回的影响。brute-force f32 余弦 top-k 为真值，
+// 对比「dequant-int8 库（模拟落盘 int8 读回）vs f32 query」的 top-k。
+// 隔离量化误差对召回的影响（与 HNSW 近似性无关）。复用 vec::int8 的
+// per-vector 对称量化（= 落盘码字的同一方案）。
+double measure_quant_recall(std::size_t n, std::size_t dim,
+                            std::size_t nq, std::size_t k) {
+    auto base = make_vectors(n, dim, 0xBA5E);
+    auto queries = make_vectors(nq, dim, 0xC0DE);
+
+    std::vector<float> baseq(n * dim);  // dequant-int8 副本
+    for (std::size_t i = 0; i < n; ++i) {
+        auto qv = bitcask::vec::int8::quantize(base.data() + i * dim, dim);
+        const float s = qv.scale / 127.0f;
+        for (std::size_t d = 0; d < dim; ++d) {
+            baseq[i * dim + d] = static_cast<float>(qv.codes[d]) * s;
+        }
+    }
+
+    std::size_t hit = 0;
+    for (std::size_t qi = 0; qi < nq; ++qi) {
+        const float* q = queries.data() + qi * dim;
+        auto truth = brute_topk(base, n, dim, q, k);
+        auto got   = brute_topk(baseq, n, dim, q, k);
+        for (auto id : got) {
+            if (std::find(truth.begin(), truth.end(), id) != truth.end()) ++hit;
+        }
+    }
+    return static_cast<double>(hit) / static_cast<double>(nq * k);
+}
+
 }  // namespace
+
+// P3c 召回测量（dim=2560，与部署 qwen3-embedding 同维）。阈值是回归红线，
+// 设在实测值之下；实测数 + 决策见 doc/vector-ondisk-quant-design-zh.md §6。
+TEST(VectorQuant, OnDiskInt8RecallAt10) {
+    const double r = measure_quant_recall(2000, 2560, 30, 10);
+    RecordProperty("recall_int8_at10", std::to_string(r));
+    std::printf("[P3c] on-disk int8 recall@10 (dim=2560, n=2000) = %.4f\n", r);
+    EXPECT_GE(r, 0.95) << "int8 recall@10 = " << r;
+}
+
+TEST(VectorQuant, OnDiskInt8RecallAt100) {
+    const double r = measure_quant_recall(2000, 2560, 30, 100);
+    RecordProperty("recall_int8_at100", std::to_string(r));
+    std::printf("[P3c] on-disk int8 recall@100 (dim=2560, n=2000) = %.4f\n", r);
+    EXPECT_GE(r, 0.95) << "int8 recall@100 = " << r;
+}
 
 // 红线:10k 库 recall@10。
 TEST(Hnsw, RecallAt10_Ef64) {

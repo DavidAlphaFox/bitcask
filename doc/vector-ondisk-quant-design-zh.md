@@ -66,12 +66,27 @@ f32 当前是三处的 source of truth，int8-only 落盘都会受影响：
    `vector_dim`/`vector_metric`）。
 5. 配 embedder 时与 MRL 正交：先 MRL 截断到 `vector_dim`，再 int8 量化落盘。
 
-## 6. 召回测量 gate（实现前必须做）
+## 6. 召回测量 gate（P3c ✅）
 
-用 qwen3-embedding 真实语料（`doc/embedding_endpoint`）+ mock 双轨：
-- 对比 f32 vs int8 落盘的 recall@10 / @100 @ ef64。
-- 阈值建议：recall 跌幅 < 1% → int8 可作为磁盘受限部署的推荐；否则保持 opt-in 小众。
-- 记录 cliff（向量数 vs 召回）。
+测量隔离量化误差对召回的影响：brute-force f32 余弦 top-k 为真值，对比
+「dequant-int8 库（= 落盘 int8 读回）vs f32 query」的 top-k 重叠。复用 `vec::int8`
+的同一量化方案。harness：`cpp/tests/hnsw_test.cpp::measure_quant_recall`（CI
+回归红线 ≥ 0.95，可任意改 n/dim/k 复跑）。
+
+**结果（2026-06，合成归一化高斯，dim=2560，n=2000，nq=30）：**
+
+| 指标 | f32 真值 vs 落盘 int8 |
+|------|----------------------|
+| recall@10 | **0.9867**（跌 ~1.33%） |
+| recall@100 | **0.9953**（跌 ~0.47%） |
+
+**决策：int8 保持 opt-in，f32 仍为默认。** 理由：recall@10 跌幅 ~1.3% 略超
+「< 1% 才设默认」的保守线；top-10 是最常见 UI 路径，召回敏感。4× 磁盘换 ~1.3%
+recall@10 对磁盘受限部署是合理取舍，由部署方 `{vector_quantized, true}` 自选。
+
+**真实语料再验证（设默认前必须）：** 上述为合成语料。真实 qwen3 嵌入有聚簇
+结构，int8 召回可能更高或更低。要把 int8 设为某类部署默认前，应在真实语料上用
+同一 harness 复测（端点见 [[embedding_endpoint]]）。当前结论：不设默认。
 
 ## 7. fixtures / 兼容
 
