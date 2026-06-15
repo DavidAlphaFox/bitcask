@@ -1204,9 +1204,70 @@ WAND 路径无此问题。建议顺序：P2.1 → 基准 → P2.2 → P2.3。
 | # | 内容 | ROI/风险 | 状态 |
 |---|------|---------|------|
 | **P1 Hint 写缓冲** | hint 可重建（崩溃丢缓冲 → 下次 open 回退 data fold，trailer CRC 判失效）。`HintFile::write` 由每条 `write(2)` 改为内存缓冲，按阈值（64KB）+ roll/finalize flush。写路径 syscall 减半；data 写仍逐条（权威 + offset 即时）。 | 高 / 低 | ✅ |
-| **P2 merge 不重分词** | 倒排 posting 以 ord 为键、跨 merge 稳定；merge 只改 file_id/offset（keydir CAS 已处理），terms 不变。当前 `rebuild_index` 全量重读+重分词兼做「物理清死 posting」。拆分：merge 走 location-only 重映射；死 posting 靠 `is_live` 查询过滤；压实降频为周期/阈值触发。**先核实 posting 不依赖文件位置再动。** | 高 / 中 | 🚧 进行中 |
+| **P2 merge 不重分词** | 倒排 posting 以 ord 为键、跨 merge 稳定；`on_relocate` 已重映射定位、死文档 `is_live` 过滤。merge 后由全量 `rebuild_index`（重读+重分词）改为阈值 `compact(0.2)`（清死 posting，不读盘不跑 NLP）。 | 高 / 中 | ✅ |
 | **P3 向量落盘 int8 量化** | data file 向量 f32（2560 维=10KB/doc）→ 落盘 int8（4× 磁盘+读 I/O）。设计见 `doc/vector-ondisk-quant-design-zh.md`。**P3a ✅** codec int8 编解码（码字 `[Dim][SchemeVer:u8][scale:f32][int8×Dim]`）+ `doc_vector_f32` + fixture。**P3b ✅** open `{vector_quantized,true}` + meta 持久化（offset[9]）+ 重开一致校验 + put 落盘 int8 + get/recovery dequant；顺带修 Erlang open 裸 atom 故障 case_clause。**P3c ✅** 召回 harness（`hnsw_test::measure_quant_recall`）实测合成 dim=2560：recall@10=0.987 / @100=0.995；**决策：int8 保持 opt-in，f32 默认**（@10 跌 ~1.3% 略超设默认的 1% 线；真实语料设默认前需复测）。可选 follow-on：HNSW 直接吃 codes 的 CPU 微优化（int8 非默认 → 低优）。 | 中高 / 高 | ✅ |
 | **P4 单写者组提交** | 实测发现 `{seconds,N}` 文档有声明但 C++ 未实现（只认 o_sync）。新增 `{sync_strategy,{puts,N}}`：单写者线程内每 N 次写 fsync 一次（`maybe_group_commit`），close/roll/sync 收尾 force-flush。不引入跨线程锁（区别于已否决的「WAL group-commit 跨线程」）。 | 中 / 中 | ✅ |
 
 **已分析判否**：Ord/Tstamp 变长（破坏 O(1) 随机 offset 独立解码）；hint key 去重
 （hint 须自带 key 重建 keydir）；mmap（与 merge unlink 生命周期冲突）。
+
+---
+
+## 2.1.1 路线图
+
+### P5 — HNSW int8-only 内存模式（向量内存墙的主要杠杆）
+
+> 背景：dot 模式下 HNSW 内存里是 f32 `vecs` + int8 `qcodes` **两份**（int8 为 VNNI
+> 提速、反而 +25% 内存）。P3 落盘 int8 只省磁盘、不动内存。真正省**内存**要丢常驻
+> f32、建图/精排都用 int8。实测见 `doc/vector-ondisk-quant-design-zh.md §7`。
+>
+> **实测收益（合成簇 dim=2560，`hnsw_test::Int8OnlyMemoryAndRecall`）**：向量内存
+> **−80%（~5×）**，1M 向量 12.81 GB → 2.57 GB；代价 **recall@10 约 −3%**
+> （f32 1.0 → int8-only 0.9675）。opt-in，真实语料 gate。
+
+| # | 内容 | ROI/风险 | 状态 |
+|---|------|---------|------|
+| P5a | HNSW int8-only 配置：按 flag 不分配/保留常驻 f32 `vecs`，NodeChunk 裁掉 vecs；距离 + 「精排」都走 int8（查询侧也量化，用 VNNI int8×int8）。 | 中高 / 中 | 📋 |
+| P5b | open 选项 `{vector_inmem_int8, true}` 接线 + meta 持久化 + 重开一致校验（同 P3b）；与 P3 落盘 int8 正交可组合（盘+内存都省）。`get` 仍可经盘 f32 / dequant 返回。 | 中 / 中 | 📋 |
+| P5c | 真实 qwen3 语料召回 gate（复用 `Int8OnlyMemoryAndRecall` harness）；定 opt-in 默认 + 文档；recall 跌幅可接受才推荐给内存受限/大规模部署。 | 中 / 低 | 📋 |
+
+**依赖/关联**：建在 P3（int8 量化方案 + codec）与 V6.4.2 外存预留点之上；harness 复用
+P3c。**红线**：默认仍 f32+int8（召回优先）；int8-only 是内存受限/大规模的 opt-in。
+
+### P6 — sealed 文件 mmap 只读路径（取代原 value LRU 方案）
+
+> 目标：对 **sealed（封口不可变）data 文件**做 mmap 只读——**零拷贝 + 免 pread
+> syscall**，且直接用 OS page cache、**不双缓存**（优于 value LRU）。**active 文件
+> 永远 pread**（append 增长对 mmap 不友好：映射定长、SIGBUS-past-EOF、重映射移址；
+> 分析见对话记录）。range 模型同 LevelDB SSTable：不可变文件 + 引用计数延迟删除 +
+> mmap_limit + pread 兜底。DocValue decode 近零成本，故不需缓解码值（原 value LRU 已弃）。
+
+| # | 内容 | ROI/风险 | 状态 |
+|---|------|---------|------|
+| P6a | `DataFile` sealed mmap 模式：sealed 文件首次读时 `mmap(PROT_READ, MAP_SHARED)` 整文件，`read(off,sz)` 返回**指向映射的 span**（零拷贝、无 syscall）；active / 未映射 / 超额 → 回退 pread。**mmap 后可 close fd**（映射仍有效）→ 顺带缓解 read_files_ 的 fd 累积（大库撞 ulimit）。 | 高 / 中 | 📋 |
+| **P6b merge 生命周期（重点）** | **释放**：merge unlink 旧文件时**不立即 munmap**——从 read_files_ erase 缓存的 `shared_ptr<DataFile>`，但在途读者仍持 shared_ptr → DataFile 存活 → 映射存活；**munmap 延迟到引用计数归零**（`~DataFile`）。Linux 上 unlinked-but-mapped 文件仍可读（inode 由映射续命，类似 open fd），在途读安全。**再次 mmap**：merge 产出的新 sealed 文件 + active roll 成 sealed 后，下次经 `read_file` 懒加载时按 sealed mmap 路径建立映射。 | 高 / 高 | 📋 |
+| P6c | `GetResultView` 适配：mmap 命中时持 `shared_ptr<DataFile>`（映射引用）+ span 指向映射，保证 view 生命内映射不撤（现版持 owned ReadRecord/pread 拷贝）。mmap_limit（文件数/字节）+ pread 兜底；**32 位禁用 mmap**（地址空间，同 LevelDB）。 | 中 / 中 | 📋 |
+| P6-gate | 量化 get 延迟：mmap 命中 vs 纯 pread vs OS page-cache 命中；ulimit/地址空间影响；小库（≤几文件）可全映射、大库走 limit+pread。 | — | 📋 先做 |
+
+**关键不变量**：只 mmap sealed（不可变）文件——merge 只 unlink、**绝不原地 truncate** sealed
+文件，故无 SIGBUS-on-truncate；torn-tail 也不存在（sealed 已 finalize）。**生命周期靠
+现有 `shared_ptr<DataFile>` 引用计数扩展到映射区**（= LevelDB Version refcount 的等价），
+不引入新锁模型。
+**已移除**：原 P6 value LRU + 统一 LRU 基件——mmap 覆盖其主要收益（省 syscall+拷贝）
+且无双缓存；DocValue decode 近零、缓解码值无意义。（DocTextLru/SearchCache 保留现状。）
+
+### P7 — 派生值 compute cache（建在 mmap 之上）⚠️ 备选（依赖 P6，按 gate 决策）
+
+> 有 mmap 后 LRU **改定位**：不缓 raw bytes（mmap+page cache 已最优、缓了是双缓存
+> + 跟内核抢 RAM），只缓**派生/解码后、recompute 有真实 CPU 成本**的结果。省的是
+> recompute，不是 I/O。同 LevelDB 分工（mmap 取字节 / block LRU 缓解压块）。
+> **纯 KV value decode 近零 → 不缓**。
+
+| # | 内容 | ROI/风险 | 状态 |
+|---|------|---------|------|
+| P7a | compute cache 框架：**按逻辑键（key/ord）**缓（跨 merge 内容稳定，miss 回 mmap 取原始字节再派生）；**存 owned `shared_ptr<const Derived>`，绝不存指向 mmap 的 span**（与 munmap/merge 生命周期解耦、无 UAF）；byte budget + shared_mutex；put/delete 按键失效、merge 不失效。 | 中 / 中 | 📋 备选 |
+| P7b | 首批派生目标：① highlight 的 NFKC+`analyze_with_offsets` 结果（现每次高亮重算，即便 DocTextLru 原文命中）——把 DocTextLru 升级为缓**分词 offsets**；② int8→f32 dequant 向量（盘上 int8 且 get 要返 f32 时）。 | 中 / 中 | 📋 备选 |
+| P7-gate | 仅当 **derive 成本 ≫ mmap 访问**才上：量化「LRU 命中(派生) vs mmap+现场 derive」延迟差，显著才做。 | — | 📋 先做 |
+
+**读路径分层**：`LRU(派生) 命中? → 否 → mmap(raw, 无 syscall) → decode/dequant/分词 → 回填`。
+mmap = L1 字节层，P7 = L2 计算层，互补不竞争。**备选**：依赖 P6 先落地；raw value 永不缓。

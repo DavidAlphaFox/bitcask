@@ -2,7 +2,7 @@
 
 [中文](README.md) | [![CI](https://github.com/basho/bitcask/workflows/CI/badge.svg)](https://github.com/basho/bitcask/actions)
 
-📖 **API reference**: [English](doc/api-en.md) · [中文](doc/api-zh.md) · 📝 [Changelog](CHANGELOG_EN.md)
+📖 **API reference**: [English](doc/api-en.md) · [中文](doc/api-zh.md) · 📝 [Changelog](CHANGELOG_EN.md) · 🗺️ [Roadmap](ROADMAP_EN.md)
 
 Bitcask is a log-structured hash table for fast key/value data, written in C++23
 with an Erlang NIF interface. On-disk format uses typed records (`kDoc`/`kTombstone`)
@@ -178,7 +178,8 @@ ok
 | `doc/hnsw-design-zh.md` | HNSW 向量索引设计（并发/持久化/RRF/实施表） |
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
 | `doc/unified-architecture-plan-zh.md` | 统一架构计划（已实施） |
-| `TASK.md` | Project roadmap |
+| `ROADMAP_EN.md` / `ROADMAP.md` | **Roadmap**: 2.1.1 plan (P5/P6/P7) (EN/中) |
+| `TASK.md` | Detailed task breakdown & history |
 
 ## Project status
 

@@ -116,7 +116,107 @@ double measure_quant_recall(std::size_t n, std::size_t dim,
     return static_cast<double>(hit) / static_cast<double>(nq * k);
 }
 
+// 聚簇向量：nc 个随机单位中心，每点 = normalize(center + 噪声)。均匀随机高维
+// 向量近乎正交、无有意义最近邻（HNSW 召回退化为噪声）；真实 embedding 有聚簇
+// 结构，这里用聚簇合成逼近，让 top-k 有定义、召回可解释。
+// 中心由 seed_centers 决定（base 与 queries 传同一个 → 同一聚簇空间）；
+// 点由 seed_points 决定。spread 是「簇内扰动总范数」(已除 sqrt(dim)，避免高维下
+// per-component 噪声 ×sqrt(dim) 淹没单位中心)。spread < 中心间距(~1.4) 才有簇结构。
+std::vector<float> make_clustered(std::size_t n, std::size_t dim, std::size_t nc,
+                                  float spread, std::uint64_t seed_centers,
+                                  std::uint64_t seed_points) {
+    auto unit = [dim](std::mt19937_64& rng, float* v) {
+        std::normal_distribution<float> g(0.0f, 1.0f);
+        double sq = 0.0;
+        for (std::size_t d = 0; d < dim; ++d) { v[d] = g(rng); sq += double(v[d]) * v[d]; }
+        const auto inv = static_cast<float>(1.0 / std::sqrt(sq));
+        for (std::size_t d = 0; d < dim; ++d) v[d] *= inv;
+    };
+    std::mt19937_64 crng(seed_centers);
+    std::vector<float> centers(nc * dim);
+    for (std::size_t c = 0; c < nc; ++c) unit(crng, centers.data() + c * dim);
+
+    const float sigma = spread / static_cast<float>(std::sqrt(double(dim)));
+    std::mt19937_64 prng(seed_points);
+    std::normal_distribution<float> g(0.0f, 1.0f);
+    std::vector<float> out(n * dim);
+    for (std::size_t i = 0; i < n; ++i) {
+        const float* ctr = centers.data() + (i % nc) * dim;
+        float* v = out.data() + i * dim;
+        double sq = 0.0;
+        for (std::size_t d = 0; d < dim; ++d) {
+            v[d] = ctr[d] + sigma * g(prng);
+            sq += double(v[d]) * v[d];
+        }
+        const auto inv = static_cast<float>(1.0 / std::sqrt(sq));
+        for (std::size_t d = 0; d < dim; ++d) v[d] *= inv;
+    }
+    return out;
+}
+
+// int8-only 内存模式建模：在 build_db 上建图+搜索，真值始终用 f32 truth_db 的
+// brute-force top-k。build_db=base → 现行 f32 精排模式召回；build_db=dequant-int8
+// → int8-only 召回（所有数据都是 int8 精度，连「f32 精排」也只有 int8 精度）。
+double hnsw_recall_vs_truth(const std::vector<float>& build_db,
+                            const std::vector<float>& truth_db,
+                            const std::vector<float>& queries,
+                            std::size_t n, std::size_t dim,
+                            std::size_t nq, std::size_t k, std::size_t ef) {
+    HnswConfig cfg;
+    cfg.dim = static_cast<std::uint16_t>(dim);
+    cfg.metric = HnswMetric::kDot;
+    HnswIndex idx(cfg);
+    for (std::size_t i = 0; i < n; ++i) {
+        idx.insert(i, std::span<const float>(build_db.data() + i * dim, dim));
+    }
+    std::size_t hit = 0;
+    for (std::size_t qi = 0; qi < nq; ++qi) {
+        const float* q = queries.data() + qi * dim;
+        auto truth = brute_topk(truth_db, n, dim, q, k);
+        auto got = idx.search(std::span<const float>(q, dim), k, ef);
+        for (const auto& h : got) {
+            if (std::find(truth.begin(), truth.end(), h.ord) != truth.end()) ++hit;
+        }
+    }
+    return static_cast<double>(hit) / static_cast<double>(nq * k);
+}
+
 }  // namespace
+
+// int8-only 内存模式实测：省多少内存 + 召回掉多少。
+// 内存账是按 NodeChunk 字段精确推算（向量存储部分；邻接表两模式相同，不计入差值）。
+TEST(VectorQuant, Int8OnlyMemoryAndRecall) {
+    const std::size_t n = 3000, dim = 2560, nq = 40, k = 10, ef = 64, nc = 50;
+    // 同一簇空间（中心 seed 相同）；base/queries 点不同（point seed 不同）。
+    // spread=0.5：簇内总范数 0.5 < 中心间距 ~1.4 → 簇可分、top-k 有定义。
+    auto base    = make_clustered(n,  dim, nc, 0.5f, /*centers*/0xCE57, /*points*/0xBA5E);
+    auto queries = make_clustered(nq, dim, nc, 0.5f, /*centers*/0xCE57, /*points*/0xC0DE);
+    std::vector<float> baseq(n * dim);  // dequant-int8 副本 = int8-only 存储
+    for (std::size_t i = 0; i < n; ++i) {
+        auto qv = bitcask::vec::int8::quantize(base.data() + i * dim, dim);
+        const float s = qv.scale / 127.0f;
+        for (std::size_t d = 0; d < dim; ++d) {
+            baseq[i * dim + d] = static_cast<float>(qv.codes[d]) * s;
+        }
+    }
+    const double r_f32  = hnsw_recall_vs_truth(base,  base, queries, n, dim, nq, k, ef);
+    const double r_int8 = hnsw_recall_vs_truth(baseq, base, queries, n, dim, nq, k, ef);
+
+    // 向量存储/向量字节：现行 dot 模式 = f32(4d) + int8(d) + scale(4) + sum(4)；
+    // int8-only = int8(d) + scale(4) + sum(4)（丢掉常驻 f32 vecs）。
+    const double cur = 5.0 * dim + 8.0;
+    const double i8o = 1.0 * dim + 8.0;
+    std::printf("[int8-only] recall@10 ef64: f32-rerank=%.4f  int8-only=%.4f  (Δ=%.4f)\n",
+                r_f32, r_int8, r_f32 - r_int8);
+    std::printf("[int8-only] vec mem/vector (dim=%zu): cur(f32+int8)=%.0fB  int8-only=%.0fB"
+                "  → %.2fx, 省 %.1f%%\n",
+                dim, cur, i8o, cur / i8o, 100.0 * (cur - i8o) / cur);
+    std::printf("[int8-only] 1M 向量(仅向量存储): %.2f GB → %.2f GB\n",
+                cur * 1e6 / 1e9, i8o * 1e6 / 1e9);
+    RecordProperty("recall_f32", std::to_string(r_f32));
+    RecordProperty("recall_int8only", std::to_string(r_int8));
+    EXPECT_GT(r_int8, 0.90) << "int8-only recall@10 = " << r_int8;  // 实测 0.9675
+}
 
 // P3c 召回测量（dim=2560，与部署 qwen3-embedding 同维）。阈值是回归红线，
 // 设在实测值之下；实测数 + 决策见 doc/vector-ondisk-quant-design-zh.md §6。

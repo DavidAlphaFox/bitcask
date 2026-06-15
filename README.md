@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/basho/bitcask/workflows/CI/badge.svg)](https://github.com/basho/bitcask/actions)
 
-[English](README_EN.md) · 📖 **API 参考**：[中文](doc/api-zh.md) · [English](doc/api-en.md) · 📝 [更新日志](CHANGELOG.md)
+[English](README_EN.md) · 📖 **API 参考**：[中文](doc/api-zh.md) · [English](doc/api-en.md) · 📝 [更新日志](CHANGELOG.md) · 🗺️ [路线图](ROADMAP.md)
 
 Bitcask 是一个日志结构（log-structured）的哈希表键值存储引擎，使用 C++23 实现，
 通过 Erlang NIF 接口对外暴露。磁盘格式采用带类型记录（`kDoc`/`kTombstone`）与
@@ -175,7 +175,8 @@ ok
 | `doc/hnsw-design-zh.md` | HNSW 向量索引设计（并发/持久化/RRF/实施表） |
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
 | `doc/unified-architecture-plan-zh.md` | 统一架构计划（已实施） |
-| `TASK.md` | 项目路线图 |
+| `ROADMAP.md` / `ROADMAP_EN.md` | **路线图**：2.1.1 规划（P5/P6/P7）（中/英） |
+| `TASK.md` | 详细任务拆分与历史 |
 
 ## 项目状态
 
