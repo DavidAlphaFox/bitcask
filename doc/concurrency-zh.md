@@ -277,32 +277,71 @@ keydir 会当 merge-race 拒掉（`kAlreadyExists`）→ 由主动 roll + put �
 ## 6. 索引模式（SearchLayer）的并发
 
 索引模式（`open(Dir, [read_write, {analyzer, ...}])`）在 Cask 内部创建
-一个 `SearchLayer` 实例，用于 BM25 全文搜索。
+一个 `SearchLayer` 实例（BM25 全文索引 + 可选 HNSW 向量索引），外加一个
+**单 worker 线程的 `IndexPool`**（`cpp/include/bitcask/thread_pool.hpp`）。
 
-### SearchLayer 线程模型
+### 写路径其实是异步单写者
 
-`SearchLayer` **不是线程安全的**：内部 `InvertedIndex` 使用 16 个分片
-锁（按 term hash 分桶），但 `SearchLayer` 自身要求单写者模型。
+索引的「单写者」**不是** `Cask::put` 的调用线程，而是 IndexPool 的那一个
+worker 线程：
 
-这与 KV 层的并发模型**不冲突**：
+```
+put/delete (调用方写线程)
+   └─ submit_index_task → IndexPool 有界队列（capacity 10240，满则 push 阻塞做背压）
+        └─ worker 线程串行执行 on_write / on_delete / on_vector
+                                  / Index::set_meta / InvertedIndex::add_doc
+```
+
+所以所有索引结构的变更都在这一个 worker 线程上串行发生——写-写竞态天然
+不存在。调用线程只负责入队。
+
+### 读路径与 worker 并发
+
+搜索（`search_text` / `search_vector` / `search_hybrid`）在**调用线程**上跑
+（NIF，可能落在 dirty 调度器），与 worker 线程**并发**。`prepare_search`
+先 `flush()` 排空在途任务再搜，但搜索进行中新来的 `put` 仍会让 worker
+并发改索引。因此读路径必须对「与 worker 并发」鲁棒。
 
 | 组件            | 线程安全？ | 并发要求                                      |
 |---|---|---|
-| KeyDir          | ✅ 是      | `unique_lock` 串行写，shared_lock 并发读      |
-| SearchLayer    | ❌ 否      | 单写者（由 `Cask::put` 在同一写线程里调用）     |
-| InvertedIndex  | ✅ 是      | 内部 16 分片锁，搜索可并发                     |
+| KeyDir          | ✅ 是      | 分片锁串行写，并发读（见 §2、§下方锁全序图）   |
+| SearchLayer    | ⚠️ 半     | 写经 IndexPool 单 worker 串行；读可与之并发    |
+| InvertedIndex  | ✅ 是      | 内部分片锁 + tbb 桶锁 + CoW，搜索可并发        |
+| Index（meta/live） | ✅ 是   | `shared_mutex`，读拷贝出值后再用              |
+| SearchCache    | ✅ 是      | `shared_mutex`，读拷贝结果集后返回            |
+| HnswIndex      | ✅ 是      | per-node 自旋锁 + `atomic<shared_ptr>` 快照   |
 
-### InvertedIndex 分片锁
+### 读路径安全不变量（2026-06 并发审计加固）
 
-`InvertedIndex` 内部按 term hash 分 16 个 shard（`std::mutex` 数组），
-搜索时对命中的 shard 加 `shared_lock` 并发查。这让多个 `search_text`
-调用可以并行——每个调用只锁自己命中的分片，不锁整个索引。
+读路径与 worker 并发，下列不变量是正确性的关键——**违反任一条都是真实
+的 use-after-free 或数据竞态**：
+
+1. **`Index::meta_blob` 锁内拷贝返回**，不返回指向内部存储的 `span`。否则
+   搜索侧 filter 求值时，worker 的 `set_meta` 重分配该 vector → 悬垂读。
+2. **`SearchCache::get` 锁内拷贝结果集返回**，不逃逸指针。命中条目被并发
+   `put`/淘汰时不悬垂。
+3. **`InvertedIndex::save` 用 key 快照 + `const_accessor` 安全遍历**，不裸
+   遍历 `tbb::concurrent_hash_map`。merge 线程落快照与 worker 的 `add_doc`
+   并发，裸遍历会撞懒 rehash 重访/漏访、裸读会撞 CoW 替换撕裂。
+4. **跨线程标量一律原子**：`InvertedIndex::max_indexed_ord_`（worker 写、
+   搜索读）用 `std::atomic`；`SearchCache::last_used` 全程经 `atomic_ref`
+   访问（混用 atomic_ref 与普通访问同一对象是 UB）。
+5. **IndexPool 消费者 `try/catch` 兜底**：索引回调抛异常不杀 worker、也不
+   让搜索路径每次都走的 `flush()` 因 `pending_` 不归零而永久挂起；失败按
+   best-effort 丢弃本次更新。
+
+### merge 与索引重建
+
+merge 在 dirty 调度器线程上跑，merge 末尾 `rebuild_index` + `save_snapshot`
+与 worker、读路径并发。安全靠：先 `flush()` 排空 worker，再重建/落盘；落盘
+遍历走上面不变量 3 的安全路径；HNSW 重建提交给 worker 执行（维持单写者），
+`flush()` 等其完成后才拍快照（旧图被 in-flight reader 的 `shared_ptr` 续命）。
 
 ### 与 KV 层的关系
 
-索引模式的 SearchLayer 不改变 KeyDir 的共享语义——同一个目录的多个
-`bitcask:open` 仍共享 KeyDir；SearchLayer 作为 `Cask` 的成员只在
-`put/delete` 路径上被调用，不影响 reader 的并发读。
+索引模式不改变 KeyDir 的共享语义——同一目录的多个 `bitcask:open` 仍共享
+KeyDir；SearchLayer 作为 `Cask` 成员只在 `put/delete`（入队）与搜索路径上
+被触碰，不影响 reader 对 KV 的并发读。
 
 ---
 
@@ -377,6 +416,7 @@ keydir 会当 merge-race 拒掉（`kAlreadyExists`）→ 由主动 roll + put �
 | **InvertedIndex** | tbb::concurrent_hash_map | bucket locks (内部) | (未在 keydir 中) | TBB 内部哈希表桶锁 |
 | **HnswIndex** | atomic&lt;shared_ptr&gt; | std::atomic | (未在 keydir 中) | 内部，无外部锁嵌套 |
 | **HnswIndex** | per-node spinlock | (内部) | (未在 keydir 中) | 内部，无外部锁嵌套 |
+| **IndexPool** | queue_ + pending_ | tbb 有界队列 + atomic | thread_pool.hpp | 单 worker 串行消费；队列满时 push 阻塞做背压 |
 
 ### 2. 锁层级 ASCII 图
 
@@ -405,6 +445,7 @@ keydir 会当 merge-race 拒掉（`kAlreadyExists`）→ 由主动 roll + put �
 │     InvertedIndex::vocab_mtx_[i] (shared_mutex ×64)                        │
 │     HnswIndex::atomic<shared_ptr> (atomic)                                 │
 │     HnswIndex::per-node spinlock (内部)                                    │
+│     IndexPool::queue_ (tbb 有界队列) + pending_ (atomic)                   │
 │                                                                             │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
@@ -604,7 +645,8 @@ shard.mu (unique) → (可选) meta_mu_ (unique)
 **问题：** 旧实现同时持有全部 kShards+1=257 把锁
 - 撞 TSan 死锁检测器的 64 持锁硬上限
 - 位置：compiler-rt sanitizer_deadlock_detector.h:67 CHECK
-- 测试案例：KeyDir.DeepCopyPreservesOrd 在 TSAN_OPTIONS=detect_deadlocks=1 下崩溃
+- 触发场景：屏障类全量遍历操作（save_snapshot / 全量 fold）在
+  `TSAN_OPTIONS=detect_deadlocks=1` 下崩溃
 
 **解决方案：** 屏障 v2 写者闸门机制
 - BarrierGuard 任意瞬间至多持 1 把分片锁
@@ -681,7 +723,7 @@ key ∈ 某分片 entries  ⟹  pending_ 不会有它的更新版本
 - Helgrind（Valgrind）- 死锁检测
 
 **关键测试案例：**
-- KeyDir.DeepCopyPreservesOrd（屏障 v2 正确性）
+- KeyDir.AllocOrdThreadSafety（并发分配 ord 无竞态；屏障 v2 正确性）
 - 并发 fold 与 put/remove 互不阻塞
 - 多 fold 并发场景（keyfolders_ > 1）
 
@@ -709,6 +751,6 @@ ctest --test-dir _build/tsan --output-on-failure
 
 ---
 
-**文档版本：** 2026 重构补全版本
-**最后更新：** 2026-06-13
+**文档版本：** 2026 重构补全版本（2026-06 并发审计加固：§6 索引读路径不变量）
+**最后更新：** 2026-06-15
 **维护者：** Bitcask C++ 团队
