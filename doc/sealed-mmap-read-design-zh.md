@@ -73,11 +73,20 @@ pread**，append 问题自然规避。
 | 32 位 | 禁 mmap | 同 |
 
 ## 6. 子任务
-- **P6a**：DataFile sealed mmap 模式（首读 mmap、read 返回 span、active/超额回退 pread、
-  mmap 后 close fd）。
-- **P6b（重点）**：merge 生命周期——unlink 延迟 munmap（refcount）、新/roll-sealed 重新 mmap。
-- **P6c**：GetResultView 持映射引用；`mmap_limit` + pread 兜底；32 位禁用。
-- **P6-gate**：量化 get 延迟（mmap 命中 vs pread vs page-cache 命中）；ulimit/地址空间影响。
+- **P6a**（已落地）：DataFile sealed mmap（`DataFile::open` 新增 `mmap_enabled`；kRead+64 位+
+  非空 → 整文件 `mmap(PROT_READ,MAP_SHARED)`；`read_mmap` 返回指向映射的 `DataRecordView`
+  零拷贝；自定义 move/dtor 管 `munmap`；纯 fold 的 recovery/merge/迭代器 pin 传
+  `mmap_enabled=false`）。**偏差**：未 `close(fd)`——保留 fd 让 `read()`/`fold()` 的 pread
+  在 mmapped 句柄上仍可用（迭代器 `next()`/恢复需要）；fd 回收归 P9。
+- **P6b**（已落地）：merge unlink 延迟 munmap——直接复用现有 `shared_ptr<DataFile>` 引用计数
+  （O10 UAF 修复同款），unlink + `read_files_` 淘汰后,在途读者/`GetResultView` 持 shared_ptr
+  续命映射,最后引用析构才 munmap。新/roll-sealed 文件下次 `read_file` 懒加载重新 mmap。
+- **P6c**（部分）：`GetResultView` 持 `map_holder_`(shared_ptr) 锚定映射 + value_bytes 解耦
+  （owned/mmap 两源统一 derive）✅；32 位禁用 ✅。**未做**：`mmap_limit`（映射数/字节上限 +
+  超额回退 pread）——与 P9 read-handle LRU 同款驱逐,合并到 P9。
+- 测试：`P6MmapViewSurvivesMergeUnlink`（读中 merge unlink，view 仍读，ASAN address+leak 全过）；
+  416 测试通过（get 全程经 mmap 零拷贝路径,等价性由既有 get/迭代器测试守护）。
+- **P6-gate**：量化 get 延迟（mmap 命中 vs pread vs page-cache 命中）；ulimit/地址空间影响。**待测**。
 
 ## 7. 风险
 - 生命周期正确性（映射指针悬垂）——靠 shared_ptr 锚定 + 单元测试（读中 merge unlink）。

@@ -53,6 +53,16 @@ f32+int8）+ 用户文档（`bitcask.erl` 选项注释）；**未完**：真实 
 **范式**：LevelDB SSTable——不可变文件 + 引用计数延迟删除 + mmap 限额 + pread 兜底。
 **不变量**：只 mmap sealed（merge 只 unlink、绝不原地 truncate → 无 SIGBUS-on-truncate）。
 
+**状态 ✅（核心落地）**：**P6a** DataFile sealed mmap（`read_mmap` 零拷贝、`DataFile::open`
+新增 `mmap_enabled`、自定义 move/dtor 管 munmap、32 位 `sizeof(void*)<8` 禁用、纯 fold 的
+recovery/merge/迭代器 pin 传 `mmap_enabled=false`）；**P6b** merge unlink 延迟 munmap——
+复用现有 `shared_ptr<DataFile>` 引用计数（无新锁），测试 `P6MmapViewSurvivesMergeUnlink`
+持 view 跨 merge unlink 仍读、**ASAN(address+leak)全过**；**P6c** `GetResultView` 持映射
+`shared_ptr` 锚定 + 32 位禁用 ✅。416 测试通过。
+**偏差（诚实）**：① **不 close fd**——保留 fd 让 `read()`/`fold()` 的 pread 在 mmapped 句柄上
+可用（迭代器/恢复要走）；fd 回收（close+munmap 统一驱逐）归 **P9**。② `mmap_limit`（映射数/
+字节上限 + 超额回退 pread）**未做**——与 P9 read-handle LRU 同款驱逐机制，合并到 P9 一起做。
+
 ### P7 — 派生值 compute cache（建在 mmap 之上）⚠️ 备选
 
 > 详细设计：[`doc/derived-compute-cache-design-zh.md`](doc/derived-compute-cache-design-zh.md)
