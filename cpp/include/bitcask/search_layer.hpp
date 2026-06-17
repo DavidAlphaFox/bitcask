@@ -262,6 +262,13 @@ public:
     // fold,recover_doc 的 put_doc 覆盖语义保证收敛)。成功返回标记。
     [[nodiscard]] std::optional<std::uint64_t>
     load_index_sidecar(std::string_view path);
+    // P14e:docmap 序列化到/自字节缓冲(供 search.ckpt 分段)。字节与
+    // save/load_index_sidecar 一致(BCIS 自带框架)。serialize 返回 false 仅
+    // 当某 ext 超 64KiB;deserialize 校验失败返回 nullopt,成功返回 covers。
+    [[nodiscard]] bool serialize_docmap(std::vector<std::uint8_t>& out,
+                                        std::uint64_t covers_next_ord) const;
+    [[nodiscard]] std::optional<std::uint64_t>
+    deserialize_docmap(std::span<const std::uint8_t> bytes);
 
     // ---- 快照持久化 ----
     [[nodiscard]] std::expected<void, std::string> save_snapshot(std::string_view path) const;

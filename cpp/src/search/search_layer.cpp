@@ -826,9 +826,9 @@ void sc_put64(std::vector<std::uint8_t>& b, std::uint64_t v) {
 }
 }  // namespace
 
-bool SearchLayer::save_index_sidecar(std::string_view path,
-                                     std::uint64_t covers_next_ord) const {
-    std::vector<std::uint8_t> buf;
+bool SearchLayer::serialize_docmap(std::vector<std::uint8_t>& buf,
+                                   std::uint64_t covers_next_ord) const {
+    buf.clear();
     sc_put32(buf, kSidecarMagic);
     sc_put32(buf, kSidecarVersion);
     sc_put64(buf, covers_next_ord);
@@ -858,7 +858,13 @@ bool SearchLayer::save_index_sidecar(std::string_view path,
     const std::uint32_t crc = bitcask::codec::crc32(std::span<const std::byte>(
         reinterpret_cast<const std::byte*>(buf.data() + 8), buf.size() - 8));
     sc_put32(buf, crc);
+    return true;
+}
 
+bool SearchLayer::save_index_sidecar(std::string_view path,
+                                     std::uint64_t covers_next_ord) const {
+    std::vector<std::uint8_t> buf;
+    if (!serialize_docmap(buf, covers_next_ord)) return false;
     const std::string fp(path);
     const std::string tmp = fp + ".tmp";
     std::FILE* f = std::fopen(tmp.c_str(), "wb");
@@ -879,12 +885,18 @@ SearchLayer::load_index_sidecar(std::string_view path) {
     std::fseek(f, 0, SEEK_END);
     const long fsz = std::ftell(f);
     std::fseek(f, 0, SEEK_SET);
-    if (fsz < 28) { std::fclose(f); return std::nullopt; }
+    if (fsz < 0) { std::fclose(f); return std::nullopt; }
     std::vector<std::uint8_t> buf(static_cast<std::size_t>(fsz));
-    const bool rd = std::fread(buf.data(), 1, buf.size(), f) == buf.size();
+    const bool rd = buf.empty() ||
+                    std::fread(buf.data(), 1, buf.size(), f) == buf.size();
     std::fclose(f);
     if (!rd) return std::nullopt;
+    return deserialize_docmap(buf);
+}
 
+std::optional<std::uint64_t>
+SearchLayer::deserialize_docmap(std::span<const std::uint8_t> buf) {
+    if (buf.size() < 28) return std::nullopt;
     auto rd32 = [&](std::size_t off) {
         std::uint32_t v; std::memcpy(&v, buf.data() + off, 4); return v;
     };
