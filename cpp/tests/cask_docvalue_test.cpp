@@ -737,6 +737,68 @@ TEST_F(CaskDocValueTest, FoldSurvivesConcurrentMergeUnlink) {
     cask.close();
 }
 
+// P6:持有 mmap 命中的 GetResultView 期间,并发 merge unlink 掉该 view 映射的
+// sealed 文件 → view 照常读、无 UAF/SIGBUS（map_holder_ shared_ptr 锚定映射,
+// 即便文件被 unlink + 从 read_files_ 淘汰）。释放后映射随最后引用 munmap。
+TEST_F(CaskDocValueTest, P6MmapViewSurvivesMergeUnlink) {
+    namespace fs = std::filesystem;
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.max_file_size = 256;  // 滚出多个 sealed 文件
+    constexpr int N = 20;
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        for (int i = 0; i < N; ++i) {
+            std::vector<std::byte> key{std::byte{'k'}, static_cast<std::byte>(i)};
+            std::vector<std::byte> val(40, static_cast<std::byte>(i));
+            ASSERT_TRUE((*c)->put(key, val, static_cast<std::uint32_t>(1000 + i)));
+        }
+        (*c)->close();
+    }
+    // reopen:此后所有 data 文件均 sealed,get 经 read_file 按需 mmap。
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+    auto& cask = **c;
+
+    std::vector<std::pair<std::uint32_t, std::string>> files;
+    for (const auto& de : fs::directory_iterator(tmpdir_)) {
+        if (auto t = bitcask::fileops::parse_data_tstamp(
+                de.path().filename().string())) {
+            files.push_back({static_cast<std::uint32_t>(*t), de.path().string()});
+        }
+    }
+    ASSERT_GE(files.size(), 2u);
+
+    // 持有 k0 的 view(mmap 命中其 sealed 文件)。
+    std::vector<std::byte> k0{std::byte{'k'}, static_cast<std::byte>(0)};
+    auto view = cask.get(k0);
+    ASSERT_TRUE(view);
+    const std::vector<std::byte> before(view->value.begin(), view->value.end());
+    ASSERT_FALSE(before.empty());
+
+    // merge 掉全部 sealed 文件 → unlink(含 k0 所在文件)+ 从 read_files_ 淘汰。
+    std::vector<std::string> to_merge;
+    for (const auto& f : files) to_merge.push_back(f.second);
+    auto mr = cask.merge(to_merge);
+    ASSERT_TRUE(mr);
+    for (const auto& p : to_merge) {
+        EXPECT_FALSE(fs::exists(p)) << "merge 后旧文件应被 unlink:" << p;
+    }
+
+    // 关键:持有的 view 仍可读(映射经 shared_ptr 续命,无 UAF/SIGBUS)。
+    const std::vector<std::byte> after(view->value.begin(), view->value.end());
+    EXPECT_EQ(after, before);
+
+    // merge 后新 get 从重定位的新文件读,值一致。
+    auto v2 = cask.get(k0);
+    ASSERT_TRUE(v2);
+    const std::vector<std::byte> fresh(v2->value.begin(), v2->value.end());
+    EXPECT_EQ(fresh, before);
+
+    cask.close();
+}
+
 // --- #1: FieldSchema 注册表 ---
 
 // intern 确定性：同名同 id、新名递增；name_of 反查。
