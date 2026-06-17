@@ -165,7 +165,8 @@ ok
 |------|------|
 | `doc/api-zh.md` / `doc/api-en.md` | **API 参考**：能力、参数含义与限制、返回值（中/英） |
 | `doc/USAGE.md` | 教程：打开、合并、配置、搜索 |
-| `doc/format-zh.md` | 磁盘格式字节级规范（带类型记录、DocValue、提示文件、锁） |
+| `doc/format-zh.md` | 磁盘格式字节级规范（带类型记录、DocValue、提示文件、锁；字节序统一小端） |
+| `doc/migrate-le.md` / `doc/migrate-le-en.md` | `migrate_le` 工具：把旧大端目录离线迁移成小端（v1→v2）（中/EN） |
 | `doc/cpp-arch.md` | C++ 模块布局、锁策略、构建入口 |
 | `doc/migration.md` | 特性状态与 API 参考 |
 | `doc/concurrency-zh.md` | 并发与共享语义 |
