@@ -15,6 +15,7 @@
 #include "bitcask/format.hpp"
 #include "bitcask/hint_file.hpp"
 #include "bitcask/migrate.hpp"
+#include "bitcask/search_checkpoint.hpp"
 
 using bitcask::fileops::DataFile;
 using bitcask::fileops::DataFileError;
@@ -616,4 +617,108 @@ TEST(MigrateBEtoLE, RejectsAlreadyV2) {
     write_file_bytes((fs::path(src) / "bitcask.meta").string(), m);
     auto res = bitcask::migrate::migrate_be_to_le(src, td / "dst2");
     EXPECT_FALSE(res);
+}
+
+// ---------------------------------------------------------------------------
+// P14e：search.ckpt 分段容器（SearchCheckpoint）。
+// ---------------------------------------------------------------------------
+namespace {
+using bitcask::search::SearchCheckpoint;
+using bitcask::search::CkptSection;
+
+std::span<const std::byte> sp(const std::string& s) {
+    return {reinterpret_cast<const std::byte*>(s.data()), s.size()};
+}
+// 翻转文件第 off 字节的一个 bit。
+void flip_byte(const std::string& path, long off) {
+    std::FILE* f = std::fopen(path.c_str(), "rb+");
+    ASSERT_NE(f, nullptr);
+    std::fseek(f, off, SEEK_SET);
+    unsigned char c = 0;
+    ASSERT_EQ(std::fread(&c, 1, 1, f), 1u);
+    c ^= 0x01;
+    std::fseek(f, off, SEEK_SET);
+    ASSERT_EQ(std::fwrite(&c, 1, 1, f), 1u);
+    std::fclose(f);
+}
+long file_size(const std::string& path) {
+    return static_cast<long>(fs::file_size(path));
+}
+}  // namespace
+
+TEST(SearchCheckpoint, RoundTrip) {
+    TempDir td;
+    const std::string path = td / "search.ckpt";
+    const std::string s1 = "docmap-bytes", s2 = "bm25-bytes!", s3 = "hnsw";
+    std::vector<CkptSection> secs = {
+        {1, 0, sp(s1)}, {2, 0, sp(s2)}, {4, 7, sp(s3)}};
+    ASSERT_TRUE(SearchCheckpoint::write(path, /*watermark*/ 4242, secs));
+
+    auto lc = SearchCheckpoint::read(path);
+    ASSERT_TRUE(lc.has_value());
+    EXPECT_EQ(lc->watermark, 4242u);
+    ASSERT_EQ(lc->sections.size(), 3u);
+    EXPECT_EQ(lc->sections[0].type, 1u);
+    EXPECT_EQ(lc->sections[1].type, 2u);
+    EXPECT_EQ(lc->sections[2].type, 4u);
+    EXPECT_EQ(lc->sections[2].flags, 7u);
+    EXPECT_EQ(view_str(lc->sections[0].payload), s1);
+    EXPECT_EQ(view_str(lc->sections[1].payload), s2);
+    EXPECT_EQ(view_str(lc->sections[2].payload), s3);
+    for (auto& ls : lc->sections) EXPECT_TRUE(ls.crc_ok);
+}
+
+// 单段 payload 损坏 → 仅该段 crc_ok=false，其余段正常、结构完整（损坏隔离）。
+TEST(SearchCheckpoint, SectionCorruptionIsolated) {
+    TempDir td;
+    const std::string path = td / "search.ckpt";
+    const std::string s1 = "AAAA", s2 = "BBBBBB";  // 段0[16,20) 段1[20,26)
+    std::vector<CkptSection> secs = {{2, 0, sp(s1)}, {4, 0, sp(s2)}};
+    ASSERT_TRUE(SearchCheckpoint::write(path, 9, secs));
+
+    flip_byte(path, 16);  // 段0 第一字节(payload 区)。
+    auto lc = SearchCheckpoint::read(path);
+    ASSERT_TRUE(lc.has_value());  // 结构仍完整。
+    ASSERT_EQ(lc->sections.size(), 2u);
+    EXPECT_FALSE(lc->sections[0].crc_ok);  // 坏段。
+    EXPECT_TRUE(lc->sections[1].crc_ok);   // 好段照常。
+}
+
+// 页脚损坏（trailer / footerCrc）→ 结构性拒绝（read 返回 nullopt）。
+TEST(SearchCheckpoint, FooterCorruptRejected) {
+    TempDir td;
+    const std::string path = td / "search.ckpt";
+    const std::string s1 = "x";
+    std::vector<CkptSection> secs = {{1, 0, sp(s1)}};
+    ASSERT_TRUE(SearchCheckpoint::write(path, 1, secs));
+    const long sz = file_size(path);
+    flip_byte(path, sz - 1);  // trailer 最后一字节。
+    EXPECT_FALSE(SearchCheckpoint::read(path).has_value());
+
+    // footerCrc 区损坏(dir 内容与 crc 不符)。
+    ASSERT_TRUE(SearchCheckpoint::write(path, 1, secs));
+    flip_byte(path, file_size(path) - 12);  // footerCrc 首字节。
+    EXPECT_FALSE(SearchCheckpoint::read(path).has_value());
+}
+
+// 截断 → 拒绝。
+TEST(SearchCheckpoint, TruncatedRejected) {
+    TempDir td;
+    const std::string path = td / "search.ckpt";
+    std::vector<CkptSection> secs = {{1, 0, sp(std::string("payload"))}};
+    ASSERT_TRUE(SearchCheckpoint::write(path, 1, secs));
+    const long sz = file_size(path);
+    std::filesystem::resize_file(path, static_cast<std::uintmax_t>(sz / 2));
+    EXPECT_FALSE(SearchCheckpoint::read(path).has_value());
+}
+
+// 空段集 round-trip（仅头部+空目录+页脚）。
+TEST(SearchCheckpoint, EmptySections) {
+    TempDir td;
+    const std::string path = td / "search.ckpt";
+    ASSERT_TRUE(SearchCheckpoint::write(path, 77, {}));
+    auto lc = SearchCheckpoint::read(path);
+    ASSERT_TRUE(lc.has_value());
+    EXPECT_EQ(lc->watermark, 77u);
+    EXPECT_TRUE(lc->sections.empty());
 }
