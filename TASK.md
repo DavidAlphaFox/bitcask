@@ -210,7 +210,6 @@ WAL `.f{i}.inv.wal→.f{i}.wal`；常量 `kKeydirSnapName`/`kIndexSidecarName`/
 | HNSW 外存 mmap | ❌ V7+ | V3.5 BCVS 已给 46×；100M+ 规模问题是另一类设计 |
 | ord 重编号 | ❌ 正式取消 | format "never reused" 约束正确；gap 测量结论正式取消 |
 | wildcard trie/FST/DAWG | ❌ V7+ | 中缀全扫 141μs 已亚毫秒，suffix array/n-gram 收益用户无感知，工程 ROI 不足 |
-| value 压缩 zstd/LZ4 | ❌ 取消 | 与 V6.1 零拷贝互斥 |
-| A4-P2 live gate re-open | ❌ V7+ | Index sidecar 持久化是实质 blocker；当前性能不受损 |
-| Live/Roaring bitmap (ord > 100M) | ❌ V7+ | 未到规模 |
-| WAL group-commit 跨线程 | ❌ V7+ | TSan 死锁检测器 64 持锁上限（M6.6），新锁模式需独立评审 |
+| value 压缩 zstd/LZ4 | ❌ 永久取消 | P6 mmap 零拷贝读路径已全量落地，压缩破坏 mmap 直接映射，不可逆 |
+| A4-P2 live gate re-open | ❌ 永久取消（被 P14e 取代） | P14e S4 统一 checkpoint + 自门模型已实现水位恢复；docmap 作为 search.ckpt 段持久化，4-way 配对门删除 |
+| WAL group-commit 跨线程 | ❌ 永久取消（被 P14e 取代） | P14e S6 删除整个 WAL 系统，统一 checkpoint 替代增量 WAL 持久化，无 WAL 可优化 |
