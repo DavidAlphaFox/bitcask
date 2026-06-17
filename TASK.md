@@ -80,7 +80,7 @@
 
 ## V7 — 文件持久化优化（P 系列）
 
-> P1-P6 已完成，P7/P12 备选（按 gate 决策）。
+> P1-P6 已完成，P7/P12 gate 不通过（收益不足），全部路线图任务收尾。
 
 ---
 
@@ -127,21 +127,20 @@ P3c。**红线**：默认仍 f32+int8（召回优先）；int8-only 是内存受
 **已移除**：原 P6 value LRU + 统一 LRU 基件——mmap 覆盖其主要收益（省 syscall+拷贝）
 且无双缓存；DocValue decode 近零、缓解码值无意义。（DocTextLru/SearchCache 保留现状。）
 
-### P7 — 派生值 compute cache（建在 mmap 之上）⚠️ 备选（依赖 P6，按 gate 决策）
+### P7 — 派生值 compute cache ❌ gate 不通过
 
-> 有 mmap 后 LRU **改定位**：不缓 raw bytes（mmap+page cache 已最优、缓了是双缓存
-> + 跟内核抢 RAM），只缓**派生/解码后、recompute 有真实 CPU 成本**的结果。省的是
-> recompute，不是 I/O。同 LevelDB 分工（mmap 取字节 / block LRU 缓解压块）。
-> **纯 KV value decode 近零 → 不缓**。
+> **Gate 结论（2026-06，`gate_bench.cpp`）**：highlight derive（nfkc_fold +
+> analyze_with_offsets）= **11 μs/doc**，是 mmap 读（251 ns）的 44×——数字上值得缓存。
+> 但 highlight **非热路径**（仅 `search_text_highlight` 触发，DocTextLru miss 时降级
+> 为无片段不阻塞），收益面太窄。dequant derive = **52-325 ns**，仅 mmap 的 1-1.3×，
+> 缓存收益微乎其微。**不做通用 compute cache**；若未来 highlight 成瓶颈，直接在
+> DocTextLru 中加缓 offsets 即可（一行改动，无需框架）。
 
 | # | 内容 | ROI/风险 | 状态 |
 |---|------|---------|------|
-| P7a | compute cache 框架：**按逻辑键（key/ord）**缓（跨 merge 内容稳定，miss 回 mmap 取原始字节再派生）；**存 owned `shared_ptr<const Derived>`，绝不存指向 mmap 的 span**（与 munmap/merge 生命周期解耦、无 UAF）；byte budget + shared_mutex；put/delete 按键失效、merge 不失效。 | 中 / 中 | ⚠️ 备选 |
-| P7b | 首批派生目标：① highlight 的 NFKC+`analyze_with_offsets` 结果（现每次高亮重算，即便 DocTextLru 原文命中）——把 DocTextLru 升级为缓**分词 offsets**；② int8→f32 dequant 向量（盘上 int8 且 get 要返 f32 时）。 | 中 / 中 | ⚠️ 备选 |
-| P7-gate | 仅当 **derive 成本 ≫ mmap 访问**才上：量化「LRU 命中(派生) vs mmap+现场 derive」延迟差，显著才做。 | — | ⚠️ 先做 |
-
-**读路径分层**：`LRU(派生) 命中? → 否 → mmap(raw, 无 syscall) → decode/dequant/分词 → 回填`。
-mmap = L1 字节层，P7 = L2 计算层，互补不竞争。**备选**：依赖 P6 先落地；raw value 永不缓。
+| P7-gate | 量化 derive 成本 vs mmap：highlight=11μs(44×)、dequant=52-325ns(1-1.3×)。 | — | ❌ 不通过 |
+| P7a | compute cache 框架 | 中 / 中 | ❌ 取消 |
+| P7b | highlight offsets / dequant 缓存 | 中 / 中 | ❌ 取消 |
 
 ### P8–P13 — 增量优化
 
@@ -151,7 +150,7 @@ mmap = L1 字节层，P7 = L2 计算层，互补不竞争。**备选**：依赖 
 | **P9 read_files_ fd 预算 LRU** | `read_files_` 每文件常驻 fd、无淘汰（`cask.cpp:1072`）→ 大库撞 ulimit。只读句柄按 LRU/数量上限淘汰（与 P6「mmap 后 close fd」互补）。详见 `doc/read-handle-lru-design-zh.md`。 | 中 / 低 | ✅ |
 | **P10 search_hybrid 两路并行** | `search_text`→`search_vector` 现串行（`search_layer.cpp:263/270`）+ RRF；两路独立 → 丢线程池并行，hybrid 延迟近减半。注意 filter/缓存共享并发安全。详见 `doc/hybrid-parallel-design-zh.md`。 | 中 / 中 | ✅ |
 | **P11 merge I/O 顺序优化** | merge 顺序读旧写新、无 readahead 提示。加 `posix_fadvise(SEQUENTIAL/WILLNEED)` + 大缓冲，降 IO stall（顺带 active 写也可 fadvise）。详见 `doc/merge-io-tuning-design-zh.md`。 | 中低 / 低 | ✅ |
-| **P12 meta_blobs_ 内存按需/有界** | `Index::meta_blobs_` 每 ord 全量常驻；改有界 LRU 或按需读盘。**但 filter 在搜索热路径 → 按需读盘拖慢，需 gate。** 详见 `doc/meta-blob-residency-design-zh.md`。 | 中 / 中 | ⚠️ 备选 |
+| **P12 meta_blobs_ 内存按需/有界** | `Index::meta_blobs_` 每 ord 全量常驻；改有界 LRU 或按需读盘。**Gate 结论（2026-06，`gate_bench.cpp`）**：访问延迟 200-300 ns @ 1M ords（shared_lock + vector copy），内存 ~280 MB @ 1M×256B——当前规模可接受。按需读盘会在搜索热路径引入毫秒级 I/O（比当前慢 10000×）。❌ **不做**，>10M ords 时再评估。详见 `doc/meta-blob-residency-design-zh.md`。 | 中 / 中 | ❌ gate 不通过 |
 | **P13 open 时按需后台 merge**（小文件收拢）| 每个写会话首次写建**新** active 文件（file_id 单调不回退、不重开旧文件——by design）→ 多次 open-写-close 累积小文件。**方案 A（承诺）**：open 后按 `needs_merge`（复用 `small_file_threshold` 等）门控、**后台**触发 merge（不阻塞 open），收成少数 sealed + 新 active；复用现有的 merge 全套 + `{merge_on_open, off|background}` 选项。否决无条件/同步 merge-on-open（O(data) 启动）。**方案 B（备选）**：复用上一个未满 sealed 文件续写（需 un-seal、破坏 sealed 不可变/与 P6 冲突）。**校正**：合并不提速单 get（keydir O(1)），收益在 open/fd/mmap/死空间。详见 `doc/open-merge-design-zh.md`。 | 中 / 中 | ✅（方案 A） |
 
 ---
