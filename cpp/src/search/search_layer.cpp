@@ -794,7 +794,8 @@ void SearchLayer::recover_tomb(std::string_view key, std::uint64_t ord) {
     index_.remove(key, ord);
 }
 
-// S8.6：多字段快照 = manifest（字段名清单）+ 每字段一个 `<path>.f<N>.inv`。
+// S8.6：多字段快照 = manifest（字段名清单）+ 每字段一个 `<path>.f<N>.seg`
+// （P14a：段后缀 .inv→.seg、WAL .inv.wal→.wal，契约见命名设计 §3）。
 // manifest 文本行：第一行字段数，之后每行一个字段名。字段名→序号即行号。
 std::uint64_t SearchLayer::indexed_ord_floor() const {
     std::shared_lock lk(fields_mu_);
@@ -932,7 +933,7 @@ std::expected<void, std::string> SearchLayer::save_snapshot(std::string_view pat
     std::size_t idx = 0;
     for (auto& [field, inv] : fields_) {
         mf << field << '\n';   // 字段名（可能含控制字符前缀，按行存）
-        if (!inv->save(base + ".f" + std::to_string(idx) + ".inv")) {
+        if (!inv->save(base + ".f" + std::to_string(idx) + ".seg")) {
             return std::unexpected("failed to save field snapshot " + field);
         }
         inv->truncate_wal();
@@ -959,11 +960,11 @@ std::expected<bool, std::string> SearchLayer::load_snapshot(std::string_view pat
                 return std::unexpected("manifest truncated for " + base);
             }
             auto inv = std::make_unique<bm25::InvertedIndex>(config_.bm25_params, config_.index_positions);
-            if (!inv->load(base + ".f" + std::to_string(i) + ".inv")) {
+            if (!inv->load(base + ".f" + std::to_string(i) + ".seg")) {
                 return std::unexpected("failed to load field snapshot " + field);
             }
             // S8.9：加载快照后如 WAL 文件存在，启用并重放。
-            auto wal_path = base + ".f" + std::to_string(i) + ".inv.wal";
+            auto wal_path = base + ".f" + std::to_string(i) + ".wal";
             if (std::ifstream(wal_path).good()) {
                 inv->enable_wal(wal_path, config_.wal_batch_size);
                 inv->replay_wal();
@@ -1012,7 +1013,7 @@ void SearchLayer::rebuild_index(DocReader doc_reader) {
     fields_.emplace(default_field, std::move(new_inv));
 
     if (had_wal && !snapshot_path_.empty()) {
-        fields_[default_field]->enable_wal(snapshot_path_ + ".f0.inv.wal",
+        fields_[default_field]->enable_wal(snapshot_path_ + ".f0.wal",
                                             config_.wal_batch_size);
     }
 

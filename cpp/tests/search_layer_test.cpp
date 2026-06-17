@@ -564,8 +564,8 @@ TEST(SearchLayer, WalIntegration) {
     std::filesystem::remove(snapshot_path);
     std::filesystem::remove(snapshot_path.string() + ".manifest");
     for (int i = 0; i < 10; ++i) {
-        std::filesystem::remove(snapshot_path.string() + ".f" + std::to_string(i) + ".inv");
-        std::filesystem::remove(snapshot_path.string() + ".f" + std::to_string(i) + ".inv.wal");
+        std::filesystem::remove(snapshot_path.string() + ".f" + std::to_string(i) + ".seg");
+        std::filesystem::remove(snapshot_path.string() + ".f" + std::to_string(i) + ".wal");
     }
 
     auto save_result = layer1.save_snapshot(snapshot_path.string());
@@ -599,7 +599,7 @@ TEST(SearchLayer, WalIntegration) {
     std::filesystem::remove(snapshot_path);
     std::filesystem::remove(snapshot_path.string() + ".manifest");
     for (int i = 0; i < 10; ++i) {
-        std::filesystem::remove(snapshot_path.string() + ".f" + std::to_string(i) + ".inv");
-        std::filesystem::remove(snapshot_path.string() + ".f" + std::to_string(i) + ".inv.wal");
+        std::filesystem::remove(snapshot_path.string() + ".f" + std::to_string(i) + ".seg");
+        std::filesystem::remove(snapshot_path.string() + ".f" + std::to_string(i) + ".wal");
     }
 }
