@@ -107,19 +107,16 @@ TEST(SearchLayer, SnapshotSaveLoad) {
     layer1.on_write("key1", 0, "hello world", 1, 100, 50, 1000);
     layer1.on_write("key2", 1, "foo bar", 1, 200, 40, 1001);
 
-    auto snapshot_path = std::filesystem::temp_directory_path() / "bitcask_search_snapshot_test.inv";
+    auto snapshot_path = std::filesystem::temp_directory_path() / "bitcask_search_ckpt_test.bin";
     std::filesystem::remove(snapshot_path);
+    std::filesystem::remove(std::string(snapshot_path.string()) + ".prev");
 
-    auto save_result = layer1.save_snapshot(snapshot_path.string());
-    ASSERT_TRUE(save_result.has_value());
+    ASSERT_TRUE(layer1.save_search_ckpt(snapshot_path.string(), 2));
 
     SearchLayer layer2(config);
-    layer2.recover_doc("key1", 0, "hello world", 1, 100, 50, 1000);
-    layer2.recover_doc("key2", 1, "foo bar", 1, 200, 40, 1001);
-
-    auto load_result = layer2.load_snapshot(snapshot_path.string());
-    ASSERT_TRUE(load_result.has_value());
-    EXPECT_TRUE(*load_result);
+    auto result = layer2.load_search_ckpt(snapshot_path.string());
+    ASSERT_TRUE(result.loaded);
+    ASSERT_TRUE(result.all_segments_ok);
 
     auto search_result = layer2.search_text("hello", 10);
     ASSERT_TRUE(search_result.has_value());
@@ -127,6 +124,7 @@ TEST(SearchLayer, SnapshotSaveLoad) {
     EXPECT_EQ(search_result->at(0).key, "key1");
 
     std::filesystem::remove(snapshot_path);
+    std::filesystem::remove(std::string(snapshot_path.string()) + ".prev");
 }
 
 TEST(SearchLayer, PhraseSearch) {
@@ -552,39 +550,23 @@ TEST(SearchLayer, QueryTimeBm25ParamsOverride) {
         << "override b=0 should change score vs default b=0.75";
 }
 
-TEST(SearchLayer, WalIntegration) {
+TEST(SearchLayer, CheckpointRoundTrip) {
     auto config = default_config();
     SearchLayer layer1(config);
 
     layer1.on_write("doc1", 0, "hello world", 1, 100, 50, 1000);
     layer1.on_write("doc2", 1, "foo bar", 1, 200, 40, 1001);
 
-    auto snapshot_path = std::filesystem::temp_directory_path() / "wal_integration_test.inv";
-    // 清理上次测试残留
-    std::filesystem::remove(snapshot_path);
-    std::filesystem::remove(snapshot_path.string() + ".manifest");
-    for (int i = 0; i < 10; ++i) {
-        std::filesystem::remove(snapshot_path.string() + ".f" + std::to_string(i) + ".seg");
-        std::filesystem::remove(snapshot_path.string() + ".f" + std::to_string(i) + ".wal");
-    }
+    auto ckpt_path = std::filesystem::temp_directory_path() / "bitcask_ckpt_roundtrip.bin";
+    std::filesystem::remove(ckpt_path);
+    std::filesystem::remove(std::string(ckpt_path.string()) + ".prev");
 
-    auto save_result = layer1.save_snapshot(snapshot_path.string());
-    ASSERT_TRUE(save_result.has_value());
-
-    layer1.on_write("doc3", 2, "baz qux", 1, 300, 50, 1002);
-
-    auto search_before_load = layer1.search_text("hello", 10);
-    ASSERT_TRUE(search_before_load.has_value());
-    EXPECT_EQ(search_before_load->size(), 1u);
+    ASSERT_TRUE(layer1.save_search_ckpt(ckpt_path.string(), 2));
 
     SearchLayer layer2(config);
-    // load_snapshot 只恢复 InvertedIndex（倒排索引），不恢复 Index（ord→key 映射）。
-    // 要搜索生效，需先用 recover_doc 恢复 Index。
-    layer2.recover_doc("doc1", 0, "hello world", 1, 100, 50, 1000);
-    layer2.recover_doc("doc2", 1, "foo bar", 1, 200, 40, 1001);
-
-    auto load_result = layer2.load_snapshot(snapshot_path.string());
-    ASSERT_TRUE(load_result.has_value());
+    auto result = layer2.load_search_ckpt(ckpt_path.string());
+    ASSERT_TRUE(result.loaded);
+    ASSERT_TRUE(result.all_segments_ok);
 
     auto search_hello = layer2.search_text("hello", 10);
     ASSERT_TRUE(search_hello.has_value());
@@ -596,10 +578,87 @@ TEST(SearchLayer, WalIntegration) {
     ASSERT_EQ(search_foo->size(), 1u);
     EXPECT_EQ(search_foo->at(0).key, "doc2");
 
-    std::filesystem::remove(snapshot_path);
-    std::filesystem::remove(snapshot_path.string() + ".manifest");
-    for (int i = 0; i < 10; ++i) {
-        std::filesystem::remove(snapshot_path.string() + ".f" + std::to_string(i) + ".seg");
-        std::filesystem::remove(snapshot_path.string() + ".f" + std::to_string(i) + ".wal");
+    std::filesystem::remove(ckpt_path);
+    std::filesystem::remove(std::string(ckpt_path.string()) + ".prev");
+}
+
+// CRC 段隔离：search.ckpt 中某段 CRC 失败不应影响其他段的加载。
+// 写入 3 篇文档 → 保存 → 位翻转中部（破坏 payload）→ 加载后
+// all_segments_ok=false，但结构本身仍可解析（loaded=true）。
+TEST(SearchLayer, CheckpointCrcCorruptionDetected) {
+    auto config = default_config();
+    SearchLayer layer1(config);
+    layer1.on_write("a", 0, "alpha beta", 1, 0, 50, 1000);
+    layer1.on_write("b", 1, "gamma delta", 1, 100, 50, 1001);
+    layer1.on_write("c", 2, "epsilon zeta", 1, 200, 50, 1002);
+
+    auto path = std::filesystem::temp_directory_path() / "bitcask_crc_test.ckpt";
+    std::filesystem::remove(path);
+    std::filesystem::remove(std::string(path.string()) + ".prev");
+    ASSERT_TRUE(layer1.save_search_ckpt(path.string(), 3));
+    ASSERT_TRUE(std::filesystem::exists(path));
+
+    {
+        std::FILE* f = std::fopen(path.string().c_str(), "rb+");
+        ASSERT_NE(f, nullptr);
+        std::fseek(f, 0, SEEK_END);
+        const long mid = std::ftell(f) / 2;
+        std::fseek(f, mid, SEEK_SET);
+        int ch = std::fgetc(f);
+        std::fseek(f, mid, SEEK_SET);
+        std::fputc(ch ^ 0xFF, f);
+        std::fclose(f);
     }
+
+    SearchLayer layer2(config);
+    auto result = layer2.load_search_ckpt(path.string());
+    EXPECT_TRUE(result.loaded);
+    EXPECT_FALSE(result.all_segments_ok);
+
+    std::filesystem::remove(path);
+    std::filesystem::remove(std::string(path.string()) + ".prev");
+}
+
+// .prev 代际回退：第一次保存正常 search.ckpt；第二次保存时刻意损坏
+// （截断为一半）→ load 应回退到 .prev 并恢复健康状态。
+TEST(SearchLayer, CheckpointPrevFallback) {
+    auto config = default_config();
+    SearchLayer layer1(config);
+    layer1.on_write("k1", 0, "hello world", 1, 0, 50, 1000);
+    layer1.on_write("k2", 1, "foo bar baz", 1, 100, 50, 1001);
+    layer1.on_write("k3", 2, "test data here", 1, 200, 50, 1002);
+
+    auto path = std::filesystem::temp_directory_path() / "bitcask_prev_test.ckpt";
+    auto prev = std::filesystem::path(std::string(path.string()) + ".prev");
+    std::filesystem::remove(path);
+    std::filesystem::remove(prev);
+
+    ASSERT_TRUE(layer1.save_search_ckpt(path.string(), 3));
+    ASSERT_TRUE(std::filesystem::exists(path));
+    ASSERT_FALSE(std::filesystem::exists(prev));
+
+    SearchLayer layer_more(config);
+    layer_more.on_write("k4", 3, "extra doc", 1, 300, 50, 1003);
+    layer_more.on_write("k5", 4, "another doc", 1, 400, 50, 1004);
+    ASSERT_TRUE(layer_more.save_search_ckpt(path.string(), 5));
+    ASSERT_TRUE(std::filesystem::exists(prev))
+        << ".prev should exist after second save";
+
+    // 损坏当前 search.ckpt → load 应回退到 .prev。
+    std::filesystem::resize_file(path, std::filesystem::file_size(path) / 2);
+
+    SearchLayer layer2(config);
+    auto result = layer2.load_search_ckpt(path.string());
+    EXPECT_TRUE(result.loaded) << "should fall back to .prev";
+    EXPECT_TRUE(result.all_segments_ok) << ".prev should be healthy";
+    EXPECT_EQ(result.watermark, 3u) << ".prev has watermark from first save";
+
+    // k1/k2/k3 在 .prev 中；k4/k5 不在（需要 fold 回放）。
+    auto sr = layer2.search_text("hello", 10);
+    ASSERT_TRUE(sr.has_value());
+    ASSERT_EQ(sr->size(), 1u);
+    EXPECT_EQ(sr->at(0).key, "k1");
+
+    std::filesystem::remove(path);
+    std::filesystem::remove(prev);
 }
