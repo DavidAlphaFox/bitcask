@@ -122,3 +122,118 @@ f32=1.0 饱和、只暴露 int8 的隔离代价；真实语料 f32 < 1，int8 de
 - P3c：§6 召回测量 + 决定默认与文档。
 
 > 本设计完成「start」；P3a-c 是后续实现，P3b 起改 DocValue 写出需先过 P3a fixture。
+
+---
+
+## 9. 行业对比：PQ vs per-vector int8
+
+> 2026-06 归档。背景：评估 PQ 是否需要在 2.1.1 落地，结论 V7+。
+
+### 方案对比
+
+| | per-vector int8（当前） | Product Quantization (PQ) |
+|---|---|---|
+| 原理 | 每向量独立：`scale = max|v[i]|`, `codes[i] = round(v[i]/scale×127)` | 切 M 子段，每段在离线 k-means codebook 里找最近质心 |
+| 每向量内存 | dim bytes + 4B (2.56 KB @2560d) | M bytes (32B @M=32) + 共享 codebook |
+| 1M 向量 | 2.56 GB | ~35 MB（**73×**） |
+| 压缩比 | 4× (f32→int8) | ~300× (f32→PQ) |
+| recall 损失 | ~3% | ~5-15%（取决于 M/k） |
+| 训练 | 不需要 | **需要离线 k-means** |
+| 距离计算 | int8×int8 dot (VNNI) | 查表 (ADC) |
+
+### 各向量数据库采用情况
+
+| 数据库 | 方案 | 说明 |
+|---|---|---|
+| FAISS (Meta) | 两者都有 | `IndexScalarQuantizer` (int8) + `IndexIVFPQ` (PQ) |
+| Milvus | 两者都有 | SQ8 (int8) 和 PQ 可选；DiskANN 用 PQ 做盘上压缩 |
+| Qdrant | per-vector int8 | 与 bitcask 最像——per-vector scalar，无训练 |
+| Weaviate | PQ | 大规模场景默认 PQ |
+| Pinecone | PQ 系 | 闭源，基于 PQ 原理 |
+| pgvector | 全精度/f16 | 默认 f32，近年加 f16 和 binary，无 PQ |
+| Chroma | 全精度 | 几乎不量化 |
+| LanceDB | 两者都有 | IVF+PQ 或 scalar |
+
+### 规模分层
+
+```
+< 10M 向量  → per-vector int8 够用（内存可控，recall ≈97%，零训练）
+10M ~ 1B   → PQ 主流（73× 压缩，但 recall 掉 5-15%，需训练管线）
+> 1B       → PQ + DiskANN（盘上 PQ，内存只放粗粒度索引）
+```
+
+bitcask 处于**百万级**档位——per-vector int8 + int8-only 模式（P5，内存 -80%）是正确选
+择。PQ 的离线训练管线 + recall 损失在此规模不划算，留 V7+。
+
+---
+
+## 10. 大规模方向（V7+）：DiskANN vs mmap HNSW
+
+> 2026-06 归档。TASK.md 排除项「HNSW 外存 mmap」的决策分析。
+
+### 问题
+
+100M+ 向量时，HNSW 图结构本身（邻接表 + node 元数据）≈ 10 GB，加上 int8 向量
+≈ 250 GB——内存放不下。需要一种盘上方案。
+
+### DiskANN（Microsoft Research 2019）
+
+论文：*DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node*
+目标：**单机 64 GB RAM 扛 10 亿向量**。
+
+#### 架构
+
+```
+┌─── RAM (小) ───┐   ┌─────────── SSD ───────────┐
+│ 入口点 + 缓存   │   │ Vamana 图邻接表            │
+│ top-k 精排缓冲  │←→│ PQ 压缩向量（内联在节点旁） │
+│ ~64 B/vec      │   │ 全量数据，TB 级随意         │
+└────────────────┘   └────────────────────────────┘
+```
+
+#### 三个关键设计
+
+**① Vamana 图（替代 HNSW 多层跳表）**
+
+单层图，引入 α 参数控制建边多样性：
+- α 小 → 只连近邻（局部密集，远距离跳数多）
+- α 大 → 也连远邻（长程边，减少跳数）
+- 兼顾短边（精局部搜索）+ 长边（快长程跳跃）
+- 单层比 HNSW 多层**磁盘友好**（不用跨层跳 = 减少随机读）
+
+**② PQ 内联存储**
+
+每个节点在 SSD 上存 `[邻居 ID × R][PQ 码 M bytes]`：
+- PQ 码做粗排距离计算——不需读完整向量
+- 最终 top-K 才做精排（从 RAM cache 或 SSD 读 f32）
+
+**③ Beam Search（驯服 SSD 随机读）**
+
+HNSW 纯贪心遍历在 SSD 上每次随机读 ~100 μs 灾难。DiskANN：
+- 维护候选队列，每次批量读 L 个候选的邻居（beam width = L）
+- L 次 SSD 读 pipeline 成顺序预读
+- 把 ~100μs 随机读摊薄成 ~10μs/节点有效吞吐
+- 典型 beam width = 4-8，实测延迟 ~1-5 ms/query
+
+#### 规模对比
+
+| 规模 | HNSW（当前） | DiskANN |
+|---|---|---|
+| 1M | ✅ ~2.5 GB RAM，μs 级延迟 | 不值得 |
+| 10M | ✅ ~25 GB，需大内存 | 可选但 HNSW 更优 |
+| 100M | ⚠️ ~250 GB，内存不够 | ✅ ~6.4 GB RAM + SSD |
+| 1B | ❌ 不可行 | ✅ ~64 GB RAM + TB SSD |
+
+### 为什么 HNSW 外存 mmap 不是好方案
+
+1. **图遍历是随机访问**：跳邻居→跳邻居，mmap page fault 极频繁，性能不可控
+2. **P14e 不改变加载模型**：search.ckpt 序列化是 flat 小端字节，理论可 mmap，但
+   HnswIndex 访问层（NodeChunk/vector）需要全部改 mmap-aware 指针——工程量等同重写
+3. **业界 100M+ 主流是 DiskANN**，不是 mmap HNSW
+
+### bitcask 的结论
+
+当前百万级：HNSW 全内存（μs 级）+ search.ckpt 序列化持久化，完全够用。
+
+若未来要扛 1 亿+ 向量，需要 DiskANN 类架构（Vamana 图 + PQ + SSD beam search）——
+本质上是另一个引擎，属 V7+ 大版本架构变更。P14e 的统一 checkpoint 不改变这一结论。
