@@ -1348,6 +1348,61 @@ TEST_F(CaskDocValueTest, LegacyV1MetaRejectedCleanly) {
     EXPECT_FALSE(c) << "旧大端目录 open 必须失败,提示重建";
 }
 
+// P9:read 句柄缓存上限——读 > cap 个文件后常驻句柄数 ≤ cap;淘汰后再读正确;
+// cap=0 不限。
+TEST_F(CaskDocValueTest, P9ReadHandleCapEvictsAndRereads) {
+    constexpr int N = 16;
+    {   // 小 max_file_size 滚出 ~N 个 sealed data 文件。
+        CaskOptions w;
+        w.read_write = true;
+        w.max_file_size = 64;
+        auto c = Cask::open(tmpdir_.string(), w);
+        ASSERT_TRUE(c);
+        for (int i = 0; i < N; ++i) {
+            std::vector<std::byte> key{std::byte{'k'}, static_cast<std::byte>(i)};
+            std::vector<std::byte> val(40, static_cast<std::byte>(i));
+            ASSERT_TRUE((*c)->put(key, val, static_cast<std::uint32_t>(1000 + i)));
+        }
+        (*c)->close();
+    }
+
+    // 重开,cap=4。get_owned 逐个读(view 即取即弃 → 句柄空闲可淘汰)。
+    CaskOptions r;
+    r.read_write = false;
+    r.max_read_handles = 4;
+    auto c = Cask::open(tmpdir_.string(), r);
+    ASSERT_TRUE(c);
+    for (int i = 0; i < N; ++i) {
+        std::vector<std::byte> key{std::byte{'k'}, static_cast<std::byte>(i)};
+        auto g = (*c)->get_owned(key);
+        ASSERT_TRUE(g);
+        ASSERT_EQ(g->value.size(), 40u);
+        EXPECT_EQ(static_cast<unsigned char>(g->value[0]), static_cast<unsigned>(i & 0xFF));
+        // 常驻句柄始终不超过 cap(软上限;空闲句柄被近似 LRU 淘汰)。
+        EXPECT_LE((*c)->read_handle_count(), 4u);
+    }
+    // 淘汰后再读最早写的 key(其句柄早被淘汰)→ 重开仍正确。
+    {
+        std::vector<std::byte> k0{std::byte{'k'}, static_cast<std::byte>(0)};
+        auto g = (*c)->get_owned(k0);
+        ASSERT_TRUE(g);
+        EXPECT_EQ(static_cast<unsigned char>(g->value[0]), 0u);
+    }
+    (*c)->close();
+
+    // cap=0 → 不限:读完所有文件后常驻句柄数 = 文件数(> 4)。
+    CaskOptions u;
+    u.read_write = false;  // max_read_handles 默认 0
+    auto c2 = Cask::open(tmpdir_.string(), u);
+    ASSERT_TRUE(c2);
+    for (int i = 0; i < N; ++i) {
+        std::vector<std::byte> key{std::byte{'k'}, static_cast<std::byte>(i)};
+        ASSERT_TRUE((*c2)->get_owned(key));
+    }
+    EXPECT_GT((*c2)->read_handle_count(), 4u);
+    (*c2)->close();
+}
+
 // 校验:dim 不符 / 未配置却带向量 / cosine 下零向量,全部拒绝。
 TEST_F(CaskDocValueTest, V31VectorValidation) {
     std::vector<std::byte> key{std::byte{'k'}};
