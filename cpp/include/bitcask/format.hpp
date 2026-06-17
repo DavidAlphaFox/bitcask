@@ -21,15 +21,17 @@ namespace bitcask::format {
 // 数据文件 record 布局（向量库 typed record，V1）：
 //   [0..3]   CRC32       (覆盖 Type..Value 区段，即 [4..] 全部)
 //   [4]      Type        u8   (RecordType：kDoc / kTombstone)
-//   [5..8]   Tstamp      u32 大端
-//   [9..16]  Ord         u64 大端 (引擎单调分配的写入序号，per-write，永不复用)
-//   [17..18] KeySz       u16 大端 (key == ext_id)
-//   [19..22] ValueSz     u32 大端 (kDoc 时是打包 value；kTombstone 时通常为 0)
+//   [5..8]   Tstamp      u32 小端
+//   [9..16]  Ord         u64 小端 (引擎单调分配的写入序号，per-write，永不复用)
+//   [17..18] KeySz       u16 小端 (key == ext_id)
+//   [19..22] ValueSz     u32 小端 (kDoc 时是打包 value；kTombstone 时通常为 0)
 //   [23..]   Key | Value
 // 总长 = kHeaderSize + KeySz + ValueSz
 //
 // 设计依据见 doc/vector-db-design-zh.md §2.2。CRC 覆盖范围从 Type 开始
 // （含 ord），而非 legacy 的 Tstamp 起。
+// 字节序：P 起全盘统一小端(LE-only 主机，原生零转换 + mmap 零拷贝)。
+// flag-day 切换，旧大端文件不可读(需重建)，见 doc/format-zh.md。
 // ---------------------------------------------------------------------------
 inline constexpr std::size_t kHeaderSize = 23;  // 4 + 1 + 4 + 8 + 2 + 4
 inline constexpr std::size_t kCrcOffset = 0;
@@ -50,10 +52,10 @@ enum class RecordType : std::uint8_t {
 
 // ---------------------------------------------------------------------------
 // hint 文件 record 布局（用于 keydir 重建加速；不带 value）：
-//   [0..3]   Tstamp      u32 大端
-//   [4..5]   KeySz       u16 大端
-//   [6..9]   TotalSz     u32 大端 (对应 data file 里整条 record 的 total）
-//   [10..17] (Tomb:1<<63) | (Offset:63)，整体 u64 大端
+//   [0..3]   Tstamp      u32 小端
+//   [4..5]   KeySz       u16 小端
+//   [6..9]   TotalSz     u32 小端 (对应 data file 里整条 record 的 total）
+//   [10..17] (Tomb:1<<63) | (Offset:63)，整体 u64 小端
 //   [18..]   Key (KeySz 字节)
 // 总长 = kHintRecordSize + KeySz
 //

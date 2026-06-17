@@ -12,39 +12,43 @@ namespace bitcask::codec {
 
 namespace {
 
-// 大端 load/store 辅助。bitcask record 在磁盘上是大端存储——
-// Erlang 的 <<X:N>> 默认就是大端，跟旧 NIF 互操作要保持一致。
-constexpr void be_store_u16(std::byte* p, std::uint16_t v) noexcept {
-    p[0] = static_cast<std::byte>((v >> 8) & 0xFF);
-    p[1] = static_cast<std::byte>(v & 0xFF);
+// 小端 load/store 辅助。统一盘格式字节序为小端(LE):全引擎 LE-only 主机
+// (x86/ARM64,见本文件下方 static_assert),原生零转换 + mmap 零拷贝友好。
+// 位移实现与主机字节序无关(LE 主机上编译器优化为单条 mov)。
+// 历史:record/hint 曾为大端(对齐 Erlang <<X:N>>);flag-day 全切 LE 后,
+// 旧大端文件不可读(需重建),见 doc/format-zh.md。
+constexpr void le_store_u16(std::byte* p, std::uint16_t v) noexcept {
+    p[0] = static_cast<std::byte>(v & 0xFF);
+    p[1] = static_cast<std::byte>((v >> 8) & 0xFF);
 }
-constexpr void be_store_u32(std::byte* p, std::uint32_t v) noexcept {
-    p[0] = static_cast<std::byte>((v >> 24) & 0xFF);
-    p[1] = static_cast<std::byte>((v >> 16) & 0xFF);
-    p[2] = static_cast<std::byte>((v >> 8) & 0xFF);
-    p[3] = static_cast<std::byte>(v & 0xFF);
+constexpr void le_store_u32(std::byte* p, std::uint32_t v) noexcept {
+    p[0] = static_cast<std::byte>(v & 0xFF);
+    p[1] = static_cast<std::byte>((v >> 8) & 0xFF);
+    p[2] = static_cast<std::byte>((v >> 16) & 0xFF);
+    p[3] = static_cast<std::byte>((v >> 24) & 0xFF);
 }
-constexpr void be_store_u64(std::byte* p, std::uint64_t v) noexcept {
+constexpr void le_store_u64(std::byte* p, std::uint64_t v) noexcept {
     for (int i = 0; i < 8; ++i) {
         p[static_cast<std::size_t>(i)] =
-            static_cast<std::byte>((v >> (56 - 8 * i)) & 0xFFu);
+            static_cast<std::byte>((v >> (8 * i)) & 0xFFu);
     }
 }
-constexpr std::uint16_t be_load_u16(const std::byte* p) noexcept {
+constexpr std::uint16_t le_load_u16(const std::byte* p) noexcept {
     return static_cast<std::uint16_t>(
-        (static_cast<std::uint16_t>(p[0]) << 8) |
-         static_cast<std::uint16_t>(p[1]));
+        static_cast<std::uint16_t>(p[0]) |
+        (static_cast<std::uint16_t>(p[1]) << 8));
 }
-constexpr std::uint32_t be_load_u32(const std::byte* p) noexcept {
-    return (static_cast<std::uint32_t>(p[0]) << 24) |
-           (static_cast<std::uint32_t>(p[1]) << 16) |
-           (static_cast<std::uint32_t>(p[2]) << 8)  |
-            static_cast<std::uint32_t>(p[3]);
+constexpr std::uint32_t le_load_u32(const std::byte* p) noexcept {
+    return  static_cast<std::uint32_t>(p[0])        |
+           (static_cast<std::uint32_t>(p[1]) << 8)  |
+           (static_cast<std::uint32_t>(p[2]) << 16) |
+           (static_cast<std::uint32_t>(p[3]) << 24);
 }
-constexpr std::uint64_t be_load_u64(const std::byte* p) noexcept {
+constexpr std::uint64_t le_load_u64(const std::byte* p) noexcept {
     std::uint64_t v = 0;
     for (int i = 0; i < 8; ++i) {
-        v = (v << 8) | static_cast<std::uint64_t>(p[static_cast<std::size_t>(i)]);
+        v |= static_cast<std::uint64_t>(p[static_cast<std::size_t>(i)])
+             << (8 * i);
     }
     return v;
 }
@@ -118,17 +122,17 @@ std::size_t encode_data_record(std::vector<std::byte>& out,
     // 布局: [CRC|Type|Tstamp|Ord|KeySz|ValueSz|Key|Value]。
     // CRC 覆盖它自身之后的全部字节（即 Type..Value）。
     p[format::kTypeOffset] = static_cast<std::byte>(type);
-    be_store_u32(p + format::kTstampOffset, tstamp);
-    be_store_u64(p + format::kOrdOffset, ord);
-    be_store_u16(p + format::kKeySzOffset, static_cast<std::uint16_t>(key.size()));
-    be_store_u32(p + format::kValueSzOffset, static_cast<std::uint32_t>(value.size()));
+    le_store_u32(p + format::kTstampOffset, tstamp);
+    le_store_u64(p + format::kOrdOffset, ord);
+    le_store_u16(p + format::kKeySzOffset, static_cast<std::uint16_t>(key.size()));
+    le_store_u32(p + format::kValueSzOffset, static_cast<std::uint32_t>(value.size()));
     if (!key.empty()) std::memcpy(p + format::kHeaderSize, key.data(), key.size());
     if (!value.empty()) std::memcpy(p + format::kHeaderSize + key.size(),
                                     value.data(), value.size());
 
     const std::span<const std::byte> covered{p + format::kTypeOffset,
                                               total - format::kTypeOffset};
-    be_store_u32(p + format::kCrcOffset, crc32(covered));
+    le_store_u32(p + format::kCrcOffset, crc32(covered));
     return total;
 }
 
@@ -140,13 +144,13 @@ decode_data_record(std::span<const std::byte> buf) {
     if (buf.size() < format::kHeaderSize) {
         return std::unexpected(DecodeError::kBufferTooShort);
     }
-    const std::uint32_t crc      = be_load_u32(buf.data() + format::kCrcOffset);
+    const std::uint32_t crc      = le_load_u32(buf.data() + format::kCrcOffset);
     const auto          type     = static_cast<format::RecordType>(
                                        buf.data()[format::kTypeOffset]);
-    const std::uint32_t tstamp   = be_load_u32(buf.data() + format::kTstampOffset);
-    const std::uint64_t ord      = be_load_u64(buf.data() + format::kOrdOffset);
-    const std::uint16_t key_sz   = be_load_u16(buf.data() + format::kKeySzOffset);
-    const std::uint32_t value_sz = be_load_u32(buf.data() + format::kValueSzOffset);
+    const std::uint32_t tstamp   = le_load_u32(buf.data() + format::kTstampOffset);
+    const std::uint64_t ord      = le_load_u64(buf.data() + format::kOrdOffset);
+    const std::uint16_t key_sz   = le_load_u16(buf.data() + format::kKeySzOffset);
+    const std::uint32_t value_sz = le_load_u32(buf.data() + format::kValueSzOffset);
 
     // 第二道关：header 说有 N 字节 body 但 buf 不够长 → kBufferTooShort
     const std::size_t total = format::kHeaderSize + key_sz + value_sz;
@@ -380,15 +384,15 @@ std::size_t encode_hint_record(std::vector<std::byte>& out,
     out.resize(base + total);
     std::byte* p = out.data() + base;
 
-    be_store_u32(p + 0, tstamp);
-    be_store_u16(p + 4, static_cast<std::uint16_t>(key.size()));
-    be_store_u32(p + 6, total_sz);
+    le_store_u32(p + 0, tstamp);
+    le_store_u16(p + 4, static_cast<std::uint16_t>(key.size()));
+    le_store_u32(p + 6, total_sz);
 
     // 把 tombstone 标志压到 offset 的最高位——节省 1 字节，跟 legacy 完全
     // 一致的 wire format。读取时反向 mask。
     const std::uint64_t packed =
         (tombstone ? format::kTombMaskV2 : 0ull) | offset;
-    be_store_u64(p + 10, packed);
+    le_store_u64(p + 10, packed);
 
     if (!key.empty()) std::memcpy(p + format::kHintRecordSize, key.data(), key.size());
     return total;
@@ -415,10 +419,10 @@ decode_hint_record(std::span<const std::byte> buf) {
     if (buf.size() < format::kHintRecordSize) {
         return std::unexpected(DecodeError::kBufferTooShort);
     }
-    const std::uint32_t tstamp   = be_load_u32(buf.data() + 0);
-    const std::uint16_t key_sz   = be_load_u16(buf.data() + 4);
-    const std::uint32_t total_sz = be_load_u32(buf.data() + 6);
-    const std::uint64_t packed   = be_load_u64(buf.data() + 10);
+    const std::uint32_t tstamp   = le_load_u32(buf.data() + 0);
+    const std::uint16_t key_sz   = le_load_u16(buf.data() + 4);
+    const std::uint32_t total_sz = le_load_u32(buf.data() + 6);
+    const std::uint64_t packed   = le_load_u64(buf.data() + 10);
 
     // 反向解 packed：最高位 bit = tombstone，剩余 63 位 = offset。
     const bool tomb = (packed & format::kTombMaskV2) != 0;
