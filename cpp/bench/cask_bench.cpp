@@ -190,7 +190,7 @@ static void BM_Cask_Open_FullFold(benchmark::State& state) {
     for (auto _ : state) {
         state.PauseTiming();
         std::error_code ec;
-        fs::remove(fs::path(dir) / "bitcask.keydir.snap", ec);
+        fs::remove(fs::path(dir) / "kv.keydir.ckpt", ec);
         state.ResumeTiming();
         auto c = Cask::open(dir, rw_opts());
         if (!c) state.SkipWithError("open failed");
@@ -202,7 +202,7 @@ BENCHMARK(BM_Cask_Open_FullFold)->Unit(benchmark::kMicrosecond);
 
 // -----------------------------------------------------------------------------
 // V3.5:vector 集合 open——hnsw 快照(BCVS)快路径 vs 全量 fold 重插。
-// 1 万条 384d(归一化)向量文档;FullFold 变体每轮删 hnsw.snap(covers 门
+// 1 万条 384d(归一化)向量文档;FullFold 变体每轮删 search.vec.ckpt(covers 门
 // 关闭 → 整库 fold,重分词 + 重插 HNSW)。无红线,只记实测(设计 §6)。
 // -----------------------------------------------------------------------------
 namespace {
@@ -266,7 +266,7 @@ static void BM_Cask_Open_VecFullFold(benchmark::State& state) {
     for (auto _ : state) {
         state.PauseTiming();
         std::error_code ec;
-        fs::remove(fs::path(dir) / "hnsw.snap", ec);
+        fs::remove(fs::path(dir) / "search.vec.ckpt", ec);
         state.ResumeTiming();
         auto c = Cask::open(dir, vec_opts());
         if (!c) state.SkipWithError("open failed");

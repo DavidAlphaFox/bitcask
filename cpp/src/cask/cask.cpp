@@ -17,12 +17,18 @@
 
 namespace bitcask {
 
-// A4:keydir 段快照文件名(目录级,与 bitcask.meta 同级)。
-inline constexpr const char* kKeydirSnapName = "bitcask.keydir.snap";
-// A4-P3:Index 侧表 sidecar(search 模式成对快照的第三块)。
-inline constexpr const char* kIndexSidecarName = "bitcask.index.snap";
-// V3.5:HNSW 图快照(BCVS v1,vector 集合成对快照的第四块)。
-inline constexpr const char* kHnswSnapName = "hnsw.snap";
+// P14a:恢复 checkpoint 文件名(目录级,与 bitcask.meta 同级)。
+// 命名契约 {kv|search}.{组件}.{ckpt|seg|wal|manifest},见
+// doc/recovery-unified-checkpoint-design-zh.md §3。后缀 .ckpt = 可 fold
+// 重建的 checkpoint(纯优化)。旧名(bitcask.keydir.snap 等)不再读——
+// 这些文件可重建,升级后首次 open 走全量 fold,close 时落新名。
+inline constexpr const char* kKeydirSnapName = "kv.keydir.ckpt";
+// 搜索文档目录(docmap):ord↔key/loc/live/dl,成对快照第三块。
+inline constexpr const char* kIndexSidecarName = "search.docmap.ckpt";
+// HNSW 图 checkpoint(BCVS v1),向量集合成对快照第四块。
+inline constexpr const char* kHnswSnapName = "search.vec.ckpt";
+// bm25 倒排 checkpoint base(派生出 .manifest / .f{i}.seg / .f{i}.wal)。
+inline constexpr const char* kBm25SnapBase = "search.bm25";
 
 namespace {
 namespace fs = std::filesystem;
@@ -662,7 +668,7 @@ void Cask::close() noexcept {
         index_pool_.reset();
     }
     if (search_ && opts_.read_write && keydir_) {
-        (void)search_->save_snapshot(dirname_ + "/bm25_snapshot.inv");
+        (void)search_->save_snapshot(dirname_ + "/" + kBm25SnapBase);
         (void)search_->save_index_sidecar(
             dirname_ + "/" + kIndexSidecarName, keydir_->peek_next_ord());
         // V3.5:保存顺序 bm25 → sidecar → hnsw snap → keydir snap。
@@ -852,7 +858,7 @@ Cask::load_recovery_snapshots(search::SearchLayer* search_layer) {
     bool hnsw_snap_ok = false;
     std::optional<std::uint64_t> sidecar_covers;
     if (search_layer) {
-        auto sl = search_layer->load_snapshot(dirname_ + "/bm25_snapshot.inv");
+        auto sl = search_layer->load_snapshot(dirname_ + "/" + kBm25SnapBase);
         search_snap_ok = sl.has_value() && *sl;
         if (search_snap_ok) {
             sidecar_covers = search_layer->load_index_sidecar(
@@ -1685,7 +1691,7 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
         search_->compact(kMergeCompactDeadRatio);
         search_->compact_index_chunks();
 
-        auto snap = dirname_ + "/bm25_snapshot.inv";
+        auto snap = dirname_ + "/" + kBm25SnapBase;
         search_->save_snapshot(snap);
         (void)search_->save_index_sidecar(
             dirname_ + "/" + kIndexSidecarName, keydir_->peek_next_ord());

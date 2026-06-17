@@ -815,7 +815,7 @@ TEST_F(CaskDocValueTest, KeydirSnapshotRoundTripEquivalence) {
         }
         (*c)->close();
     }
-    const auto snap = tmpdir_ / "bitcask.keydir.snap";
+    const auto snap = tmpdir_ / "kv.keydir.ckpt";
     ASSERT_TRUE(std::filesystem::exists(snap));
 
     auto collect = [&]() {
@@ -846,7 +846,7 @@ TEST_F(CaskDocValueTest, KeydirSnapshotRoundTripEquivalence) {
 TEST_F(CaskDocValueTest, KeydirSnapshotStaleTailReplay) {
     CaskOptions opts;
     opts.read_write = true;
-    const auto snap = tmpdir_ / "bitcask.keydir.snap";
+    const auto snap = tmpdir_ / "kv.keydir.ckpt";
     const auto snap_old = tmpdir_ / "snap.old";
 
     {   // 会话 1
@@ -901,7 +901,7 @@ TEST_F(CaskDocValueTest, KeydirSnapshotCorruptFallsBackToFullFold) {
         }
         (*c)->close();
     }
-    const auto snap = tmpdir_ / "bitcask.keydir.snap";
+    const auto snap = tmpdir_ / "kv.keydir.ckpt";
 
     // 位翻转 payload 中部。
     {
@@ -964,7 +964,7 @@ TEST_F(CaskDocValueTest, SearchSnapshotFastReopen) {
         ASSERT_TRUE((*c)->remove(sv_bytes(std::string("k7"))));
         (*c)->close();
     }
-    ASSERT_TRUE(std::filesystem::exists(tmpdir_ / "bitcask.index.snap"));
+    ASSERT_TRUE(std::filesystem::exists(tmpdir_ / "search.docmap.ckpt"));
 
     auto c = Cask::open(tmpdir_.string(), opts);
     ASSERT_TRUE(c);
@@ -980,7 +980,7 @@ TEST_F(CaskDocValueTest, SearchSnapshotFastReopen) {
 // 陈旧 keydir 快照:尾部回放在 search 模式下同样生效(门按覆盖判定放行)。
 TEST_F(CaskDocValueTest, SearchSnapshotStaleKeydirTailReplay) {
     auto opts = p3_search_opts();
-    const auto snap = tmpdir_ / "bitcask.keydir.snap";
+    const auto snap = tmpdir_ / "kv.keydir.ckpt";
     const auto snap_old = tmpdir_ / "kd.old";
     {
         auto c = Cask::open(tmpdir_.string(), opts);
@@ -1026,7 +1026,7 @@ TEST_F(CaskDocValueTest, SearchSnapshotCorruptSidecarFallsBack) {
         }
         (*c)->close();
     }
-    const auto sc = tmpdir_ / "bitcask.index.snap";
+    const auto sc = tmpdir_ / "search.docmap.ckpt";
     std::filesystem::resize_file(sc, std::filesystem::file_size(sc) / 2);
 
     auto c = Cask::open(tmpdir_.string(), opts);
@@ -1472,7 +1472,7 @@ std::vector<std::string> v35_hit_keys(const bitcask::TextSearchResult& r) {
 // 三件套 1:干净 close → reopen 走快路径,search_vector 与 close 前一致。
 // 快路径实证:把目录复制一份并删光 data/hint 文件——没有 data 可 fold,
 // 搜索仍正确 ⟹ 结果只可能来自四块快照(keydir/bm25/sidecar/hnsw)。
-// 再删 hnsw.snap 对比全量 fold 的等价结果(A4 既有断言范式)。
+// 再删 search.vec.ckpt 对比全量 fold 的等价结果(A4 既有断言范式)。
 TEST_F(CaskDocValueTest, V35SnapshotFastReopen) {
     constexpr std::size_t kDim = 8;
     auto opts = v31_opts(kDim);
@@ -1504,7 +1504,7 @@ TEST_F(CaskDocValueTest, V35SnapshotFastReopen) {
         expect_keys = v35_hit_keys(*r);
         (*c)->close();
     }
-    ASSERT_TRUE(std::filesystem::exists(tmpdir_ / "hnsw.snap"));
+    ASSERT_TRUE(std::filesystem::exists(tmpdir_ / "search.vec.ckpt"));
 
     auto search_in = [&](const std::string& dir) {
         std::vector<std::string> keys;
@@ -1539,10 +1539,10 @@ TEST_F(CaskDocValueTest, V35SnapshotFastReopen) {
     EXPECT_EQ(search_in(snaponly.string()), expect_keys);
     std::filesystem::remove_all(snaponly, ec);
 
-    // (c) 删 hnsw.snap → 全量 fold,结果等价;close 后快照重新落盘。
-    std::filesystem::remove(tmpdir_ / "hnsw.snap");
+    // (c) 删 search.vec.ckpt → 全量 fold,结果等价;close 后快照重新落盘。
+    std::filesystem::remove(tmpdir_ / "search.vec.ckpt");
     EXPECT_EQ(search_in(tmpdir_.string()), expect_keys);
-    EXPECT_TRUE(std::filesystem::exists(tmpdir_ / "hnsw.snap"));
+    EXPECT_TRUE(std::filesystem::exists(tmpdir_ / "search.vec.ckpt"));
 }
 
 // 三件套 2:快照旧于 data 尾部(崩溃形态)——回退 keydir+hnsw 快照到
@@ -1551,8 +1551,8 @@ TEST_F(CaskDocValueTest, V35StaleTailReplay) {
     constexpr std::size_t kDim = 8;
     auto opts = v31_opts(kDim);
     auto vecs = v35_make_vecs(35, kDim, 0x57A1E);
-    const auto kd_snap = tmpdir_ / "bitcask.keydir.snap";
-    const auto hs_snap = tmpdir_ / "hnsw.snap";
+    const auto kd_snap = tmpdir_ / "kv.keydir.ckpt";
+    const auto hs_snap = tmpdir_ / "search.vec.ckpt";
     const auto kd_old = tmpdir_ / "kd.old";
     const auto hs_old = tmpdir_ / "hs.old";
 
@@ -1600,7 +1600,7 @@ TEST_F(CaskDocValueTest, V35StaleTailReplay) {
     (*c)->close();
 }
 
-// 三件套 3:hnsw.snap 损坏(位翻转)→ 整体拒绝 + 回退全量 fold,
+// 三件套 3:search.vec.ckpt 损坏(位翻转)→ 整体拒绝 + 回退全量 fold,
 // 不崩、结果正确;再 close 后快照恢复健康。
 TEST_F(CaskDocValueTest, V35CorruptFallsBack) {
     constexpr std::size_t kDim = 8;
@@ -1622,7 +1622,7 @@ TEST_F(CaskDocValueTest, V35CorruptFallsBack) {
         expect_keys = v35_hit_keys(*r);
         (*c)->close();
     }
-    const auto snap = tmpdir_ / "hnsw.snap";
+    const auto snap = tmpdir_ / "search.vec.ckpt";
     ASSERT_TRUE(std::filesystem::exists(snap));
 
     {   // 位翻转 payload 中部(CRC 必炸 → load 整体拒绝)。
@@ -2008,7 +2008,7 @@ TEST_F(CaskMergeSearchTest, DeletionRateTrigger) {
     }
 }
 
-// V4.2:merge 后 hnsw.snap 应被保存,重开时走快照路径而非全量 fold。
+// V4.2:merge 后 search.vec.ckpt 应被保存,重开时走快照路径而非全量 fold。
 // 验证方法:merge 前删除一半节点,merge 后 close,再 open 后图大小
 // 应等于活节点数(不是全部节点数),证明 snap 被使用(而非全量重建)。
 TEST_F(CaskDocValueTest, V4HnswSnapSavedAtMerge) {
@@ -2041,7 +2041,7 @@ TEST_F(CaskDocValueTest, V4HnswSnapSavedAtMerge) {
         (*c)->close();
     }
 
-    // merge:V4 改为同步 rebuild + save hnsw.snap
+    // merge:V4 改为同步 rebuild + save search.vec.ckpt
     {
         auto c = Cask::open(tmpdir_.string(), opts);
         ASSERT_TRUE(c);
@@ -2060,11 +2060,11 @@ TEST_F(CaskDocValueTest, V4HnswSnapSavedAtMerge) {
         (*c)->close();
     }
 
-    // 关键验证:重开时 hnsw.snap 存在,图大小 = 活节点数(非全量 fold 重建)
+    // 关键验证:重开时 search.vec.ckpt 存在,图大小 = 活节点数(非全量 fold 重建)
     {
         auto c = Cask::open(tmpdir_.string(), opts);
         ASSERT_TRUE(c);
-        // hnsw.snap 被 merge 保存,open 时走快照路径,图大小 = kN/2
+        // search.vec.ckpt 被 merge 保存,open 时走快照路径,图大小 = kN/2
         EXPECT_EQ((*c)->search()->hnsw_size(), kN / 2);
         auto r = (*c)->search_vector(std::span<const float>(q.data(), kDim),
                                      10, /*ef=*/256);
@@ -2077,11 +2077,11 @@ TEST_F(CaskDocValueTest, V4HnswSnapSavedAtMerge) {
         (*c)->close();
     }
 
-    // 验证 hnsw.snap 文件确实存在
+    // 验证 search.vec.ckpt 文件确实存在
     {
         namespace fs = std::filesystem;
-        EXPECT_TRUE(fs::exists(tmpdir_ / "hnsw.snap"))
-            << "hnsw.snap should exist after merge";
+        EXPECT_TRUE(fs::exists(tmpdir_ / "search.vec.ckpt"))
+            << "search.vec.ckpt should exist after merge";
     }
 }
 
