@@ -127,7 +127,8 @@ fold 尾部回放」。后缀编码契约（`.ckpt`/`.wal`/`.seg`/`.manifest`）
 回放下界取**各块水位最小值 wm_min**，一趟 fold 同时喂 keydir/docmap/bm25/hnsw——成对门从
 「最弱环→全量 fold 悬崖」降为「从 wm_min 多读点尾巴」，这是重用率从 0 起来的机理。
 
-**子阶段**：**P14a** 纯重命名 + 契约文档化（零格式/逻辑变更、旧名兼容读）；
+**子阶段**：**P14a** ✅ 纯重命名 + 契约文档化（零格式/逻辑变更；旧名不再读——可重建，
+升级后首次 open 一次全量 fold、close 落新名；410 测试通过）；
 **P14b** wm_min 单趟回放（替双轨 + 消门悬崖）；**P14c** 周期性 checkpoint（`checkpoint_interval`
 + worker 静止窗口）；**P14d** 摘 bm25 WAL（profiling 驱动决定是否留 `terms` 纯缓存）。
 **收益**：命名契约清晰 · 写放大 2→1 · 稳态文件数减少（无 `.wal`）· 崩溃后不再全量 fold。

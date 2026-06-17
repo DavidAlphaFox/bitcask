@@ -117,10 +117,14 @@ fold**——这正是重用率从 0 提升的关键。
 > 路线图编号见 `ROADMAP.md` P14;子阶段 P14a–d 与本节一一对应
 > (避免与 2.1.0 的 P1–P4 撞号)。开发顺序(与 P5–P13 交织)见 ROADMAP「开发顺序」。
 
-- **P14a**:纯重命名 + 文件契约文档化。`.snap→.ckpt`、bm25 文件改名;
-  代码常量(`kKeydirSnapName` 等)与写/读路径同步;**无格式/逻辑变更**。
-  迁移:open 时若见旧名、无新名 → 读旧名,下次 checkpoint 写新名
-  (旧名可留待 fold 验证后清)。meta/field.schema/data/hint 不动。
+- **P14a**(已落地):纯重命名 + 文件契约文档化。`.snap→.ckpt`、bm25
+  base `bm25_snapshot.inv→search.bm25`、段 `.f{i}.inv→.f{i}.seg`、
+  WAL `.f{i}.inv.wal→.f{i}.wal`;代码常量(`kKeydirSnapName` 等)与
+  写/读路径同步;**无格式/逻辑变更**。
+  迁移(不考虑可重建文件兼容,见原始约束):**旧名不再读**——升级后
+  首次 open 因找不到新名 checkpoint 走一次全量 fold,close 落新名;
+  旧名文件成孤儿(无害,可手删)。meta/field.schema/data/hint 不动。
+  验证:`cpp/` 全量 410 测试通过。
 - **P14b**:统一 wm_min 单趟回放,替换双轨 + 成对门悬崖。删除「有
   search_layer 跳过快路径」逻辑。
 - **P14c**:周期性 checkpoint(`checkpoint_interval` 配置 + worker 静止窗口)。
