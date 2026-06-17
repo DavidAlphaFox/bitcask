@@ -64,16 +64,21 @@ public:
     enum class Mode { kRead, kAppend, kCreate };
 
     DataFile() = default;
-    ~DataFile() = default;
+    // P6:析构 munmap(若已映射);移动转移映射所有权并把源置空,避免
+    // 默认 move 拷贝裸指针 → 双 munmap。定义在 .cpp。
+    ~DataFile();
 
     DataFile(const DataFile&) = delete;
     DataFile& operator=(const DataFile&) = delete;
-    DataFile(DataFile&&) noexcept = default;
-    DataFile& operator=(DataFile&&) noexcept = default;
+    DataFile(DataFile&&) noexcept;
+    DataFile& operator=(DataFile&&) noexcept;
 
     // 线程安全: 是（每次调用产出新对象）；不需任何锁。
+    // P6:mmap_enabled 且 Mode::kRead 且 64 位 → 整文件 mmap 只读(零拷贝),
+    // 映射成功后 close(fd)。失败/active/32 位/禁用 → 走 pread。
     [[nodiscard]] static std::expected<DataFile, DataFileFault>
-    open(std::string_view path, Mode mode, bool sync = false);
+    open(std::string_view path, Mode mode, bool sync = false,
+         bool mmap_enabled = true);
 
     // ---- 写入（仅 Mode::kAppend / kCreate 有效；kRead 调用是逻辑 bug）----
 
@@ -106,6 +111,17 @@ public:
     // 「读只读老文件」「写仅写 active」的拓扑避免该情况。
     [[nodiscard]] std::expected<ReadRecord, DataFileFault>
     read(std::uint64_t offset, std::uint32_t total_size);
+
+    // P6:sealed mmap 命中时的零拷贝读。返回的 DataRecordView 的 key/value
+    // span **指向映射内存**——调用方必须在 view 生命期内持有本 DataFile 的
+    // shared_ptr 锚定映射(析构即 munmap → span 悬垂)。仅 mmapped() 为真时
+    // 有效;CRC 不通过 → kBadCrc,越界 → kShortRead。
+    // 线程安全: 是(只读映射 + 纯解码,不碰 fd/offset)。
+    [[nodiscard]] bool mmapped() const noexcept {
+        return map_base_ != nullptr;
+    }
+    [[nodiscard]] std::expected<codec::DataRecordView, DataFileFault>
+    read_mmap(std::uint64_t offset, std::uint32_t total_size) const;
 
     // 顺序遍历整个文件的所有 record。fn 收到解码后的 view + 偏移 + 大小。
     //
@@ -150,6 +166,10 @@ private:
     std::uint64_t  current_offset_ = 0;
     Mode           mode_           = Mode::kRead;
     std::vector<std::byte> write_buf_;  // write() 复用的编码缓冲;容量跨调用保留
+    // P6:sealed mmap。map_base_ != nullptr 表示整文件已 mmap(PROT_READ,
+    // MAP_SHARED);此时 fd 已关闭,read_mmap 直读映射。~DataFile munmap。
+    const std::byte* map_base_ = nullptr;
+    std::size_t      map_size_ = 0;
 };
 
 // ---------------------------------------------------------------------------

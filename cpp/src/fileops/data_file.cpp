@@ -1,5 +1,6 @@
 #include "bitcask/data_file.hpp"
 
+#include <sys/mman.h>
 #include <sys/stat.h>
 
 #include <algorithm>
@@ -19,7 +20,7 @@ constexpr int kCrcSkipLimit = 20;
 }  // namespace
 
 std::expected<DataFile, DataFileFault>
-DataFile::open(std::string_view path, Mode mode, bool sync) {
+DataFile::open(std::string_view path, Mode mode, bool sync, bool mmap_enabled) {
     using io::OpenFlag;
     OpenFlag flags = OpenFlag::kNone;
     switch (mode) {
@@ -40,7 +41,81 @@ DataFile::open(std::string_view path, Mode mode, bool sync) {
         if (!end) return std::unexpected(io_fault(end.error()));
         initial_off = *end;
     }
-    return DataFile(std::move(*f), std::string(path), initial_off, mode);
+    DataFile df(std::move(*f), std::string(path), initial_off, mode);
+
+    // P6:sealed 只读文件整文件 mmap(PROT_READ, MAP_SHARED)。只对 kRead
+    // (sealed 不可变,无 torn-tail/SIGBUS)、64 位(地址空间)、非空文件。
+    // read_mmap 直读映射(get 热路径零拷贝);read()/fold() 仍走 pread——
+    // 故 **fd 保留不关**(关 fd 会让迭代器/恢复在 mmapped 句柄上的 pread 失效)。
+    // fd 预算的回收(close + munmap)交给 P9(read_files_ LRU)。失败 → 纯 pread。
+    // mmap_enabled=false(纯 fold 的恢复/merge/迭代器 pin)跳过,避免无谓映射。
+    if (mode == Mode::kRead && mmap_enabled && sizeof(void*) >= 8 &&
+        initial_off > 0) {
+        void* base = ::mmap(nullptr, static_cast<std::size_t>(initial_off),
+                            PROT_READ, MAP_SHARED, df.file_.fd(), 0);
+        if (base != MAP_FAILED) {
+            df.map_base_ = static_cast<const std::byte*>(base);
+            df.map_size_ = static_cast<std::size_t>(initial_off);
+        }
+    }
+    return df;
+}
+
+DataFile::~DataFile() {
+    if (map_base_ != nullptr) {
+        ::munmap(const_cast<std::byte*>(map_base_), map_size_);
+        map_base_ = nullptr;
+    }
+}
+
+DataFile::DataFile(DataFile&& o) noexcept
+    : file_(std::move(o.file_)), path_(std::move(o.path_)),
+      current_offset_(o.current_offset_), mode_(o.mode_),
+      write_buf_(std::move(o.write_buf_)),
+      map_base_(o.map_base_), map_size_(o.map_size_) {
+    o.map_base_ = nullptr;
+    o.map_size_ = 0;
+}
+
+DataFile& DataFile::operator=(DataFile&& o) noexcept {
+    if (this != &o) {
+        if (map_base_ != nullptr) {
+            ::munmap(const_cast<std::byte*>(map_base_), map_size_);
+        }
+        file_           = std::move(o.file_);
+        path_           = std::move(o.path_);
+        current_offset_ = o.current_offset_;
+        mode_           = o.mode_;
+        write_buf_      = std::move(o.write_buf_);
+        map_base_       = o.map_base_;
+        map_size_       = o.map_size_;
+        o.map_base_     = nullptr;
+        o.map_size_     = 0;
+    }
+    return *this;
+}
+
+std::expected<codec::DataRecordView, DataFileFault>
+DataFile::read_mmap(std::uint64_t offset, std::uint32_t total_size) const {
+    if (map_base_ == nullptr) {
+        return std::unexpected(DataFileFault{DataFileError::kIo});
+    }
+    if (offset > map_size_ || total_size > map_size_ - offset) {
+        return std::unexpected(DataFileFault{DataFileError::kShortRead});
+    }
+    auto rec = codec::decode_data_record(
+        std::span<const std::byte>(map_base_ + offset, total_size));
+    if (!rec) {
+        switch (rec.error()) {
+            case codec::DecodeError::kBadCrc:
+                return std::unexpected(DataFileFault{DataFileError::kBadCrc});
+            case codec::DecodeError::kBufferTooShort:
+                return std::unexpected(DataFileFault{DataFileError::kShortRead});
+            default:
+                return std::unexpected(DataFileFault{DataFileError::kBadCrc});
+        }
+    }
+    return *rec;
 }
 
 // ---------------------------------------------------------------------------
