@@ -169,6 +169,24 @@ inline void dequantize(const QVector& qv, float* out,
     }
 }
 
+// ---------------------------------------------------------------------------
+// dot_scalar_raw — Int8DotFn-compatible scalar reconstructed dot from raw
+// code pointers (P5 int8-only fallback). Matches dot_scalar (QVector) and the
+// VNNI result exactly for the dot product. sum_db is unused here (it only
+// corrects VNNI's unsigned×signed +128 bias); symmetric int8 codes are signed
+// so the plain signed accumulation needs no correction. Lets int8-only mode
+// (which has no resident f32) work on machines without AVX(512)-VNNI.
+// ---------------------------------------------------------------------------
+inline float dot_scalar_raw(const std::int8_t* a, const std::int8_t* b,
+                            std::int32_t /*sum_db*/, float scale_a,
+                            float scale_b, std::size_t dim) noexcept {
+    std::int64_t raw = 0;
+    for (std::size_t i = 0; i < dim; ++i) {
+        raw += static_cast<std::int32_t>(a[i]) * static_cast<std::int32_t>(b[i]);
+    }
+    return static_cast<float>(raw) * (scale_a * scale_b) / (127.0f * 127.0f);
+}
+
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 
 // ---------------------------------------------------------------------------
