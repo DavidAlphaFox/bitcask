@@ -75,8 +75,14 @@ int8 在内存里是**为速度**，反而 **+25% 内存**。P3 落盘 int8 只�
 - 红线：默认 f32+int8；int8-only 面向内存受限/大规模 opt-in，真实语料 recall 可接受才推荐。
 
 ## 7. 子任务
-- **P5a**：`HnswConfig.inmem_int8`；NodeChunk 按 flag 不分配 vecs；审计 `vec_of` 调用点全
-  改 int8；建图 + 精排走 int8 + query 量化。
+- **P5a**（已落地）：`HnswConfig.inmem_int8`；NodeChunk `inmem_int8` 时 vecs 容量 0；
+  insert 只落量化副本、建图全走 int8（`greedy_closest_int8`/`search_layer_int8`/
+  新增 `select_neighbors_int8`/收缩用 `dist_id_int8_node`）；search 强制 int8 路径 +
+  跳过 f32 精排（found 已按 int8 距离序）；`node_vec` 在 int8-only 下反量化到
+  thread_local（供 merge `rebuild_hnsw`）；BCVS save 反量化写 f32、load 读 f32 再量化
+  （盘格式仍 v1，盘上存 int8 留 P5b）；非 VNNI 机器加标量 `int8::dot_scalar_raw` 兜底。
+  测试 `VectorQuant.Int8OnlyRealModeRecallAndRoundtrip`：真实模式 recall@10=0.9725、
+  save/load round-trip 召回一致。
 - **P5b**：open `{vector_inmem_int8}` + meta（offset[10]）+ 重开校验；BCVS 快照适配；
   与 P3 组合矩阵测试。
 - **P5c**：真实 qwen3 语料召回 gate（复用 harness），定 opt-in 默认 + 文档。

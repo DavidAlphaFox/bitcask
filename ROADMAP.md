@@ -23,8 +23,11 @@ opt-in `{vector_inmem_int8, true}`，可与 P3 落盘 int8 组合（盘 + 内存
 **实测收益**（合成簇 dim=2560，`hnsw_test::Int8OnlyMemoryAndRecall`）：向量内存
 **−80%（~5×）**，1M 向量 12.81 GB → 2.57 GB；代价 **recall@10 约 −3%**（1.0 → 0.9675）。
 
-**子任务**：P5a 配置 + NodeChunk 裁掉 vecs；P5b open/meta 接线 + 重开一致校验；
-P5c 真实 qwen3 语料召回 gate 定默认。
+**子任务**：**P5a** ✅ `HnswConfig.inmem_int8` + NodeChunk 裁 vecs + 建图/查询/收缩全 int8 +
+query 量化 + BCVS save/load 适配（盘仍存 f32）+ 非 VNNI 标量 int8 兜底；真实模式测试
+`VectorQuant.Int8OnlyRealModeRecallAndRoundtrip` recall@10=0.9725、save/load round-trip 一致，
+411 测试通过。**P5b** open/meta 接线（`{vector_inmem_int8}` + meta offset[10] + 重开校验 +
+kL2 拒绝 + 与 P3 组合矩阵）；**P5c** 真实 qwen3 语料召回 gate 定默认。
 **红线**：默认仍 f32+int8（召回优先）；int8-only 面向内存受限 / 大规模 opt-in。
 
 ### P6 — sealed 文件 mmap 只读路径 ✅
