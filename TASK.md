@@ -1282,3 +1282,77 @@ mmap = L1 字节层，P7 = L2 计算层，互补不竞争。**备选**：依赖 
 | **P11 merge I/O 顺序优化** | merge 顺序读旧写新、无 readahead 提示。加 `posix_fadvise(SEQUENTIAL/WILLNEED)` + 大缓冲，降 IO stall（顺带 active 写也可 fadvise）。详见 `doc/merge-io-tuning-design-zh.md`。 | 中低 / 低 | ✅ |
 | **P12 meta_blobs_ 内存按需/有界** | `Index::meta_blobs_` 每 ord 全量常驻；改有界 LRU 或按需读盘。**但 filter 在搜索热路径 → 按需读盘拖慢，需 gate。** 详见 `doc/meta-blob-residency-design-zh.md`。 | 中 / 中 | ⚠️ 备选 |
 | **P13 open 时按需后台 merge**（小文件收拢）| 每个写会话首次写建**新** active 文件（file_id 单调不回退、不重开旧文件——by design）→ 多次 open-写-close 累积小文件。**方案 A（承诺）**：open 后按 `needs_merge`（复用 `small_file_threshold` 等）门控、**后台**触发 merge（不阻塞 open），收成少数 sealed + 新 active；复用现有 merge 全套 + `{merge_on_open, off\|background}` 选项。否决无条件/同步 merge-on-open（O(data) 启动）。**方案 B（备选）**：复用上一个未满 sealed 文件续写（需 un-seal、破坏 sealed 不可变/与 P6 冲突）。**校正**：合并不提速单 get（keydir O(1)），收益在 open/fd/mmap/死空间。详见 `doc/open-merge-design-zh.md`。 | 中 / 中 | ✅（方案 A）|
+
+---
+
+## 2.1.1 落地进度（本轮，2026-06）
+
+> 本节为**实际实现状态的权威记录**，对上文 2.1.1 路线图各表的 📋/✅ 标记为准
+> （P5/P6/P9/P14a/P15 已实现；P8/P10/P11/P12/P13 仍为承诺/备选、代码未动）。
+> 每项 standalone 编译 + 全量 `ctest` 验证；改格式处更新黄金 fixture。
+
+### ✅ P14a — 恢复 checkpoint 命名重构（ctest 410）
+`.snap→.ckpt`、bm25 `bm25_snapshot.inv→search.bm25`、段 `.f{i}.inv→.f{i}.seg`、
+WAL `.f{i}.inv.wal→.f{i}.wal`；常量 `kKeydirSnapName`/`kIndexSidecarName`/
+`kHnswSnapName`/新增 `kBm25SnapBase`；`search_layer` 段/WAL 后缀同步。**纯重命名、
+零格式/逻辑变更**；旧名不再读（可重建，flag-day）。契约 `{kv|search}.{组件}.{ckpt|seg|wal|manifest}`。
+
+### ✅ P5 — HNSW int8-only 内存模式（ctest 415）
+- **P5a** `HnswConfig.inmem_int8`；NodeChunk 裁 vecs；建图/查询/收缩全 int8
+  (`greedy_closest_int8`/`search_layer_int8`/新增 `select_neighbors_int8`/
+  `dist_id_int8_node`)；search 强制 int8 + 跳过 f32 精排；`node_vec` 反量化兜
+  rebuild；BCVS 盘仍存 f32（load 量化）；非 VNNI 标量 `int8::dot_scalar_raw` 兜底。
+  真实模式 recall@10=0.9725。
+- **P5b** `{vector_inmem_int8}` open 接线（NIF+erl）+ meta offset[10] + 重开校验 +
+  kL2 拒绝 + 与 P3 落盘 int8 正交可组合。
+- **P5c** 召回 gate `Int8OnlyRecallGate_Dim2560`（真实 inmem_int8 + query 量化，
+  dim=2560 recall@10=0.9650，红线 0.90）；默认 opt-in（默认 f32+int8）；用户文档。
+  **未尽**：真实 qwen3 语料复测须部署侧做（CI 无 embedding 端点）。
+
+### ✅ P6 — sealed 文件 mmap 只读路径（ctest 416，ASAN 过）
+- **P6a** `DataFile` sealed mmap（`read_mmap` 零拷贝、`open` 加 `mmap_enabled`、
+  自定义 move/dtor 管 munmap、32 位禁用、纯 fold 的 recovery/merge/迭代器 pin 传
+  `mmap_enabled=false`）。**P6b** merge unlink 延迟 munmap = 复用现有
+  `shared_ptr<DataFile>` 引用计数（无新锁）。**P6c** `GetResultView` 持映射 shared_ptr。
+  测试 `P6MmapViewSurvivesMergeUnlink`。
+- **偏差**：① 不 close fd（保留供 read/fold pread；fd 回收归 P9）；② `mmap_limit`
+  按映射数已由 P9 `max_read_handles` 实现，按字节的上限仍备选。
+
+### ✅ P9 — read_files_ fd 预算 LRU（ctest 420，ASAN 过）
+`read_files_` 值改 `ReadHandle{shared_ptr<DataFile>+atomic atime}`；命中共享锁置
+atime（近似 LRU）；miss 独占锁 `evict_read_handles_locked()` 淘汰最旧空闲
+(use_count==1) 句柄（在途读者续命）。选项 `{max_read_handles,N}`（0=不限，NIF+erl）。
+**一并兜住 P6 延后的 fd 回收 + 按数 mmap_limit**。测试
+`P9ReadHandleCapEvictsAndRereads`；内省 `read_handle_count()`。
+
+### ✅ P15 — 字节序统一（全盘小端）+ 大端目录迁移（ctest 419，路线图外插入项）
+- **P15a** 全盘 LE：`codec` `be_*→le_*`(record+hint)、`data_file`/`hint_file` 手写
+  字节序读点、`field.schema` NameLen、墓碑 v2 shadow、`format.hpp`/`format-zh.md`
+  注释；golden 测试翻 LE（**修复 hint fold 在 LE 下漏读 key_sz 的真 bug**）。
+- **P15b** 护栏：`bitcask.meta` version `1→2`，旧 v1 大端目录 open 干净拒绝
+  （`LegacyV1MetaRejectedCleanly`）。
+- **P15c** 迁移工具 `migrate_le <src> <dst>`（非破坏；data 重编码+hint 重生成+meta+
+  field.schema+shadow 翻转；ckpt/seg/wal 不迁移、首开重建）+ 中英文档
+  (`doc/migrate-le.md` / `migrate-le-en.md`) + round-trip 测试。
+
+### ◐ P14e+P14b — 单文件分段 search.ckpt + 单趟尾部回放（合并，进行中）
+> 设计：`doc/recovery-unified-checkpoint-design-zh.md`（采纳 cellar 文件结构，
+> 与其全面收敛于路线 A）。水位模型：search.ckpt 单 ord watermark + keydir per-file
+> 字节水位 + 保存序不变量 `keydir_covered≤search_covered` ⟹ 无成对门、无悬崖。
+- **S1** ✅ `SearchCheckpoint` 分段容器（`search_checkpoint.hpp`：头部 watermark +
+  逐段 CRC + 页脚目录 + 结构完整性）；5 个测试（round-trip/单段损坏隔离/页脚损坏拒绝/
+  截断/空段）。ctest 425。
+- **S2** ✅ 三序列化器 → 字节缓冲：`HnswIndex`/`InvertedIndex`/`DocIndex(sidecar)`
+  各加 `serialize`/`deserialize`，`save`/`load` 包一层（盘字节逐字不变，原生小端）；
+  `deserialize` 带界游标。新测 `InvertedIndex.SerializeDeserializeRoundtrip`。ctest 426。
+- **S3** 📋 接 save：SearchLayer 产 {docmap,bm25.default,bm25.fields,hnsw} 段 → 写
+  `search.ckpt` + `.prev` rename + 段级脏位复用；替换 cask 多文件搜索保存。
+- **S4** 📋 接 recovery（P14b 核心）：载 search.ckpt（逐段）→ `.prev` 回退 →
+  `fold_start` 判定（健康则 keydir_wm，否则 0）+ 单趟自门 fold；删成对门。
+- **S5** 📋 段级脏位复用细化。**S6** 📋 删旧多文件 + 与 P14d 协调收尾。
+
+### 📋 2.1.1 余项（设计已定，代码未动）
+- **P14b/c/d/e** 见上（P14b 并入 P14e；**P14c** 周期 checkpoint、**P14d** 摘 bm25 WAL 待做）。
+- **P8** HNSW merge 门控、**P10** search_hybrid 两路并行、**P11** merge I/O、
+  **P13** open 后台 merge（承诺，未实现）。
+- **P7** 派生值 compute cache ⚠️、**P12** meta_blobs 有界 ⚠️（备选，gate 后置）。
