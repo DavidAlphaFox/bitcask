@@ -1377,26 +1377,27 @@ Cask::put(std::span<const std::byte> key,
 //
 // 墓碑 encoding (v2 backward compat):
 //   v0: empty value (RecordType::kTombstone carries the meaning)
-//   v2: 4-byte big-endian shadow file_id (tells merger "I exist because of
+//   v2: 4-byte little-endian shadow file_id (tells merger "I exist because of
 //       an entry in file_id N; if that entry is gone, I'm meaningless").
 //       If key not in keydir or file_id==0, fall back to v0.
+//       (P：盘格式统一小端，flag-day 前为大端。)
 std::expected<void, CaskFault>
 Cask::remove(std::span<const std::byte> key, std::uint32_t tstamp) {
     if (!opts_.read_write) return std::unexpected(err(CaskError::kReadOnly));
     if (tstamp == 0) tstamp = now_sec_default();
 
     std::span<const std::byte> tomb_value;
-    std::uint8_t shadow_be[4] = {0};
+    std::uint8_t shadow_le[4] = {0};
     if (opts_.tombstone_version == 2) {
         if (auto entry = keydir_->get(bytes_to_view(key))) {
             if (entry->file_id != 0) {
-                shadow_be[0] = static_cast<std::uint8_t>((entry->file_id >> 24) & 0xFF);
-                shadow_be[1] = static_cast<std::uint8_t>((entry->file_id >> 16) & 0xFF);
-                shadow_be[2] = static_cast<std::uint8_t>((entry->file_id >>  8) & 0xFF);
-                shadow_be[3] = static_cast<std::uint8_t>( entry->file_id        & 0xFF);
+                shadow_le[0] = static_cast<std::uint8_t>( entry->file_id        & 0xFF);
+                shadow_le[1] = static_cast<std::uint8_t>((entry->file_id >>  8) & 0xFF);
+                shadow_le[2] = static_cast<std::uint8_t>((entry->file_id >> 16) & 0xFF);
+                shadow_le[3] = static_cast<std::uint8_t>((entry->file_id >> 24) & 0xFF);
                 tomb_value = std::span<const std::byte>(
-                    reinterpret_cast<const std::byte*>(shadow_be),
-                    sizeof(shadow_be));
+                    reinterpret_cast<const std::byte*>(shadow_le),
+                    sizeof(shadow_le));
             }
         }
     }
