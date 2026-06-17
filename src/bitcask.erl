@@ -69,7 +69,7 @@
     max_merge_size,
     analyzer, dict_path, enable_stop_words,
     min_n, max_n, min_token_length, enable_stemming,
-    vector_dim, vector_metric, vector_quantized
+    vector_dim, vector_metric, vector_quantized, vector_inmem_int8
 ]).
 
 %% =========================================================================
@@ -109,6 +109,10 @@ open(Dirname) -> open(Dirname, []).
 %%     {vector_metric, M}   — cosine | l2 | dot（默认 cosine）
 %%     {vector_quantized, true} — 向量落盘 int8 量化（4× 磁盘，有损精度；P3b）。
 %%                            创建即固定，重开须一致，否则 mode_mismatch。
+%%     {vector_inmem_int8, true} — HNSW int8-only 内存模式（向量内存 −80%/~5×，
+%%                            recall@10 约 −3%；仅 cosine/dot，l2 拒绝；P5b）。
+%%                            与 vector_quantized 正交（盘/内存可分别开）。面向
+%%                            内存受限/大规模；创建即固定，重开须一致。
 %%
 %%   MRL：embedder Cfg 里 dim = 模型原生维度，vector_dim = 截断落库维度
 %%   （≤ dim，缺省 = dim）；二者不一致时 embed 请求自动带 dimensions。

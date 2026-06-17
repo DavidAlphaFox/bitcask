@@ -80,6 +80,7 @@ struct Atoms {
     ERL_NIF_TERM vector_dim;
     ERL_NIF_TERM vector_metric;
     ERL_NIF_TERM vector_quantized;  // P3b：{vector_quantized, true}
+    ERL_NIF_TERM vector_inmem_int8; // P5b：{vector_inmem_int8, true}
     ERL_NIF_TERM cosine;
     ERL_NIF_TERM l2;
     ERL_NIF_TERM dot;

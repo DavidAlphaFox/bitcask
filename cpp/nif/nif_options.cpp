@@ -147,6 +147,9 @@ void parse_2tuple_option(ErlNifEnv* env, const ERL_NIF_TERM* tup, CaskOptions& o
     } else if (key == atoms().vector_quantized) {
         // P3b:{vector_quantized, true} —— 向量落盘 int8（仅 vector_dim>0 有效）。
         o.vector_quantized = (val == atoms().atom_true);
+    } else if (key == atoms().vector_inmem_int8) {
+        // P5b:{vector_inmem_int8, true} —— HNSW int8-only 内存（仅 kDot/cosine）。
+        o.vector_inmem_int8 = (val == atoms().atom_true);
     } else if (key == atoms().vector_metric) {
         // V3.6:{vector_metric, cosine|l2|dot};默认 cosine(写入归一化)。
         if      (val == atoms().cosine) o.vector_metric = meta::VectorMetric::kCosineNormalized;
