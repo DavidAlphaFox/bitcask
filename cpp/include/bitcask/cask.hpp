@@ -128,13 +128,19 @@ struct GetResult;
 struct GetResultView {
 private:
     friend class Cask;
-    fileops::ReadRecord storage_;          // ① 持有 pread 数据，move-in
+    fileops::ReadRecord storage_;          // ① owned(pread)路径：持 pread 数据
+    // P6:② mmap 路径——持 sealed DataFile 的 shared_ptr 锚定映射(view 生命内
+    // 映射不撤,即便期间 merge unlink),value_bytes_ 指向映射,storage_ 空。
+    std::shared_ptr<fileops::DataFile> map_holder_;
+    // DocValue 原始字节来源(owned: 借 storage_.value;mmap: 指向映射)。
+    std::span<const std::byte> value_bytes_{};
+    format::RecordType rec_type_ = format::RecordType::kDoc;
     // P3b:量化文档落盘是 int8，无法零拷贝成 f32 span——dequant 进此拥有缓冲，
-    // vector span 指向它。未量化时为空，vector span 直接借 storage_（零拷贝）。
+    // vector span 指向它。未量化时为空，vector span 直接借底层字节（零拷贝）。
     std::vector<float> vector_dequant_;
 
 public:
-    std::span<const std::byte> value{};    // text 段（指向 storage_.value 内部）
+    std::span<const std::byte> value{};    // text 段（指向底层字节内部）
     std::span<const std::byte> meta{};     // meta 段（可为空）
     std::span<const float> vector{};       // 向量段（空=无向量）
     std::uint32_t tstamp = 0;
@@ -149,9 +155,14 @@ public:
     GetResultView& operator=(const GetResultView&) = delete;
 
 private:
-    explicit GetResultView(fileops::ReadRecord&& rec);
-    // 从 storage_ 解出 value/meta/vector span（量化则 dequant 进 vector_dequant_）。
-    // 两个 ctor 共用，避免漂移。
+    explicit GetResultView(fileops::ReadRecord&& rec);  // owned(pread)
+    // P6:mmap 命中——holder 锚定映射,value_bytes 指向映射内的 DocValue 字节。
+    GetResultView(std::shared_ptr<fileops::DataFile> holder,
+                  std::span<const std::byte> value_bytes,
+                  format::RecordType type,
+                  std::uint32_t tstamp, std::uint64_t ord);
+    // 从 value_bytes_ 解出 value/meta/vector span（量化则 dequant 进
+    // vector_dequant_）。三个 ctor 共用，避免漂移。
     void derive_from_storage();
 };
 

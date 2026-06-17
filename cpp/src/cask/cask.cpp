@@ -214,7 +214,11 @@ void CaskIter::pin_files() {
     for (const auto& e : *scan) {
         const auto fid = static_cast<std::uint32_t>(e.tstamp);
         if (parent_->active_data_ && fid == parent_->active_file_id_) continue;
-        auto df = fileops::DataFile::open(e.data_path, fileops::DataFile::Mode::kRead);
+        // P6:迭代器 pin 句柄经 read() 读(非 read_mmap),且只用于本次 fold——
+        // 不 mmap(避免无谓映射;fd 开着,read() pread 正常)。
+        auto df = fileops::DataFile::open(e.data_path,
+                                          fileops::DataFile::Mode::kRead,
+                                          /*sync*/ false, /*mmap_enabled*/ false);
         if (!df) continue;
         pinned_files_.emplace(
             fid, std::make_unique<fileops::DataFile>(std::move(*df)));
@@ -791,8 +795,10 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
         // Fallback：fold 整个 data file。tolerate_crc_errors=true 让单条
         // 损坏的 record 跳过而不是中断整个文件加载——legacy 也是这语义。
         // out_last_valid_end 用于后续 torn-write 修复。
+        // P6:恢复纯 fold,不 mmap(避免对大库逐文件全映射)。
         auto df = fileops::DataFile::open(e.data_path,
-                                           fileops::DataFile::Mode::kRead);
+                                           fileops::DataFile::Mode::kRead,
+                                           /*sync*/ false, /*mmap_enabled*/ false);
         if (!df) {
             return std::unexpected(io_fault(df.error().errnum, e.data_path));
         }
@@ -1202,6 +1208,25 @@ Cask::get(std::span<const std::byte> key) {
     if (!df) return std::unexpected(err(CaskError::kIo,
         "open file_id=" + std::to_string(entry->file_id)));
 
+    // P6:sealed mmap 命中 → 零拷贝(无 syscall,直读 page cache)。GetResultView
+    // 持 df 的 shared_ptr 锚定映射,view 生命内映射不撤(即便并发 merge unlink)。
+    if (df->mmapped()) {
+        auto rv = df->read_mmap(entry->offset, entry->total_sz);
+        if (!rv) {
+            switch (rv.error().kind) {
+                case fileops::DataFileError::kBadCrc:
+                    return std::unexpected(err(CaskError::kBadCrc));
+                default:
+                    return std::unexpected(err(CaskError::kIo));
+            }
+        }
+        if (rv->type == format::RecordType::kTombstone) {
+            return std::unexpected(err(CaskError::kNotFound));
+        }
+        return GetResultView(std::move(df), rv->value, rv->type,
+                             rv->tstamp, rv->ord);
+    }
+
     auto rec = df->read(entry->offset, entry->total_sz);
     if (!rec) {
         switch (rec.error().kind) {
@@ -1230,10 +1255,9 @@ Cask::get_owned(std::span<const std::byte> key) {
 // --- GetResultView implementation ---
 
 void GetResultView::derive_from_storage() {
-    if (storage_.type != format::RecordType::kDoc) return;  // tombstone 等不解码
-    if (storage_.value.empty()) return;
-    auto dv = codec::decode_doc_value(
-        std::span<const std::byte>(storage_.value));
+    if (rec_type_ != format::RecordType::kDoc) return;  // tombstone 等不解码
+    if (value_bytes_.empty()) return;
+    auto dv = codec::decode_doc_value(value_bytes_);
     if (!dv) return;  // corrupt DocValue → empty spans
     value = dv->text;
     meta  = dv->meta;
@@ -1252,18 +1276,39 @@ void GetResultView::derive_from_storage() {
 
 GetResultView::GetResultView(fileops::ReadRecord&& rec)
     : storage_(std::move(rec))       // move first (declaration order)
+    , rec_type_(storage_.type)
     , tstamp(storage_.tstamp)
     , ord(storage_.ord)
+{
+    value_bytes_ = std::span<const std::byte>(storage_.value);
+    derive_from_storage();
+}
+
+// P6:mmap 命中——map_holder_ 锚定映射,value_bytes 指向映射内 DocValue 字节。
+GetResultView::GetResultView(std::shared_ptr<fileops::DataFile> holder,
+                             std::span<const std::byte> value_bytes,
+                             format::RecordType type,
+                             std::uint32_t ts, std::uint64_t o)
+    : map_holder_(std::move(holder))
+    , value_bytes_(value_bytes)
+    , rec_type_(type)
+    , tstamp(ts)
+    , ord(o)
 {
     derive_from_storage();
 }
 
 GetResultView::GetResultView(GetResultView&& other) noexcept
     : storage_(std::move(other.storage_))
+    , map_holder_(std::move(other.map_holder_))
+    , rec_type_(other.rec_type_)
     , tstamp(other.tstamp)
     , ord(other.ord)
 {
-    // Re-derive spans from our own storage (other's spans now dangle)
+    // owned 路径:value_bytes_ 重指向自己的 storage_(other 的已悬垂);
+    // mmap 路径:映射地址稳定,沿用 other 的字节区(map_holder_ 已移交本对象)。
+    value_bytes_ = map_holder_ ? other.value_bytes_
+                               : std::span<const std::byte>(storage_.value);
     derive_from_storage();
 }
 

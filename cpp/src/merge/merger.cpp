@@ -57,8 +57,11 @@ run_merge(std::span<const std::string> input_data_paths,
         const std::uint32_t in_file_id =
             static_cast<std::uint32_t>(*in_tstamp);
 
+        // P6:merge 输入纯 fold,不 mmap(避免对大库逐文件全映射)。
         auto in_data = fileops::DataFile::open(path,
-                                                fileops::DataFile::Mode::kRead);
+                                                fileops::DataFile::Mode::kRead,
+                                                /*sync*/ false,
+                                                /*mmap_enabled*/ false);
         if (!in_data) {
             return std::unexpected(io_fault(MergeError::kInputOpenFailed,
                                              in_data.error().errnum, path));
