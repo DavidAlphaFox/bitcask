@@ -5,7 +5,9 @@
 > `inverted.cpp`/`inverted_wal.cpp`(bm25 WAL)、`cask.cpp`
 > (`load_recovery_snapshots`/`load_keydir_from_disk`/写入点)。
 > 背景:本文取代并收敛 `recovery-snapshot-design-zh.md` 的命名与
-> 多写者日志策略;不变量论证沿用其 §2,不重复。
+> 多写者日志策略;不变量论证沿用其 §2,不重复。搜索快照的**单文件分段 +
+> 逐段 CRC + 代际回退**采纳自姊妹引擎提案 `cellar` 的
+> `design-cellar-search.md`(对比见 §10),但 WAL 哲学维持路线 A(data 即 WAL)。
 
 ## 1. 问题
 
@@ -27,65 +29,139 @@
   统一为「周期性 checkpoint + open 时单趟 fold 尾部回放」。
 - **砍掉 bm25 独立 WAL。** 其唯一收益是 replay 免重新分词;改为可选的
   「分析后 term 缓存」(§6),而非一条完整 WAL,消除双重日志。
+- **搜索索引合并为单个分段自描述文件 `search.ckpt`**(借鉴 cellar 提案
+  `design-cellar-search.md`):docmap / bm25 / hnsw 各为一个**段**,**逐段
+  独立 CRC**、页脚目录定位;替代 P14a 的多文件(`search.docmap.ckpt` +
+  `search.vec.ckpt` + `search.bm25.manifest` + `search.bm25.f{i}.seg`)。
+  收益:文件数大降、损坏隔离到段(只重建坏的那种索引)、加新索引类型只
+  登记 type 不新增文件、未脏的段拷贝前移省写放大。
+- **保留上一代 `search.ckpt.prev`(代际回退)。** 最新 `search.ckpt` 整体
+  位腐时回退上一代,再 fold data 尾巴追平——**回退的增量源是 data 文件
+  (我们的 WAL),不依赖搜索 WAL**(论证见 §6.5)。在本架构里 `.prev` 是
+  恢复**提速**项(把"最新损坏"从全库重建降到尾巴重放),非 durability 必需。
 - **重用率靠 checkpoint 频率提升,不靠加 WAL。** 给 keydir/docmap/hnsw
   补 WAL 是反方向(更多文件+fsync,且 hnsw WAL ≈ 重新 insert,无收益)。
-- **后缀编码契约**:`.ckpt`=可重建 checkpoint,`.wal`=日志,`.seg`=段,
-  `.manifest`=清单。所有派生文件可删,删后 fold 重建。
+- **keydir 仍独立 `kv.keydir.ckpt`**(KV 层,非搜索)——纯 KV 库不产生
+  `search.ckpt`,与 cellar 把 keydir/hint 与 search 分层一致。
+- **后缀编码契约**:`.ckpt`=可重建 checkpoint(分段或单块),`.prev`=上一代,
+  `.wal`=日志(仅 data/hint)。所有派生文件可删,删后 fold 重建。
 
-## 3. 命名方案(`{kv|search}.{组件}.{ckpt|seg|wal|manifest}`)
+## 3. 文件总览与 `search.ckpt` 分段格式
 
-| 现名 | 新名 | 角色 |
+### 3.1 目标文件布局
+
+```
+N.bitcask.data / .hint   数据日志(唯一 WAL)+ key→位置 加速(不变)
+bitcask.meta             目录配置(不变,meta v2 小端)
+field.schema             字段注册表(不变)
+kv.keydir.ckpt           KV keydir checkpoint(BCKS,单块,独立)
+search.ckpt        ← 新  搜索索引快照(分段:docmap/bm25/hnsw,逐段 CRC)
+search.ckpt.prev   ← 新  上一代搜索快照(代际回退)
+```
+
+`.prev` 只对 `search.ckpt` 设(搜索段重建最贵、最值得回退提速);keydir
+重建便宜,不设 `.prev`。无 `*.wal`(路线 A)。
+
+> **取代关系(P14a → P14e)**:P14a 已落地的多文件搜索命名
+> (`search.docmap.ckpt` / `search.vec.ckpt` / `search.bm25.manifest` /
+> `search.bm25.f{i}.seg`)是**过渡态**,被本节单文件 `search.ckpt` 收编。
+> 旧名不再读(可 fold 重建,flag-day,见 §8 P14e)。`kv.keydir.ckpt`
+> 保留(它不是搜索段)。
+
+### 3.2 `search.ckpt` 格式(自描述、分段、逐段 CRC,全小端)
+
+```
+== 头部 (16 B) ==
+[0..3]   magic     "BCSC"   4 ASCII
+[4..7]   version   u32 = 1
+[8..15]  watermark u64      本快照覆盖到的 next_ord 上界(成对门/回放用)
+
+== 段载荷区 ==
+各段 payload 顺序拼接(无内联段头;位置/校验由页脚目录给出)。
+段 payload 沿用现有内部序列化(InvertedIndex / HnswIndex / DocIndex),
+仅由"独立文件"变为"文件内的段"——字节级不变(跨引擎一致性保留)。
+
+== 页脚 ==
+directory(dirLen 字节):
+  sectionCount u32
+  每段: type u16 | flags u16 | offset u64 | len u64 | crc32 u32  (crc 覆盖该段 payload)
+footerCrc u32     CRC 覆盖 directory 字节
+dirLen    u32     directory 字节长度
+trailer   "BCSC"  4 ASCII
+```
+
+**定位页脚(从文件尾倒走)**:`[EOF-4..]`=trailer;`[EOF-8..EOF-4]`=dirLen;
+`[EOF-12..EOF-8]`=footerCrc;directory=`[EOF-12-dirLen .. EOF-12]`,按 footerCrc 校验。
+页脚最后写(tmp+rename 原子)——**页脚存在且 footerCrc 通过 = 文件结构完整**。
+
+### 3.3 段类型(type)
+
+| type | 名称 | payload |
 |---|---|---|
-| `bitcask.keydir.snap` | `kv.keydir.ckpt` | KV 索引 checkpoint |
-| `bitcask.index.snap` | `search.docmap.ckpt` | 搜索文档目录(ord↔key/loc/live/dl) |
-| `hnsw.snap` | `search.vec.ckpt` | 向量图 checkpoint |
-| `bm25_snapshot.inv.manifest` | `search.bm25.manifest` | 字段清单 |
-| `bm25_snapshot.inv.f{i}.inv` | `search.bm25.f{i}.seg` | per-field 倒排段 |
-| `bm25_snapshot.inv.f{i}.inv.wal` | **删除** | 见 §2/§6 |
-| `N.bitcask.hint` | 保留 | legacy 工具依赖,不动 |
-| `N.bitcask.data` | **保留** | legacy 格式,改名断 rebar/legacy 链 |
-| `bitcask.meta` / `field.schema` | 保留 | 权威元数据,不可 fold 重建 |
+| 1 | `docmap` | DocIndex:ord↔key/loc/live/doc_len(原 BCIS sidecar 内容) |
+| 2 | `bm25.default` | 默认域 `InvertedIndex` |
+| 3 | `bm25.fields` | `u32 fieldCount; [name; InvertedIndex]×`(多字段) |
+| 4 | `hnsw` | `HnswIndex` 图(原 BCVS 内容;int8-only 盘上仍 f32) |
+| 5 | `coverage` | `u32 count; [u64 ord]×` 存活 ord 集(完整性守卫,可选) |
 
-> "index" → "docmap":原名歧义(keydir 也是 index),它实为搜索层的
-> 文档目录。命名一眼读出「哪层·哪组件·什么契约」。
+新增索引类型只登记新 type,**不新增文件**。`coverage` 段为可选的完整性
+守卫(cellar 用法);本架构默认用 §4 的水位+fold 兜底,可不写 `coverage`。
 
-## 4. 恢复模型:单趟尾部回放
+## 4. 恢复模型:分段载入 + 单趟尾部回放
 
 open 流程(取代 `load_recovery_snapshots` + `load_keydir_from_disk` 双轨):
 
-1. **载 checkpoint**:`kv.keydir.ckpt` → keydir;`search.docmap.ckpt` →
-   DocIndex;`search.bm25.*` → 倒排;`search.vec.ckpt` → 图。任一校验
-   失败 → 该块视为空,其覆盖水位 = 0(退化为从头 fold,语义安全)。
-2. **统一水位**:每块 checkpoint 携带 **per-file 字节水位**(覆盖到的
-   data 文件偏移)。回放下界取**各块水位的最小值** `wm_min(fid)`——
-   保证回放区对每个索引都是「尾巴」,无遗漏。
-3. **单趟 fold**:对每个 data 文件,从 `wm_min(fid)` fold 到尾。**一个
-   回调里同时**喂四个索引:`keydir.put/remove` + `DocIndex.put_doc` +
-   `bm25.add_doc/remove` + `hnsw.insert`(沿用现 fold 回调
-   `cask.cpp:783-818` 的结构,只是把下界从 per-keydir-wm 改为 wm_min,
-   且不再走「有 search_layer 就跳过 hint」的特判——回放只认 data)。
-4. **幂等收敛**:回放区每条都是重 put/重 insert,与全量 fold 同语义
+1. **载 keydir**:`kv.keydir.ckpt`(单块,CRC 校验)。失败 → keydir 视为空,
+   其水位 = 0。
+2. **载 search.ckpt(分段)**:
+   - 读页脚 footerCrc:**结构完整**才继续;结构损坏(页脚缺失/footerCrc
+     失败,tmp+rename 已基本杜绝)→ **回退 `search.ckpt.prev`**(同样校验);
+     都不行 → 整个 search 视为空(水位 0,全量重建兜底)。
+   - 遍历目录**逐段校验 CRC**:CRC 通过 → 载入该段(docmap/bm25/hnsw);
+     **CRC 失败 → 仅标记该 type「待重建」,其余段照常载入**(损坏隔离)。
+3. **统一水位**:keydir.ckpt 与 search.ckpt 各携带 **per-file 字节水位**。
+   回放下界取**各源水位最小值** `wm_min(fid)`(回退到 .prev 时用 .prev 的
+   较老水位)——保证回放区对每个索引都是「尾巴」,无遗漏。
+4. **单趟 fold**:对每个 data 文件从 `wm_min(fid)` fold 到尾,**一个回调**
+   同时喂 `keydir.put/remove` + `DocIndex.put_doc` + `bm25.add_doc/remove`
+   + `hnsw.insert`(沿用现 fold 回调结构,下界改 wm_min,不再走「有
+   search_layer 跳过 hint」特判——回放只认 data)。
+   - 「待重建」的段(第 2 步标记)从其 type 对应水位 **0** 起重建:bm25 段
+     坏 → 只重分词重建倒排(向量段不动);hnsw 段坏 → 只从 DocValue 向量
+     重插(不重分词)。**损坏从"全量重建"降级为"按段重建"**。
+5. **幂等收敛**:回放区每条都是重 put/重 insert,与全量 fold 同语义
    (`recovery-snapshot-design-zh.md §2.1`),方向安全。
 
-成对门简化:不再要求四块**各自**覆盖 `next_ord`;改为「**回放从 wm_min
-起,fold 必然把每块补齐到 next_ord**」。即门恒可过,代价是 fold 区间 =
-`tail_from(wm_min)`。最弱环只影响**回放多读多少尾巴**,不再触发**全量
-fold**——这正是重用率从 0 提升的关键。
+成对门简化:不再要求各块**各自**覆盖 `next_ord`;改为「**回放从 wm_min 起,
+fold 必然把每块补齐到 next_ord**」。门恒可过,代价是 fold 区间 =
+`tail_from(wm_min)`。最弱环/坏段只影响**回放多读多少尾巴 / 重建哪一段**,
+不再触发**全库全量 fold**——重用率从 0 提升的关键。
 
-## 5. 周期性 checkpoint
+## 5. 写入(snapshot)流程 + 周期 checkpoint
 
 现仅 close(`cask.cpp:674`)/merge(`:1675/:1734`)。新增周期触发,把
-`wm_min` 拉近尾部、限定崩溃后回放量:
+`wm_min` 拉近尾部、限定崩溃后回放量。`search.ckpt` 单文件分段写流程:
 
-- **触发**:写入字节数 / 文档数累计超阈值(配置 `checkpoint_interval`),
-  在 IndexPool worker 静止窗口执行(避免与 fold/insert 抢写)。
-- **静止性**:沿用现有「写者静止点才 dump」约束
-  (`recovery-snapshot-design-zh.md §2.4`,活跃 fold 时 save 返回 false)。
-- **原子性**:每文件 tmp+rename(现 keydir/docmap/bm25/hnsw 已是此模式)。
-- **顺序**:水位**先于** dump 捕获(水位 ≤ 覆盖点 ⟹ 回放区与 checkpoint
-  重叠,幂等安全);多块落盘顺序无关(回放取 wm_min,任意子集陈旧都安全)。
-- **bm25 段**:周期 checkpoint 即重写 `search.bm25.f{i}.seg`,旧 WAL 概念
-  消失(§6)。
+```
+1. drain 异步索引(IndexPool 静止);watermark = keydir.next_ord。
+2. 逐段 type:
+   - 该段自上次 checkpoint「脏」(有相应写入)→ 重新序列化 payload + 算 crc。
+   - 否则【段级复用】→ 从旧 search.ckpt 按旧目录把该段原始字节拷贝前移
+     (含旧 crc),不重序列化。
+3. 写 temp:头部 + 各段 payload + 页脚目录(每段 offset/len/crc) + footerCrc
+   + dirLen + trailer。fsync temp。
+4.【代际】把现有 search.ckpt 重命名为 search.ckpt.prev(覆盖旧 .prev)。
+5. rename(temp → search.ckpt)(原子)。
+6. keydir.ckpt 单块照常 tmp+rename(独立)。
+```
+
+- **脏标记**:写路径维护 4 个 dirty bit(bm25 写 / 字段写 / 向量写 / docmap
+  写),落快照后清零。无向量写的周期里 `hnsw` 段**零成本前移**——砍写放大。
+- **触发**:写入字节/文档累计超阈值(`checkpoint_interval`),在 worker
+  静止窗口执行。
+- **静止性**:沿用「写者静止点才 dump」(`recovery-snapshot-design-zh.md §2.4`)。
+- **顺序**:watermark **先于** payload 捕获(水位 ≤ 覆盖点 ⟹ 回放区与快照
+  重叠,幂等安全);keydir.ckpt 与 search.ckpt 落盘顺序无关(回放取 wm_min)。
 
 ## 6. 删 bm25 WAL 的论证与替代
 
@@ -99,6 +175,30 @@ fold**——这正是重用率从 0 提升的关键。
   与「WAL=耐久日志」语义分离,不恢复双重日志。
 - **迁移**:`enable_wal/replay_wal/truncate_wal` 调用点摘除;`InvertedWal`
   保留为 terms-cache 的载体或整体下线(二期决定)。
+
+## 6.5 代际回退(`.prev`)——增量源是 data 文件,不是搜索 WAL
+
+`.prev` 是上一代 `search.ckpt`(覆盖较老 watermark)。最新 `search.ckpt`
+**整体**位腐(footerCrc 失败)时回退它,再追平到当前:
+
+```
+最新 search.ckpt footerCrc 失败
+  → 载 search.ckpt.prev(逐段 CRC 同样校验)
+  → fold data 尾巴(从 .prev 的 per-file 水位起)补 [watermark_prev, now) 增量
+  → 恢复到当前
+```
+
+**关键**:追平的增量来自 **data 文件尾巴(我们的 WAL)**,不需要搜索 WAL
+(对比 cellar 用 `cellar.search.wal` 追平)。因此「砍搜索 WAL」与「保留
+`.prev`」**互不冲突、各自独立**。
+
+- 在本架构里 `.prev` 是**纯恢复提速**:把"最新损坏"从全库重建降到尾巴重放;
+  正确性始终由 data 文件兜底,非 durability 必需。
+- 增量"保留"免费:data 记录在 merge 前一直在;merge 搬走的记录换新
+  ord/位置后 fold 当前文件照样重放(成对门处理"不在水位表→从 0 fold",
+  见 §7.3)。**无需 cellar 那样的"WAL 保留到最老代际"截断策略**。
+- 段级 CRC(§3.2)与 `.prev` 互补:**单段坏**→ 当代按段重建(§4.2);
+  **整文件结构坏**→ 回退 `.prev`。二者覆盖不同损坏粒度。
 
 ## 7. 关键不变量
 
@@ -129,7 +229,12 @@ fold**——这正是重用率从 0 提升的关键。
   search_layer 跳过快路径」逻辑。
 - **P14c**:周期性 checkpoint(`checkpoint_interval` 配置 + worker 静止窗口)。
 - **P14d**:摘除 bm25 WAL;按 profiling 决定是否引入 `terms` 缓存。
-- 各阶段独立可上线、独立验收;P14a 即可消除命名混乱。
+- **P14e**(新增,采纳 cellar 文件结构):把 P14a 的多文件搜索 checkpoint
+  收编为单个分段 `search.ckpt`(§3.2 格式:页脚目录 + 逐段 CRC + 段级脏位
+  复用)+ 代际 `search.ckpt.prev`(§6.5)。`kv.keydir.ckpt` 保留独立。
+  恢复改为分段载入 + 段级重建 + `.prev` 回退(§4)。旧多文件名不再读
+  (可 fold 重建,flag-day)。
+- 各阶段独立可上线、独立验收;P14a 即可消除命名混乱,P14e 收口为单文件。
 
 ## 9. 验收
 
@@ -139,7 +244,39 @@ fold**——这正是重用率从 0 提升的关键。
   全量 fold**,fold 区间 ≈ `tail_from(wm_min)`;P3 后该区间被周期阈值限定。
 - **IO 下降**:P4 后单次搜索 put 的写放大从 2(data+WAL)降到 1;
   统计稳态文件数减少(无 `.wal`)。
-- **损坏注入**:任一 .ckpt 截断/位翻转 → 该块退空、wm_min 下移、fold
-  补齐,数据完好;无悬崖。
+- **损坏注入(P14e 段级)**:翻转 `search.ckpt` **单段** payload 字节 → 仅该
+  type 走重建、其余段正常载入(验证损坏隔离);翻转**页脚** → 回退 `.prev`
+  + fold 尾巴追平;两者数据/检索结果均与全量 fold 等价。
+- **代际回退**:会话2写入后 kill,损坏最新 `search.ckpt` → reopen 用 `.prev`
+  + data 尾巴恢复,会话2 的写/删可见。
+- **段级复用**:无向量写的周期落 checkpoint → `hnsw` 段字节与上代逐字节相同
+  (未重序列化)。
 - **基准**:`BM_Cask_Open` 三模 × {clean close / crash} × {有无周期
-  checkpoint},对照全量 fold。
+  checkpoint};写放大 / 稳态文件数对照。
+
+## 10. 与 cellar 提案(`design-cellar-search.md`)对比
+
+cellar(JDK/.NET 姊妹引擎)提出 `cellar.search` 单文件分段方案。本设计
+**采纳其文件结构,在 WAL 哲学上分叉**:
+
+| 维度 | cellar 提案 | 本设计(路线 A + cellar 结构) |
+|---|---|---|
+| 搜索快照 | 单文件 `cellar.search` 分段 + 逐段 CRC + 页脚目录 | **同**(`search.ckpt`,§3.2)✅ 采纳 |
+| 段级脏位复用 | ✓ | **同** ✅ 采纳 |
+| 代际回退 | `cellar.search.prev` | **同**(`search.ckpt.prev`)✅ 采纳 |
+| 周期 checkpoint | ✓ | **同** ✅ 采纳 |
+| **WAL** | 保留 `cellar.search.wal`(已分析增量)+ coverage 守卫 | **砍搜索 WAL**:data 文件即唯一 WAL,fold 尾巴重放 ✗ 分叉 |
+| `.prev` 追平增量源 | 搜索 WAL | **data 文件尾巴**(§6.5)|
+| 完整性守卫 | `coverage` 段(存活 ord)∪ WAL | 水位 + fold 兜底;`coverage` 段可选(§3.3) |
+| keydir/hint | 与 search 分层独立 | **同**(`kv.keydir.ckpt` 独立) |
+
+**分叉点解释**:bitcask 的 data 文件(DocValue 含原始 text+vector)本身就是
+搜索输入的完整 WAL,再写一份搜索 WAL = 双重日志(§1.2)。故本设计省掉搜索
+WAL,代价是回放尾巴需重分词/重插(由 checkpoint 频率限定,§6);若 cellar
+引擎不把 data 文件当搜索输入源(或其 data 不存原始向量),则它需要搜索 WAL
+作为搜索输入的耐久来源——这是两引擎的架构差异,不是优劣。
+
+**字节互通**:cellar 用 `cellar.*` 前缀、`CSCH` magic;本设计用 `bitcask.*`/
+`search.ckpt`、`BCSC` magic——**当前不互通**。段 payload 沿用各自中立小端
+序列化,若未来要 C++↔JDK↔.NET 同文件互读,需统一 magic/前缀/段编号(届时
+再评估,见 §3 取代关系)。

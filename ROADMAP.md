@@ -147,8 +147,10 @@ fold 尾部回放」。后缀编码契约（`.ckpt`/`.wal`/`.seg`/`.manifest`）
 **子阶段**：**P14a** ✅ 纯重命名 + 契约文档化（零格式/逻辑变更；旧名不再读——可重建，
 升级后首次 open 一次全量 fold、close 落新名；410 测试通过）；
 **P14b** wm_min 单趟回放（替双轨 + 消门悬崖）；**P14c** 周期性 checkpoint（`checkpoint_interval`
-+ worker 静止窗口）；**P14d** 摘 bm25 WAL（profiling 驱动决定是否留 `terms` 纯缓存）。
-**收益**：命名契约清晰 · 写放大 2→1 · 稳态文件数减少（无 `.wal`）· 崩溃后不再全量 fold。
++ worker 静止窗口）；**P14d** 摘 bm25 WAL（profiling 驱动决定是否留 `terms` 纯缓存）；
+**P14e** 搜索快照收编为单个分段 `search.ckpt`（逐段 CRC + 页脚目录 + 段级脏位复用）+ 代际
+`search.ckpt.prev`（采纳 cellar 文件结构，WAL 仍走路线 A；对比见设计文档 §10）。
+**收益**：命名契约清晰 · 写放大 2→1 · 文件数大降（搜索多文件→1）· 损坏隔离到段 · 崩溃后不再全量 fold。
 
 ---
 
@@ -164,12 +166,17 @@ fold 尾部回放」。后缀编码契约（`.ckpt`/`.wal`/`.seg`/`.manifest`）
 - **W4 merge**：**P8** HNSW merge 门控 + **P11** merge I/O（同 merge 主题、捆绑）→ **P13** open 后台 merge。
 - **W5 周期 checkpoint + 去 WAL**：**P14c** 周期 checkpoint（触发点对齐 W4 的 merge/open-merge 时机）
   → **P14d** 摘 bm25 WAL（依赖 P14b 回放已验证）。
+- **W5.5 搜索快照收口**：**P14e** 多文件搜索 checkpoint → 单个分段 `search.ckpt`（逐段 CRC + 页脚目录
+  + 段级脏位复用）+ 代际 `search.ckpt.prev`。排在 W5 之后——它要在「P14b 分段载入语义 + P14c 写流程
+  + P14d 无 WAL」都就位后做收口（脏位复用挂在 P14c 的写流程上、去 WAL 后段集才稳定）。
 - **W6 查询（顺序无关，可浮动）**：**P10** search_hybrid 两路并行（独立，任意波次可插）。
 - **W7 备选（gate 后置）**：**P7** 派生值 compute cache（依赖 P6）⚠️ · **P12** meta_blobs 有界（filter 热路径）⚠️。
 
-**关键依赖边**：P7→P6 · P9↔P6 · P14b 受益于 P6 · P14c 对齐 P8/P13 的 merge 时机 · P14d 依赖 P14b。
-**为何 P14 拆两段**：P14b（恢复模型）须先于 merge 改动，给 P8/P13 一个干净的回放语义；
-P14c（周期 checkpoint）须**后于** P8/P13——它把 checkpoint 触发挂在 merge/open-merge 静止点上。
+**关键依赖边**：P7→P6 · P9↔P6 · P14b 受益于 P6 · P14c 对齐 P8/P13 的 merge 时机 · P14d 依赖 P14b ·
+**P14e 依赖 P14b（分段载入）+ P14c（段级脏位复用写流程）+ P14d（去 WAL 后段集稳定）**。
+**为何 P14 拆多段**：P14b（恢复模型）须先于 merge 改动，给 P8/P13 一个干净的回放语义；
+P14c（周期 checkpoint）须**后于** P8/P13——它把 checkpoint 触发挂在 merge/open-merge 静止点上；
+P14e（单文件收口）放最后——格式收编依赖前三者就位，且它会再做一次 flag-day（旧多文件名不再读，可重建）。
 
 ---
 
