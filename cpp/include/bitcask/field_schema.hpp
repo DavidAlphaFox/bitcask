@@ -5,7 +5,7 @@
 // 改为存 field id（小整数 varint），字段名只在本注册表存一份。
 //
 // 持久化：append-only 文件 <dir>/field.schema，每个新字段名追加一条
-//   [NameLen:u16 大端][name bytes]
+//   [NameLen:u16 小端][name bytes]   （P：盘格式统一小端，flag-day 前为大端）
 // id == 出现顺序（0 基）。open 时顺序重放即还原 name↔id。完全 append-only，
 // 契合 bitcask 哲学；并发 put_doc 调 intern，写路径持 unique_lock + fflush。
 
@@ -41,7 +41,8 @@ public:
                 std::uint8_t hdr[2];
                 if (std::fread(hdr, 1, 2, rf) != 2) break;
                 const std::uint16_t nlen =
-                    static_cast<std::uint16_t>((static_cast<std::uint16_t>(hdr[0]) << 8) | hdr[1]);
+                    static_cast<std::uint16_t>(hdr[0] |
+                        (static_cast<std::uint16_t>(hdr[1]) << 8));
                 std::string name(nlen, '\0');
                 if (nlen > 0 && std::fread(name.data(), 1, nlen, rf) != nlen) break;
                 const auto id = static_cast<std::uint32_t>(id_to_name_.size());
@@ -72,8 +73,8 @@ public:
         if (fp_ != nullptr) {
             const auto nlen = static_cast<std::uint16_t>(name.size());
             const std::uint8_t hdr[2] = {
-                static_cast<std::uint8_t>((nlen >> 8) & 0xFF),
-                static_cast<std::uint8_t>(nlen & 0xFF)};
+                static_cast<std::uint8_t>(nlen & 0xFF),
+                static_cast<std::uint8_t>((nlen >> 8) & 0xFF)};
             std::fwrite(hdr, 1, 2, fp_);
             if (!name.empty()) std::fwrite(name.data(), 1, name.size(), fp_);
             std::fflush(fp_);

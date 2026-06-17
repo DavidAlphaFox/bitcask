@@ -252,16 +252,13 @@ DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
         if (!hn) return std::unexpected(io_fault(hn.error()));
         if (*hn < format::kHeaderSize) break;  // 含 EOF(0 字节)
 
-        // 只读出长度字段，CRC 等下读完整 record 再校验。手动做大端→主机
-        // 字节序转换（不复用 codec 的 be_load_u* 是因为这里只想要这两个
-        // 字段，不想 decode 整个 header）。
+        // 只读出长度字段，CRC 等下读完整 record 再校验。盘格式为小端
+        // (全引擎 LE-only 主机,见 codec 顶部 static_assert)→ 直接 memcpy,
+        // 无需字节序转换(不 decode 整个 header,只取这两个长度字段)。
         std::uint16_t key_sz;
         std::uint32_t value_sz;
         std::memcpy(&key_sz,  buf.data() + format::kKeySzOffset,  sizeof(key_sz));
         std::memcpy(&value_sz, buf.data() + format::kValueSzOffset, sizeof(value_sz));
-        key_sz   = static_cast<std::uint16_t>(((key_sz & 0xFF) << 8) | (key_sz >> 8));
-        value_sz = ((value_sz & 0xFFu) << 24) | ((value_sz & 0xFF00u) << 8) |
-                   ((value_sz & 0xFF0000u) >> 8) | (value_sz >> 24);
 
         const std::uint32_t rec_total =
             static_cast<std::uint32_t>(format::kHeaderSize) +

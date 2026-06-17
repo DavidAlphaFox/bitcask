@@ -88,7 +88,7 @@ std::expected<void, DataFileFault> HintFile::fold(FoldFn fn) {
     // 缓冲整个 fold 循环复用(容量只增),每条 record 零分配。
     std::vector<std::byte> buf;
     while (offset + format::kHintRecordSize <= total) {
-        // 先读 18 字节固定 header 拿 key_sz（offset 4..5, BE u16）。
+        // 先读 18 字节固定 header 拿 key_sz（offset 4..5, P:小端 u16）。
         // 直接 decode_hint_record(header_only) 会被 kBufferTooShort 拒掉，
         // 因为 decoder 要求 header + key 全部就位——所以分两次 pread。
         if (buf.size() < format::kHintRecordSize) {
@@ -102,8 +102,8 @@ std::expected<void, DataFileFault> HintFile::fold(FoldFn fn) {
         const auto* p = buf.data();
         const std::uint16_t key_sz =
             static_cast<std::uint16_t>(
-                (static_cast<std::uint16_t>(p[4]) << 8) |
-                 static_cast<std::uint16_t>(p[5]));
+                static_cast<std::uint16_t>(p[4]) |
+                (static_cast<std::uint16_t>(p[5]) << 8));
         const std::uint64_t rec_size =
             format::kHintRecordSize + static_cast<std::uint64_t>(key_sz);
 
