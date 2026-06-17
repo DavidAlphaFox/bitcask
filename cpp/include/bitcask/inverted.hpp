@@ -340,6 +340,12 @@ public:
 
     auto save(std::string_view path) const -> bool;
     auto load(std::string_view path) -> bool;
+    // P14e:序列化到字节缓冲(供 search.ckpt 分段嵌入)。盘字节与 save() 一致
+    // (自带 INV 框架、原生小端)。serialize 仅追加缓冲、不会失败。
+    void serialize(std::vector<std::byte>& out) const;
+    // 从字节缓冲反序列化(search.ckpt 段)。语义同 load:任何越界/校验违例
+    // 整体拒绝返回 false。
+    [[nodiscard]] auto deserialize(std::span<const std::byte> bytes) -> bool;
 
     // ---- 统计 ----
     [[nodiscard]] auto live_doc_count() const -> std::uint64_t;
