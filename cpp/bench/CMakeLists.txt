@@ -26,6 +26,7 @@ add_executable(bitcask_bench
     analyzer_bench.cpp
     hnsw_bench.cpp
     crc32_bench.cpp
+    gate_bench.cpp
     bench_main.cpp
 )
 target_link_libraries(bitcask_bench
