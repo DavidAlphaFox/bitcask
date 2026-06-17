@@ -8,7 +8,13 @@
 - Meta 文件：`cpp/include/bitcask/meta_file.hpp`
 - 字节级测试固件：`cpp/tests/codec_test.cpp`
 
-所有多字节整数均为**大端**（f32 向量数组除外，为小端）。字段大小单位均为字节。
+所有多字节整数均为**小端**（LE-only 主机：x86/ARM64，原生零转换 + mmap 零拷贝
+友好）。**flag-day 切换**：此前 record/hint/field.schema 为大端（对齐 legacy Erlang
+`<<X:N>>`），切换后旧大端文件不可读（meta version 1→2，旧目录 open 时被干净拒绝），
+不再与 legacy Erlang 字节互通。**迁移**：旧大端目录可用 `cpp/tools/migrate_le
+<src> <dst>` 离线转换成小端（非破坏性；迁移 data/hint/meta/field.schema，ckpt/seg/wal
+等可重建文件由新库首开自动重建）；详见 `cpp/include/bitcask/migrate.hpp`。
+字段大小单位均为字节。
 
 ---
 
@@ -18,15 +24,27 @@
 
 ```
 <dir>/
-├── bitcask.meta              # 二进制元数据（模式标记）
-├── <tstamp1>.bitcask.data    # append-only data 文件
-├── <tstamp1>.bitcask.hint    # 可选 sidecar 索引（与 data 文件一一对应）
+├── bitcask.meta              # 二进制元数据（模式 + 向量配置）        §一
+├── <tstamp1>.bitcask.data    # append-only data 文件                 §二
+├── <tstamp1>.bitcask.hint    # 可选 sidecar 索引（与 data 一一对应）  §四
 ├── <tstamp2>.bitcask.data
 ├── <tstamp2>.bitcask.hint
 ├── ...
-├── bitcask.write.lock        # 写锁（live writer 持有）
-└── bitcask.merge.lock        # 合并锁（active merger 持有）
+├── field.schema              # 字段名↔id 注册表（索引模式）          §五
+├── bitcask.write.lock        # 写锁（live writer 持有）              §六
+├── bitcask.merge.lock        # 合并锁（active merger 持有）          §六
+│   # —— 以下为恢复 checkpoint / 索引文件（可 fold 重建，纯优化）——  §十
+├── kv.keydir.ckpt            # keydir checkpoint（BCKS）
+├── search.docmap.ckpt        # 搜索文档目录 checkpoint（BCIS）
+├── search.vec.ckpt           # HNSW 向量图 checkpoint（BCVS）
+├── search.bm25.manifest      # bm25 字段清单（文本）
+├── search.bm25.f<i>.seg      # bm25 per-field 倒排段
+└── search.bm25.f<i>.wal      # bm25 per-field 增量 WAL
 ```
+
+> checkpoint/索引文件**全部可由 fold 数据文件重建**（纯优化），命名契约
+> `{kv|search}.{组件}.{ckpt|seg|wal|manifest}`（P14a）；详见 §十与
+> [`recovery-unified-checkpoint-design-zh.md`](recovery-unified-checkpoint-design-zh.md)。
 
 `<tstampN>` 是 file id，一个全局单调递增的十进制整数（内部 uint32，
 解析时按 uint64 安全处理）。`KeyDirRegistry` 跨 open/close 持久化
@@ -36,15 +54,21 @@
 ### bitcask.meta（18 字节）
 
 ```
-偏移   字段       字节数  说明
-────────────────────────────────────────────
-0      Magic      4       "BCME" (0x42434D45)
-4      Version    1       1
-5      Mode       1       0 = KV 模式，1 = 索引模式（BM25 搜索）
-6      Reserved   12      全零；预留将来扩展
+偏移   字段          字节数  说明
+──────────────────────────────────────────────────────────
+0      Magic         4       "BCME" (0x42434D45)
+4      Version       1       2（v1=大端 legacy；v2=小端 flag-day 起，旧 v1 目录 open 时拒绝）
+5      Mode          1       0 = KV 模式，1 = 索引模式（BM25 搜索）
+6      VecMetric     1       0=kNone 1=kCosineNormalized 2=kL2 3=kDot（V3.1）
+7      VecDim        2       向量维度 u16 小端；0 = 无向量（V3.1）
+9      VecQuantized  1       0/1：向量落盘 int8 量化（P3b；旧文件全零=否）
+10     VecInmemInt8  1       0/1：HNSW int8-only 内存模式（P5b；仅 kDot）
+11     Reserved      7       全零；预留将来扩展
 ```
 
-来源：`cpp/include/bitcask/meta_file.hpp`。
+不变量：`(VecMetric==kNone) ⟺ (VecDim==0)`。VecMetric/Dim/Quantized/InmemInt8
+创建即固定，重开必须与 open 选项一致，否则 `kModeMismatch`。
+来源：`cpp/src/cask/meta_file.cpp`、`cpp/include/bitcask/meta_file.hpp`。
 
 ---
 
@@ -58,7 +82,7 @@ append-only 的 record 序列，文件本身无 header，record 之间无 paddin
 0      CRC32       4       覆盖 Type..Value（zlib 多项式，跟 erlang:crc32 一致）
 4      Type        1       RecordType：0 = kDoc，1 = kTombstone
 5      Tstamp      4       写入时刻的 Unix 秒
-9      Ord         8       单调递增的写入序号（大端），永不复用
+9      Ord         8       单调递增的写入序号（小端），永不复用
 17     KeySz       2       key 字节数（≤ 65535）
 19     ValueSz     4       value 字节数（≤ ~4 GiB）
 23     Key         KeySz
@@ -172,7 +196,7 @@ Hint 是不含 value 的离线索引，用于在 open 时加速 keydir 重建
 
 整条长度 = `18 + KeySz`，header 固定 18 字节。
 
-### Packed offset 字段（位置 10..17 的 8 字节大端 uint64）
+### Packed offset 字段（位置 10..17 的 8 字节小端 uint64）
 
 ```
 位 63       位 62..0
@@ -183,11 +207,12 @@ Hint 是不含 value 的离线索引，用于在 open 时加速 keydir 重建
 - `Offset` 上限 `kMaxOffsetV2 = 0x7FFF_FFFF_FFFF_FFFF`（约 8 EiB，
   远超任何实际 data 文件大小）
 
-注意：墓碑标志在 **offset 字段的最高位**，**不是** tstamp 字段。
-这与 legacy `bitcask_fileops:hintfile_entry/5` 完全一致：
+注意：墓碑标志在 **offset 字段的最高位（bit 63）**，**不是** tstamp 字段。
+小端编码下 packed u64 的最高位落在**最后一字节**（位置 17）。逻辑布局对应
+legacy 的 5 元组打包,但**字节序已由大端切为小端**(flag-day,不再字节级互通)：
 
 ```erlang
-%% legacy 5-arg packing
+%% 逻辑打包（legacy 为大端；现为小端字节序）
 <<Tstamp:32, KeySz:16, TotalSz:32, Tomb:1, Offset:63>>
 ```
 
@@ -269,7 +294,7 @@ Z      Fields 段（可选，Flags&0x10 时存在；多字段）
 ### VByte 变长（S11，#2）
 
 所有长度/计数（Dim、各段 Len、FieldCount、FieldId）用 VByte 编码，取代旧版固定
-4B/2B 大端整数，省掉小字段的固定前缀开销。
+4B/2B 整数，省掉小字段的固定前缀开销。
 
 - 每字节低 7 位为数据；**最高位 = 终止标记**（`1` 表示末字节）。
 - ⚠️ 注意：终止位语义与 LEB128 的「续位」相反。例如 `varint(2) = 0x82`
@@ -290,7 +315,7 @@ Z      Fields 段（可选，Flags&0x10 时存在；多字段）
 的海量文档把字段名重复无数次。v3 改为存 **字段 id**，字段名只在注册表存一份。
 
 - **注册表**：append-only 文件 `<dir>/field.schema`，每个新字段名追加一条
-  `[NameLen:u16 大端][name]`，**id = 出现顺序**（0 基）。open 时顺序重放还原
+  `[NameLen:u16 小端][name]`，**id = 出现顺序**（0 基）。open 时顺序重放还原
   name↔id。实现见 `field_schema.hpp`（`FieldSchema::open/intern/name_of`），
   Cask 在 `open`/`upgrade` 时加载，`put_doc` 把字段名 `intern` 成 id 后编码。
 - **codec 保持纯函数**：`DocField{id, value}`，名字↔id 映射只在 Cask 层；
@@ -420,13 +445,13 @@ NFS 上 `O_EXCL` 不可靠，但 bitcask 也不该跑在网络文件系统上。
 以下为线格式（wire-format）保证，在 `cpp/tests/codec_test.cpp`
 中有字节级测试固件。修改其中任何一项都破坏二进制兼容性：
 
-- **大端**编码贯穿全部字段（无平台原生捷径）。
-  例外：DocValue 内的 f32 向量数组为小端。
+- **小端**编码贯穿全部多字节整数字段（LE-only 主机原生零转换 + mmap 零拷贝）。
+  flag-day 前为大端（对齐 legacy Erlang）；切换后旧大端文件不可读、需重建。
 - Header 长度：data record = **23 B**，hint record = **18 B**。
 - CRC 多项式 = **zlib / IEEE 802.3**（使 `erlang:crc32/1` 结果一致）。
 - CRC 覆盖 `Type..Value`（不是从 `Tstamp` 开始，这与某些 legacy 格式不同）。
 - Record type：`kDoc = 0`，`kTombstone = 1`。
-- Ord 字段：8 字节，大端，单调递增，永不复用。
+- Ord 字段：8 字节，小端，单调递增，永不复用。
 - 墓碑标志在 hint packed offset 的**最高位**（字节 10..17，位 63），
   Offset 限于 63 位。
 - DocValue：当前 Ver=3，Flags 在偏移 1 处，各段按 vector→text→meta→fields
@@ -434,3 +459,83 @@ NFS 上 `O_EXCL` 不可靠，但 bitcask 也不该跑在网络文件系统上。
   Ver==3（不向后兼容）。
 
 所有这些常量集中在 `cpp/include/bitcask/format.hpp`，是本格式的唯一权威来源。
+
+---
+
+## 十、恢复 checkpoint 与索引文件
+
+以下文件都是**派生缓存**：可由 fold 数据文件完全重建（`recover_doc` / keydir
+重建），是**纯优化**——任何校验失败 → 丢弃 → 回退全量 fold，绝不影响正确性。
+命名契约 `{kv|search}.{组件}.{ckpt|seg|wal|manifest}`（P14a）。详见
+[`recovery-unified-checkpoint-design-zh.md`](recovery-unified-checkpoint-design-zh.md)。
+
+**统一外壳**（除 manifest 与 bm25 段外）：`[Magic:u32 LE][Version:u32 LE]
+[payload][CRC32(payload):u32 LE]`，`tmp + rename` 原子落盘。全部多字节整数小端。
+
+### 10.1 kv.keydir.ckpt — keydir checkpoint（BCKS v1）
+
+Magic `0x42434B53`（"BCKS"），Version 1。payload：
+
+```
+next_ord u64 | epoch u64 | biggest_file_id u32 | key_count u64 | key_bytes u64
+fstats_n u32, 重复 fstats_n 次:
+    file_idx u32 | live_keys u64 | total_keys u64 | live_bytes u64
+    total_bytes u64 | oldest_tstamp u32 | newest_tstamp u32 | expiration_epoch u64
+wm_n u32, 重复 wm_n 次:  file_id u32 | covered_offset u64   ← per-file 字节水位
+entry_n u64, 重复 entry_n 次:
+    klen u16 | key[klen] | file_id u32 | total_sz u32 | offset u64
+    | epoch u64 | tstamp u32 | ord u64
+```
+
+`covered_offset` 是尾部回放的水位：open 装载快照后只 fold 各文件该偏移之后的
+尾巴。来源 `cpp/src/keydir/keydir.cpp`（`save_snapshot`/`load_snapshot`）。
+
+### 10.2 search.docmap.ckpt — 搜索文档目录 checkpoint（BCIS v1）
+
+Magic `0x42434953`（"BCIS"），Version 1。payload：
+
+```
+covers_next_ord u64                 ← 保存时 keydir.next_ord（成对性门用）
+rows u64, 重复 rows 次（每活索引文档一行）:
+    ord u64 | klen u16 | ext[klen] | file_id u32 | offset u64
+    | total_sz u32 | tstamp u32 | doc_len u32
+```
+
+把 bm25/hnsw 吐出的 ord 翻译回 key / 物理位置 / live / doc_len。与 keydir.ckpt
+字段大量重叠（见 recovery 设计），但按 ord 而非 key 索引。来源
+`cpp/src/search/search_layer.cpp`（`save_index_sidecar`/`load_index_sidecar`）。
+
+### 10.3 search.vec.ckpt — HNSW 向量图 checkpoint（BCVS v1）
+
+Magic `0x42435653`（"BCVS"），Version 1。payload：
+
+```
+dim u16 | metric u8 | M u32 | ef_construction u32 | seed u64
+count u32 | entry_meta u64 | max_inserted_ord u64
+重复 count 次（节点 id = 写出顺序 0..count-1）:
+    ord u64 | level u8 | vec[dim] f32 小端
+    重复 (level+1) 层:  cnt u32 | cnt×(neighbor_id u32)
+```
+
+不变量：邻居/entry id `< count`、ord 严格递增、layer-l 表只含 level≥l 的节点。
+**注意**：即便内存为 int8-only（P5），盘上仍存 f32（save 反量化、load 再量化）。
+来源 `cpp/src/vector/hnsw.cpp`（`save`/`load`）。
+
+### 10.4 search.bm25.* — bm25 倒排索引
+
+多字段：一个 `manifest` + 每字段一个 `.seg`（+ 运行期 `.wal`）。
+
+- **search.bm25.manifest**（文本）：第一行 = 字段数；其后每行一个字段名
+  （可能含控制字符前缀，如默认字段 `\x01default`）。
+- **search.bm25.f\<i\>.seg**：第 i 个字段的倒排段（`InvertedIndex::save`）。
+  标量字段 u32/u64 **小端**（原生 `fwrite`），postings 用 VByte gap 压缩 +
+  block-max 元数据。逐字节布局随检索特性（BMW / zero-copy posting）演进，
+  以源码为准：`cpp/src/bm25/inverted.cpp` + `doc/posting-zero-copy-design-zh.md`、
+  `doc/kway-blockmax-bmw-zh.md`。
+- **search.bm25.f\<i\>.wal**：`[Magic "WAL1"=0x57414C31:u32][Version=1:u32]` +
+  增量记录（`add_doc`/`remove_doc`，VByte 编码）。load 快照后若 WAL 存在则重放、
+  随后 truncate。来源 `cpp/src/bm25/inverted_wal.cpp`。
+
+> 字节序例外回顾：bm25 倒排**位流**为 MSB-first 位级打包（`inverted.cpp`），
+> 作为字节序列与主机字节序无关；VByte（§五）同样字节序中立。其余所有多字节
+> 整数字段一律小端（§九）。
