@@ -1,5 +1,7 @@
 # 大端 → 小端目录迁移（`migrate_le`）
 
+English: [`migrate-le-en.md`](migrate-le-en.md)
+
 把**旧的大端（big-endian）bitcask 目录**离线迁移成**新的小端（little-endian）
 格式**的工具。
 

@@ -168,7 +168,8 @@ ok
 |------|----------------|
 | `doc/api-en.md` / `doc/api-zh.md` | **API reference**: capabilities, parameter meaning & constraints, return values (EN/中) |
 | `doc/USAGE.md` | Tutorial: opening, merging, configuring, searching |
-| `doc/format-zh.md` | 磁盘格式字节级规范（带类型记录、DocValue、提示文件、锁） |
+| `doc/format-zh.md` | 磁盘格式字节级规范（带类型记录、DocValue、提示文件、锁；字节序统一小端） |
+| `doc/migrate-le.md` / `doc/migrate-le-en.md` | `migrate_le` tool: offline-migrate an old big-endian dir to little-endian (v1→v2) (中/EN) |
 | `doc/cpp-arch.md` | C++ 模块布局、锁策略、构建入口 |
 | `doc/migration.md` | 特性状态与 API 参考 |
 | `doc/concurrency-zh.md` | 并发与共享语义 |
