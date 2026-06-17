@@ -3,6 +3,71 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [2.1.1] — 2026-06-17
+
+2.1.0 引入 C++23 引擎后的第一轮**系统级优化**——聚焦向量库的内存/磁盘墙、
+读路径零拷贝、恢复持久化统一、以及全盘字节序规范化。428 GoogleTests 全绿。
+
+### 新增
+
+- **P5 — HNSW int8-only 内存模式**（opt-in `{vector_inmem_int8, true}`）：丢掉
+  常驻 f32 `vecs`，建图/查询/精排全走 int8（查询侧也量化、VNNI int8×int8）。向量
+  内存 **−80%（~5×）**，1M 向量 dim=2560 从 12.81 GB → 2.57 GB；代价 recall@10 约
+  −3%（合成簇 1.0→0.965）。与 P3 落盘 int8 正交可组合。默认仍 f32+int8（召回优先）。
+- **P6 — sealed 文件 mmap 只读路径**：sealed（封口不可变）data 文件 mmap 零拷贝读
+  ——免 pread syscall、直接用 OS page cache、不双缓存。active 文件永远 pread。merge
+  unlink 旧文件延迟 munmap（`shared_ptr<DataFile>` 引用计数，在途读者续命）。32 位
+  禁用。`GetResultView` 持映射引用锚定生命。
+- **P8 — HNSW merge rebuild 门控**：按死节点比例门控全量重建（同 P2 范式），死占比
+  < 阈值跳过（`is_live` 过滤兜底），≥ 阈值才全量重建——节省向量库 merge 的主要 CPU。
+- **P9 — read 句柄 fd 预算 LRU**（`{max_read_handles, N}`）：只读文件句柄按 LRU /
+  数量上限淘汰，解决大库 fd 撞 ulimit 问题（与 P6「mmap 后 close fd」互补）。0=不限。
+- **P10 — search_hybrid 两路并行**：BM25 与 HNSW 两路搜索丢线程池并行执行，hybrid
+  查询延迟近减半。
+- **P11 — merge I/O 顺序优化**：merge 读旧/写新文件加 `posix_fadvise(SEQUENTIAL/
+  WILLNEED)` + 大缓冲，降低 IO stall。
+- **P13 — open 时按需后台 merge**（`{merge_on_open, off|background}`）：open
+  （read_write）后按 `needs_merge` 门控**后台**触发 merge，收拢小文件，不阻塞 open。
+- **P14 — 恢复持久化统一**：
+  - **P14a** checkpoint 命名重构（`.snap→.ckpt`、bm25 `.inv→.seg`/`.inv.wal→.wal`），
+    契约 `{kv|search}.{组件}.{ckpt|seg|wal|manifest}` 文档化。
+  - **P14b/P14e** 单文件分段 `search.ckpt`（逐段 CRC + 页脚目录 + 段级脏位复用 + 代际
+    `.prev` 回退）+ 单趟尾部回放（认 data 文件为唯一 WAL，消 4-way 配对门悬崖、重用率
+    从 0 起来）。写放大 2→1、搜索多文件→1、崩溃后不再全量 fold。
+- **P15 — 全盘字节序统一（小端）+ 迁移工具**：
+  - 全盘统一小端（mmap 读无 bswap、`static_assert` 守护）。
+  - `bitcask.meta` version 1→2，旧 v1 大端目录 open 干净拒绝（fail-loud）。
+  - `migrate_le` 离线迁移工具（data 重编码 + hint 重生成 + meta + field.schema + shadow
+    翻转）；中英文档 [`doc/migrate-le.md`](doc/migrate-le.md) /
+    [`doc/migrate-le-en.md`](doc/migrate-le-en.md)。
+- **libcask 独立库拆分可行性评估**：见
+  [`doc/libcask-extraction-zh.md`](doc/libcask-extraction-zh.md)。
+
+### 变更
+
+- checkpoint 文件后缀全面变更：keydir `.snap→.ckpt`、bm25 `.inv→.seg`/
+  `.inv.wal→.wal`、搜索多文件 → 单个 `search.ckpt`。
+- 磁盘格式字节序从混合（record/hint 大端、向量/snapshot 小端）统一为**全盘小端**。
+  `bitcask.meta` version 从 1 升到 2。
+
+### 不兼容的变化
+
+1. **磁盘格式字节序**：全盘统一小端（meta v2）。旧 v1（大端）目录**不被读取**——
+   需用 [`migrate_le`](doc/migrate-le.md) 工具迁移或从新目录重建。
+2. **checkpoint 文件命名**：`.snap`/`.inv`/`.inv.wal` 后缀废弃，统一为
+   `.ckpt`/`.seg`/`.wal` + `search.ckpt`。旧名不再读（可重建，升级后首次 open 一次
+   全量 fold、close 落新名）。
+
+### 备选项目 gate 结论
+
+- **P7（派生值 compute cache）❌ 不做**：dequant derive 仅 mmap 访问的 1-1.3×，缓存
+  收益微乎其微；highlight 非热路径（仅 `search_text_highlight` 触发），收益面太窄。
+- **P12（meta_blobs_ 有界）❌ 不做**：1M ords 访问 200-300 ns（`shared_lock` + vector
+  copy）、内存 ~280 MB——当前规模可接受；按需读盘会在搜索热路径引入毫秒级 I/O
+  （比当前慢 10000×）。>10M ords 时再评估。
+
+---
+
 ## [2.1.0] — 2026-06-15
 
 引擎的一次彻底 **C++23 重写**（单一 NIF，`priv/bitcask_cpp.so`），把 bitcask 从

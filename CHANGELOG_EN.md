@@ -3,6 +3,86 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.1.1] — 2026-06-17
+
+The first round of **system-level optimizations** after the 2.1.0 C++23 engine —
+focused on the vector-DB memory/disk walls, zero-copy read path, unified recovery
+persistence, and a global endianness normalization. 428 GoogleTests green.
+
+### Added
+
+- **P5 — HNSW int8-only memory mode** (opt-in `{vector_inmem_int8, true}`): drops the
+  resident f32 `vecs`; graph traversal, rerank, and query all operate at int8 (query
+  quantized, VNNI int8×int8). Vector memory **−80% (~5×)** — 1M vectors at dim=2560
+  drops from 12.81 GB to 2.57 GB; cost is ~−3% recall@10 (synthetic 1.0→0.965).
+  Composes orthogonally with P3 on-disk int8. Default stays f32+int8 (recall first).
+- **P6 — sealed-file mmap read path**: sealed (immutable) data files are mmap'd for
+  zero-copy reads — no pread syscall, backed by OS page cache, no double-caching. The
+  active file always uses pread. Merge unlink defers munmap via `shared_ptr<DataFile>`
+  refcount (in-flight readers keep the mapping alive). Disabled on 32-bit.
+  `GetResultView` holds a mapping ref to anchor lifetime.
+- **P8 — HNSW merge-rebuild threshold gating**: gates full graph rebuild on the
+  dead-node ratio (same pattern as P2) — skip rebuild below a threshold (`is_live`
+  filter covers correctness), full rebuild at/above — saves the main merge CPU for
+  vector mode.
+- **P9 — read-handle fd-budget LRU** (`{max_read_handles, N}`): evicts read-only file
+  handles by LRU / count cap, solving the fd-vs-ulimit problem at scale (complements
+  P6's "close fd after mmap"). 0 = unlimited.
+- **P10 — search_hybrid two-leg parallelism**: BM25 and HNSW legs run in parallel on
+  a thread pool, roughly halving hybrid query latency.
+- **P11 — merge I/O sequential tuning**: adds `posix_fadvise(SEQUENTIAL/WILLNEED)` +
+  larger buffers to sequential merge reads/writes, cutting IO stalls.
+- **P13 — on-open on-demand background merge** (`{merge_on_open, off|background}`):
+  after open (read_write), gates on `needs_merge` and triggers merge **in the
+  background** (never blocks open), consolidating small files.
+- **P14 — recovery persistence unification**:
+  - **P14a** checkpoint naming refactor (`.snap→.ckpt`, bm25 `.inv→.seg`/
+    `.inv.wal→.wal`); contract `{kv|search}.{component}.{ckpt|seg|wal|manifest}`
+    documented.
+  - **P14b/P14e** single-file segmented `search.ckpt` (per-segment CRC + footer
+    directory + segment-level dirty-flag reuse + generational `.prev` fallback) +
+    single-pass tail replay (data files are the sole WAL; eliminates the 4-way
+    pairwise-gate cliff, lifts replay reuse from ~0). Write amplification 2→1,
+    search files 5→1, no more full fold after crash.
+- **P15 — global endianness unification (little-endian) + migration tool**:
+  - Unified all on-disk formats to little-endian (mmap reads with zero bswap;
+    `static_assert` guarded).
+  - `bitcask.meta` version 1→2; legacy v1 (big-endian) dirs are cleanly rejected
+    (fail-loud).
+  - `migrate_le` offline migration tool (data re-encode + hint regenerate + meta +
+    field.schema + shadow flip); bilingual docs
+    [`doc/migrate-le-en.md`](doc/migrate-le-en.md) / [`doc/migrate-le.md`](doc/migrate-le.md).
+- **libcask extraction feasibility assessment**: see
+  [`doc/libcask-extraction-zh.md`](doc/libcask-extraction-zh.md).
+
+### Changed
+
+- Checkpoint file suffixes globally renamed: keydir `.snap→.ckpt`, bm25
+  `.inv→.seg`/`.inv.wal→.wal`, search multi-file → single `search.ckpt`.
+- On-disk endianness changed from mixed (record/hint big-endian, vectors/snapshots
+  little-endian) to **uniform little-endian**. `bitcask.meta` version bumped 1→2.
+
+### Breaking changes
+
+1. **On-disk endianness**: unified little-endian (meta v2). Legacy v1 (big-endian)
+   dirs are **not read** — use the [`migrate_le`](doc/migrate-le-en.md) tool or start
+   from a fresh directory.
+2. **Checkpoint file naming**: `.snap`/`.inv`/`.inv.wal` suffixes are retired,
+   replaced by `.ckpt`/`.seg`/`.wal` + `search.ckpt`. Old names are no longer read
+   (rebuildable; first open after upgrade does one full fold, close writes new names).
+
+### Candidate gate results
+
+- **P7 (derived-value compute cache) ❌ rejected**: dequant derive is only 1-1.3×
+  mmap access — negligible cache benefit; highlight is not a hot path (only triggered
+  by `search_text_highlight`), too narrow a win.
+- **P12 (meta_blobs_ bounded) ❌ rejected**: at 1M ords, access is 200-300 ns
+  (`shared_lock` + vector copy), memory ~280 MB — acceptable at current scale; on-demand
+  disk reads would introduce millisecond-level I/O on the search hot path (10000× slower).
+  Revisit at >10M ords.
+
+---
+
 ## [2.1.0] — 2026-06-15
 
 A ground-up **C++23 rewrite** of the engine (single NIF, `priv/bitcask_cpp.so`)
