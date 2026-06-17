@@ -124,12 +124,18 @@ public:
     // ——后者在写者 mid-insert 时可能领先于 count 发布,照抄会让重开后的
     // 水位幂等错杀该文档的尾部回放。静止点(close/merge flush 后)两者相等。
     [[nodiscard]] bool save(std::string_view path) const;
+    // P14e:序列化到字节缓冲(供 search.ckpt 分段嵌入);返回 false 同 save
+    // 的"活跃 fold/不一致"放弃。盘字节与 save() 完全一致(自带 BCVS 框架)。
+    [[nodiscard]] bool serialize(std::vector<std::uint8_t>& out) const;
     // load:仅 open 期单线程调用(空图上,不可与任何读写并发)。校验:
     // config(dim/metric/M)一致、邻居/entry id < count、level/cnt 不超容、
     // ord 严格递增、邻居层数覆盖(layer-l 表只允许 level ≥ l 的节点,防
     // copy_neighbors 越块读)——任何违例**整体拒绝**返回 false(本实例
     // 报废,调用方弃之换全量 fold;绝不半载示人)。
     [[nodiscard]] bool load(std::string_view path);
+    // P14e:从字节缓冲反序列化(search.ckpt 段)。语义同 load:仅空图调用,
+    // 任何校验违例整体拒绝返回 false。
+    [[nodiscard]] bool deserialize(std::span<const std::uint8_t> bytes);
 
 private:
     static constexpr std::uint32_t kChunkBits = 16;

@@ -893,7 +893,7 @@ void vs_put64(std::vector<std::uint8_t>& b, std::uint64_t v) {
 
 }  // namespace
 
-bool HnswIndex::save(std::string_view path) const {
+bool HnswIndex::serialize(std::vector<std::uint8_t>& buf) const {
     // 读者协议快照:entry 先于 count(同 search;entry 发布 happens-after
     // 其 count 发布)。n 之后追加的节点/反向边一律不进本快照。
     const std::uint64_t em = entry_meta_.load(std::memory_order_acquire);
@@ -903,7 +903,7 @@ bool HnswIndex::save(std::string_view path) const {
         return false;
     }
 
-    std::vector<std::uint8_t> buf;
+    buf.clear();
     buf.reserve(64 + static_cast<std::size_t>(n) *
                          (16 + static_cast<std::size_t>(cfg_.dim) * 4 +
                           (1 + cfg_.M * 2) * 4));
@@ -962,7 +962,12 @@ bool HnswIndex::save(std::string_view path) const {
     const std::uint32_t crc = bitcask::codec::crc32(std::span<const std::byte>(
         reinterpret_cast<const std::byte*>(buf.data() + 8), buf.size() - 8));
     vs_put32(buf, crc);
+    return true;
+}
 
+bool HnswIndex::save(std::string_view path) const {
+    std::vector<std::uint8_t> buf;
+    if (!serialize(buf)) return false;
     const std::string fp(path);
     const std::string tmp = fp + ".tmp";
     std::FILE* f = std::fopen(tmp.c_str(), "wb");
@@ -977,30 +982,34 @@ bool HnswIndex::save(std::string_view path) const {
 }
 
 bool HnswIndex::load(std::string_view path) {
-    // open 期单线程(本实例尚未发布给任何读者)——成员虽是 atomic,直填
-    // relaxed 即可;对外可见性由调用方的发布点(shared_ptr atomic store /
-    // count_ release)建立。
-    assert(count_.load(std::memory_order_relaxed) == 0 &&
-           "HnswIndex::load: 仅限空图(open 期)调用");
-
-    // 防御性释放残留 chunk:契约要求空图调用,但失败后在同一实例重试 load,
-    // 下方分配循环会覆盖旧 chunk 指针而泄漏(assert 在 release 被编译掉)。
-    // open 期单线程,relaxed 即可(发布序见上方注释)。
-    for (auto& slot : chunks_) {
-        delete slot.exchange(nullptr, std::memory_order_relaxed);
-    }
-
     std::FILE* f = std::fopen(std::string(path).c_str(), "rb");
     if (!f) return false;
     std::fseek(f, 0, SEEK_END);
     const long fsz = std::ftell(f);
     std::fseek(f, 0, SEEK_SET);
-    // 最小:magic+ver+header(39)+crc。
-    if (fsz < 51) { std::fclose(f); return false; }
+    if (fsz < 0) { std::fclose(f); return false; }
     std::vector<std::uint8_t> buf(static_cast<std::size_t>(fsz));
     const bool rd = std::fread(buf.data(), 1, buf.size(), f) == buf.size();
     std::fclose(f);
     if (!rd) return false;
+    return deserialize(buf);
+}
+
+bool HnswIndex::deserialize(std::span<const std::uint8_t> buf) {
+    // open 期单线程(本实例尚未发布给任何读者)——成员虽是 atomic,直填
+    // relaxed 即可;对外可见性由调用方的发布点(shared_ptr atomic store /
+    // count_ release)建立。
+    assert(count_.load(std::memory_order_relaxed) == 0 &&
+           "HnswIndex::deserialize: 仅限空图(open 期)调用");
+
+    // 防御性释放残留 chunk:契约要求空图调用,但失败后在同一实例重试,
+    // 下方分配循环会覆盖旧 chunk 指针而泄漏(assert 在 release 被编译掉)。
+    for (auto& slot : chunks_) {
+        delete slot.exchange(nullptr, std::memory_order_relaxed);
+    }
+
+    // 最小:magic+ver+header(39)+crc。
+    if (buf.size() < 51) return false;
 
     auto rd32at = [&](std::size_t off) {
         std::uint32_t v;
