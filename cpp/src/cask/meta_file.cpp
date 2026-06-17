@@ -20,7 +20,10 @@ inline constexpr std::size_t kMetaVecQuantOffset  = 9;  // P3b：u8 0/1（旧文
 inline constexpr std::size_t kMetaVecInmemInt8Offset = 10;  // P5b：u8 0/1（旧文件全零=否）
 inline constexpr std::size_t kMetaFileSize = kMetaMagicSize + 1 + 1 + kMetaReservedSize;  // 18 bytes
 
-inline constexpr std::uint8_t kMetaVersion = 1;
+// v1 = 大端纪元(legacy);v2 = 小端 flag-day 起。bump 到 2 后,旧大端目录
+// (meta version 1)在 open 时被干净拒绝,而非静默把大端字节读成小端 → 全 record
+// CRC 失败 → 恢复成空库的危险路径。见 doc/format-zh.md 字节序说明。
+inline constexpr std::uint8_t kMetaVersion = 2;
 inline constexpr char kMetaMagic[kMetaMagicSize + 1] = "BCME";
 
 }  // namespace
@@ -49,6 +52,13 @@ std::expected<MetaConfig, MetaError> read_meta(std::string_view dirname) {
 
     const std::uint8_t ver = static_cast<std::uint8_t>(header[kMetaVersionOffset]);
     if (ver != kMetaVersion) {
+        // v1 = 大端 legacy 格式;v2 起为小端(flag-day)。旧目录在此干净拒绝,
+        // 提示重建——绝不静默把大端字节按小端读坏。
+        if (ver == 1) {
+            return std::unexpected(MetaError{0,
+                "incompatible legacy big-endian format (meta v1); "
+                "little-endian flag-day requires rebuild — re-ingest data"});
+        }
         return std::unexpected(MetaError{0, "unsupported meta version"});
     }
 
