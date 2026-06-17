@@ -17,6 +17,7 @@ inline constexpr std::size_t kMetaReservedSize = 12;
 inline constexpr std::size_t kMetaVecMetricOffset = 6;
 inline constexpr std::size_t kMetaVecDimOffset    = 7;  // u16 LE
 inline constexpr std::size_t kMetaVecQuantOffset  = 9;  // P3b：u8 0/1（旧文件全零=否）
+inline constexpr std::size_t kMetaVecInmemInt8Offset = 10;  // P5b：u8 0/1（旧文件全零=否）
 inline constexpr std::size_t kMetaFileSize = kMetaMagicSize + 1 + 1 + kMetaReservedSize;  // 18 bytes
 
 inline constexpr std::uint8_t kMetaVersion = 1;
@@ -72,6 +73,8 @@ std::expected<MetaConfig, MetaError> read_meta(std::string_view dirname) {
     }
     cfg.vector_quantized =
         static_cast<std::uint8_t>(header[kMetaVecQuantOffset]) != 0;
+    cfg.vector_inmem_int8 =
+        static_cast<std::uint8_t>(header[kMetaVecInmemInt8Offset]) != 0;
     return cfg;
 }
 
@@ -88,6 +91,8 @@ std::expected<void, MetaError> write_meta(std::string_view dirname, const MetaCo
         static_cast<char>(config.vector_metric);
     std::memcpy(header + kMetaVecDimOffset, &config.vector_dim, 2);
     header[kMetaVecQuantOffset] = static_cast<char>(config.vector_quantized ? 1 : 0);
+    header[kMetaVecInmemInt8Offset] =
+        static_cast<char>(config.vector_inmem_int8 ? 1 : 0);
     header[kMetaVersionOffset] = static_cast<char>(kMetaVersion);
     header[kMetaModeOffset] = static_cast<char>(
         config.mode == Mode::kKV ? 0 : 1);

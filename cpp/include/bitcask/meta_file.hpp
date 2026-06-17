@@ -44,6 +44,7 @@ struct MetaConfig {
     VectorMetric vector_metric = VectorMetric::kNone;
     std::uint16_t vector_dim = 0;   // 0 = 无向量
     bool vector_quantized = false;  // P3b：向量落盘 int8 量化（仅 vector_dim>0 有意义）
+    bool vector_inmem_int8 = false; // P5b：HNSW int8-only 内存模式（仅 vector_dim>0 + kDot）
 };
 
 // meta 文件操作错误
