@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <random>
 #include <thread>
 #include <vector>
@@ -216,6 +217,67 @@ TEST(VectorQuant, Int8OnlyMemoryAndRecall) {
     RecordProperty("recall_f32", std::to_string(r_f32));
     RecordProperty("recall_int8only", std::to_string(r_int8));
     EXPECT_GT(r_int8, 0.90) << "int8-only recall@10 = " << r_int8;  // 实测 0.9675
+}
+
+// P5a:真实 inmem_int8 模式(非模拟)——用 cfg.inmem_int8 建图 + 查询,
+// 召回须接近模拟预期;并验证 BCVS save/load round-trip 后结果一致。
+TEST(VectorQuant, Int8OnlyRealModeRecallAndRoundtrip) {
+    const std::size_t n = 3000, dim = 768, nq = 40, k = 10, ef = 64, nc = 50;
+    auto base    = make_clustered(n,  dim, nc, 0.5f, 0xCE57, 0xBA5E);
+    auto queries = make_clustered(nq, dim, nc, 0.5f, 0xCE57, 0xC0DE);
+
+    auto build = [&](bool inmem_int8) {
+        HnswConfig cfg;
+        cfg.dim = static_cast<std::uint16_t>(dim);
+        cfg.metric = HnswMetric::kDot;
+        cfg.inmem_int8 = inmem_int8;
+        auto idx = std::make_unique<HnswIndex>(cfg);
+        for (std::size_t i = 0; i < n; ++i) {
+            idx->insert(i, std::span<const float>(base.data() + i * dim, dim));
+        }
+        return idx;
+    };
+    auto recall_of = [&](HnswIndex& idx) {
+        std::size_t hit = 0;
+        for (std::size_t qi = 0; qi < nq; ++qi) {
+            const float* q = queries.data() + qi * dim;
+            auto truth = brute_topk(base, n, dim, q, k);
+            auto got = idx.search(std::span<const float>(q, dim), k, ef);
+            for (const auto& h : got) {
+                if (std::find(truth.begin(), truth.end(), h.ord) != truth.end()) {
+                    ++hit;
+                }
+            }
+        }
+        return static_cast<double>(hit) / static_cast<double>(nq * k);
+    };
+
+    auto f32  = build(false);
+    auto i8o  = build(true);
+    const double r_f32 = recall_of(*f32);
+    const double r_i8o = recall_of(*i8o);
+    std::printf("[int8-only real] recall@10 ef64: f32=%.4f  inmem_int8=%.4f\n",
+                r_f32, r_i8o);
+    RecordProperty("recall_inmem_int8_real", std::to_string(r_i8o));
+    // 真实 int8-only 还量化 query(模拟测试未含),召回略低于 0.9675;红线 0.85。
+    EXPECT_GT(r_i8o, 0.85) << "real inmem_int8 recall@10 = " << r_i8o;
+
+    // BCVS round-trip:save int8-only 图 → load 进新的 int8-only 图 → 结果一致。
+    const auto path =
+        (std::filesystem::temp_directory_path() / "bitcask_i8o_roundtrip.bcvs")
+            .string();
+    ASSERT_TRUE(i8o->save(path));
+    HnswConfig cfg;
+    cfg.dim = static_cast<std::uint16_t>(dim);
+    cfg.metric = HnswMetric::kDot;
+    cfg.inmem_int8 = true;
+    HnswIndex reloaded(cfg);
+    ASSERT_TRUE(reloaded.load(path));
+    EXPECT_EQ(reloaded.size(), i8o->size());
+    const double r_reload = recall_of(reloaded);
+    EXPECT_NEAR(r_reload, r_i8o, 0.02)
+        << "reload recall " << r_reload << " vs in-mem " << r_i8o;
+    std::filesystem::remove(path);
 }
 
 // P3c 召回测量（dim=2560，与部署 qwen3-embedding 同维）。阈值是回归红线，
