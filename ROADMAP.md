@@ -8,7 +8,7 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ## 2.1.1 规划
 
-围绕**向量库的内存 / 磁盘瓶颈**与**读路径**的三项优化。
+围绕**向量库的内存 / 磁盘瓶颈**、**读路径**与**恢复持久化**的一组优化（P5–P15）。
 
 ### P5 — HNSW int8-only 内存模式 ✅
 
@@ -60,8 +60,9 @@ recovery/merge/迭代器 pin 传 `mmap_enabled=false`）；**P6b** merge unlink 
 持 view 跨 merge unlink 仍读、**ASAN(address+leak)全过**；**P6c** `GetResultView` 持映射
 `shared_ptr` 锚定 + 32 位禁用 ✅。416 测试通过。
 **偏差（诚实）**：① **不 close fd**——保留 fd 让 `read()`/`fold()` 的 pread 在 mmapped 句柄上
-可用（迭代器/恢复要走）；fd 回收（close+munmap 统一驱逐）归 **P9**。② `mmap_limit`（映射数/
-字节上限 + 超额回退 pread）**未做**——与 P9 read-handle LRU 同款驱逐机制，合并到 P9 一起做。
+可用（迭代器/恢复要走）；fd/mmap 回收（驱逐时随句柄析构 close+munmap）**已由 P9 兜住**。
+② `mmap_limit` 按映射**数**的上限**已由 P9 `max_read_handles` 实现**（每句柄 = 1 fd + 可能 1 映射）；
+按**字节**的上限仍未做（备选）。
 
 ### P7 — 派生值 compute cache（建在 mmap 之上）⚠️ 备选
 
@@ -93,6 +94,16 @@ merge 现**无条件全量重建 HNSW 图**（重插所有 live 向量）；但�
 
 `read_files_`（只读文件句柄）每文件常驻一个 fd、**无淘汰** → 大库读过多文件**撞 ulimit**。
 改为按 LRU / 数量上限淘汰只读句柄（与 P6「mmap 后 close fd」互补）。
+
+**状态 ✅（落地）**：`read_files_` 值改为 `ReadHandle{shared_ptr<DataFile> + atomic atime}`；
+命中在共享锁下置 `atime`（近似 LRU，零锁升级）；miss 在独占锁下 `try_emplace` 后
+`evict_read_handles_locked()`——超 `max_read_handles` 时淘汰 `atime` 最旧的**空闲
+(use_count==1)** 句柄，**在途读者持 shared_ptr 续命**（fd/mmap 随最后引用析构才释放，同
+O10/merge-unlink）。选项 `{max_read_handles, N}`（0=不限，NIF + erl 透传）。**一并兜住 P6
+延后的 fd 回收 + mmap 数上限**：每个缓存句柄 = 1 fd（+ 可能 1 映射），cap 即同时限两者。
+测试 `P9ReadHandleCapEvictsAndRereads`（>cap 文件后常驻 ≤ cap、淘汰后重读正确、cap=0 不限），
+420 测试通过 + ASAN 全过。**偏差**：`mmap_limit` 按**字节**的上限未做（按句柄数的 cap 已足够
+控两者；字节级留备选）。
 
 ### P10 — search_hybrid 两路并行 ✅
 
@@ -152,6 +163,31 @@ fold 尾部回放」。后缀编码契约（`.ckpt`/`.wal`/`.seg`/`.manifest`）
 可选加速缓存，缺失从 keydir⋈postings+fold 派生）+ 代际 `search.ckpt.prev`（与 cellar 全面收敛于路线 A；见设计文档 §10）。
 **收益**：命名契约清晰 · 写放大 2→1 · 文件数大降（搜索多文件→1）· 损坏隔离到段 · 崩溃后不再全量 fold。
 
+### P15 — 字节序统一（全盘小端）+ 大端目录迁移 ✅
+
+> 详细设计：[`doc/format-zh.md`](doc/format-zh.md)（字节序说明 + §十 checkpoint 格式）、
+> [`doc/migrate-le.md`](doc/migrate-le.md) / [`doc/migrate-le-en.md`](doc/migrate-le-en.md)（迁移工具）。
+> 路线图外插入项（从字节序审计衍生），已落地。
+
+**问题**：盘格式字节序**二分**——核心 record/hint/field.schema/墓碑 shadow 为**大端**（对齐
+legacy Erlang `<<X:N>>`），而向量/各 snapshot/meta/bm25 为**小端**。大端字段每次从 mmap 读都要
+bswap，与 P6 零拷贝方向相悖；且"靠 native memcpy 碰巧 LE"非显式规范。
+
+**方案（flag-day）**：全盘统一**小端**（LE-only 主机原生零转换 + mmap 零拷贝友好），不留读大端
+路径；旧大端目录**干净拒绝**而非静默读坏；提供离线迁移工具。
+
+**子任务**（均已落地，419 测试通过 + ASAN/Erlang 编译过）：
+- **P15a** ✅ 全盘 LE:`codec` 的 `be_*→le_*`(record + hint)、`data_file`/`hint_file` 手写字节序读点、
+  `field.schema` NameLen、墓碑 v2 shadow file_id、`format.hpp`/`format-zh.md` 规范注释;golden 测试翻 LE
+  （含修复 hint fold 在 LE 下漏读 key_sz 的真 bug）。
+- **P15b** ✅ 护栏:`bitcask.meta` version `1→2`,旧 v1(大端)目录 open 时干净报错"需重建"
+  （`LegacyV1MetaRejectedCleanly`）。
+- **P15c** ✅ 迁移工具 `migrate_le <src> <dst>`（非破坏性;data 重编码 + hint 重生成 + meta v1→2 +
+  field.schema + shadow 翻转;ckpt/seg/wal 不迁移、首开重建）+ 中英文档 + round-trip 测试。
+
+**收益**：字节序规范统一显式（`static_assert` 守护）· mmap 读无 bswap · 旧目录 fail-loud 不静默坏 ·
+有迁移路径不丢数据。**红线**:旧大端数据须迁移或重建,新代码不读 v1。
+
 ---
 
 ## 开发顺序（2.1.1，重拍）
@@ -160,6 +196,8 @@ fold 尾部回放」。后缀编码契约（`.ckpt`/`.wal`/`.seg`/`.manifest`）
 > ⚠️ 备选项一律压到其依赖满足之后、波次末尾。
 
 - **W0 清债（立即，零风险）**：**P14a** 纯重命名——独立可上线，当场消除命名混乱，不阻塞任何项。
+- **W0.5 字节序统一（跨切面，已落地）**：**P15** 全盘小端 + meta v2 护栏 + `migrate_le`。逻辑上应早于 W2
+  （mmap 零拷贝要求盘序=主机序），本轮已随手完成；旧大端目录走迁移/重建。
 - **W1 内存墙（独立 headline）**：**P5** HNSW int8-only（向量内存 −80%，已实测，无外部依赖）。
 - **W2 读路径地基**：**P6** sealed mmap → **P9** read fd LRU（P6「mmap 后 close fd」的互补，紧随）。
 - **W3 恢复核心**：**P14b** 单趟回放——fold sealed 文件时直接吃 W2 的 mmap；消门悬崖、抬重用率。
