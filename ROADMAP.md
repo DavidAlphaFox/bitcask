@@ -113,6 +113,46 @@ sealed + 新 active。复用现有 merge 全套，主要是触发接线 + `{merg
 **方案 B（备选）**：open 复用上一个未满 sealed 文件续写——从源头止小文件，但需 un-seal、
 破坏 sealed 不可变（与 P6 冲突）、invasive，故仅备选。
 
+### P14 — 恢复持久化统一：checkpoint 命名 + 单趟尾部回放 ✅
+
+> 详细设计：[`doc/recovery-unified-checkpoint-design-zh.md`](doc/recovery-unified-checkpoint-design-zh.md)
+
+**三个痛点**：① `.snap` 后缀盖在裸 checkpoint（keydir/index/hnsw）与 checkpoint+WAL（bm25）
+两种契约上，命名混乱；② **双重日志**——一次搜索 put 既写 data 文件（本身已是带 ord 的全量
+WAL），又追加 bm25 WAL，写放大 2；③ **重用率 ≈ 0**——checkpoint 仅 close/merge 落盘，崩溃后
+成对门按最弱环判定 → 全量 fold，bm25 WAL 形同白记。
+
+**方案（路线 A）**：认 **data 文件为唯一 WAL**，所有派生索引统一「周期性 checkpoint + open 单趟
+fold 尾部回放」。后缀编码契约（`.ckpt`/`.wal`/`.seg`/`.manifest`），`index→docmap` 去歧义。
+回放下界取**各块水位最小值 wm_min**，一趟 fold 同时喂 keydir/docmap/bm25/hnsw——成对门从
+「最弱环→全量 fold 悬崖」降为「从 wm_min 多读点尾巴」，这是重用率从 0 起来的机理。
+
+**子阶段**：**P14a** 纯重命名 + 契约文档化（零格式/逻辑变更、旧名兼容读）；
+**P14b** wm_min 单趟回放（替双轨 + 消门悬崖）；**P14c** 周期性 checkpoint（`checkpoint_interval`
++ worker 静止窗口）；**P14d** 摘 bm25 WAL（profiling 驱动决定是否留 `terms` 纯缓存）。
+**收益**：命名契约清晰 · 写放大 2→1 · 稳态文件数减少（无 `.wal`）· 崩溃后不再全量 fold。
+
+---
+
+## 开发顺序（2.1.1，重拍）
+
+> P 编号是**标识符不是顺序**。下列波次按**依赖 + 风险 + 收益**排，波内可并行，
+> ⚠️ 备选项一律压到其依赖满足之后、波次末尾。
+
+- **W0 清债（立即，零风险）**：**P14a** 纯重命名——独立可上线，当场消除命名混乱，不阻塞任何项。
+- **W1 内存墙（独立 headline）**：**P5** HNSW int8-only（向量内存 −80%，已实测，无外部依赖）。
+- **W2 读路径地基**：**P6** sealed mmap → **P9** read fd LRU（P6「mmap 后 close fd」的互补，紧随）。
+- **W3 恢复核心**：**P14b** 单趟回放——fold sealed 文件时直接吃 W2 的 mmap；消门悬崖、抬重用率。
+- **W4 merge**：**P8** HNSW merge 门控 + **P11** merge I/O（同 merge 主题、捆绑）→ **P13** open 后台 merge。
+- **W5 周期 checkpoint + 去 WAL**：**P14c** 周期 checkpoint（触发点对齐 W4 的 merge/open-merge 时机）
+  → **P14d** 摘 bm25 WAL（依赖 P14b 回放已验证）。
+- **W6 查询（顺序无关，可浮动）**：**P10** search_hybrid 两路并行（独立，任意波次可插）。
+- **W7 备选（gate 后置）**：**P7** 派生值 compute cache（依赖 P6）⚠️ · **P12** meta_blobs 有界（filter 热路径）⚠️。
+
+**关键依赖边**：P7→P6 · P9↔P6 · P14b 受益于 P6 · P14c 对齐 P8/P13 的 merge 时机 · P14d 依赖 P14b。
+**为何 P14 拆两段**：P14b（恢复模型）须先于 merge 改动，给 P8/P13 一个干净的回放语义；
+P14c（周期 checkpoint）须**后于** P8/P13——它把 checkpoint 触发挂在 merge/open-merge 静止点上。
+
 ---
 
 ## 已落地（2.1.0，持久化优化 P1–P4）
