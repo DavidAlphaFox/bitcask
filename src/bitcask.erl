@@ -60,7 +60,7 @@
 %% cask_cpp NIF 能识别的选项白名单。Opts 里其它键会被静默丢弃
 %% （legacy 时代就是这个语义，新代码沿用以免破坏现有调用方）。
 -define(CASK_PASSTHROUGH_OPTS, [
-    expiry_secs, max_file_size,
+    expiry_secs, max_file_size, max_read_handles,
     sync_strategy,
     tombstone_version,
     frag_merge_trigger, dead_bytes_merge_trigger,
@@ -85,6 +85,8 @@ open(Dirname) -> open(Dirname, []).
 %%     read_write           — 写权限；竞争 bitcask.write.lock
 %%     {expiry_secs, N}     — N 秒前的 entry 视作过期
 %%     {max_file_size, N}   — 写满 N 字节切下一个 active data file
+%%     {max_read_handles, N}— read 句柄缓存上限（0=不限，默认）；超额按近似 LRU
+%%                            淘汰空闲只读句柄，控 fd / mmap 数（大库防撞 ulimit；P9）
 %%     {sync_strategy, X}   — none（默认，靠 OS 刷盘）| o_sync（每条写 durable）
 %%                            | {puts, N}（单写者组提交：每 N 次写 fsync 一次）
 %%     {tombstone_version, V} — 1 或 2，控制墓碑编码（默认 2）

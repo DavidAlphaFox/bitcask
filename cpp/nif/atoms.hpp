@@ -37,6 +37,7 @@ struct Atoms {
     ERL_NIF_TERM read_write;
     ERL_NIF_TERM merge_only;
     ERL_NIF_TERM max_file_size;
+    ERL_NIF_TERM max_read_handles;  // P9：read 句柄缓存上限
     ERL_NIF_TERM expiry_secs;
     ERL_NIF_TERM sync_strategy;
     ERL_NIF_TERM tombstone_version;

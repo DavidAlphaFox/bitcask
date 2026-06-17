@@ -118,6 +118,10 @@ void parse_2tuple_option(ErlNifEnv* env, const ERL_NIF_TERM* tup, CaskOptions& o
         o.read_write = (val == atoms().atom_true);
     } else if (key == atoms().max_file_size) {
         opt_u64(env, val, &o.max_file_size);
+    } else if (key == atoms().max_read_handles) {
+        // P9:read 句柄缓存上限(0=不限)。
+        std::uint64_t n = 0;
+        if (opt_u64(env, val, &n)) o.max_read_handles = static_cast<std::size_t>(n);
     } else if (key == atoms().expiry_secs) {
         opt_u32_min(env, val, 1, &o.expiry_secs);
     } else if (key == atoms().tombstone_version) {
