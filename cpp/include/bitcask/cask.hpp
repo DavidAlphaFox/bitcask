@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <expected>
 #include <memory>
@@ -53,6 +54,7 @@ namespace keydir { class KeyDirRegistry; }
 struct CaskOptions {
     bool          read_write       = false;
     std::uint64_t max_file_size    = 2ULL * 1024ULL * 1024ULL * 1024ULL;  // 2 GiB
+    std::size_t   max_read_handles = 0;  // P9：read 句柄缓存上限（0=不限）；超额近似 LRU 淘汰空闲句柄，控 fd/mmap 数
     bool          o_sync           = false;
     // P4 单写者组提交：每 N 次写（put/remove）后对 active data file fsync 一次，
     // 兼顾持久性与吞吐（区别于 o_sync 的每条 durable）。0 = 关闭（默认）。
@@ -314,6 +316,10 @@ public:
     [[nodiscard]] std::expected<GetResult, CaskFault>
     get_owned(std::span<const std::byte> key);
 
+    /// P9:当前常驻的 read 句柄数（read_files_ 大小）。内省用（测试断言 fd
+    /// 预算上限生效）。线程安全：共享锁读。
+    [[nodiscard]] std::size_t read_handle_count() const;
+
     // 写入。tstamp=0 表示用当前 wall-clock 秒。
     // 线程安全: 否（写路径要求「一个 Cask 同时只有一个写线程」——M5 通过
     // 「一个 Erlang 进程独占一个 Cask」实现，本类不提供互斥）。
@@ -483,11 +489,20 @@ private:
     // 按 file_id 缓存的 DataFile 读句柄。read 路径懒打开。
     // 多读者并发，read_cache_mu_ 保护 unordered_map 本身；DataFile 内部
     // 的 pread 是 thread-safe 的。
-    std::shared_mutex read_cache_mu_;  // 命中走共享锁;lazy open/清理走独占
-    // 值用 shared_ptr:read_file 返回的句柄在锁外被使用,merge 清理
-    // erase 时在途读者靠引用计数 pin 住对象(修 UAF,O10)。
-    std::unordered_map<std::uint32_t,
-                        std::shared_ptr<fileops::DataFile>> read_files_;
+    mutable std::shared_mutex read_cache_mu_;  // 命中走共享锁;lazy open/清理走独占（const 内省也需锁）
+    // P9:近似 LRU read 句柄缓存。值含 atime(命中在共享锁下置位,近似 LRU);
+    // 超 opts_.max_read_handles 时在独占锁下淘汰最旧的**空闲**(use_count==1)
+    // 句柄——在途读者持 shared_ptr 续命,fd/mmap 随最后引用析构才释放(与
+    // O10/merge-unlink 同模式)。atomic atime 非可移/拷,unordered_map 节点
+    // 稳定(rehash 不移动节点),emplace 原地构造即可。
+    struct ReadHandle {
+        std::shared_ptr<fileops::DataFile> df;
+        mutable std::atomic<std::uint64_t> atime{0};
+        ReadHandle(std::shared_ptr<fileops::DataFile> d, std::uint64_t a)
+            : df(std::move(d)), atime(a) {}
+    };
+    std::unordered_map<std::uint32_t, ReadHandle> read_files_;
+    std::atomic<std::uint64_t> read_clock_{0};  // 近似 LRU 单调访问计数
 
     // 目录锁。read_write 模式下是 bitcask.write.lock（live writer 持有），
     // merge_only 模式下是 bitcask.merge.lock（merger 跟 writer 并行）。
@@ -535,6 +550,9 @@ public:
     [[nodiscard]] std::expected<void, CaskFault> roll_active();
     [[nodiscard]] std::shared_ptr<fileops::DataFile>
     read_file(std::uint32_t file_id);
+    // P9：read_files_ 超 max_read_handles 时淘汰最旧空闲句柄。
+    // 调用方须已持 read_cache_mu_ 独占锁。
+    void evict_read_handles_locked();
 
     // ---- open() 拆分出来的私有阶段 ----
 

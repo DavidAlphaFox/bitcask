@@ -1072,7 +1072,14 @@ std::shared_ptr<fileops::DataFile> Cask::read_file(std::uint32_t file_id) {
     {
         std::shared_lock lk(read_cache_mu_);
         auto it = read_files_.find(file_id);
-        if (it != read_files_.end()) return it->second;
+        if (it != read_files_.end()) {
+            // P9:命中置 atime(近似 LRU)。atomic store 在共享锁下安全
+            // (不改 map 结构);多读者并发 store 无 race。
+            it->second.atime.store(
+                read_clock_.fetch_add(1, std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            return it->second.df;
+        }
         if (active_data_ && file_id == active_file_id_) {
             return active_data_;
         }
@@ -1081,7 +1088,7 @@ std::shared_ptr<fileops::DataFile> Cask::read_file(std::uint32_t file_id) {
     std::unique_lock lk(read_cache_mu_);
     // 双检:释放共享锁到拿独占锁之间可能有人已 open。
     auto it = read_files_.find(file_id);
-    if (it != read_files_.end()) return it->second;
+    if (it != read_files_.end()) return it->second.df;
 
     // active writer 也能给自己当 reader 用——pread 不影响 append 写入位置。
     if (active_data_ && file_id == active_file_id_) {
@@ -1092,8 +1099,40 @@ std::shared_ptr<fileops::DataFile> Cask::read_file(std::uint32_t file_id) {
     auto df = fileops::DataFile::open(path, fileops::DataFile::Mode::kRead);
     if (!df) return nullptr;
     auto sp = std::make_shared<fileops::DataFile>(std::move(*df));
-    read_files_.emplace(file_id, sp);
+    read_files_.try_emplace(
+        file_id, sp, read_clock_.fetch_add(1, std::memory_order_relaxed));
+    // P9:刚插入的 sp 本地仍持有(use_count==2)→ 淘汰会跳过它(只淘空闲)。
+    evict_read_handles_locked();
     return sp;
+}
+
+std::size_t Cask::read_handle_count() const {
+    std::shared_lock lk(read_cache_mu_);
+    return read_files_.size();
+}
+
+// P9:read_files_ 超 max_read_handles 时,淘汰 atime 最旧的**空闲**句柄
+// (use_count==1:仅 map 持有,无在途读者)。在途句柄(use_count>1)跳过——
+// 其 fd 正被使用,erase 也不能立即释放,留到下次;故 cap 是软上限。
+// 调用方须持 read_cache_mu_ 独占锁。
+void Cask::evict_read_handles_locked() {
+    const std::size_t cap = opts_.max_read_handles;
+    if (cap == 0 || read_files_.size() <= cap) return;
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> idle;  // {atime,file_id}
+    idle.reserve(read_files_.size());
+    for (auto& [fid, h] : read_files_) {
+        if (h.df.use_count() == 1) {
+            idle.emplace_back(h.atime.load(std::memory_order_relaxed), fid);
+        }
+    }
+    const std::size_t over = read_files_.size() - cap;
+    if (idle.size() <= over) {
+        for (auto& [at, fid] : idle) read_files_.erase(fid);  // 全部空闲都淘汰
+        return;
+    }
+    std::partial_sort(idle.begin(), idle.begin() + static_cast<std::ptrdiff_t>(over),
+                      idle.end());
+    for (std::size_t i = 0; i < over; ++i) read_files_.erase(idle[i].second);
 }
 
 // ---- 搜索 / 写入共用辅助 ---------------------------------------------------
