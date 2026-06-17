@@ -6,7 +6,37 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
-## 2.1.1 规划
+## 2.2.0 规划
+
+### libcask 独立库拆分 ✅
+
+> 可行性评估：[`doc/libcask-extraction-zh.md`](doc/libcask-extraction-zh.md)
+
+将 C++ 非 NIF 核心（`cpp/src/` + `cpp/include/`，24 源文件 + 45 头文件）独立为
+`libcask.so` / `libcask.a`，当前 Erlang 项目仅保留 NIF 胶水层（`cpp/nif/`）依赖之。
+
+现有架构已具备分离条件：
+- C++ 核心零 `erl_nif.h` 依赖、零 `enif_*` 调用
+- 构建系统已模块化（11 个 static library，`cpp/CMakeLists.txt` 支持独立构建）
+- 耦合单向且极薄（NIF → C++，无反向调用；唯一桥接是 `CaskHandle { unique_ptr<Cask> }`）
+
+**路径 A（C++ API 直出，推荐）**：导出 C++ 类，NIF 层直接 include，改动最小，保留 LTO。
+**路径 B（C API 封装）**：额外 `extern "C"` wrapper，ABI 稳定，支持跨语言绑定（Python/Rust）。
+
+### V7+ 向量优化 ⚠️
+
+> 行业对标分析：[`doc/vector-ondisk-quant-design-zh.md`](doc/vector-ondisk-quant-design-zh.md) §9-11
+
+- **DiskANN 式大规模架构**：V3.5 BCVS 快照已给 46× 加载提速；100M+ 规模需
+  DiskANN 式「外存图 + PQ 粗筛 + SSD 精排」分层架构。
+- **Product Quantization (PQ)**：离线训练管线是独立项目；V6.4.1 已留 seam。
+- **Vamana / robust prune**：DiskANN 建图算法（α 参数 + robust prune）研究储备，
+  磁盘友好性分析详见 §11。
+- **HNSW 外存 mmap**：100M+ 规模问题是另一类设计（图结构分页 mmap + SSD 友好布局）。
+
+---
+
+## 2.1.1 已落地
 
 围绕**向量库的内存 / 磁盘瓶颈**、**读路径**与**恢复持久化**的一组优化（P5–P15）。
 

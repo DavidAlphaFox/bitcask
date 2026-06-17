@@ -6,7 +6,45 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
-## 2.1.1 plan
+## 2.2.0 plan
+
+### libcask standalone extraction ✅
+
+> Feasibility assessment: [`doc/libcask-extraction-zh.md`](doc/libcask-extraction-zh.md)
+
+Extract the C++ non-NIF core (`cpp/src/` + `cpp/include/`, 24 source files + 45 headers)
+into a standalone `libcask.so` / `libcask.a`; the Erlang project retains only the NIF
+glue layer (`cpp/nif/`) and depends on the library.
+
+The architecture is already separation-ready:
+- Zero `erl_nif.h` dependency and zero `enif_*` calls in the C++ core
+- Build system already modularized (11 static libraries; `cpp/CMakeLists.txt` supports
+  standalone builds)
+- Coupling is one-directional and paper-thin (NIF → C++, no reverse calls; the sole
+  bridge is `CaskHandle { unique_ptr<Cask> }`)
+
+**Path A (C++ API direct, recommended)**: export C++ classes, NIF layer includes
+directly, minimal changes, preserves LTO.
+**Path B (C API wrapper)**: additional `extern "C"` wrapper, stable ABI, enables
+cross-language bindings (Python/Rust).
+
+### V7+ vector optimization ⚠️
+
+> Industry analysis: [`doc/vector-ondisk-quant-design-zh.md`](doc/vector-ondisk-quant-design-zh.md) §9-11
+
+- **DiskANN-style large-scale architecture**: V3.5 BCVS snapshot already delivers 46×
+  load speedup; 100M+ scale needs DiskANN-style "external graph + PQ coarse filter +
+  SSD rerank" layered architecture.
+- **Product Quantization (PQ)**: offline training pipeline is a separate project;
+  V6.4.1 left a seam.
+- **Vamana / robust prune**: DiskANN graph-build algorithm (α parameter + robust prune)
+  research reserve; disk-friendliness analysis in §11.
+- **HNSW external-memory mmap**: 100M+ scale is a different class of design (paged graph
+  mmap + SSD-friendly layout).
+
+---
+
+## 2.1.1 shipped
 
 Three optimizations targeting the **vector-DB memory / disk walls** and the **read path**.
 
