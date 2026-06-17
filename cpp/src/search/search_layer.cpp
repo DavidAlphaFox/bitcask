@@ -30,6 +30,7 @@ SearchLayer::SearchLayer(const SearchLayerConfig& config)
         hc.metric = config.vector_metric == meta::VectorMetric::kL2
                         ? vec::HnswMetric::kL2
                         : vec::HnswMetric::kDot;
+        hc.inmem_int8 = config.vector_inmem_int8;  // P5b
         hnsw_.store(std::make_shared<vec::HnswIndex>(hc),
                     std::memory_order_release);
     }

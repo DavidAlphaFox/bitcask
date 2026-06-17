@@ -65,6 +65,8 @@ struct SearchLayerConfig {
     // 写入端归一化),kL2 → kL2。
     std::uint16_t        vector_dim = 0;
     meta::VectorMetric   vector_metric = meta::VectorMetric::kNone;
+    // P5b:HNSW int8-only 内存模式(Cask::open 从 meta 透传)。仅 kDot。
+    bool                 vector_inmem_int8 = false;
     // V6.2:WAL 批量刷新阈值。1 = 即时模式(默认,与旧版行为完全一致)。
     // >1 时积攒 entries 缓冲后单次 fwrite+fflush,减少 sync 调用次数。
     std::size_t          wal_batch_size = 1;
