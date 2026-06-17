@@ -67,12 +67,19 @@ int8 在内存里是**为速度**，反而 **+25% 内存**。P3 落盘 int8 只�
 
 ## 6. 召回 gate（设默认前必须）
 
-实测（合成簇 dim=2560，`hnsw_test::Int8OnlyMemoryAndRecall`）：f32 精排 recall@10=1.0
-→ int8-only **0.9675（−3.25%）**。注意：该 harness 用 f32 query × dequant-int8 库；
-真实 VNNI int8-only 还会**量化 query**（§4.2），额外误差，需在真实 qwen3 语料复测。
+模拟实测（合成簇 dim=2560，`hnsw_test::Int8OnlyMemoryAndRecall`，f32 query ×
+dequant-int8 库）：f32 精排 recall@10=1.0 → int8-only **0.9675（−3.25%）**。
+
+**P5c 真实模式 gate（已落地，`hnsw_test::Int8OnlyRecallGate_Dim2560`）**：真正
+`inmem_int8` 建图 + 查询（**含 query 量化**，§4.2），合成簇 dim=2560、n=2000：
+recall@10 ef64 = **0.9650（−3.5% vs f32）**——query 量化的额外误差仅 ~0.25pt,
+比预期小。红线设 **0.90**(回归红线,低于即查实现/量化退化)。
 - 度量限制：int8 路径仅 `kDot`（cosine 归一化也走 dot）；**L2 不支持 int8-only**，
-  L2 集合开此选项应报 `kInvalidOption`。
-- 红线：默认 f32+int8；int8-only 面向内存受限/大规模 opt-in，真实语料 recall 可接受才推荐。
+  L2 集合开此选项报 `kInvalidOption`（已实现）。
+- **默认策略（定）**：默认 **f32+int8**（recall 优先）；`{vector_inmem_int8,true}`
+  opt-in,面向内存受限/大规模。
+- **诚实边界**：合成簇 ≠ 真实 qwen3 语料——本仓库 CI 无 embedding 端点,用合成
+  数据作代理;**推荐默认前仍须在部署侧(qwen3 endpoint)用真实语料复测**召回。
 
 ## 7. 子任务
 - **P5a**（已落地）：`HnswConfig.inmem_int8`；NodeChunk `inmem_int8` 时 vecs 容量 0；
@@ -83,9 +90,17 @@ int8 在内存里是**为速度**，反而 **+25% 内存**。P3 落盘 int8 只�
   （盘格式仍 v1，盘上存 int8 留 P5b）；非 VNNI 机器加标量 `int8::dot_scalar_raw` 兜底。
   测试 `VectorQuant.Int8OnlyRealModeRecallAndRoundtrip`：真实模式 recall@10=0.9725、
   save/load round-trip 召回一致。
-- **P5b**：open `{vector_inmem_int8}` + meta（offset[10]）+ 重开校验；BCVS 快照适配；
-  与 P3 组合矩阵测试。
-- **P5c**：真实 qwen3 语料召回 gate（复用 harness），定 opt-in 默认 + 文档。
+- **P5b**（已落地）：`CaskOptions.vector_inmem_int8` + NIF atom/解析 + erl 透传白名单；
+  `MetaConfig.vector_inmem_int8` 持久化到 `bitcask.meta` offset[10]（旧文件全零=否）；
+  `check_or_create_meta` 重开一致校验（不符 → kModeMismatch）+ kL2 拒绝（kInvalidOption）；
+  meta → `SearchLayerConfig` → `HnswConfig.inmem_int8` 透传。BCVS 快照适配已在 P5a 完成
+  （盘存 f32、load 量化）；盘上直接存 int8 的优化仍未做（可选，收益仅省一次 dequant 往返）。
+  测试：`P5bInmemInt8OpenSearchAndReopen` / `P5bInmemInt8RejectsL2` /
+  `P5bInmemInt8ComposesWithQuantized`。
+- **P5c**（已落地，部分）：召回 gate `Int8OnlyRecallGate_Dim2560`（真实 inmem_int8 +
+  query 量化，dim=2560 recall@10=0.9650，红线 0.90）；默认策略定为 opt-in（默认 f32+int8）；
+  用户文档（`bitcask.erl` open 选项注释加 `{vector_inmem_int8,true}`）。
+  **未完**：真实 qwen3 语料复测须在部署侧做（CI 无 embedding 端点，合成簇作代理）。
 
 ## 8. 风险
 - query 量化误差（harness 未含）→ 真实召回可能略低于 0.9675。

@@ -26,8 +26,12 @@ opt-in `{vector_inmem_int8, true}`，可与 P3 落盘 int8 组合（盘 + 内存
 **子任务**：**P5a** ✅ `HnswConfig.inmem_int8` + NodeChunk 裁 vecs + 建图/查询/收缩全 int8 +
 query 量化 + BCVS save/load 适配（盘仍存 f32）+ 非 VNNI 标量 int8 兜底；真实模式测试
 `VectorQuant.Int8OnlyRealModeRecallAndRoundtrip` recall@10=0.9725、save/load round-trip 一致，
-411 测试通过。**P5b** open/meta 接线（`{vector_inmem_int8}` + meta offset[10] + 重开校验 +
-kL2 拒绝 + 与 P3 组合矩阵）；**P5c** 真实 qwen3 语料召回 gate 定默认。
+411 测试通过。**P5b** ✅ open 接线 `{vector_inmem_int8}`（NIF + erl 透传）+ meta offset[10] 持久化 +
+重开一致校验 + kL2 拒绝 + 与 P3 落盘 int8 正交可组合；3 个端到端测试（open/search/reopen、
+kL2 拒绝、quantized 组合）。**P5c** ✅（部分）召回 gate `Int8OnlyRecallGate_Dim2560`（真实
+inmem_int8 + query 量化，dim=2560 recall@10=**0.9650**、红线 0.90）+ 默认定为 opt-in（默认
+f32+int8）+ 用户文档（`bitcask.erl` 选项注释）；**未完**：真实 qwen3 语料复测须部署侧做
+（CI 无 embedding 端点，合成簇代理）。415 测试通过。
 **红线**：默认仍 f32+int8（召回优先）；int8-only 面向内存受限 / 大规模 opt-in。
 
 ### P6 — sealed 文件 mmap 只读路径 ✅
