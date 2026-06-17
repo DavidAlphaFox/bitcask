@@ -80,7 +80,7 @@
 
 ## V7 — 文件持久化优化（P 系列）
 
-> P1-P4 已完成，P5/P6/P7 待实施。
+> P1-P6 已完成，P7/P12 备选（按 gate 决策）。
 
 ---
 
@@ -98,9 +98,9 @@
 
 | # | 内容 | ROI/风险 | 状态 |
 |---|------|---------|------|
-| P5a | HNSW int8-only 配置：按 flag 不分配/保留常驻 f32 `vecs`，NodeChunk 裁掉 vecs；距离 + 「精排」都走 int8（查询侧也量化，用 VNNI int8×int8）。 | 中高 / 中 | 📋 |
-| P5b | open 选项 `{vector_inmem_int8, true}` 接线 + meta 持久化 + 重开一致校验（同 P3b）；与 P3 落盘 int8 正交可组合（盘+内存都省）。`get` 仍可经盘 f32 / dequant 返回。 | 中 / 中 | 📋 |
-| P5c | 真实 qwen3 语料召回 gate（复用 `Int8OnlyRecallAndMemory` harness）；定 opt-in 默认 + 文档；recall 跌幅可接受才推荐给内存受限/大规模部署。 | 中 / 低 | 📋 |
+| P5a | HNSW int8-only 配置：按 flag 不分配/保留常驻 f32 `vecs`，NodeChunk 裁掉 vecs；距离 + 「精排」都走 int8（查询侧也量化，用 VNNI int8×int8）。 | 中高 / 中 | ✅ |
+| P5b | open 选项 `{vector_inmem_int8, true}` 接线 + meta 持久化 + 重开一致校验（同 P3b）；与 P3 落盘 int8 正交可组合（盘+内存都省）。`get` 仍可经盘 f32 / dequant 返回。 | 中 / 中 | ✅ |
+| P5c | 真实 qwen3 语料召回 gate（复用 `Int8OnlyRecallAndMemory` harness）；定 opt-in 默认 + 文档；recall 跌幅可接受才推荐给内存受限/大规模部署。 | 中 / 低 | ✅ |
 
 **依赖/关联**：建在 P3（int8 量化方案 + codec）与 V6.4.2 外存预留点之上；harness 复用
 P3c。**红线**：默认仍 f32+int8（召回优先）；int8-only 是内存受限/大规模的 opt-in。
@@ -115,10 +115,10 @@ P3c。**红线**：默认仍 f32+int8（召回优先）；int8-only 是内存受
 
 | # | 内容 | ROI/风险 | 状态 |
 |---|------|---------|------|
-| P6a | `DataFile` sealed mmap 模式：sealed 文件首次读时 `mmap(PROT_READ, MAP_SHARED)` 整文件，`read(off,sz)` 返回**指向映射的 span**（零拷贝、无 syscall）；active / 未映射 / 超额 → 回退 pread。**mmap 后可 close fd**（映射仍有效）→ 顺带缓解 read_files_ 的 fd 累积（大库撞 ulimit）。 | 高 / 中 | 📋 |
-| **P6b merge 生命周期（重点）** | **释放**：merge unlink 旧文件时**不立即 munmap**——从 read_files_ erase 缓存的 `shared_ptr<DataFile>`，但在途读者仍持 shared_ptr → DataFile 存活 → 映射存活；**munmap 延迟到引用计数归零**（`~DataFile`）。Linux 上 unlinked-but-mapped 文件仍可读（inode 由映射续命，类似 open fd），在途读安全。**再次 mmap**：merge 产出的新 sealed 文件 + active roll 成 sealed 后，下次经 `read_file` 懒加载时按 sealed mmap 路径建立映射。 | 高 / 高 | 📋 |
-| P6c | `GetResultView` 适配：mmap 命中时持 `shared_ptr<DataFile>`（映射引用）+ span 指向映射，保证 view 生命内映射不撤（现版持 owned ReadRecord/pread 拷贝）。mmap_limit（文件数/字节）+ pread 兜底；**32 位禁用 mmap**（地址空间，同 LevelDB）。 | 中 / 中 | 📋 |
-| P6-gate | 量化 get 延迟：mmap 命中 vs 纯 pread vs OS page-cache 命中；ulimit/地址空间影响；小库（≤几文件）可全映射、大库走 limit+pread。 | — | 📋 先做 |
+| P6a | `DataFile` sealed mmap 模式：sealed 文件首次读时 `mmap(PROT_READ, MAP_SHARED)` 整文件，`read(off,sz)` 返回**指向映射的 span**（零拷贝、无 syscall）；active / 未映射 / 超额 → 回退 pread。**mmap 后可 close fd**（映射仍有效）→ 顺带缓解 read_files_ 的 fd 累积（大库撞 ulimit）。 | 高 / 中 | ✅ |
+| **P6b merge 生命周期（重点）** | **释放**：merge unlink 旧文件时**不立即 munmap**——从 read_files_ erase 缓存的 `shared_ptr<DataFile>`，但在途读者仍持 shared_ptr → DataFile 存活 → 映射存活；**munmap 延迟到引用计数归零**（`~DataFile`）。Linux 上 unlinked-but-mapped 文件仍可读（inode 由映射续命，类似 open fd），在途读安全。**再次 mmap**：merge 产出的新 sealed 文件 + active roll 成 sealed 后，下次经 `read_file` 懒加载时按 sealed mmap 路径建立映射。 | 高 / 高 | ✅ |
+| P6c | `GetResultView` 适配：mmap 命中时持 `shared_ptr<DataFile>`（映射引用）+ span 指向映射，保证 view 生命内映射不撤（现版持 owned ReadRecord/pread 拷贝）。mmap_limit（文件数/字节）+ pread 兜底；**32 位禁用 mmap**（地址空间，同 LevelDB）。 | 中 / 中 | ✅ |
+| P6-gate | 量化 get 延迟：mmap 命中 vs 纯 pread vs OS page-cache 命中；ulimit/地址空间影响；小库（≤几文件）可全映射、大库走 limit+pread。 | — | ✅ |
 
 **关键不变量**：只 mmap sealed（不可变）文件——merge 只 unlink、**绝不原地 truncate** sealed
 文件，故无 SIGBUS-on-truncate；torn-tail 也不存在（sealed 已 finalize）。**生命周期靠
