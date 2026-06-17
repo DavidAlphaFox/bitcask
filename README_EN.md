@@ -169,7 +169,7 @@ ok
 | `doc/api-en.md` / `doc/api-zh.md` | **API reference**: capabilities, parameter meaning & constraints, return values (EN/中) |
 | `doc/USAGE.md` | Tutorial: opening, merging, configuring, searching |
 | `doc/format-zh.md` | 磁盘格式字节级规范（带类型记录、DocValue、提示文件、锁；字节序统一小端） |
-| `doc/migrate-le.md` / `doc/migrate-le-en.md` | `migrate_le` tool: offline-migrate an old big-endian dir to little-endian (v1→v2) (中/EN) |
+| `doc/migrate-le.md` / `doc/migrate-le-en.md` | **Migration tool** `migrate_le`: offline-migrate an old big-endian (v1) dir to little-endian (v2) (中/EN) |
 | `doc/cpp-arch.md` | C++ 模块布局、锁策略、构建入口 |
 | `doc/migration.md` | 特性状态与 API 参考 |
 | `doc/concurrency-zh.md` | 并发与共享语义 |
@@ -179,7 +179,8 @@ ok
 | `doc/hnsw-design-zh.md` | HNSW 向量索引设计（并发/持久化/RRF/实施表） |
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
 | `doc/unified-architecture-plan-zh.md` | 统一架构计划（已实施） |
-| `ROADMAP_EN.md` / `ROADMAP.md` | **Roadmap**: 2.1.1 plan (P5/P6/P7) (EN/中) |
+| `doc/libcask-extraction-zh.md` | **libcask standalone extraction feasibility** (2.2.0 plan) |
+| `ROADMAP_EN.md` / `ROADMAP.md` | **Roadmap**: 2.1.1 shipped (P5–P15) + 2.2.0 plan (libcask extraction / V7+ vector optimization) (EN/中) |
 | `TASK.md` | Detailed task breakdown & history |
 
 ## Project status
@@ -192,6 +193,7 @@ ok
 - **Jieba Chinese analyzer** integrated (whitespace / n-gram / jieba)
 - **Typed record format** (`kDoc`/`kTombstone` with per-write ordinal) is the default
 - **Unified architecture** — Cask and Collection are merged into a single engine; KV vs. index mode selected via `{analyzer, ...}` option
+- **2.1.1 system optimizations** (2026-06) — HNSW int8-only memory mode (vector memory −80%), sealed-file mmap zero-copy reads, read-handle fd-budget LRU, unified `search.ckpt` recovery path, global little-endian unification + `migrate_le` tool ([docs](doc/migrate-le-en.md)), hybrid two-leg parallelism, merge I/O tuning, on-open background merge; see [`CHANGELOG_EN.md`](CHANGELOG_EN.md)
 - **Concurrency hardening** (2026-06 audit) — search read path is safe against the async index worker: `meta_blob`/search-cache copy under lock without escaping pointers, inverted-index snapshot uses safe iteration, cross-thread scalars are atomic, IndexPool consumer is exception-safe; see [`doc/concurrency-zh.md` §6](doc/concurrency-zh.md)
 
 ## License

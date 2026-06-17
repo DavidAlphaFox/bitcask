@@ -166,7 +166,7 @@ ok
 | `doc/api-zh.md` / `doc/api-en.md` | **API 参考**：能力、参数含义与限制、返回值（中/英） |
 | `doc/USAGE.md` | 教程：打开、合并、配置、搜索 |
 | `doc/format-zh.md` | 磁盘格式字节级规范（带类型记录、DocValue、提示文件、锁；字节序统一小端） |
-| `doc/migrate-le.md` / `doc/migrate-le-en.md` | `migrate_le` 工具：把旧大端目录离线迁移成小端（v1→v2）（中/EN） |
+| `doc/migrate-le.md` / `doc/migrate-le-en.md` | **迁移工具** `migrate_le`：把旧大端（v1）目录离线迁移成小端（v2）（中/EN） |
 | `doc/cpp-arch.md` | C++ 模块布局、锁策略、构建入口 |
 | `doc/migration.md` | 特性状态与 API 参考 |
 | `doc/concurrency-zh.md` | 并发与共享语义 |
@@ -176,7 +176,8 @@ ok
 | `doc/hnsw-design-zh.md` | HNSW 向量索引设计（并发/持久化/RRF/实施表） |
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
 | `doc/unified-architecture-plan-zh.md` | 统一架构计划（已实施） |
-| `ROADMAP.md` / `ROADMAP_EN.md` | **路线图**：2.1.1 规划（P5/P6/P7）（中/英） |
+| `doc/libcask-extraction-zh.md` | **libcask 独立库拆分可行性评估**（2.2.0 规划） |
+| `ROADMAP.md` / `ROADMAP_EN.md` | **路线图**：2.1.1 已落地（P5–P15）+ 2.2.0 规划（libcask 独立 / V7+ 向量优化）（中/英） |
 | `TASK.md` | 详细任务拆分与历史 |
 
 ## 项目状态
@@ -189,6 +190,7 @@ ok
 - **Jieba 中文分析器** 已集成（whitespace / ngram / jieba）
 - **带类型记录格式**（`kDoc`/`kTombstone` + 逐次写入序号）为默认格式
 - **统一架构** — Cask 与 Collection 已合并为单一引擎，按配置（`{analyzer, ...}`）启用 KV 或索引模式
+- **2.1.1 系统优化**（2026-06）— HNSW int8-only 内存模式（向量内存 −80%）、sealed 文件 mmap 零拷贝读、read 句柄 fd 预算 LRU、统一 `search.ckpt` 恢复路径、全盘字节序统一小端 + `migrate_le` 迁移工具（[文档](doc/migrate-le.md)）、hybrid 两路并行、merge I/O 顺序优化、open 后台 merge；详见 [`CHANGELOG.md`](CHANGELOG.md)
 - **并发加固**（2026-06 审计）— 索引读路径与异步索引 worker 并发安全：`meta_blob`/搜索缓存锁内拷贝不逃逸、倒排索引快照安全遍历、跨线程标量原子化、IndexPool 消费者异常兜底；详见 [`doc/concurrency-zh.md` §6](doc/concurrency-zh.md)
 
 ## 许可证
