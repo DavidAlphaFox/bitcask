@@ -1174,6 +1174,93 @@ TEST_F(CaskDocValueTest, P3bQuantizedVectorRoundTripAndReopen) {
     EXPECT_EQ(cbad.error().kind, bitcask::CaskError::kModeMismatch);
 }
 
+// P5b：{vector_inmem_int8} 端到端——开库建 int8-only HNSW，search_vector 命中
+// 最近者；meta 持久化（offset[10]）；重开一致 ok / 不一致 mode_mismatch；
+// kL2 拒绝；与 P3 落盘 int8 正交可组合。
+TEST_F(CaskDocValueTest, P5bInmemInt8OpenSearchAndReopen) {
+    auto opts = v31_opts(4);
+    opts.vector_inmem_int8 = true;
+    const std::string k1 = "k1", k2 = "k2", k3 = "k3";
+    const float v1[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    const float v2[4] = {0.0f, 1.0f, 0.0f, 0.0f};
+    const float v3[4] = {0.7f, 0.7f, 0.0f, 0.0f};
+    const float q[4]  = {2.0f, 0.0f, 0.0f, 0.0f};
+    auto put_vec = [&](Cask& c, const std::string& key, const float* v) {
+        bitcask::DocInput doc;
+        const std::string text = "doc " + key;
+        doc.text = sv_bytes(text);
+        doc.vector = std::span<const float>(v, 4);
+        ASSERT_TRUE(c.put_doc(sv_bytes(key), doc, 1000));
+    };
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        put_vec(**c, k1, v1);
+        put_vec(**c, k2, v2);
+        put_vec(**c, k3, v3);
+        (*c)->flush_index();
+        auto r = (*c)->search_vector(std::span<const float>(q, 4), 3);
+        ASSERT_TRUE(r);
+        ASSERT_EQ(r->hits.size(), 3u);
+        EXPECT_EQ(r->hits[0].key, k1);  // 轴对齐向量量化无损 → cos=1.0 仍最近
+        (*c)->close();
+    }
+    // meta 持久化:offset[10] == 1。
+    {
+        auto mc = bitcask::meta::read_meta(tmpdir_.string());
+        ASSERT_TRUE(mc);
+        EXPECT_TRUE(mc->vector_inmem_int8);
+    }
+    // 重开(inmem_int8 一致)→ 全量 fold 重建 int8-only 图,search 仍命中。
+    {
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c);
+        auto r = (*c)->search_vector(std::span<const float>(q, 4), 3);
+        ASSERT_TRUE(r);
+        ASSERT_EQ(r->hits.size(), 3u);
+        EXPECT_EQ(r->hits[0].key, k1);
+        (*c)->close();
+    }
+    // 重开但 inmem_int8 不一致(默认 false)→ mode_mismatch。
+    auto cbad = Cask::open(tmpdir_.string(), v31_opts(4));
+    ASSERT_FALSE(cbad);
+    EXPECT_EQ(cbad.error().kind, bitcask::CaskError::kModeMismatch);
+}
+
+// P5b:int8-only + kL2 → 干净拒绝(int8 距离仅 kDot)。
+TEST_F(CaskDocValueTest, P5bInmemInt8RejectsL2) {
+    auto opts = v31_opts(4);
+    opts.vector_inmem_int8 = true;
+    opts.vector_metric = bitcask::meta::VectorMetric::kL2;
+    auto tmp = tmpdir_ / "i8l2";
+    std::filesystem::create_directories(tmp);
+    auto c = Cask::open(tmp.string(), opts);
+    ASSERT_FALSE(c);
+    EXPECT_EQ(c.error().kind, bitcask::CaskError::kInvalidOption);
+}
+
+// P5b:与 P3 落盘 int8 正交——盘 int8 + 内存 int8 同开,put/search 正常。
+TEST_F(CaskDocValueTest, P5bInmemInt8ComposesWithQuantized) {
+    auto opts = v31_opts(4);
+    opts.vector_inmem_int8 = true;
+    opts.vector_quantized = true;
+    const float v1[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    const float q[4]  = {2.0f, 0.0f, 0.0f, 0.0f};
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+    bitcask::DocInput doc;
+    const std::string text = "doc k1";
+    doc.text = sv_bytes(text);
+    doc.vector = std::span<const float>(v1, 4);
+    ASSERT_TRUE((*c)->put_doc(sv_bytes("k1"), doc, 1000));
+    (*c)->flush_index();
+    auto r = (*c)->search_vector(std::span<const float>(q, 4), 1);
+    ASSERT_TRUE(r);
+    ASSERT_EQ(r->hits.size(), 1u);
+    EXPECT_EQ(r->hits[0].key, "k1");
+    (*c)->close();
+}
+
 // 校验:dim 不符 / 未配置却带向量 / cosine 下零向量,全部拒绝。
 TEST_F(CaskDocValueTest, V31VectorValidation) {
     std::vector<std::byte> key{std::byte{'k'}};
