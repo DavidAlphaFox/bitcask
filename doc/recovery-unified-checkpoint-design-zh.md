@@ -137,23 +137,31 @@ open 流程(取代 `load_recovery_snapshots` + `load_keydir_from_disk` 双轨):
    - 否则 → 从 **keydir(ord→key) ⋈ bm25 postings(ord→doc_len)** 现场推导;
      纯向量/空文本文档由 keydir 覆盖、dl=0;未覆盖的 ord 由第 4 步 fold 补全。
      (docmap 是纯加速缓存,缺失不影响正确性——见 §3.3、§6.6。)
-4. **统一水位**:keydir.ckpt 与 search.ckpt 各携带 **per-file 字节水位**。
-   回放下界取**各源水位最小值** `wm_min(fid)`(回退到 .prev 时用 .prev 的
-   较老水位)——保证回放区对每个索引都是「尾巴」,无遗漏。
-5. **单趟 fold**:对每个 data 文件从 `wm_min(fid)` fold 到尾,**一个回调**
+4. **水位模型(简化:单 ord watermark + keydir 字节水位 + 保存序不变量)**:
+   - `kv.keydir.ckpt` 带 **per-file 字节水位**(fold 的 `start_offset` 驱动,不变)。
+   - `search.ckpt` 头部只带**单个 ord watermark** = 保存时 `next_ord`(它覆盖的
+     搜索 ord 上界);**不需要** per-file 字节水位。
+   - **保存序不变量**:`keydir_covered ≤ search_covered`——close 端两者同点(相等)、
+     merge 端 keydir 水位在 flush 前捕获(≤ 搜索覆盖)。现存代码已维持(§5)。
+   - **fold 下界**:`fold_start(fid) = (search.ckpt 健康且全段 CRC 通过) ?
+     keydir_wm(fid) : 0`。因不变量 `keydir_covered ≤ search_covered`,从
+     keydir_wm 起 fold 给出的 `[keydir_covered, end)` **必覆盖搜索所需的
+     `[search_covered, end)`**——搜索各索引按自身 ord 水位**自门**丢弃
+     `[keydir_covered, search_covered)` 的重叠。
+5. **单趟 fold**:对每个 data 文件从 `fold_start(fid)` fold 到尾,**一个回调**
    同时喂 `keydir.put/remove` + `DocIndex.put_doc` + `bm25.add_doc/remove`
-   + `hnsw.insert`(沿用现 fold 回调结构,下界改 wm_min,不再走「有
-   search_layer 跳过 hint」特判——回放只认 data)。
-   - 「待重建」的段(第 2 步标记)从其 type 对应水位 **0** 起重建:bm25 段
-     坏 → 只重分词重建倒排(向量段不动);hnsw 段坏 → 只从 DocValue 向量
-     重插(不重分词)。**损坏从"全量重建"降级为"按段重建"**。
+   + `hnsw.insert`(沿用现 fold 回调结构;不再走「有 search_layer 跳过 hint」特判)。
+   - **自门**:bm25/hnsw/docmap 均 ord 水位幂等(add_doc 丢 ord≤floor、insert 丢
+     ord≤水位、put_doc 覆盖),keydir put 覆盖——故重喂恒安全,无需逐索引显式门。
+   - **段级重建**:某搜索段 CRC 坏/缺(第 2 步)→ 内存为空、需 `[0,end)`;此时
+     `fold_start` 取 **0**(健康段已载入,fold 中靠自门跳过其重应用,**只有坏段
+     真正重建** → bm25 坏只重分词、hnsw 坏只重插)。即 I/O 不省但 CPU 只付坏段。
 6. **幂等收敛**:回放区每条都是重 put/重 insert,与全量 fold 同语义
    (`recovery-snapshot-design-zh.md §2.1`),方向安全。
 
-成对门简化:不再要求各块**各自**覆盖 `next_ord`;改为「**回放从 wm_min 起,
-fold 必然把每块补齐到 next_ord**」。门恒可过,代价是 fold 区间 =
-`tail_from(wm_min)`。最弱环/坏段只影响**回放多读多少尾巴 / 重建哪一段**,
-不再触发**全库全量 fold**——重用率从 0 提升的关键。
+**无成对门、无悬崖**:健康路径 `fold_start=keydir_wm`(跳 I/O、各索引自门);仅当
+keydir.ckpt 缺失**或**某搜索段坏/缺(且 keydir 水位>0)才回退 `fold_start=0`——
+后者 I/O 不省,但 CPU 只付"坏段重建",健康段自门跳过。**罕见损坏 ≠ 全库全量重建。**
 
 ## 5. 写入(snapshot)流程 + 周期 checkpoint
 
