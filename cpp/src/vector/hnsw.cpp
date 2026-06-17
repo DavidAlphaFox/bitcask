@@ -286,8 +286,8 @@ std::atomic<std::uint64_t> g_instance_seq{1};
 
 }  // namespace
 
-HnswIndex::NodeChunk::NodeChunk(std::size_t dim)
-    : vecs(static_cast<std::size_t>(kChunkSize) * dim),
+HnswIndex::NodeChunk::NodeChunk(std::size_t dim, bool inmem_int8)
+    : vecs(inmem_int8 ? 0 : static_cast<std::size_t>(kChunkSize) * dim),
       ords(kChunkSize, 0),
       levels(kChunkSize, 0),
       adj(kChunkSize),
@@ -308,6 +308,29 @@ HnswIndex::HnswIndex(const HnswConfig& cfg)
       instance_id_(g_instance_seq.fetch_add(1, std::memory_order_relaxed)),
       rng_(cfg.seed) {
     assert(cfg_.dim > 0 && cfg_.M >= 2);
+    // P5:int8-only 仅 kDot;距离=int8 重建内积。kL2 由上游 open 拒绝。
+    assert(!(cfg_.inmem_int8 && cfg_.metric != HnswMetric::kDot) &&
+           "inmem_int8 requires kDot metric");
+    // int8-only 必须有可用 int8 dot——无 VNNI 时回退标量(否则建图/查询
+    // 无 f32 可算)。默认 f32+int8 路径不变:int8_dot_ 为 null 时退 f32。
+    if (cfg_.inmem_int8 && int8_dot_ == nullptr) {
+        int8_dot_ = &int8::dot_scalar_raw;
+    }
+}
+
+// P5:int8-only 无常驻 f32,从量化副本反量化到 thread_local 缓冲。
+std::span<const float> HnswIndex::node_vec(std::uint32_t id) const {
+    if (!cfg_.inmem_int8) {
+        return {vec_of(id), cfg_.dim};
+    }
+    thread_local std::vector<float> buf;
+    buf.resize(cfg_.dim);
+    const std::int8_t* codes = qcodes_of(id);
+    const float factor = qscale_of(id) / 127.0f;
+    for (std::uint32_t i = 0; i < cfg_.dim; ++i) {
+        buf[i] = static_cast<float>(codes[i]) * factor;
+    }
+    return {buf.data(), cfg_.dim};
 }
 
 HnswIndex::~HnswIndex() {
@@ -561,6 +584,37 @@ void HnswIndex::select_neighbors(
     cands = std::move(picked);
 }
 
+// P5:int8-only 版 select_neighbors。与 f32 版同启发式(Algorithm 4),
+// 只把候选-已选距离换成 dist_id_int8_node(两节点皆有量化副本,无 f32)。
+void HnswIndex::select_neighbors_int8(
+    std::vector<std::pair<float, std::uint32_t>>& cands, std::uint32_t m) const {
+    if (cands.size() <= m) return;
+    std::vector<std::pair<float, std::uint32_t>> picked;
+    picked.reserve(m);
+    for (const auto& [d, id] : cands) {
+        if (picked.size() >= m) break;
+        bool ok = true;
+        for (const auto& [pd, pid] : picked) {
+            if (dist_id_int8_node(id, pid) < d) {  // 离已选者比离 query 还近
+                ok = false;
+                break;
+            }
+        }
+        if (ok) picked.push_back({d, id});
+    }
+    if (picked.size() < m) {
+        for (const auto& c : cands) {
+            if (picked.size() >= m) break;
+            if (std::find_if(picked.begin(), picked.end(), [&](auto& p) {
+                    return p.second == c.second;
+                }) == picked.end()) {
+                picked.push_back(c);
+            }
+        }
+    }
+    cands = std::move(picked);
+}
+
 void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
     assert(vec.size() == cfg_.dim);
     // 单写者声明:多写者不支持(全引擎统一约束,设计 §3/§7)。
@@ -581,7 +635,7 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
     assert(ci < kMaxChunks && "HnswIndex capacity exceeded (kMaxChunks)");
     NodeChunk* c = chunks_[ci].load(std::memory_order_relaxed);
     if (c == nullptr) {
-        c = new NodeChunk(cfg_.dim);
+        c = new NodeChunk(cfg_.dim, cfg_.inmem_int8);
         chunks_[ci].store(c, std::memory_order_release);
     }
     const std::uint32_t slot = id & kChunkMask;
@@ -593,12 +647,9 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
     if (level > 31) level = 31;
 
     // 1) 写满本节点数据:vec/ord/level + 零初始化邻接块。
-    std::memcpy(c->vecs.data() + static_cast<std::size_t>(slot) * cfg_.dim,
-                vec.data(), static_cast<std::size_t>(cfg_.dim) * sizeof(float));
-    // V4.2:同步落 int8 量化副本。int8 路径存在时(VNNI)下游 search 用
-    // 4× 缩的带宽 + VNNI 加速;int8_dot_ == nullptr 时这段写的码不被读,
-    // 浪费一些内存但功能不变(仅 kDot 有意义,kL2 见 search 路径判断)。
-    if (int8_dot_ != nullptr && cfg_.metric == HnswMetric::kDot) {
+    // P5:int8-only 不存常驻 f32(vecs 容量 0),只落量化副本——建图/查询
+    // 全程 int8。默认 f32+int8 路径不变:存 f32,VNNI 在时附带量化副本粗筛。
+    if (cfg_.inmem_int8) {
         auto qv = int8::quantize(vec.data(), cfg_.dim);
         std::memcpy(c->qcodes.data() +
                         static_cast<std::size_t>(slot) * cfg_.dim,
@@ -606,6 +657,22 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
                     static_cast<std::size_t>(cfg_.dim) * sizeof(std::int8_t));
         c->qscales[slot] = qv.scale;
         c->qsums[slot]   = qv.sum_codes;
+    } else {
+        std::memcpy(c->vecs.data() + static_cast<std::size_t>(slot) * cfg_.dim,
+                    vec.data(),
+                    static_cast<std::size_t>(cfg_.dim) * sizeof(float));
+        // V4.2:同步落 int8 量化副本。int8 路径存在时(VNNI)下游 search 用
+        // 4× 缩的带宽 + VNNI 加速;int8_dot_ == nullptr 时这段不被读,浪费
+        // 一些内存但功能不变(仅 kDot 有意义,kL2 见 search 路径判断)。
+        if (int8_dot_ != nullptr && cfg_.metric == HnswMetric::kDot) {
+            auto qv = int8::quantize(vec.data(), cfg_.dim);
+            std::memcpy(c->qcodes.data() +
+                            static_cast<std::size_t>(slot) * cfg_.dim,
+                        qv.codes.data(),
+                        static_cast<std::size_t>(cfg_.dim) * sizeof(std::int8_t));
+            c->qscales[slot] = qv.scale;
+            c->qsums[slot]   = qv.sum_codes;
+        }
     }
     c->ords[slot] = ord;
     c->levels[slot] = static_cast<std::uint8_t>(level);
@@ -629,14 +696,24 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
     // 写者侧搜索的可见边界 = id(自身排除:防低层把自己选成自己邻居)。
     const std::uint32_t n_bound = id;
     std::vector<std::uint32_t> scratch(1 + cfg_.M * 2);
+
+    // P5:int8-only 用本节点量化副本作建图 query(无常驻 f32);默认用 f32。
+    const bool i8 = cfg_.inmem_int8;
     const float* q =
-        c->vecs.data() + static_cast<std::size_t>(slot) * cfg_.dim;
+        i8 ? nullptr
+           : c->vecs.data() + static_cast<std::size_t>(slot) * cfg_.dim;
+    const std::int8_t* qc = i8 ? qcodes_of(id) : nullptr;
+    const float        qs = i8 ? qscale_of(id) : 0.0f;
+    const std::int32_t qsum = i8 ? qsum_of(id) : 0;
 
     // 上层贪心下降到 level+1。
     for (std::int32_t l = max_level;
          l > static_cast<std::int32_t>(level); --l) {
-        cur = greedy_closest(q, cur, static_cast<std::uint32_t>(l), n_bound,
-                             scratch.data());
+        cur = i8 ? greedy_closest_int8(qc, qs, qsum, cur,
+                                       static_cast<std::uint32_t>(l), n_bound,
+                                       scratch.data())
+                 : greedy_closest(q, cur, static_cast<std::uint32_t>(l), n_bound,
+                                  scratch.data());
     }
 
     // 3) level..0:efConstruction 搜索 + 启发式选边 + 双向连边 + 邻居收缩。
@@ -645,12 +722,18 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
              static_cast<std::int32_t>(level), max_level);
          l >= 0; --l) {
         const auto lay = static_cast<std::uint32_t>(l);
-        search_layer(q, cur, cfg_.ef_construction, lay, n_bound,
-                     scratch.data(), found);
+        if (i8) {
+            search_layer_int8(qc, qs, qsum, cur, cfg_.ef_construction, lay,
+                              n_bound, scratch.data(), found);
+        } else {
+            search_layer(q, cur, cfg_.ef_construction, lay, n_bound,
+                         scratch.data(), found);
+        }
         cur = found.front().second;  // 下层入口 = 本层最近
 
         auto picked = found;
-        select_neighbors(q, picked, cfg_.M);  // L0 也选 M 条,容量 2M 留收缩余量
+        if (i8) select_neighbors_int8(picked, cfg_.M);
+        else    select_neighbors(q, picked, cfg_.M);  // L0 也选 M,容量 2M 留收缩余量
 
         // 正向边:本节点已发布,读者可能在拷它的邻居 → 持自身锁写。
         {
@@ -677,15 +760,23 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
                 // 收缩:旧邻居 + 新候选并集,以 nid 为查询点重选 cap 条。
                 // 持锁做距离计算(微秒级临界区):读者只在 copy_neighbors
                 // 短暂争同一把锁,实测可接受;arena/锁外预选留 V3.x。
-                const float* nv = vec_of(nid);
                 std::vector<std::pair<float, std::uint32_t>> pool;
                 pool.reserve(cap + 1);
-                for (std::uint32_t i = 1; i <= nb[0]; ++i) {
-                    pool.push_back({dist_id(nv, nb[i]), nb[i]});
+                if (i8) {
+                    for (std::uint32_t i = 1; i <= nb[0]; ++i) {
+                        pool.push_back({dist_id_int8_node(nid, nb[i]), nb[i]});
+                    }
+                    pool.push_back({dist_id_int8_node(nid, id), id});
+                } else {
+                    const float* nv = vec_of(nid);
+                    for (std::uint32_t i = 1; i <= nb[0]; ++i) {
+                        pool.push_back({dist_id(nv, nb[i]), nb[i]});
+                    }
+                    pool.push_back({dist_id(nv, id), id});
                 }
-                pool.push_back({dist_id(nv, id), id});
                 std::sort(pool.begin(), pool.end());
-                select_neighbors(nv, pool, cap);
+                if (i8) select_neighbors_int8(pool, cap);
+                else    select_neighbors(vec_of(nid), pool, cap);
                 nb[0] = static_cast<std::uint32_t>(pool.size());
                 for (std::uint32_t i = 0; i < pool.size(); ++i) {
                     nb[i + 1] = pool[i].second;
@@ -725,9 +816,12 @@ std::vector<HnswIndex::Hit> HnswIndex::search(
     // 启用。粗筛用与 f32 相同的 ef(无扩展),以 int8 VNNI 距离遍历图;
     // 精排仅对 top k*3 候选做 f32 距离(固定开销 ~30 次距离计算),保证
     // 召回与纯 f32 一致。
+    // P5:int8-only 强制 int8 路径(无 f32 可算,且 dim<64 也得走)。默认
+    // 路径仍按 VNNI+kDot+dim≥64 才启 int8 粗筛,否则纯 f32。
     const bool use_int8 =
-        (int8_dot_ != nullptr) && (cfg_.metric == HnswMetric::kDot) &&
-        (cfg_.dim >= 64);
+        cfg_.inmem_int8 ||
+        ((int8_dot_ != nullptr) && (cfg_.metric == HnswMetric::kDot) &&
+         (cfg_.dim >= 64));
 
     std::vector<std::pair<float, std::uint32_t>> found;
     if (use_int8) {
@@ -739,14 +833,19 @@ std::vector<HnswIndex::Hit> HnswIndex::search(
         }
         search_layer_int8(qq.codes.data(), qq.scale, qq.sum_codes,
                           cur, ef, 0, n, scratch.data(), found);
-        const std::size_t rerank_n = std::min(found.size(), k * 3);
-        std::partial_sort(found.begin(), found.begin() + rerank_n,
-                          found.end(),
-                          [this, q](const auto& a, const auto& b) {
-                              return dist_id(q, a.second) < dist_id(q, b.second);
-                          });
-        found.resize(rerank_n);
-        for (auto& [d, id] : found) d = dist_id(q, id);
+        // int8-only:无 f32 可精排,found 已按 int8 距离升序,直接取。
+        // 默认 f32+int8:对 top k*3 做 f32 精排,召回对齐纯 f32。
+        if (!cfg_.inmem_int8) {
+            const std::size_t rerank_n = std::min(found.size(), k * 3);
+            std::partial_sort(found.begin(), found.begin() + rerank_n,
+                              found.end(),
+                              [this, q](const auto& a, const auto& b) {
+                                  return dist_id(q, a.second) <
+                                         dist_id(q, b.second);
+                              });
+            found.resize(rerank_n);
+            for (auto& [d, id] : found) d = dist_id(q, id);
+        }
     } else {
         for (std::int32_t l = max_level; l > 0; --l) {
             cur = greedy_closest(q, cur, static_cast<std::uint32_t>(l), n,
@@ -828,10 +927,23 @@ bool HnswIndex::save(std::string_view path) const {
         vs_put64(buf, c->ords[slot]);
         const std::uint8_t level = c->levels[slot];
         buf.push_back(level);
-        const auto* v = reinterpret_cast<const std::uint8_t*>(
-            c->vecs.data() + static_cast<std::size_t>(slot) * cfg_.dim);
-        buf.insert(buf.end(), v,
-                   v + static_cast<std::size_t>(cfg_.dim) * sizeof(float));
+        // P5:BCVS v1 盘上恒存 f32(格式不变)。int8-only 无常驻 f32 →
+        // 从量化副本反量化写出;load 再量化回。盘上存 int8 的优化留 P5b。
+        if (cfg_.inmem_int8) {
+            const std::int8_t* codes =
+                c->qcodes.data() + static_cast<std::size_t>(slot) * cfg_.dim;
+            const float factor = c->qscales[slot] / 127.0f;
+            for (std::uint32_t d = 0; d < cfg_.dim; ++d) {
+                const float fv = static_cast<float>(codes[d]) * factor;
+                const auto* fp = reinterpret_cast<const std::uint8_t*>(&fv);
+                buf.insert(buf.end(), fp, fp + sizeof(float));
+            }
+        } else {
+            const auto* v = reinterpret_cast<const std::uint8_t*>(
+                c->vecs.data() + static_cast<std::size_t>(slot) * cfg_.dim);
+            buf.insert(buf.end(), v,
+                       v + static_cast<std::size_t>(cfg_.dim) * sizeof(float));
+        }
         for (std::uint32_t l = 0; l <= level; ++l) {
             // 持节点锁拷邻接(与并发写者互斥);≥ n 的邻居(快照水位外的
             // 反向边)滤掉,保证文件内不变量 id < count。
@@ -943,13 +1055,16 @@ bool HnswIndex::load(std::string_view path) {
 
     const std::size_t vec_bytes =
         static_cast<std::size_t>(cfg_.dim) * sizeof(float);
+    // P5:int8-only 读盘 f32 → 量化进 qcodes 的对齐暂存(逐节点复用)。
+    std::vector<float> tmpvec;
+    if (cfg_.inmem_int8) tmpvec.resize(cfg_.dim);
     std::uint64_t prev_ord = 0;
     bool have_prev = false;
     for (std::uint32_t id = 0; id < cnt; ++id) {
         const std::uint32_t ci = id >> kChunkBits;
         NodeChunk* c = chunks_[ci].load(std::memory_order_relaxed);
         if (c == nullptr) {
-            c = new NodeChunk(cfg_.dim);
+            c = new NodeChunk(cfg_.dim, cfg_.inmem_int8);
             chunks_[ci].store(c, std::memory_order_relaxed);
         }
         const std::uint32_t slot = id & kChunkMask;
@@ -963,8 +1078,21 @@ bool HnswIndex::load(std::string_view path) {
         have_prev = true;
         const std::uint8_t level = *p++;
         if (level > 31) return false;
-        std::memcpy(c->vecs.data() + static_cast<std::size_t>(slot) * cfg_.dim,
-                    p, vec_bytes);
+        if (cfg_.inmem_int8) {
+            // 无常驻 f32:读 f32(memcpy 防未对齐)→ 量化进 qcodes。
+            std::memcpy(tmpvec.data(), p, vec_bytes);
+            auto qv = int8::quantize(tmpvec.data(), cfg_.dim);
+            std::memcpy(c->qcodes.data() +
+                            static_cast<std::size_t>(slot) * cfg_.dim,
+                        qv.codes.data(),
+                        static_cast<std::size_t>(cfg_.dim) * sizeof(std::int8_t));
+            c->qscales[slot] = qv.scale;
+            c->qsums[slot]   = qv.sum_codes;
+        } else {
+            std::memcpy(c->vecs.data() +
+                            static_cast<std::size_t>(slot) * cfg_.dim,
+                        p, vec_bytes);
+        }
         p += vec_bytes;
         c->ords[slot]   = ord;
         c->levels[slot] = level;
@@ -1020,7 +1148,9 @@ bool HnswIndex::load(std::string_view path) {
     // V4.2:从 f32 副本重算 int8 量化。BCVS v1 不持久化量化副本——量化是
     // 确定的(f32 输入 → 同一组 int8 codes),重算开销与全图加载同阶,免去
     // 格式升级/兼容成本。仅 kDot + VNNI 路径需要;kL2/无 VNNI 跳过。
-    if (int8_dot_ != nullptr && cfg_.metric == HnswMetric::kDot && cnt > 0) {
+    // P5:int8-only 已在读盘循环内量化(无常驻 f32 可重读),此处跳过。
+    if (!cfg_.inmem_int8 && int8_dot_ != nullptr &&
+        cfg_.metric == HnswMetric::kDot && cnt > 0) {
         for (std::uint32_t id = 0; id < cnt; ++id) {
             NodeChunk* c = chunks_[id >> kChunkBits].load(
                 std::memory_order_relaxed);

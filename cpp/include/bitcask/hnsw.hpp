@@ -66,6 +66,10 @@ struct HnswConfig {
     std::uint32_t M = 16;                 // 上层邻居容量;L0 = 2M
     std::uint32_t ef_construction = 200;
     std::uint64_t seed = 0x5EEDF00D;      // 层数抽样种子(测试可复现)
+    // P5:int8-only 内存模式。true → NodeChunk 不存常驻 f32(vecs 容量 0),
+    // 建图/查询全程 int8,向量内存 ~−80%。仅 kDot(int8 距离=重建内积);
+    // kL2 不支持(上游 open 接线拒绝)。设计 doc/hnsw-int8-only-design-zh.md。
+    bool          inmem_int8 = false;
 };
 
 class HnswIndex {
@@ -105,9 +109,9 @@ public:
     [[nodiscard]] std::uint64_t node_ord(std::uint32_t id) const {
         return ord_of(id);
     }
-    [[nodiscard]] std::span<const float> node_vec(std::uint32_t id) const {
-        return {vec_of(id), cfg_.dim};
-    }
+    // P5:int8-only 下无常驻 f32,反量化到 thread_local 缓冲返回(仅
+    // rebuild_hnsw 单写者即时消费,下次调用前已被 insert 拷走)。
+    [[nodiscard]] std::span<const float> node_vec(std::uint32_t id) const;
 
     // ---- V3.5:快照持久化(BCVS v1,设计 doc/hnsw-design-zh.md §5)----
     // 外壳与 BCKS/BCIS 同款:[magic "BCVS"][ver u32=1][payload][crc32(payload)],
@@ -150,7 +154,8 @@ private:
         std::vector<float>          qscales; // kChunkSize
         std::vector<std::int32_t>   qsums;   // kChunkSize(VNNI 偏置补偿)
 
-        explicit NodeChunk(std::size_t dim);
+        // P5:inmem_int8 时 vecs 容量 0(不存常驻 f32),只分配量化副本。
+        NodeChunk(std::size_t dim, bool inmem_int8);
         ~NodeChunk() = default;
         NodeChunk(const NodeChunk&) = delete;
         NodeChunk& operator=(const NodeChunk&) = delete;
@@ -212,6 +217,15 @@ private:
         return -d;
     }
 
+    // P5:两个已存节点间的 int8 距离(int8-only 建图选边/收缩用,无 f32)。
+    // 与 dist_id_int8 同约定"越小越近"(kDot:取重建内积的负)。
+    [[nodiscard]] float dist_id_int8_node(std::uint32_t a,
+                                          std::uint32_t b) const {
+        const float d = int8_dot_(qcodes_of(a), qcodes_of(b), qsum_of(b),
+                                  qscale_of(a), qscale_of(b), cfg_.dim);
+        return -d;
+    }
+
     // 读者协议:持 id 的自旋锁把 layer 层邻居拷入 out(容量 ≥ 2M),
     // 返回个数。
     std::uint32_t copy_neighbors(std::uint32_t id, std::uint32_t layer,
@@ -248,6 +262,12 @@ private:
     // 已选邻居更近才保留——避免聚簇数据上邻居全挤在同一方向。
     void select_neighbors(
         const float* q,
+        std::vector<std::pair<float, std::uint32_t>>& cands,
+        std::uint32_t m) const;
+
+    // P5:int8-only 版选边启发式。候选 dist(到 query)已预算在 pair 里;
+    // 候选-已选比较走 dist_id_int8_node(两节点皆有量化副本)。
+    void select_neighbors_int8(
         std::vector<std::pair<float, std::uint32_t>>& cands,
         std::uint32_t m) const;
 
