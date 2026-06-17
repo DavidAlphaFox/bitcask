@@ -1323,6 +1323,31 @@ TEST_F(CaskDocValueTest, P5bInmemInt8ComposesWithQuantized) {
     (*c)->close();
 }
 
+// LE flag-day 护栏:旧 v1(大端 legacy)meta 在 open 时被干净拒绝,而非静默把
+// 大端字节读成小端 → 全 record CRC 失败 → 恢复成空库。bump kMetaVersion=2。
+TEST_F(CaskDocValueTest, LegacyV1MetaRejectedCleanly) {
+    // 手写一个 v1 meta:magic "BCME" + version=1 + mode=0(KV) + 余 12 字节零。
+    unsigned char hdr[18] = {0};
+    hdr[0] = 'B'; hdr[1] = 'C'; hdr[2] = 'M'; hdr[3] = 'E';
+    hdr[4] = 1;  // version 1 = 大端 legacy 纪元
+    hdr[5] = 0;  // mode = KV
+    const auto path = (tmpdir_ / "bitcask.meta").string();
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    ASSERT_NE(f, nullptr);
+    ASSERT_EQ(std::fwrite(hdr, 1, sizeof(hdr), f), sizeof(hdr));
+    std::fclose(f);
+
+    // read_meta 直接拒绝(version 不匹配 → 报错,不返回半读配置)。
+    auto mc = bitcask::meta::read_meta(tmpdir_.string());
+    EXPECT_FALSE(mc) << "v1 大端 legacy meta 必须被拒绝";
+
+    // 经 Cask::open 也应失败(不静默读坏)。
+    CaskOptions opts;
+    opts.read_write = true;
+    auto c = Cask::open(tmpdir_.string(), opts);
+    EXPECT_FALSE(c) << "旧大端目录 open 必须失败,提示重建";
+}
+
 // 校验:dim 不符 / 未配置却带向量 / cosine 下零向量,全部拒绝。
 TEST_F(CaskDocValueTest, V31VectorValidation) {
     std::vector<std::byte> key{std::byte{'k'}};

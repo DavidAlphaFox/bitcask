@@ -10,8 +10,11 @@
 
 #include <gtest/gtest.h>
 
+#include "bitcask/codec.hpp"
 #include "bitcask/data_file.hpp"
+#include "bitcask/format.hpp"
 #include "bitcask/hint_file.hpp"
+#include "bitcask/migrate.hpp"
 
 using bitcask::fileops::DataFile;
 using bitcask::fileops::DataFileError;
@@ -46,6 +49,47 @@ std::span<const std::byte> as_bytes(std::string_view s) {
 
 std::string view_str(std::span<const std::byte> b) {
     return std::string(reinterpret_cast<const char*>(b.data()), b.size());
+}
+
+// 大端编码器（仅迁移测试用——构造 v1 legacy 字节固件）。
+void be_put16(std::vector<std::byte>& b, std::uint16_t v) {
+    b.push_back(static_cast<std::byte>((v >> 8) & 0xFF));
+    b.push_back(static_cast<std::byte>(v & 0xFF));
+}
+void be_put32(std::vector<std::byte>& b, std::uint32_t v) {
+    for (int i = 3; i >= 0; --i)
+        b.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xFF));
+}
+void be_put64(std::vector<std::byte>& b, std::uint64_t v) {
+    for (int i = 7; i >= 0; --i)
+        b.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xFF));
+}
+// 一条 v1 大端 data record：[crc BE][type][tstamp BE][ord BE][keysz BE][valsz BE][key][val]。
+std::vector<std::byte> be_data_record(bitcask::format::RecordType type,
+                                      std::uint32_t ts, std::uint64_t ord,
+                                      std::string_view key,
+                                      std::string_view val) {
+    std::vector<std::byte> covered;
+    covered.push_back(static_cast<std::byte>(type));
+    be_put32(covered, ts);
+    be_put64(covered, ord);
+    be_put16(covered, static_cast<std::uint16_t>(key.size()));
+    be_put32(covered, static_cast<std::uint32_t>(val.size()));
+    auto kb = as_bytes(key);
+    covered.insert(covered.end(), kb.begin(), kb.end());
+    auto vb = as_bytes(val);
+    covered.insert(covered.end(), vb.begin(), vb.end());
+    std::vector<std::byte> rec;
+    be_put32(rec, bitcask::codec::crc32(covered));  // CRC 字段（大端）
+    rec.insert(rec.end(), covered.begin(), covered.end());
+    return rec;
+}
+
+void write_file_bytes(const std::string& path, std::span<const std::byte> b) {
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    ASSERT_NE(f, nullptr);
+    if (!b.empty()) ASSERT_EQ(std::fwrite(b.data(), 1, b.size(), f), b.size());
+    std::fclose(f);
 }
 
 }  // namespace
@@ -293,18 +337,18 @@ TEST(HintFile, EmptyFileFoldReturnsNoRecords) {
 }
 
 // ---------------------------------------------------------------------------
-// Cross-language golden:
-//   The hex below was emitted by Erlang (legacy bit-syntax encoding —
-//   identical to bitcask_fileops:hintfile_entry / close_hintfile) for three
-//   records and the trailer:
+// Hint 字节 golden（自洽,非跨语言）。
+//   P:flag-day 后全盘统一小端——**不再与 legacy Erlang 大端字节互通**,故原
+//   "cross-language golden" 失效。下方 hex 是当前 LE 编码对三条 record + trailer
+//   的钉死字节(字段全小端;packed u64 的 tomb 标记落在最后一字节;trailer 的
+//   totalsz=running CRC 随 LE 字节重算)。任何编码漂移在此失败。
 //
 //     R1: key="a"    tstamp=100 totalsz=19 offset=0    tomb=false
 //     R2: key="bb"   tstamp=101 totalsz=20 offset=19   tomb=true
 //     R3: key="cccc" tstamp=102 totalsz=22 offset=39   tomb=false
-//     trailer:       tstamp=0   keysz=0   totalsz=CRC=0xED5B567A
-//                    tomb=0     offset=0x7FFFFFFFFFFFFFFF
+//     trailer:       tstamp=0   keysz=0   totalsz=CRC  offset=0x7FFFFFFFFFFFFFFF
 //
-// To regenerate:  escript scripts/gen_golden_hint.escript
+// 重新生成:跑 EncodingMatchesGoldenByteForByte,取 stderr 的 CAPTURE_LE_HINT_HEX。
 // ---------------------------------------------------------------------------
 namespace {
 
@@ -332,27 +376,27 @@ std::string write_temp_with_bytes(const TempDir& td, std::string_view name,
     return path;
 }
 
-// Single literal to avoid splitting bugs. 158 chars = 79 bytes total.
-constexpr std::string_view kLegacyHintHex =
-    "00000064000100000013000000000000000061"            // R1: 19 B
-    "00000065000200000014800000000000001362"  "62"      // R2: 20 B
-    "00000066000400000016000000000000002763636363"      // R3: 22 B
-    "00000000" "0000" "ed5b567a" "7fffffffffffffff";    // trailer: 18 B
+// 158 chars = 79 bytes total（小端 golden,见上方注释生成方式）。
+constexpr std::string_view kGoldenHintHex =
+    "64000000010013000000000000000000000061"            // R1: 19 B
+    "6500000002001400000013000000000000806262"          // R2: 20 B
+    "66000000040016000000270000000000000063636363"      // R3: 22 B
+    "0000000000002d272b6cffffffffffffff7f";              // trailer: 18 B
 
 }  // namespace
 
-TEST(HintFileGolden, ReadsLegacyEncodedFile) {
+TEST(HintFileGolden, ReadsGoldenEncodedFile) {
     TempDir td;
-    auto bytes = hex_to_bytes(kLegacyHintHex);
+    auto bytes = hex_to_bytes(kGoldenHintHex);
     ASSERT_EQ(bytes.size(), 79u);
-    const auto path = write_temp_with_bytes(td, "legacy.bitcask.hint", bytes);
+    const auto path = write_temp_with_bytes(td, "golden.bitcask.hint", bytes);
 
     auto h = HintFile::open(path, HintFile::Mode::kRead);
     ASSERT_TRUE(h);
 
     auto valid = h->validate_trailer();
     ASSERT_TRUE(valid);
-    EXPECT_TRUE(*valid) << "trailer CRC must validate against legacy bytes";
+    EXPECT_TRUE(*valid) << "trailer CRC must validate against golden LE bytes";
 
     struct R { std::string key; std::uint32_t ts; std::uint32_t sz;
                std::uint64_t off; bool tomb; };
@@ -377,9 +421,9 @@ TEST(HintFileGolden, ReadsLegacyEncodedFile) {
     EXPECT_FALSE(seen[2].tomb);
 }
 
-// Inverse direction: bytes our HintFile produces must match what legacy
-// would have produced for the same logical inputs.
-TEST(HintFileGolden, EncodingMatchesLegacyByteForByte) {
+// Inverse direction: bytes our HintFile produces must match the pinned LE
+// golden for the same logical inputs (drift guard).
+TEST(HintFileGolden, EncodingMatchesGoldenByteForByte) {
     TempDir td;
     const auto path = td / "ours.bitcask.hint";
     auto h = HintFile::open(path, HintFile::Mode::kCreate);
@@ -399,7 +443,7 @@ TEST(HintFileGolden, EncodingMatchesLegacyByteForByte) {
     ASSERT_EQ(std::fread(got.data(), 1, sz, fp), sz);
     std::fclose(fp);
 
-    auto expected = hex_to_bytes(kLegacyHintHex);
+    auto expected = hex_to_bytes(kGoldenHintHex);
     ASSERT_EQ(got.size(), expected.size());
     for (std::size_t i = 0; i < got.size(); ++i) {
         EXPECT_EQ(got[i], expected[i])
@@ -452,4 +496,124 @@ TEST(DataAndHint, ParallelStreamsAreConsistent) {
     });
     ASSERT_TRUE(fr);
     EXPECT_EQ(keys_seen.size(), input.size());
+}
+
+// ---------------------------------------------------------------------------
+// migrate_le：v1 大端目录 → v2 小端目录端到端。手工构造 v1 大端 meta /
+// field.schema / data（含墓碑 + 4 字节 shadow），迁移后用小端读路径校验。
+// ---------------------------------------------------------------------------
+TEST(MigrateBEtoLE, RoundTrip) {
+    using bitcask::format::RecordType;
+    TempDir td;
+    const std::string src = td / "src";
+    const std::string dst = td / "dst";
+    fs::create_directories(src);
+
+    // v1 大端 meta：index 模式(1)、metric=cosine(1)、dim=4(大端 00 04)。
+    {
+        std::vector<std::byte> m(18, std::byte{0});
+        std::memcpy(m.data(), "BCME", 4);
+        m[4] = static_cast<std::byte>(1);  // version 1 (legacy 大端)
+        m[5] = static_cast<std::byte>(1);  // mode = index
+        m[6] = static_cast<std::byte>(1);  // metric = cosine
+        m[7] = static_cast<std::byte>(0);  // dim hi (大端)
+        m[8] = static_cast<std::byte>(4);  // dim lo → dim=4
+        write_file_bytes((fs::path(src) / "bitcask.meta").string(), m);
+    }
+    // v1 大端 field.schema：title(id0)、body(id1)，NameLen u16 大端。
+    {
+        std::vector<std::byte> f;
+        be_put16(f, 5);
+        auto t = as_bytes("title"); f.insert(f.end(), t.begin(), t.end());
+        be_put16(f, 4);
+        auto b = as_bytes("body");  f.insert(f.end(), b.begin(), b.end());
+        write_file_bytes((fs::path(src) / "field.schema").string(), f);
+    }
+    // data 文件：doc k1->v1、doc k2->v2、墓碑 k1（4 字节大端 shadow file_id=1）。
+    {
+        std::vector<std::byte> data;
+        auto r1 = be_data_record(RecordType::kDoc, 100, 1, "k1", "v1");
+        auto r2 = be_data_record(RecordType::kDoc, 101, 2, "k2", "v2");
+        const char shadow_be[4] = {0, 0, 0, 1};  // 大端 u32 = 1
+        auto r3 = be_data_record(RecordType::kTombstone, 102, 3, "k1",
+                                 std::string_view(shadow_be, 4));
+        for (auto* r : {&r1, &r2, &r3}) data.insert(data.end(), r->begin(), r->end());
+        write_file_bytes((fs::path(src) / "1.bitcask.data").string(), data);
+    }
+
+    auto res = bitcask::migrate::migrate_be_to_le(src, dst);
+    ASSERT_TRUE(res) << (res ? "" : res.error());
+    EXPECT_EQ(res->data_files, 1u);
+    EXPECT_EQ(res->records, 3u);
+    EXPECT_EQ(res->tombstones, 1u);
+    EXPECT_EQ(res->skipped_bad_crc, 0u);
+    EXPECT_TRUE(res->meta_migrated);
+    EXPECT_TRUE(res->field_schema_migrated);
+
+    // dst meta：version 2、dim 小端 = 4。
+    {
+        std::FILE* f = std::fopen((fs::path(dst) / "bitcask.meta").c_str(), "rb");
+        ASSERT_NE(f, nullptr);
+        unsigned char m[18];
+        ASSERT_EQ(std::fread(m, 1, 18, f), 18u);
+        std::fclose(f);
+        EXPECT_EQ(m[4], 2u);
+        EXPECT_EQ(static_cast<std::uint16_t>(m[7] | (m[8] << 8)), 4u);
+    }
+
+    // dst data：用小端读路径 fold，逐 record 校验（CRC 重算后必须通过）。
+    {
+        auto df = DataFile::open((fs::path(dst) / "1.bitcask.data").string(),
+                                 DataFile::Mode::kRead, false, false);
+        ASSERT_TRUE(df);
+        struct Rec { RecordType type; std::uint32_t ts; std::uint64_t ord;
+                     std::string key; std::string val; };
+        std::vector<Rec> recs;
+        auto fr = df->fold([&](const bitcask::codec::DataRecordView& v,
+                               std::uint64_t, std::uint32_t) {
+            recs.push_back({v.type, v.tstamp, v.ord, view_str(v.key),
+                            view_str(v.value)});
+        });
+        ASSERT_TRUE(fr);
+        ASSERT_EQ(recs.size(), 3u);
+        EXPECT_EQ(recs[0].ts, 100u); EXPECT_EQ(recs[0].ord, 1u);
+        EXPECT_EQ(recs[0].key, "k1"); EXPECT_EQ(recs[0].val, "v1");
+        EXPECT_EQ(recs[1].key, "k2"); EXPECT_EQ(recs[1].val, "v2");
+        EXPECT_EQ(recs[2].type, RecordType::kTombstone);
+        EXPECT_EQ(recs[2].key, "k1");
+        // 4 字节 shadow 大端→小端：file_id=1 → 01 00 00 00。
+        ASSERT_EQ(recs[2].val.size(), 4u);
+        EXPECT_EQ(static_cast<unsigned char>(recs[2].val[0]), 1u);
+        EXPECT_EQ(static_cast<unsigned char>(recs[2].val[3]), 0u);
+    }
+
+    // dst hint：重生成，fold 出 3 条，墓碑标志正确。
+    {
+        auto h = HintFile::open((fs::path(dst) / "1.bitcask.hint").string(),
+                                HintFile::Mode::kRead);
+        ASSERT_TRUE(h);
+        auto v = h->validate_trailer();
+        ASSERT_TRUE(v); EXPECT_TRUE(*v);
+        std::vector<std::string> keys; std::vector<bool> tombs;
+        auto fr = h->fold([&](const auto& rec) {
+            keys.push_back(view_str(rec.key));
+            tombs.push_back(rec.tombstone);
+        });
+        ASSERT_TRUE(fr);
+        EXPECT_EQ(keys, (std::vector<std::string>{"k1", "k2", "k1"}));
+        EXPECT_EQ(tombs, (std::vector<bool>{false, false, true}));
+    }
+}
+
+// 已是小端(v2)的目录再迁移 → 干净报错(不重复迁移)。
+TEST(MigrateBEtoLE, RejectsAlreadyV2) {
+    TempDir td;
+    const std::string src = td / "src2";
+    fs::create_directories(src);
+    std::vector<std::byte> m(18, std::byte{0});
+    std::memcpy(m.data(), "BCME", 4);
+    m[4] = static_cast<std::byte>(2);  // 已是 v2
+    write_file_bytes((fs::path(src) / "bitcask.meta").string(), m);
+    auto res = bitcask::migrate::migrate_be_to_le(src, td / "dst2");
+    EXPECT_FALSE(res);
 }

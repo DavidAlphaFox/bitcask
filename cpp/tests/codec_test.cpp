@@ -82,40 +82,56 @@ TEST(DataRecord, GoldenLayout) {
                               /*ord*/ 1, as_bytes("k"), as_bytes("vv"));
     ASSERT_EQ(out.size(), kHeaderSize + 1 + 2);
 
-    // Covered region (everything after the 4-byte CRC):
+    // Covered region (everything after the 4-byte CRC). P:小端盘格式——
+    // 多字节字段低位在前。
     //   Type:    00
-    //   Tstamp:  12 34 56 78
-    //   Ord:     00 00 00 00 00 00 00 01
-    //   KeySz:   00 01
-    //   ValueSz: 00 00 00 02
+    //   Tstamp:  78 56 34 12   (0x12345678 LE)
+    //   Ord:     01 00 00 00 00 00 00 00
+    //   KeySz:   01 00
+    //   ValueSz: 02 00 00 00
     //   Key:     6b
     //   Value:   76 76
-    auto covered = hex_to_bytes("00" "12345678" "0000000000000001"
-                                "0001" "00000002" "6b" "7676");
+    auto covered = hex_to_bytes("00" "78563412" "0100000000000000"
+                                "0100" "02000000" "6b" "7676");
     const std::uint32_t expected_crc = codec::crc32(covered);
 
-    EXPECT_EQ(out[0], static_cast<std::byte>((expected_crc >> 24) & 0xFF));
-    EXPECT_EQ(out[1], static_cast<std::byte>((expected_crc >> 16) & 0xFF));
-    EXPECT_EQ(out[2], static_cast<std::byte>((expected_crc >> 8) & 0xFF));
-    EXPECT_EQ(out[3], static_cast<std::byte>(expected_crc & 0xFF));
+    EXPECT_EQ(out[0], static_cast<std::byte>(expected_crc & 0xFF));
+    EXPECT_EQ(out[1], static_cast<std::byte>((expected_crc >> 8) & 0xFF));
+    EXPECT_EQ(out[2], static_cast<std::byte>((expected_crc >> 16) & 0xFF));
+    EXPECT_EQ(out[3], static_cast<std::byte>((expected_crc >> 24) & 0xFF));
     for (std::size_t i = 0; i < covered.size(); ++i) {
         EXPECT_EQ(out[4 + i], covered[i]) << "mismatch at byte " << (4 + i);
     }
 }
 
-// Full pinned hex (incl. CRC) — any silent format drift fails here.
+// Full pinned layout (incl. CRC) — any silent format drift fails here.
+// P:小端盘格式——从 covered(全小端字段)+ 计算 CRC(小端前置)独立重建期望,
+// 钉死「[crc:u32 LE][type][tstamp:u32 LE][ord:u64 LE][keysz:u16 LE][valsz:u32 LE][key][val]」。
 TEST(DataRecord, GoldenHex) {
+    auto le_u32 = [](std::vector<std::byte>& b, std::uint32_t v) {
+        for (int i = 0; i < 4; ++i)
+            b.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xFF));
+    };
+    auto build = [&](std::span<const std::byte> covered) {
+        std::vector<std::byte> e;
+        le_u32(e, codec::crc32(covered));
+        e.insert(e.end(), covered.begin(), covered.end());
+        return e;
+    };
+
+    auto doc_covered = hex_to_bytes("00" "78563412" "0100000000000000"
+                                    "0100" "02000000" "6b" "7676");
     std::vector<std::byte> doc;
     codec::encode_data_record(doc, RecordType::kDoc, 0x12345678, 1,
                               as_bytes("k"), as_bytes("vv"));
-    EXPECT_EQ(bytes_to_hex(doc),
-              "a391d9e0001234567800000000000000010001000000026b7676");
+    EXPECT_EQ(doc, build(doc_covered));
 
+    auto tomb_covered = hex_to_bytes("01" "07000000" "0900000000000000"
+                                     "0100" "00000000" "6b");
     std::vector<std::byte> tomb;
     codec::encode_data_record(tomb, RecordType::kTombstone, 7, 9,
                               as_bytes("k"), {});
-    EXPECT_EQ(bytes_to_hex(tomb),
-              "993828e0010000000700000000000000090001000000006b");
+    EXPECT_EQ(tomb, build(tomb_covered));
 }
 
 TEST(DataRecord, RoundTrip) {
@@ -473,8 +489,9 @@ TEST(HintRecord, GoldenLayoutNonTombstone) {
     std::vector<std::byte> out;
     codec::encode_hint_record(out, 0xDEADBEEF, 0x00000010,
                               0x0000000001020304ull, false, as_bytes("ab"));
-    auto expected = hex_to_bytes("deadbeef" "0002" "00000010"
-                                 "0000000001020304" "6162");
+    // P:小端——Tstamp/KeySz/TotalSz/packed 全低位在前。
+    auto expected = hex_to_bytes("efbeadde" "0200" "10000000"
+                                 "0403020100000000" "6162");
     ASSERT_EQ(out.size(), expected.size());
     EXPECT_EQ(bytes_to_hex(out), bytes_to_hex(expected));
 }
@@ -482,7 +499,8 @@ TEST(HintRecord, GoldenLayoutNonTombstone) {
 TEST(HintRecord, GoldenLayoutTombstoneSetsHighBit) {
     std::vector<std::byte> out;
     codec::encode_hint_record(out, 1, 22, 0x10, true, as_bytes("k"));
-    EXPECT_EQ(static_cast<std::uint8_t>(out[10]) & 0x80u, 0x80u);
+    // P:packed u64 小端 → 最高位(bit63=tomb 标记)落在最后一字节 out[17]。
+    EXPECT_EQ(static_cast<std::uint8_t>(out[17]) & 0x80u, 0x80u);
     auto rec = codec::decode_hint_record(out);
     ASSERT_TRUE(rec.has_value());
     EXPECT_TRUE(rec->tombstone);
