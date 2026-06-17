@@ -95,6 +95,7 @@ struct CaskOptions {
     // 创建时写入 meta,重开校验不符 → kModeMismatch。库内 dim 恒定。
     std::uint16_t vector_dim = 0;
     bool          vector_quantized = false;  // P3b：向量落盘 int8 量化（4× 磁盘，有损）
+    bool          vector_inmem_int8 = false; // P5b：HNSW int8-only 内存（−80% 向量内存，仅 kDot；与 quantized 正交）
     meta::VectorMetric vector_metric = meta::VectorMetric::kCosineNormalized;
 };
 

@@ -534,6 +534,12 @@ std::expected<void, CaskFault> Cask::acquire_open_locks() {
 // 之前——meta 决定 KV / 索引模式以及向量配置,SearchLayer 内部 HnswIndex
 // 创建依赖 meta_config_。vector_dim/metric 不符 → kModeMismatch。
 std::expected<void, CaskFault> Cask::check_or_create_meta() {
+    // P5b:int8-only 仅 kDot(int8 距离=重建内积);kL2 不支持,干净拒绝。
+    if (opts_.vector_dim > 0 && opts_.vector_inmem_int8 &&
+        opts_.vector_metric == meta::VectorMetric::kL2) {
+        return std::unexpected(err(CaskError::kInvalidOption,
+            "vector_inmem_int8 requires kDot/cosine metric (kL2 unsupported)"));
+    }
     if (meta::meta_exists(dirname_)) {
         auto mc = meta::read_meta(dirname_);
         if (!mc) return std::unexpected(err(CaskError::kIo, "read meta failed"));
@@ -550,11 +556,14 @@ std::expected<void, CaskFault> Cask::check_or_create_meta() {
                                      ? opts_.vector_metric
                                      : meta::VectorMetric::kNone;
         const bool want_quant = opts_.vector_dim > 0 && opts_.vector_quantized;
+        const bool want_inmem_int8 =
+            opts_.vector_dim > 0 && opts_.vector_inmem_int8;
         if (mc->vector_dim != opts_.vector_dim ||
             mc->vector_metric != want_metric ||
-            mc->vector_quantized != want_quant) {
+            mc->vector_quantized != want_quant ||
+            mc->vector_inmem_int8 != want_inmem_int8) {
             return std::unexpected(err(CaskError::kModeMismatch,
-                "vector config mismatch (meta dim/metric/quantized vs options)"));
+                "vector config mismatch (meta dim/metric/quantized/inmem_int8 vs options)"));
         }
         meta_config_ = *mc;
         return {};
@@ -570,6 +579,7 @@ std::expected<void, CaskFault> Cask::check_or_create_meta() {
         mc.vector_dim = opts_.vector_dim;
         mc.vector_metric = opts_.vector_metric;
         mc.vector_quantized = opts_.vector_quantized;  // P3b
+        mc.vector_inmem_int8 = opts_.vector_inmem_int8;  // P5b
     }
     auto wr = meta::write_meta(dirname_, mc);
     if (!wr) return std::unexpected(err(CaskError::kIo, "write meta failed"));
@@ -592,6 +602,7 @@ Cask::create_search_infra(const CaskOptions& opts) {
     auto scfg = *opts.search_config;
     scfg.vector_dim = meta_config_.vector_dim;
     scfg.vector_metric = meta_config_.vector_metric;
+    scfg.vector_inmem_int8 = meta_config_.vector_inmem_int8;  // P5b
     search_ = std::make_unique<search::SearchLayer>(scfg);
     // analyzer 构造失败（无效配置 / 分词器未注册 / 词典加载失败）则 analyzer_
     // 为空——决不能带病打开，否则首次带 text 的 put 段错误。干净拒绝。
