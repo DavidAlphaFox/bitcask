@@ -148,8 +148,8 @@ fold 尾部回放」。后缀编码契约（`.ckpt`/`.wal`/`.seg`/`.manifest`）
 升级后首次 open 一次全量 fold、close 落新名；410 测试通过）；
 **P14b** wm_min 单趟回放（替双轨 + 消门悬崖）；**P14c** 周期性 checkpoint（`checkpoint_interval`
 + worker 静止窗口）；**P14d** 摘 bm25 WAL（profiling 驱动决定是否留 `terms` 纯缓存）；
-**P14e** 搜索快照收编为单个分段 `search.ckpt`（逐段 CRC + 页脚目录 + 段级脏位复用）+ 代际
-`search.ckpt.prev`（采纳 cellar 文件结构，WAL 仍走路线 A；对比见设计文档 §10）。
+**P14e** 搜索快照收编为单个分段 `search.ckpt`（逐段 CRC + 页脚目录 + 段级脏位复用 + docmap/meta/terms
+可选加速缓存，缺失从 keydir⋈postings+fold 派生）+ 代际 `search.ckpt.prev`（与 cellar 全面收敛于路线 A；见设计文档 §10）。
 **收益**：命名契约清晰 · 写放大 2→1 · 文件数大降（搜索多文件→1）· 损坏隔离到段 · 崩溃后不再全量 fold。
 
 ---
