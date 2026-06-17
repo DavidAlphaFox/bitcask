@@ -185,19 +185,7 @@ public:
     // 不崩)。水位幂等由 HnswIndex 保证(回放重叠区安全)。
     void on_vector(std::uint64_t ord, std::span<const float> vec);
 
-    // ---- V3.5:HNSW 快照(BCVS v1)+ merge 重建 ----
-    // save:把当前图(向量+邻接+entry)整体落盘;无向量配置返回 false。
-    // 调用点 = 写者静止处(close;merge 末尾如启用)。
-    [[nodiscard]] bool save_vec_snapshot(std::string_view path) const;
-    // load:open 期调用。新建同 config 实例 → HnswIndex::load 全量校验,
-    // 成功才原子换入(整体拒绝语义:失败弃新实例,现图原样保留——
-    // 调用方走全量 fold,insert 水位幂等收敛)。
-    [[nodiscard]] bool load_vec_snapshot(std::string_view path);
-    // covers 标记(A4 门合取项):图水位 + 1;空图(或无向量配置)= 0。
-    // 语义:所有 ord < 返回值的**向量**文档已在图中(墓碑/无向量文档不占
-    // 图水位——但它们消耗 ord,故尾部若是此类记录,门会保守关闭,回退
-    // 全量 fold;与 bm25 floor 门同款保守性,安全方向)。
-    [[nodiscard]] std::uint64_t hnsw_covers_next_ord() const;
+    // ---- HNSW 大小 + merge 重建 ----
     // 图节点数(含软删死节点;测试/观测用)。无向量配置 = 0。
     [[nodiscard]] std::size_t hnsw_size() const;
     // merge 重建(物理清除死节点)。**只能由 IndexPool worker 执行**
@@ -246,35 +234,32 @@ public:
     // ---- 恢复：从磁盘 record 重放墓碑 ----
     void recover_tomb(std::string_view key, std::uint64_t ord);
 
-    // A4-P2:全字段已索引 ord 水位的下确界(min over fields)。
-    // u64(-1) = 任一字段无文档/无字段——调用方据此判定 search 状态是否
-    // 覆盖 keydir 快照的跳过区(成对性门,recovery 设计 §4)。
-    [[nodiscard]] std::uint64_t indexed_ord_floor() const;
-
-    // ---- A4-P3:Index sidecar 快照(BCIS v1)----
-    // 持久化 Index 侧表(ext2ord/slots/doc_lens/live,经 for_each_live
-    // 公开 API dump;put_doc 重建)。covers_next_ord 为覆盖标记:
-    // 调用时刻所有 ord < 该值的文档已进 Index(调用方保证 IndexPool 已
-    // flush)。这是 Phase 2 成对性门缺失的第三块状态,见 recovery 设计 §4。
-    [[nodiscard]] bool save_index_sidecar(std::string_view path,
-                                          std::uint64_t covers_next_ord) const;
-    // 校验失败返回 nullopt(Index 态可能已部分写入——调用方届时走全量
-    // fold,recover_doc 的 put_doc 覆盖语义保证收敛)。成功返回标记。
-    [[nodiscard]] std::optional<std::uint64_t>
-    load_index_sidecar(std::string_view path);
-    // P14e:docmap 序列化到/自字节缓冲(供 search.ckpt 分段)。字节与
-    // save/load_index_sidecar 一致(BCIS 自带框架)。serialize 返回 false 仅
-    // 当某 ext 超 64KiB;deserialize 校验失败返回 nullopt,成功返回 covers。
+    // P14e:docmap 序列化到/自字节缓冲(供 search.ckpt 分段)。
+    // serialize 返回 false 仅当某 ext 超 64KiB;
+    // deserialize 校验失败返回 nullopt,成功返回 covers。
     [[nodiscard]] bool serialize_docmap(std::vector<std::uint8_t>& out,
                                         std::uint64_t covers_next_ord) const;
     [[nodiscard]] std::optional<std::uint64_t>
     deserialize_docmap(std::span<const std::uint8_t> bytes);
 
-    // ---- 快照持久化 ----
-    [[nodiscard]] std::expected<void, std::string> save_snapshot(std::string_view path) const;
+    // ---- P14e:统一分段 search.ckpt 持久化 ----
+    // save_search_ckpt: 序列化所有索引段（docmap/bm25.default/bm25.fields/
+    // hnsw）写入单个 search.ckpt，并做 .prev 代际回退。watermark = 保存时
+    // 的 next_ord（覆盖上界）。caller 须先排干 IndexPool（写者静止点）。
+    // 返回 false = 序列化或写入失败（best-effort，caller 不阻断）。
+    [[nodiscard]] bool save_search_ckpt(std::string_view path,
+                                        std::uint64_t watermark);
 
-    // ---- 快照加载 ----
-    [[nodiscard]] std::expected<bool, std::string> load_snapshot(std::string_view path);
+    // load_search_ckpt 结果。
+    struct CkptLoadResult {
+        bool loaded         = false;  // search.ckpt（或 .prev）结构完整
+        std::uint64_t watermark = 0;   // 快照覆盖的 next_ord 上界
+        bool all_segments_ok = false;  // 全段 CRC 通过 → 可走快路径
+    };
+    // 读 search.ckpt → 逐段校验 CRC → 分发到各反序列化器。
+    // 结构损坏 → 尝试 .prev；都失败 → loaded=false（全量 fold 兜底）。
+    // 段 CRC 失败 → 该段内存为空（fold 时重建），其余段照常载入。
+    [[nodiscard]] CkptLoadResult load_search_ckpt(std::string_view path);
 
     // 从磁盘重建倒排索引：遍历 Index 中所有 live 文档，通过 doc_reader 回调读取文本，
     // 重新分词并构建全新的 InvertedIndex，原子替换旧的。
@@ -383,11 +368,10 @@ private:
     // V3.5:atomic<shared_ptr>——merge 重建以"新图旁路构建 + 原子换指针"
     // 实现,读者每次操作开头 load 一次快照指针,旧图由引用计数续命;
     // 写路径(worker 单线程)同样经 load 取图。指针仅在构造与
-    // rebuild_hnsw/load_vec_snapshot 的换入点变更。
+    // rebuild_hnsw 的换入点变更。
     std::atomic<std::shared_ptr<vec::HnswIndex>> hnsw_;
     mutable SearchCache cache_;
     mutable DocTextLru  doc_texts_;
-    mutable std::string snapshot_path_;
     std::unique_ptr<text::SynonymMap> synonym_map_;
 };
 

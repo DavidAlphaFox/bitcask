@@ -1,4 +1,5 @@
 #include "bitcask/search_layer.hpp"
+#include "bitcask/search_checkpoint.hpp"
 #include "bitcask/text_utils.hpp"
 #include "bitcask/codec.hpp"
 #include "bitcask/highlighter.hpp"
@@ -7,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <limits>
@@ -45,46 +47,19 @@ void SearchLayer::on_vector(std::uint64_t ord, std::span<const float> vec) {
     hnsw->insert(ord, vec);
 }
 
-// ---- V3.5:HNSW 快照 + merge 重建(协议见 search_layer.hpp 声明)----
-
-bool SearchLayer::save_vec_snapshot(std::string_view path) const {
-    auto hnsw = hnsw_.load(std::memory_order_acquire);
-    if (!hnsw) return false;
-    return hnsw->save(path);
-}
-
-bool SearchLayer::load_vec_snapshot(std::string_view path) {
-    auto cur = hnsw_.load(std::memory_order_acquire);
-    if (!cur) return false;  // 无向量配置
-    auto fresh = std::make_shared<vec::HnswIndex>(cur->config());
-    if (!fresh->load(path)) return false;  // 整体拒绝:弃 fresh,现图不动
-    hnsw_.store(std::move(fresh), std::memory_order_release);
-    return true;
-}
-
-std::uint64_t SearchLayer::hnsw_covers_next_ord() const {
-    auto hnsw = hnsw_.load(std::memory_order_acquire);
-    if (!hnsw) return 0;
-    const auto wm = hnsw->max_inserted_ord();
-    return wm == static_cast<std::uint64_t>(-1) ? 0 : wm + 1;
-}
-
 std::size_t SearchLayer::hnsw_size() const {
     auto hnsw = hnsw_.load(std::memory_order_acquire);
     return hnsw ? hnsw->size() : 0;
 }
 
 void SearchLayer::rebuild_hnsw() {
-    // 仅 IndexPool worker 线程调用(单写者约束:新图的 insert 与后续
-    // on_vector 都在本线程串行)。重建期间并发查询走旧图(含死节点,
-    // 语义同 V3.4 软删);换入后旧图由在途读者 shared_ptr 续命。
     auto old = hnsw_.load(std::memory_order_acquire);
     if (!old) return;
     auto fresh = std::make_shared<vec::HnswIndex>(old->config());
     const auto n = static_cast<std::uint32_t>(old->size());
     for (std::uint32_t id = 0; id < n; ++id) {
         const std::uint64_t ord = old->node_ord(id);
-        if (!index_.is_live(ord)) continue;  // 物理清死(merge 承诺)
+        if (!index_.is_live(ord)) continue;
         fresh->insert(ord, old->node_vec(id));
     }
     hnsw_.store(std::move(fresh), std::memory_order_release);
@@ -795,23 +770,6 @@ void SearchLayer::recover_tomb(std::string_view key, std::uint64_t ord) {
     index_.remove(key, ord);
 }
 
-// S8.6：多字段快照 = manifest（字段名清单）+ 每字段一个 `<path>.f<N>.seg`
-// （P14a：段后缀 .inv→.seg、WAL .inv.wal→.wal，契约见命名设计 §3）。
-// manifest 文本行：第一行字段数，之后每行一个字段名。字段名→序号即行号。
-std::uint64_t SearchLayer::indexed_ord_floor() const {
-    std::shared_lock lk(fields_mu_);
-    if (fields_.empty()) return static_cast<std::uint64_t>(-1);
-    std::uint64_t floor = std::numeric_limits<std::uint64_t>::max() - 1;
-    for (auto& [_, inv] : fields_) {
-        const auto wm = inv->max_indexed_ord();
-        if (wm == static_cast<std::uint64_t>(-1)) {
-            return static_cast<std::uint64_t>(-1);  // 有空字段:无覆盖保证
-        }
-        floor = std::min(floor, wm);
-    }
-    return floor;
-}
-
 
 namespace {
 constexpr std::uint32_t kSidecarMagic   = 0x42434953;  // "BCIS"
@@ -861,39 +819,6 @@ bool SearchLayer::serialize_docmap(std::vector<std::uint8_t>& buf,
     return true;
 }
 
-bool SearchLayer::save_index_sidecar(std::string_view path,
-                                     std::uint64_t covers_next_ord) const {
-    std::vector<std::uint8_t> buf;
-    if (!serialize_docmap(buf, covers_next_ord)) return false;
-    const std::string fp(path);
-    const std::string tmp = fp + ".tmp";
-    std::FILE* f = std::fopen(tmp.c_str(), "wb");
-    if (!f) return false;
-    const bool wrote = std::fwrite(buf.data(), 1, buf.size(), f) == buf.size();
-    std::fclose(f);
-    if (!wrote || std::rename(tmp.c_str(), fp.c_str()) != 0) {
-        std::remove(tmp.c_str());
-        return false;
-    }
-    return true;
-}
-
-std::optional<std::uint64_t>
-SearchLayer::load_index_sidecar(std::string_view path) {
-    std::FILE* f = std::fopen(std::string(path).c_str(), "rb");
-    if (!f) return std::nullopt;
-    std::fseek(f, 0, SEEK_END);
-    const long fsz = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    if (fsz < 0) { std::fclose(f); return std::nullopt; }
-    std::vector<std::uint8_t> buf(static_cast<std::size_t>(fsz));
-    const bool rd = buf.empty() ||
-                    std::fread(buf.data(), 1, buf.size(), f) == buf.size();
-    std::fclose(f);
-    if (!rd) return std::nullopt;
-    return deserialize_docmap(buf);
-}
-
 std::optional<std::uint64_t>
 SearchLayer::deserialize_docmap(std::span<const std::uint8_t> buf) {
     if (buf.size() < 28) return std::nullopt;
@@ -936,67 +861,6 @@ SearchLayer::deserialize_docmap(std::span<const std::uint8_t> buf) {
     return covers;
 }
 
-std::expected<void, std::string> SearchLayer::save_snapshot(std::string_view path) const {
-    const std::string base(path);
-    snapshot_path_ = base;
-    std::ofstream mf(base + ".manifest", std::ios::binary);
-    if (!mf) return std::unexpected("failed to open manifest for " + base);
-    std::shared_lock fields_lk(fields_mu_);  // 快照期间禁止新字段插入
-    mf << fields_.size() << '\n';
-    std::size_t idx = 0;
-    for (auto& [field, inv] : fields_) {
-        mf << field << '\n';   // 字段名（可能含控制字符前缀，按行存）
-        if (!inv->save(base + ".f" + std::to_string(idx) + ".seg")) {
-            return std::unexpected("failed to save field snapshot " + field);
-        }
-        inv->truncate_wal();
-        ++idx;
-    }
-    if (!mf.good()) return std::unexpected("failed to write manifest for " + base);
-    return {};
-}
-
-std::expected<bool, std::string> SearchLayer::load_snapshot(std::string_view path) {
-    const std::string base(path);
-    snapshot_path_ = base;
-    std::ifstream mf(base + ".manifest", std::ios::binary);
-    if (mf) {
-        std::size_t count = 0;
-        mf >> count;
-        mf.get();  // 吃掉换行
-        std::unique_lock fields_lk(fields_mu_);
-        fields_.clear();
-        ord_field_lens_.clear();  // 旧 ord 多字段统计随快照失效,清掉防残留。
-        for (std::size_t i = 0; i < count; ++i) {
-            std::string field;
-            if (!std::getline(mf, field)) {
-                return std::unexpected("manifest truncated for " + base);
-            }
-            auto inv = std::make_unique<bm25::InvertedIndex>(config_.bm25_params, config_.index_positions);
-            if (!inv->load(base + ".f" + std::to_string(i) + ".seg")) {
-                return std::unexpected("failed to load field snapshot " + field);
-            }
-            // S8.9：加载快照后如 WAL 文件存在，启用并重放。
-            auto wal_path = base + ".f" + std::to_string(i) + ".wal";
-            if (std::ifstream(wal_path).good()) {
-                inv->enable_wal(wal_path, config_.wal_batch_size);
-                inv->replay_wal();
-            }
-            fields_.emplace(std::move(field), std::move(inv));
-        }
-        return true;
-    }
-    // 回退：无 manifest 时尝试旧单文件格式 → 映射到默认字段（向后兼容）。
-    auto inv_fallback = std::make_unique<bm25::InvertedIndex>(config_.bm25_params, config_.index_positions);
-    if (!inv_fallback->load(base)) {
-        return std::unexpected(std::string("failed to load snapshot from ") + base);
-    }
-    fields_.clear();
-    ord_field_lens_.clear();  // 旧 ord 多字段统计随快照失效,清掉防残留。
-    fields_.emplace(std::string(kDefaultField), std::move(inv_fallback));
-    return true;
-}
-
 void SearchLayer::rebuild_index(DocReader doc_reader) {
     // 阶段2a：仍按默认字段重建（多字段从 DocValue 取字段在阶段4打通）。
     auto new_inv = std::make_unique<bm25::InvertedIndex>(config_.bm25_params, config_.index_positions);
@@ -1019,16 +883,8 @@ void SearchLayer::rebuild_index(DocReader doc_reader) {
     new_inv->finalize_all_postings();
 
     const std::string default_field(kDefaultField);
-    auto it = fields_.find(default_field);
-    bool had_wal = (it != fields_.end()) && it->second->has_wal();
-
     fields_.clear();
     fields_.emplace(default_field, std::move(new_inv));
-
-    if (had_wal && !snapshot_path_.empty()) {
-        fields_[default_field]->enable_wal(snapshot_path_ + ".f0.wal",
-                                            config_.wal_batch_size);
-    }
 
     cache_.invalidate();
 }
@@ -1101,6 +957,277 @@ SearchLayer::search_text_highlight(std::string_view query, std::size_t k,
         });
     }
     return hits;
+}
+
+// ---- P14e:统一分段 search.ckpt 持久化 ----
+
+namespace {
+// type 3 (bm25.fields) 辅助:把多个非默认字段序列化为一个段 payload。
+// 格式:u32 fieldCount; 每字段 [u16 nameLen][name][u64 invLen][inv bytes]。
+// 使用与 search_checkpoint.hpp 相同的小端编码。
+void put_u16_byte(std::vector<std::byte>& b, std::uint16_t v) {
+    b.push_back(static_cast<std::byte>(v & 0xFF));
+    b.push_back(static_cast<std::byte>((v >> 8) & 0xFF));
+}
+void put_u32_byte(std::vector<std::byte>& b, std::uint32_t v) {
+    for (int i = 0; i < 4; ++i)
+        b.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xFF));
+}
+void put_u64_byte(std::vector<std::byte>& b, std::uint64_t v) {
+    for (int i = 0; i < 8; ++i)
+        b.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xFF));
+}
+std::uint16_t get_u16_byte(const std::byte* p) {
+    return static_cast<std::uint16_t>(p[0]) |
+           (static_cast<std::uint16_t>(p[1]) << 8);
+}
+std::uint32_t get_u32_byte(const std::byte* p) {
+    return static_cast<std::uint32_t>(p[0]) |
+           (static_cast<std::uint32_t>(p[1]) << 8) |
+           (static_cast<std::uint32_t>(p[2]) << 16) |
+           (static_cast<std::uint32_t>(p[3]) << 24);
+}
+std::uint64_t get_u64_byte(const std::byte* p) {
+    std::uint64_t v = 0;
+    for (int i = 0; i < 8; ++i)
+        v |= static_cast<std::uint64_t>(p[i]) << (8 * i);
+    return v;
+}
+}  // namespace
+
+bool SearchLayer::save_search_ckpt(std::string_view path,
+                                   std::uint64_t watermark) {
+    namespace sc = bitcask::search;
+    const std::string fp(path);
+
+    std::vector<sc::CkptSection> secs;
+    // 段 payload 缓冲区须活到 write() 完成——span 是非 owning 视图。
+    std::vector<std::vector<std::byte>> byte_bufs;
+    std::vector<std::vector<std::uint8_t>> u8_bufs;
+    auto add_byte_sec = [&](std::uint16_t type,
+                            std::vector<std::byte> buf) {
+        byte_bufs.push_back(std::move(buf));
+        secs.push_back(sc::CkptSection{
+            type, 0,
+            std::span<const std::byte>(byte_bufs.back().data(),
+                                        byte_bufs.back().size())});
+    };
+    auto add_u8_sec = [&](std::uint16_t type,
+                          std::vector<std::uint8_t> buf) {
+        u8_bufs.push_back(std::move(buf));
+        secs.push_back(sc::CkptSection{
+            type, 0,
+            std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(u8_bufs.back().data()),
+                u8_bufs.back().size())});
+    };
+
+    // 段 1: docmap (type 1)。
+    {
+        std::vector<std::uint8_t> buf;
+        if (serialize_docmap(buf, watermark)) {
+            add_u8_sec(static_cast<std::uint16_t>(sc::CkptSectionType::kDocmap),
+                       std::move(buf));
+        }
+    }
+
+    // 段 2 + 3: bm25.default + bm25.fields。
+    {
+        std::shared_lock lk(fields_mu_);
+        auto dit = fields_.find(std::string(kDefaultField));
+        if (dit != fields_.end()) {
+            std::vector<std::byte> buf;
+            dit->second->serialize(buf);
+            add_byte_sec(
+                static_cast<std::uint16_t>(sc::CkptSectionType::kBm25Default),
+                std::move(buf));
+        }
+        std::uint32_t other_count = 0;
+        for (auto& [field, inv] : fields_) {
+            if (field == kDefaultField) continue;
+            ++other_count;
+        }
+        if (other_count > 0) {
+            std::vector<std::byte> fbuf;
+            put_u32_byte(fbuf, other_count);
+            for (auto& [field, inv] : fields_) {
+                if (field == kDefaultField) continue;
+                put_u16_byte(fbuf, static_cast<std::uint16_t>(field.size()));
+                fbuf.insert(fbuf.end(),
+                    reinterpret_cast<const std::byte*>(field.data()),
+                    reinterpret_cast<const std::byte*>(field.data()) +
+                        field.size());
+                std::uint64_t pos = fbuf.size();
+                put_u64_byte(fbuf, 0);  // invLen 占位
+                inv->serialize(fbuf);
+                std::uint64_t inv_len = fbuf.size() - pos - 8;
+                std::memcpy(fbuf.data() + pos, &inv_len, 8);
+            }
+            add_byte_sec(
+                static_cast<std::uint16_t>(sc::CkptSectionType::kBm25Fields),
+                std::move(fbuf));
+        }
+    }
+
+    // 段 4: hnsw (type 4)。
+    if (config_.vector_dim > 0) {
+        auto hnsw = hnsw_.load(std::memory_order_acquire);
+        if (hnsw) {
+            std::vector<std::uint8_t> buf;
+            if (hnsw->serialize(buf)) {
+                add_u8_sec(static_cast<std::uint16_t>(sc::CkptSectionType::kHnsw),
+                           std::move(buf));
+            }
+        }
+    }
+
+    // 代际回退:把现有 search.ckpt 重命名为 search.ckpt.prev。
+    {
+        const std::string prev = fp + ".prev";
+        std::error_code ec;
+        if (std::filesystem::exists(fp, ec)) {
+            std::filesystem::rename(fp, prev, ec);
+        }
+    }
+
+    if (!sc::SearchCheckpoint::write(fp, watermark, secs)) return false;
+
+    // 保存成功后截断 WAL（与旧 save_snapshot 行为一致）。
+    {
+        std::shared_lock lk(fields_mu_);
+        for (auto& [_, inv] : fields_) {
+            inv->truncate_wal();
+        }
+    }
+    return true;
+}
+
+SearchLayer::CkptLoadResult
+SearchLayer::load_search_ckpt(std::string_view path) {
+    namespace sc = bitcask::search;
+    const std::string fp(path);
+    const std::string prev = fp + ".prev";
+
+    auto try_load = [&](std::string_view p) -> std::optional<sc::LoadedCheckpoint> {
+        return sc::SearchCheckpoint::read(p);
+    };
+
+    auto lc = try_load(fp);
+    bool from_prev = false;
+    if (!lc) {
+        lc = try_load(prev);
+        if (!lc) return {};
+        from_prev = true;
+    }
+
+    CkptLoadResult result;
+    result.loaded = true;
+    result.watermark = lc->watermark;
+    result.all_segments_ok = true;
+
+    // 逐段分发到反序列化器。
+    bool bm25_loaded = false;
+    bool docmap_loaded = false;
+    bool hnsw_loaded = false;
+
+    for (auto& ls : lc->sections) {
+        auto st = static_cast<sc::CkptSectionType>(ls.type);
+        if (!ls.crc_ok) {
+            result.all_segments_ok = false;
+            continue;
+        }
+        switch (st) {
+        case sc::CkptSectionType::kBm25Default: {
+            std::unique_lock lk(fields_mu_);
+            auto it = fields_.find(std::string(kDefaultField));
+            if (it == fields_.end()) {
+                auto inv = std::make_unique<bm25::InvertedIndex>(
+                    config_.bm25_params, config_.index_positions);
+                if (inv->deserialize(
+                        std::span<const std::byte>(ls.payload.data(),
+                                                    ls.payload.size()))) {
+                    fields_.emplace(std::string(kDefaultField),
+                                     std::move(inv));
+                    bm25_loaded = true;
+                } else {
+                    result.all_segments_ok = false;
+                }
+            } else {
+                bm25_loaded = it->second->deserialize(
+                    std::span<const std::byte>(ls.payload.data(),
+                                                ls.payload.size()));
+                if (!bm25_loaded) result.all_segments_ok = false;
+            }
+            break;
+        }
+        case sc::CkptSectionType::kBm25Fields: {
+            // 解析 u32 count; 每字段 [u16 nameLen][name][u64 invLen][inv]。
+            const auto* p = ls.payload.data();
+            const auto* end = p + ls.payload.size();
+            if (end - p < 4) { result.all_segments_ok = false; break; }
+            std::uint32_t cnt = get_u32_byte(p); p += 4;
+            std::unique_lock lk(fields_mu_);
+            for (std::uint32_t i = 0; i < cnt; ++i) {
+                if (end - p < 2) { result.all_segments_ok = false; break; }
+                std::uint16_t nlen = get_u16_byte(p); p += 2;
+                if (end - p < nlen + 8) { result.all_segments_ok = false; break; }
+                std::string name(reinterpret_cast<const char*>(p), nlen);
+                p += nlen;
+                std::uint64_t ilen = get_u64_byte(p); p += 8;
+                if (end - p < static_cast<std::ptrdiff_t>(ilen)) {
+                    result.all_segments_ok = false; break;
+                }
+                auto inv = std::make_unique<bm25::InvertedIndex>(
+                    config_.bm25_params, config_.index_positions);
+                if (inv->deserialize(std::span<const std::byte>(p, ilen))) {
+                    fields_.emplace(std::move(name), std::move(inv));
+                    bm25_loaded = true;
+                } else {
+                    result.all_segments_ok = false;
+                }
+                p += ilen;
+            }
+            break;
+        }
+        case sc::CkptSectionType::kDocmap: {
+            auto covers = deserialize_docmap(std::span<const std::uint8_t>(
+                reinterpret_cast<const std::uint8_t*>(ls.payload.data()),
+                ls.payload.size()));
+            if (covers) {
+                docmap_loaded = true;
+            } else {
+                result.all_segments_ok = false;
+            }
+            break;
+        }
+        case sc::CkptSectionType::kHnsw: {
+            auto cur = hnsw_.load(std::memory_order_acquire);
+            if (cur) {
+                auto fresh = std::make_shared<vec::HnswIndex>(cur->config());
+                auto* raw = reinterpret_cast<const std::uint8_t*>(ls.payload.data());
+                if (fresh->deserialize({raw, ls.payload.size()})) {
+                    hnsw_.store(std::move(fresh), std::memory_order_release);
+                    hnsw_loaded = true;
+                } else {
+                    result.all_segments_ok = false;
+                }
+            }
+            break;
+        }
+        default:
+            break;  // 未知段类型（meta/terms 等）忽略。
+        }
+    }
+
+    // 如果 docmap 未载入,标记 all_segments_ok=false（需要 fold 补全 Index 侧表）。
+    if (!docmap_loaded) result.all_segments_ok = false;
+    // bm25 至少要有一个字段载入才算成功。
+    if (!bm25_loaded) result.all_segments_ok = false;
+    // 有向量配置但 hnsw 未载入 → 需要重建。
+    if (config_.vector_dim > 0 && !hnsw_loaded) result.all_segments_ok = false;
+
+    (void)from_prev;  // 仅调试用
+    return result;
 }
 
 }  // namespace bitcask::search

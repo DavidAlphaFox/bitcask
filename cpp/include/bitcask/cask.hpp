@@ -569,10 +569,9 @@ public:
     [[nodiscard]] std::expected<void, CaskFault>
     create_search_infra(const CaskOptions& opts);
 
-    // T2.2:load_keydir_from_disk 阶段一——加载 bm25 快照 / sidecar /
-    // hnsw 快照 / keydir 快照,并按 4-way coverage gate 决定是否允许
-    // 走快路径(snap_loaded=true)。snap_wms 是 keydir 快照的水位表,
-    // 供 fold 阶段计算各文件的 fold_start 偏移。
+    // P14e/P14b:加载 keydir 快照 + search.ckpt 分段快照。snap_loaded=true
+    // 表示搜索索引健康（全段 CRC 通过）且 keydir 快照可用 → fold 阶段从
+    // keydir 水位起跳过已覆盖字节。snap_wms 是每文件水位表。
     struct RecoverySnapshots {
         bool snap_loaded = false;
         std::vector<std::pair<std::uint32_t, std::uint64_t>> snap_wms;
