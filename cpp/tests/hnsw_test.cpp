@@ -280,6 +280,44 @@ TEST(VectorQuant, Int8OnlyRealModeRecallAndRoundtrip) {
     std::filesystem::remove(path);
 }
 
+// P5c：召回 gate（部署维度 dim=2560，与 qwen3-embedding 同维）。真实
+// inmem_int8 模式（含 query 量化，区别于模拟版的 f32 query × dequant 库），
+// 是定 opt-in 默认前的回归红线。
+// 诚实边界：合成簇 ≠ 真实 qwen3 语料——本环境无 embedding 端点，用合成
+// 数据作代理；真实语料召回须在部署侧（qwen3 endpoint）复测后才定推荐默认。
+TEST(VectorQuant, Int8OnlyRecallGate_Dim2560) {
+    const std::size_t n = 2000, dim = 2560, nq = 40, k = 10, ef = 64, nc = 50;
+    auto base    = make_clustered(n,  dim, nc, 0.5f, 0xCE57, 0xBA5E);
+    auto queries = make_clustered(nq, dim, nc, 0.5f, 0xCE57, 0xC0DE);
+
+    HnswConfig cfg;
+    cfg.dim = static_cast<std::uint16_t>(dim);
+    cfg.metric = HnswMetric::kDot;
+    cfg.inmem_int8 = true;
+    HnswIndex idx(cfg);
+    for (std::size_t i = 0; i < n; ++i) {
+        idx.insert(i, std::span<const float>(base.data() + i * dim, dim));
+    }
+    std::size_t hit = 0;
+    for (std::size_t qi = 0; qi < nq; ++qi) {
+        const float* q = queries.data() + qi * dim;
+        auto truth = brute_topk(base, n, dim, q, k);
+        auto got = idx.search(std::span<const float>(q, dim), k, ef);
+        for (const auto& h : got) {
+            if (std::find(truth.begin(), truth.end(), h.ord) != truth.end()) {
+                ++hit;
+            }
+        }
+    }
+    const double r = static_cast<double>(hit) / static_cast<double>(nq * k);
+    std::printf("[P5c gate] inmem_int8 real recall@10 ef64 (dim=2560, n=%zu) "
+                "= %.4f\n", n, r);
+    RecordProperty("recall_inmem_int8_dim2560", std::to_string(r));
+    // 红线:真实 int8-only(含 query 量化)recall@10 ≥ 0.90。低于此说明实现
+    // 回归或量化误差超预期,须查。合成簇实测见上方打印。
+    EXPECT_GE(r, 0.90) << "inmem_int8 recall@10 (dim=2560) = " << r;
+}
+
 // P3c 召回测量（dim=2560，与部署 qwen3-embedding 同维）。阈值是回归红线，
 // 设在实测值之下；实测数 + 决策见 doc/vector-ondisk-quant-design-zh.md §6。
 TEST(VectorQuant, OnDiskInt8RecallAt10) {
