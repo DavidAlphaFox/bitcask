@@ -97,6 +97,7 @@ add_library(bitcask_fileops STATIC
     src/fileops/data_file.cpp
     src/fileops/hint_file.cpp
     src/fileops/scanner.cpp
+    src/fileops/migrate.cpp
 )
 target_include_directories(bitcask_fileops PUBLIC include)
 target_link_libraries(bitcask_fileops
@@ -247,6 +248,14 @@ endif()
 # ---------------------------------------------------------------------------
 add_executable(gen_inert_table tools/gen_inert_table.cpp)
 target_link_libraries(gen_inert_table PRIVATE ${UTF8PROC_TARGET})
+
+# ---------------------------------------------------------------------------
+# migrate_le — 把 v1 大端 bitcask 目录离线迁移成 v2 小端（flag-day 迁移工具）。
+# ---------------------------------------------------------------------------
+add_executable(migrate_le tools/migrate_le.cpp)
+target_link_libraries(migrate_le
+    PRIVATE bitcask_fileops bitcask_format bitcask_io
+            bitcask_warnings bitcask_sanitizers)
 
 set(INERT_TABLE_HPP
     "${CMAKE_CURRENT_SOURCE_DIR}/include/bitcask/detail/inert_table.hpp")
