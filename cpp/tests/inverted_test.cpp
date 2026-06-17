@@ -263,6 +263,39 @@ TEST(InvertedIndex, SaveLoadRoundtrip) {
     cleanup();
 }
 
+// P14e/S2:serialize/deserialize 到字节缓冲(供 search.ckpt 段),与 save/load
+// 等价。直接测缓冲 round-trip 守护新 API。
+TEST(InvertedIndex, SerializeDeserializeRoundtrip) {
+    InvertedIndex idx;
+    idx.add_doc(0, {{"hello", tp(1, {0})}, {"world", tp(2, {1, 2})}});
+    idx.add_doc(1, {{"hello", tp(3, {0, 1, 2})}, {"foo", tp(1, {3})}});
+
+    std::vector<std::byte> buf;
+    idx.serialize(buf);
+    EXPECT_FALSE(buf.empty());
+
+    InvertedIndex idx2;
+    ASSERT_TRUE(idx2.deserialize(buf));
+    EXPECT_EQ(idx2.live_doc_count(), 2u);
+    EXPECT_EQ(idx2.sum_doc_len(), 7u);
+    EXPECT_EQ(idx2.df("hello"), 2u);
+    EXPECT_EQ(idx2.df("foo"), 1u);
+
+    FakeLiveChecker checker;
+    checker.doc_lens[0] = 3;
+    checker.doc_lens[1] = 4;
+    auto results = idx2.search({"hello"}, 10, checker);
+    EXPECT_EQ(results.size(), 2u);
+    auto phrase = idx2.search_phrase({"hello", "world"}, 10, checker);
+    ASSERT_EQ(phrase.size(), 1u);
+    EXPECT_EQ(phrase[0].ord, 0u);
+
+    // 截断缓冲 → 干净拒绝。
+    InvertedIndex idx3;
+    EXPECT_FALSE(idx3.deserialize(
+        std::span<const std::byte>(buf.data(), buf.size() / 2)));
+}
+
 TEST(InvertedIndex, LoadMissingFileReturnsFalse) {
     InvertedIndex idx;
     EXPECT_FALSE(idx.load("/nonexistent/path/to/file.inv"));
