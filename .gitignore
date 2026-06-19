@@ -29,12 +29,15 @@ compile_commands.json
 .ccache/
 
 # Third-party dependencies
-third_party/benchmark/
-third_party/cppjieba/
-third_party/googletest/
-third_party/limonp/
-third_party/oneTBB/
-third_party/utf8proc/
+# NOTE: benchmark/cppjieba/googletest/limonp/oneTBB/utf8proc are symlinks into
+# the libbitcask submodule, so they must NOT have a trailing slash (gitignore
+# trailing slash matches directories only, not symlink files).
+third_party/benchmark
+third_party/cppjieba
+third_party/googletest
+third_party/limonp
+third_party/oneTBB
+third_party/utf8proc
 third_party/libbitcask/
 
 # IDE / editor
