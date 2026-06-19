@@ -202,6 +202,31 @@ WAL `.f{i}.inv.wal→.f{i}.wal`；常量 `kKeydirSnapName`/`kIndexSidecarName`/
 
 ---
 
+## L — libbitcask 库提取（C API + CMake 独立构建）
+
+> 目标：将 C++ 核心提取为 `libbitcask.a`（静态，C++ API）+ `libbitcask.so`（动态，C API wrapper），
+> CMake 管理，`install()` 规则支持 `find_package(Bitcask)`。
+> 现有 NIF `.so` 继续链接静态库，保持 LTO 跨 TU 内联优势。
+>
+> 设计文档：`doc/libcask-extraction-zh.md`（路径 B 落地，C API for ABI 稳定）。
+
+| # | 内容 | ROI/风险 | 状态 |
+|---|------|---------|------|
+| **L1** | C API 头文件 `cpp/c_api/bitcask_c.h`：38 个 `extern "C"` 函数声明 + 全部 C 类型（opaque handle、slice、error、options、get_result、search_hit、iter_entry、status）。固定缓冲 `detail[512]`、动态 `char*` key。 | 高 / 低 | ✅ |
+| **L2** | CMake 重构 `cpp/CMakeLists.txt`：11 个 STATIC 保留；聚合为 `bitcask_static`（`ar` 合并 `.a`）+ `bitcask_shared`（`.so` + C wrapper）。 | 高 / 中 | ✅ |
+| **L3** | C wrapper 生命周期 + KV：`bitcask_open/close/get/put/delete/sync/close_write_file/options_init` + `get_result_free`。CaskOptions↔C struct 映射 + error 转换。 | 高 / 低 | ✅ |
+| **L4** | C wrapper 搜索：9 个 `search_*`（text/phrase/bool/fields/near/fuzzy/wildcard/vector/hybrid）+ `set_synonym_map` + `search_result_free`。TextSearchResult↔C 转换。 | 高 / 低 | ✅ |
+| **L5** | C wrapper 迭代：`iter_start/next/next_batch/release` + `iter_entry_free`。CaskIter::Entry↔C 转换。 | 中 / 低 | ✅ |
+| **L6** | C wrapper 管理：`status/needs_merge/merge/is_empty/is_frozen` + `put_doc`。 | 中 / 低 | ✅ |
+| **L7** | CMake target 集成：`bitcask_static` + `bitcask_shared`（PRIVATE link）+ 符号导出（`-fvisibility=hidden` + C API `__attribute__((visibility("default")))`）+ `install(TARGETS/EXPORT/DIRECTORY)` + `GNUInstallDirs`。 | 高 / 中 | ✅ |
+| **L8** | C API 冒烟测试 `cpp/tests/c_api_test.c`：纯 C，直接链接 `libbitcask.so`，KV CRUD + status/needs_merge + 迭代基本路径。 | 高 / 低 | ✅ |
+| **L9** | 回归验证：`ctest`（429/429）+ NIF 编译 + `nm -D libbitcask.so` 符号可见性检查。 | 高 / 低 | ✅ |
+
+**依赖关系**：L1 → (L2, L3) → (L4, L5, L6) → L7 → (L8, L9)
+**并行机会**：L4 / L5 / L6 可并行实现（独立函数组）
+
+---
+
 ## 明确排除（V7+ 或永久取消）
 
 | 条目 | 决策 | 理由 |
