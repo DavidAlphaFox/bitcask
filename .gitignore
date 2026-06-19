@@ -28,6 +28,15 @@ compile_commands.json
 .cache/
 .ccache/
 
+# Third-party dependencies
+third_party/benchmark/
+third_party/cppjieba/
+third_party/googletest/
+third_party/limonp/
+third_party/oneTBB/
+third_party/utf8proc/
+third_party/libbitcask/
+
 # IDE / editor
 .vscode/
 .idea/
