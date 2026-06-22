@@ -6,6 +6,44 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 2.2.1 规划
+
+### libbitcask 升级到 v1.1.0 ✅
+
+submodule 由 v1.0.0 升至 v1.1.0（当前 libbitcask 最高版本）。对图工作负载（读多、
+整图加载密集）的收益：稠密扁平 keydir（`ankerl::unordered_dense`，海量 key 省内存）、
+256 分片锁改 `std::mutex`（多图并行加载不互锁）、单 `pread` 取值（整图一次 syscall）、
+fstats 无锁发布 + `thread_local` scratch 复用。
+
+消费侧适配：`SynonymMap::load_from_file` 改 `[[nodiscard]] bool`（NIF 失败回 `{error,
+load_failed}`）；`StatusInfo::index_errors` 经新 `bitcask:index_errors/1` 透出（异步索引
+漂移计数）；根 CMake 补 `unordered_dense` 依赖软链。
+
+> ⚠️ v1.1.0 改了盘上搜索格式（`search.ckpt` / 倒排 v6 / 外存向量），v1.0.0 建的索引
+> 目录需重建；KV data/hint（meta v2）不变。
+
+### 图处理层（libbitcask 存储 + Erlang 执行）✅
+
+> 设计文档：[`doc/graph-layer-design-zh.md`](doc/graph-layer-design-zh.md)
+
+以 libbitcask 为单一存储、Erlang 为执行层的简单图处理方案。核心约束：**一个图整体
+序列化进一个 value**（CSR 格式），libbitcask 只做持久化与并发加载，遍历 / 计算在 BEAM
+内存完成、热路径零 bitcask 访问。
+
+- **CSR 盘上格式**：`xadj` 行偏移 + `adjncy` 邻居数组 + etype/vprops/eprops 侧表，全小端；
+  BEAM 二进制零拷贝切片直接遍历。
+- **执行模型**：owner gen_server 持有物化图（CSR + 写 overlay）；读 / 算纯内存，写进
+  overlay、批量检查点折叠回写。
+- **Erlang 特性**：并行度在「图之间」（N 图 = N actor）、崩溃隔离、单写多读对齐 bitcask、
+  Pregel/BSP（顶点=进程、边=消息）、LRU 逐出 + MVCC 一致快照。
+- **边界**：单图须整张进内存（`value_too_large` + LRU 封顶，超大图分区成多 value）；
+  写放大在图粒度（靠批量检查点摊薄）。读多写少 / 批量构建场景最适配。
+
+阶段：P1 CSR 编解码 + owner + CRUD → P2 内存遍历 → P3 overlay 压实 + LRU + MVCC →
+P4 Pregel/BSP + 样例算法 → P5 入边转置 + 边属性 + 顶点向量混合检索。
+
+---
+
 ## 2.2.0 规划
 
 ### libcask 独立库拆分 ✅
