@@ -3,6 +3,129 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.2.0] — 2026-06-22
+
+**libcask extraction** (per [ROADMAP §2.2.0](ROADMAP_EN.md)): the C++ core (24 source
+files + 45 headers) is extracted into a standalone `libbitcask` (`libbitcask.a` static
+/ `libbitcask.so` shared); the NIF layer retains only the glue. This repo's `cpp/`
+shrinks to 9 NIF binding translation units; the single `priv/bitcask_cpp.so` links
+statically against libbitcask (preserving LTO). Third-party deps (cppjieba /
+googletest / benchmark / oneTBB / utf8proc / limonp / unordered_dense) are vendored
+via the libbitcask submodule, with symlinks delegating to
+`third_party/libbitcask/third_party/*`.
+
+Milestones L1–L9 are all complete (see [`TASK.md` §L](TASK.md)); libbitcask has
+advanced to **v1.1.0** in lockstep (stable C ABI + BCSC `search.ckpt` container +
+HNSW V7 `search.vec` off-heap + InvVersion=6 FOR/VByte + three-tier performance
+micro-opts + production-correctness fixes C1–C5).
+
+### Added
+
+- **`third_party/libbitcask` submodule** (v1.0.0 → v1.1.0): the complete C++ engine
+  with a stable C ABI (38 `extern "C"` functions, `SOVERSION=1`). Standalone build
+  via `cmake -S third_party/libbitcask -B build`; `find_package(Bitcask)` install
+  support.
+- **C++ core → standalone library** (L1–L9): 11 STATICs aggregated into
+  `bitcask_static` (`ar`-merged `.a`) + `bitcask_shared` (`.so` + C wrapper);
+  symbol-export policy (`-fvisibility=hidden` +
+  `__attribute__((visibility("default")))`).
+- **libbitcask v1.1.0 features synced**:
+  - **Unified segmented search checkpoint `search.ckpt` (BCSC container)**: docmap
+    / bm25.default / bm25.fields / hnsw each as one segment with **per-segment CRC**
+    + footer directory + `.prev` generational fallback (replaces
+    `search.docmap.ckpt` / `search.vec.ckpt` / `search.bm25.*` multi-file scheme).
+  - **HNSW V7 / BVH2 v2 off-heap**: full-precision f32 vectors live in a dedicated
+    `search.vec` file (`BCVP`, read-only mmap + 4 KB-page CRC32); the HNSW segment
+    of `search.ckpt` (magic `BVH2`, version 2) embeds int8 quantized codes,
+    eliminating the open-time requantization pass.
+  - **Inverted-index on-disk format v6 (`InvVersion=6`)**: ords use FOR
+    (Frame-of-Reference) block compression (128/block); tf/dl use VByte varint;
+    formats v1–v5 are no longer readable.
+  - **Three-tier performance micro-optimizations** (each measured-safe):
+    HNSW rerank, WAND result sort, qcodes conditional allocation, FStats cache-line
+    alignment (tier 1); KeyDir → `ankerl::unordered_dense` dense flat hash, HNSW
+    adjacency bump-slab arena (tier 2); `thread_local` scratch/encode buffer reuse,
+    serialize buffer reuse, hint `pread_into`, vector software prefetch,
+    `-march=native` switch (tier 3).
+  - **CI**: GitHub Actions matrix (Release + ASan/UBSan/TSan); crash-recovery
+    regression tests (`fork + SIGKILL` mid-write +
+    `MergeFailurePreservesKeyDirVisibility`).
+  - **Production correctness fixes C1–C5** (see Changed section).
+- **NIF adaptations (v1.1.0 API)**:
+  - New atom `load_failed`; `set_synonym_map/2` returns `{error, load_failed}` on a
+    failed file open (in v1.1.0 `load_from_file` is `[[nodiscard]] bool`; the prior
+    implementation would silently install an empty dictionary).
+  - New facade `bitcask:index_errors/1` (surfaces the v1.1.0 IndexPool exception
+    counter from [`src/bitcask.erl`](src/bitcask.erl)).
+- **Build system**: root `CMakeLists.txt` does
+  `add_subdirectory(third_party/libbitcask)` to pull in all C++ targets;
+  `cpp/CMakeLists.txt` now defines only the NIF binding (linking `bitcask_cask`).
+  The third-party symlink loop covers 7 vendored libraries.
+- **Index observability**: the async index worker's exception counter (`IndexErrors`)
+  is surfaced in the `bitcask:status/1` NIF tuple (the facade does not expose it;
+  read it via the new `bitcask:index_errors/1`). Non-zero ⇒ index may be drifting
+  and search results may be stale.
+
+### Changed
+
+- **`cpp/` directory layout**: all C++ core sources and headers removed; only
+  `cpp/nif/` remains (9 NIF TUs: `nif_main.cpp` / `nif_cask.cpp` /
+  `nif_cask_iter.cpp` / `nif_cask_admin.cpp` / `nif_cask_meta.cpp` /
+  `nif_helpers.cpp` / `nif_options.cpp` / `atoms.cpp` / `resources.cpp`).
+- **`cpp/include/` → `third_party/libbitcask/include/`**: all C++ public headers
+  move into the libbitcask library; the NIF accesses them via `bitcask/...`
+  include paths (added by CMake automatically).
+- **`cpp/c_api/` → `third_party/libbitcask/c_api/`**: the 38 `extern "C"` C API
+  functions and their header move wholesale; `nm -D libbitcask.so` exposes only C
+  ABI symbols.
+- **Third-party vendoring**: utf8proc / cppjieba / limonp / googletest / benchmark
+  / oneTBB / unordered_dense are all vendored as the libbitcask submodule; this
+  repo's `third_party/` keeps only symlinks pointing to
+  `third_party/libbitcask/third_party/*`.
+- **KeyDir shard lock**: `shared_mutex` → `std::mutex` (kills writer-favor
+  starvation); fstats switches to a lock-free publish path. Shard count advances
+  to 256 (same as 2.1.1; implementation now lives in libbitcask).
+- **`set_synonym_map/2` error behavior**: changes from "silently install empty
+  dictionary" to "return `{error, load_failed}`" (knock-on adaptation to v1.1.0's
+  tightened `load_from_file` API).
+- **`status/1` NIF return tuple**: 4-tuple `{KeyCount, KeyBytes, Epoch, Files}`
+  expands to 5-tuple with a new `IndexErrors` field (facade does not expose it;
+  read it via the new `bitcask:index_errors/1`).
+
+### Fixed (synced from libbitcask v1.1.0)
+
+- **C1 — merge failure leaves keydir completely untouched** (delayed apply):
+  failed merges don't require a restart-and-recover — data is immediately visible.
+- **C2 — all 9 merge error paths now clean up**: no partially-written output files
+  left behind.
+- **C3 — IndexPool worker wrapped in a single try/catch** (best-effort discard +
+  `index_errors` counter): exceptions no longer kill the worker; `pending_` always
+  decrements → `flush()` no longer hangs; the index no longer silently drifts.
+- **C4 — IndexPool destructor UB fix**: when `start()` was never called the
+  `joinable()` guard skips the join; `stop()` is idempotent (CAS short-circuit).
+- **C5 — `Cask::close()` (noexcept) wrapped in a top-level try/catch**: every
+  throwing op (`save_search_ckpt` / `write_keydir_snapshot` / allocation / lock
+  acquisition) is covered; even the registry-release inside the catch (itself the
+  only remaining throw site) is wrapped separately — eliminates the `std::terminate`
+  risk from a `noexcept` function throwing.
+- Merge output is unconditionally fsync'd (success-return ⇒ new files are durable).
+
+### Breaking changes
+
+**None.** 2.2.0 is a pure structural extraction + performance/correctness
+increment; the on-disk format (meta v2 / little-endian) is compatible with 2.1.1
+and old directories open directly. The only externally-visible API behavior
+changes:
+
+- `set_synonym_map/2` now returns `{error, load_failed}` on a failed synonym file
+  open (the prior version would silently install an empty dictionary) — code that
+  relied on the silent behavior must adapt.
+- `bitcask_cpp_nifs:cask_status/1` returns a 5-tuple instead of a 4-tuple (new
+  `IndexErrors` field). Pure-facade users that don't call the NIF directly are not
+  affected.
+
+---
+
 ## [2.1.1] — 2026-06-17
 
 The first round of **system-level optimizations** after the 2.1.0 C++23 engine —

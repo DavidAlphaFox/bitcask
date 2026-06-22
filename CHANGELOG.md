@@ -3,6 +3,106 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [2.2.0] — 2026-06-22
+
+**libcask 独立库拆分**（[ROADMAP §2.2.0](ROADMAP.md) 计划落地）：C++ 核心（24 源
+文件 + 45 头文件）提取为独立的 `libbitcask`（`libbitcask.a` 静态 / `libbitcask.so`
+动态），NIF 仅保留胶水层。本仓库 `cpp/` 只剩 9 个 NIF 绑定 TU，单一
+`priv/bitcask_cpp.so` 链接静态 libbitcask（保留 LTO）。第三方依赖
+（cppjieba / googletest / benchmark / oneTBB / utf8proc / limonp /
+unordered_dense）改为 libbitcask submodule vendored，符号链接委托至
+`third_party/libbitcask/third_party/*`。
+
+里程碑 L1–L9 全部完成（详见 [`TASK.md` §L](TASK.md)）；libbitcask 同步迭代到
+**v1.1.0**（独立 C API + BCSC `search.ckpt` 容器 + HNSW V7 `search.vec` 外存 +
+InvVersion=6 FOR/VByte + 三梯队性能微优化 + 生产正确性 C1–C5 修复）。
+
+### 新增
+
+- **`third_party/libbitcask` 子模块**（v1.0.0 → v1.1.0）：完整 C++ 引擎 + 稳定 C
+  ABI（38 个 `extern "C"` 函数，`SOVERSION=1`）。`cmake -S third_party/libbitcask
+  -B build` 独立可构建，`find_package(Bitcask)` 安装支持。
+- **C++ 核心 → 独立库**（L1–L9）：`bitcask_cask` / `bitcask_keydir` / `bitcask_hnsw` /
+  `bitcask_search` 等 11 个 STATIC 聚合为 `bitcask_static`（ar 合并 `.a`）+
+  `bitcask_shared`（`.so` + C wrapper）；符号导出策略（`-fvisibility=hidden` +
+  `__attribute__((visibility("default")))`）。
+- **libbitcask v1.1.0 同步引入**：
+  - **统一分段搜索 checkpoint `search.ckpt`（BCSC 容器）**：docmap / bm25.default
+    / bm25.fields / hnsw 各为一段、**逐段独立 CRC** + 页脚目录 + `.prev` 代际回退
+    （取代 `search.docmap.ckpt` / `search.vec.ckpt` / `search.bm25.*` 多文件）。
+  - **HNSW V7 / BVH2 v2 外存化**：全精度 f32 向量独立 `search.vec` 文件（`BCVP`，
+    只读 mmap + 每 4 KB 页 CRC32）；`search.ckpt` HNSW 段（magic `BVH2`,
+    version 2）内嵌 int8 量化码字，省去开库重量化 pass。
+  - **倒排盘上格式 v6（`InvVersion=6`）**：ord 改用 FOR（Frame-of-Reference）
+    块压缩（128/块），tf/dl 改用 VByte varint（不再支持 v1–v5 载入）。
+  - **三梯队性能微优化**（均经实测验证为安全微优化）：HNSW rerank、WAND 结果排序、
+    qcodes 条件分配、FStats 缓存行对齐（梯队一）；KeyDir 换
+    `ankerl::unordered_dense` 稠密扁平表、HNSW 邻接 bump-slab arena（梯队二）；
+    `thread_local` scratch/encode 缓冲复用、serialize 缓冲复用、hint `pread_into`、
+    向量软件预取、`-march=native` 开关（梯队三）。
+  - **CI**：GitHub Actions matrix（Release + ASan/UBSan/TSan）；崩溃恢复回归测试
+    （`fork + SIGKILL` 写入中 + `MergeFailurePreservesKeyDirVisibility`）。
+  - **生产正确性 C1–C5 修复**（详见变更段）。
+- **NIF 适配（v1.1.0 API）**：
+  - 新增 atom `load_failed`；`set_synonym_map/2` 文件打不开现返回 `{error, load_failed}`
+    （v1.1.0 起 `load_from_file` 为 `[[nodiscard]] bool`；旧实现会静默装上空词典）。
+  - 新增 facade `bitcask:index_errors/1`（[同步透出 v1.1.0 IndexPool 异常计数](src/bitcask.erl)）。
+- **构建系统**：根 `CMakeLists.txt` `add_subdirectory(third_party/libbitcask)` 引入
+  全部 C++ target；`cpp/CMakeLists.txt` 仅定义 NIF 绑定（链接 `bitcask_cask`）。
+  第三方依赖符号链接委托循环覆盖 7 个 vendored 库。
+- **索引状态可观测性**：异步索引 worker 异常计数（`IndexErrors`）透出到
+  `bitcask:status/1` NIF 元组（facade 通过新 `index_errors/1` 单独读取）——
+  非零即索引可能漂移、搜索结果可能陈旧。
+
+### 变更
+
+- **`cpp/` 目录结构**：移除所有 C++ 核心源文件与头文件，仅保留 `cpp/nif/`（9 个
+  NIF TU：`nif_main.cpp` / `nif_cask.cpp` / `nif_cask_iter.cpp` /
+  `nif_cask_admin.cpp` / `nif_cask_meta.cpp` / `nif_helpers.cpp` /
+  `nif_options.cpp` / `atoms.cpp` / `resources.cpp`）。
+- **`cpp/include/` → `third_party/libbitcask/include/`**：所有 C++ 公共头文件移入
+  libbitcask 库；NIF 通过 `bitcask/...` include 路径访问（CMake 自动添加）。
+- **`cpp/c_api/` → `third_party/libbitcask/c_api/`**：38 个 `extern "C"` C API
+  函数及对应头文件整体迁移；`nm -D libbitcask.so` 仅暴露 C ABI 符号。
+- **第三方依赖 vendoring**：utf8proc / cppjieba / limonp / googletest / benchmark /
+  oneTBB / unordered_dense 全部以 libbitcask submodule 形式 vendored，本仓库
+  `third_party/` 仅保留符号链接指向 `third_party/libbitcask/third_party/*`。
+- **KeyDir 分片锁**：`shared_mutex` → `std::mutex`（消写者偏好停车）；fstats 改
+  无锁发布路径。分片数演进至 256（同 2.1.1，但实现层落地于 libbitcask）。
+- **`set_synonym_map/2` 错误行为**：从「静默装上空词典」改为「返回 `{error,
+  load_failed}`」（v1.1.0 `load_from_file` API 收紧的连带适配）。
+- **`status/1` NIF 返回元组**：从 4 元组 `{KeyCount, KeyBytes, Epoch, Files}`
+  扩为 5 元组，新增 `IndexErrors` 字段（facade 不外露，新
+  `bitcask:index_errors/1` 单独读取）。
+
+### 修复（随 libbitcask v1.1.0 同步引入）
+
+- **C1 — merge 失败时 keydir 完全未动**（延后 apply）：失败后数据立即可见、无需
+  重启走恢复路径。
+- **C2 — merger 全 9 条错误路径补 cleanup**：部分输出文件不残留。
+- **C3 — IndexPool worker 整体 try/catch 吞异常**（best-effort 丢弃 +
+  `index_errors` 计数）：异常不再杀 worker、`pending_` 必递减 → `flush()` 不挂、
+  索引不静默漂移。
+- **C4 — IndexPool 析构 UB 修复**：`start()` 从未调用时 `joinable()` guard 跳过
+  join；`stop()` 幂等（CAS 短路）。
+- **C5 — `Cask::close()`（`noexcept`）整体 try/catch**：所有可抛操作
+  （`save_search_ckpt` / `write_keydir_snapshot` / 分配 / 取锁）纳入兜底；
+  catch 后的资源释放中唯一可抛的 `registry release` 也单独 try → 彻底消除
+  `noexcept` 函数抛出导致 `std::terminate` 的风险。
+- merge 输出无条件 fsync（成功返回 = 新文件已落盘）。
+
+### 不兼容的变化
+
+**无**。2.2.0 是纯结构性提取 + 性能/正确性增量，盘上格式字节序（meta v2 /
+小端）与 2.1.1 兼容；旧目录可直接 open。唯一对外可见的 API 行为变化：
+
+- `set_synonym_map/2` 在同义词文件无法打开时**改为返回 `{error, load_failed}`**，
+  旧版本会静默装上空词典——依赖静默行为的代码需适配。
+- `bitcask_cpp_nifs:cask_status/1` 返回元组从 4 元组**扩为 5 元组**（新增
+  `IndexErrors` 字段）。未直接调用此 NIF 的纯 facade 用户不受影响。
+
+---
+
 ## [2.1.1] — 2026-06-17
 
 2.1.0 引入 C++23 引擎后的第一轮**系统级优化**——聚焦向量库的内存/磁盘墙、
