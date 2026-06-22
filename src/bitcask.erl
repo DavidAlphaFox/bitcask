@@ -43,6 +43,7 @@
          is_frozen/1,
          is_empty_estimate/1,
          status/1,
+         index_errors/1,
            search_text/2, search_text/3, search_text/4,
            search_phrase/2, search_phrase/3,
            search_fields/2, search_fields/3,
@@ -426,10 +427,18 @@ is_empty_estimate(Handle) ->
     bitcask_cpp_nifs:cask_is_empty(ref(Handle)).
 
 %% 返回 {KeyCount, FilesInfo}，跟 legacy 形状一致。底层 NIF 还会返回
-%% KBytes 和 Epoch，这两个值 facade 层不外露——历史接口就只有 2 元组。
+%% KBytes、Epoch 和 IndexErrors，这几个值 facade 层不外露——历史接口就只有 2 元组。
+%% IndexErrors 另由 index_errors/1 单独透出。
 status(Handle) ->
-    {KCount, _KBytes, _Epoch, Files} = bitcask_cpp_nifs:cask_status(ref(Handle)),
+    {KCount, _KBytes, _Epoch, Files, _IndexErrors} =
+        bitcask_cpp_nifs:cask_status(ref(Handle)),
     {KCount, Files}.
+
+%% v1.1.0：异步索引 worker 吞异常计数器。非零 = 索引可能漂移、搜索结果可能陈旧。
+index_errors(Handle) ->
+    {_KCount, _KBytes, _Epoch, _Files, IndexErrors} =
+        bitcask_cpp_nifs:cask_status(ref(Handle)),
+    IndexErrors.
 
 %% =========================================================================
 %% 内部：cask 迭代器收集器 + 单位换算

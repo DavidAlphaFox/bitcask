@@ -48,6 +48,7 @@ struct Atoms {
     ERL_NIF_TERM bad_crc;
     ERL_NIF_TERM no_index;
     ERL_NIF_TERM mode_mismatch;
+    ERL_NIF_TERM load_failed;   // v1.1.0：同义词词典等文件加载失败
 
     // 合并策略阈值
     ERL_NIF_TERM frag_merge_trigger;
