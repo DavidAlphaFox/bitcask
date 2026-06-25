@@ -3,6 +3,45 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [3.0.0] — 2026-06-25
+
+**升级到 libbitcask v3.0.0**：submodule 由 v1.1.0 升至 **v3.0.0**（libbitcask 自此
+**三套版本号统一**——CHANGELOG = 库 `VERSION` = C API = `3.0.0`，`SOVERSION` 1 → 3）。
+ABI 破坏性变更，NIF 已重新编译链接；本仓库版本同步对齐为 **3.0.0**。
+
+> ⚠️ **破坏性 API 变更**：移除运行期 `bitcask:set_synonym_map/2`，同义词词典改为
+> `open/2` 的 open-time 不可变选项 `{synonym_file, Path}`。调用方需迁移（详见下）。
+
+### 变更（破坏性）
+
+- **同义词词典：运行期 setter → open-time 不可变配置**（对齐 libbitcask v3.0.0：
+  `Cask::set_synonym_map` / `bitcask_set_synonym_map` 已删除，新增
+  `CaskOptions::synonym_map`）。
+  - **移除** `bitcask:set_synonym_map/2`（及 NIF `cask_set_synonym_map/2`、atom
+    `load_failed`）。
+  - **新增** `open/2` 选项 `{synonym_file, Path}`：开库时一次性从文件加载，构造后
+    **不可变** → 并发查询天然安全。`Path` 接受 string 或 binary（facade 自动转
+    binary）；仅在索引模式（带 `{analyzer, _}`）生效；文件打不开则静默不展开
+    （沿用「无效选项值静默跳过」语义，open 仍成功）。
+  - **迁移**：`set_synonym_map(H, Path)` 运行期调用 → 改为 `open(Dir, [{analyzer,
+    _}, {synonym_file, Path}, ...])`；运行期更换词典需重开库。
+
+### 变更
+
+- **`third_party/libbitcask` 子模块**：v1.1.0 → **v3.0.0**（`SOVERSION` 1 → 3，
+  soname `libbitcask.so.1` → `libbitcask.so.3`；ABI 不兼容时链接器明确报错）。
+  随库引入 v1.2.0 引擎能力：`Cask` handle 多线程安全（写路径内部串行化 +
+  读/搜索并发 + `close()` fail-fast）、批量检索、异步索引 MapReduce 流水线、
+  `parallel_scan` 全表并行扫描；meta 格式升至 v2（新增 `VecInmemInt8` 字节）。
+  引擎细节见 [libbitcask CHANGELOG](third_party/libbitcask/CHANGELOG.md)。
+- **构建**：根 `CMakeLists.txt` 版本/ABI 注释对齐 v3.0.0；`bitcask.app.src`
+  `vsn` 2.2.0 → 3.0.0。
+
+### 文档
+
+- README（中/英）移除函数表 `set_synonym_map/2` 行；`open/2` 文档新增
+  `{synonym_file, Path}` 选项说明；ROADMAP 增 libbitcask v3.0.0 升级条目。
+
 ## [2.2.0] — 2026-06-22
 
 **libcask 独立库拆分**（[ROADMAP §2.2.0](ROADMAP.md) 计划落地）：C++ 核心（24 源

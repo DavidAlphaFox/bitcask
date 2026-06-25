@@ -3,6 +3,52 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [3.0.0] — 2026-06-25
+
+**Upgrade to libbitcask v3.0.0**: the submodule advances from v1.1.0 to **v3.0.0**
+(libbitcask now **unifies its three version numbers**—CHANGELOG = library `VERSION` =
+C API = `3.0.0`, `SOVERSION` 1 → 3). This is an ABI-breaking change; the NIF has been
+recompiled and relinked, and this repo's version is aligned to **3.0.0** in lockstep.
+
+> ⚠️ **Breaking API change**: the runtime `bitcask:set_synonym_map/2` is removed; the
+> synonym dictionary becomes an open-time immutable `open/2` option,
+> `{synonym_file, Path}`. Callers must migrate (see below).
+
+### Changed (breaking)
+
+- **Synonym dictionary: runtime setter → open-time immutable config** (mirrors
+  libbitcask v3.0.0, which removed `Cask::set_synonym_map` /
+  `bitcask_set_synonym_map` in favor of `CaskOptions::synonym_map`).
+  - **Removed** `bitcask:set_synonym_map/2` (plus the `cask_set_synonym_map/2` NIF
+    and the `load_failed` atom).
+  - **Added** the `open/2` option `{synonym_file, Path}`: loaded once at open time,
+    **immutable** thereafter → naturally concurrency-safe for queries. `Path` accepts
+    a string or binary (the facade binarizes it); only effective in index mode (with
+    `{analyzer, _}`); if the file can't be opened, expansion is silently skipped (per
+    the existing "invalid option value silently skipped" semantics, open still
+    succeeds).
+  - **Migration**: replace the runtime `set_synonym_map(H, Path)` call with
+    `open(Dir, [{analyzer, _}, {synonym_file, Path}, ...])`; changing dictionaries at
+    runtime now requires reopening the database.
+
+### Changed
+
+- **`third_party/libbitcask` submodule**: v1.1.0 → **v3.0.0** (`SOVERSION` 1 → 3,
+  soname `libbitcask.so.1` → `libbitcask.so.3`; the linker errors clearly on an
+  incompatible ABI). Brings the v1.2.0 engine capabilities along: thread-safe `Cask`
+  handle (internally serialized writes + concurrent reads/search + fail-fast
+  `close()`), batch retrieval, the async-index MapReduce pipeline, and
+  `parallel_scan` full-table parallel scan; on-disk meta format bumped to v2 (new
+  `VecInmemInt8` byte). Engine details in
+  [the libbitcask CHANGELOG](third_party/libbitcask/CHANGELOG.md).
+- **Build**: root `CMakeLists.txt` version/ABI comments aligned to v3.0.0;
+  `bitcask.app.src` `vsn` 2.2.0 → 3.0.0.
+
+### Docs
+
+- README (zh/en): drop the `set_synonym_map/2` function-table row; `open/2` docs gain
+  the `{synonym_file, Path}` option; ROADMAP gains the libbitcask v3.0.0 upgrade entry.
+
 ## [2.2.0] — 2026-06-22
 
 **libcask extraction** (per [ROADMAP §2.2.0](ROADMAP_EN.md)): the C++ core (24 source
