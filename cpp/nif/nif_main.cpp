@@ -48,7 +48,6 @@ ERL_NIF_TERM nif_cask_search_vector     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_vector_5   (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_hybrid     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_hybrid_5   (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_cask_set_synonym_map   (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_encode_meta       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_fold_start        (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_fold_start4       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
@@ -92,7 +91,6 @@ ErlNifFunc kNifFuncs[] = {
     {"cask_search_vector",      5, nif_cask_search_vector_5, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"cask_search_hybrid",      4, nif_cask_search_hybrid,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"cask_search_hybrid",      5, nif_cask_search_hybrid_5, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"cask_set_synonym_map",    2, nif_cask_set_synonym_map, 0},
     {"cask_encode_meta",        1, nif_cask_encode_meta,     0},
     // 迭代：fold 系列（独立 IterRef，可多个并发）
     {"cask_fold_start",        3, nif_cask_fold_start,       0},

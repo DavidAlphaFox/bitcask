@@ -48,7 +48,6 @@ struct Atoms {
     ERL_NIF_TERM bad_crc;
     ERL_NIF_TERM no_index;
     ERL_NIF_TERM mode_mismatch;
-    ERL_NIF_TERM load_failed;   // v1.1.0：同义词词典等文件加载失败
 
     // 合并策略阈值
     ERL_NIF_TERM frag_merge_trigger;
@@ -70,6 +69,7 @@ struct Atoms {
     ERL_NIF_TERM max_n;
     ERL_NIF_TERM min_token_length;
     ERL_NIF_TERM enable_stemming;
+    ERL_NIF_TERM synonym_file;  // v3.0.0：同义词词典 open-time 选项 {synonym_file, Path}
 
     // 索引模式 get/put 的 doc map 键（O2：热路径避免每次重建 atom）
     ERL_NIF_TERM text;

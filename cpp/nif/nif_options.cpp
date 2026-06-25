@@ -14,6 +14,7 @@
 #include "bitcask/analyzer.hpp"
 #include "bitcask/cask.hpp"
 #include "bitcask/search_layer.hpp"
+#include "bitcask/synonym_map.hpp"
 #include "term_conv.hpp"
 
 namespace bitcask::nif {
@@ -99,6 +100,18 @@ void parse_analyzer_option(ErlNifEnv* env, const ERL_NIF_TERM* tup, CaskOptions&
         opt_u32_min(env, val, 1, &ac.min_token_length);
     } else if (key == atoms().enable_stemming) {
         if (val == atoms().atom_true) ac.enable_stemming = true;
+    } else if (key == atoms().synonym_file) {
+        // v3.0.0：同义词词典改为 open-time 不可变配置（取代已删除的运行期
+        // set_synonym_map）。从文件加载一次，构造后只读 → 并发查询安全。
+        // 载入失败（路径打不开）→ 沿用「无效选项值静默跳过」语义：不装词典，
+        // open 仍成功、查询不展开同义词（与其它选项的容错一致）。
+        ErlNifBinary bin{};
+        if (enif_inspect_binary(env, val, &bin)) {
+            auto map = std::make_shared<text::SynonymMap>();
+            if (map->load_from_file(std::string(as_string_view(bin)))) {
+                o.synonym_map = std::move(map);
+            }
+        }
     }
 }
 
@@ -107,7 +120,8 @@ bool is_analyzer_key(ERL_NIF_TERM key) {
     return key == atoms().analyzer || key == atoms().dict_path
         || key == atoms().enable_stop_words
         || key == atoms().min_n || key == atoms().max_n
-        || key == atoms().min_token_length || key == atoms().enable_stemming;
+        || key == atoms().min_token_length || key == atoms().enable_stemming
+        || key == atoms().synonym_file;
 }
 
 // 二元组选项总分发：general → merge → analyzer。

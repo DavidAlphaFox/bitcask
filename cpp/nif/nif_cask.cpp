@@ -294,22 +294,4 @@ ERL_NIF_TERM nif_cask_search_hybrid_5(ErlNifEnv* env, int /*argc*/,
     return make_ok(env, make_search_hits(env, r->hits));
 }
 
-// S8.2：设置同义词词典（ref, file_path）。
-ERL_NIF_TERM nif_cask_set_synonym_map(ErlNifEnv* env, int /*argc*/,
-                                        const ERL_NIF_TERM argv[]) {
-    auto* h = checked_cask_handle(env, argv[0]);
-    if (!h || !h->cask->has_search()) return enif_make_badarg(env);
-    ErlNifBinary path_bin{};
-    if (!enif_inspect_binary(env, argv[1], &path_bin)) return enif_make_badarg(env);
-
-    auto map = std::make_unique<text::SynonymMap>();
-    // v1.1.0：load_from_file 现为 [[nodiscard]] bool——文件打不开返回 false。
-    // 不能静默吞掉：否则会把空词典装上去，掩盖路径错误。
-    if (!map->load_from_file(std::string(as_string_view(path_bin)))) {
-        return make_error(env, atoms().load_failed);
-    }
-    h->cask->set_synonym_map(std::move(map));
-    return atoms().ok;
-}
-
 }  // namespace bitcask::nif

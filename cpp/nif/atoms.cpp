@@ -42,7 +42,6 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     bad_crc         = a("bad_crc");
     no_index        = a("no_index");
     mode_mismatch   = a("mode_mismatch");
-    load_failed     = a("load_failed");
 
     frag_merge_trigger       = a("frag_merge_trigger");
     dead_bytes_merge_trigger = a("dead_bytes_merge_trigger");
@@ -62,6 +61,7 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     max_n              = a("max_n");
     min_token_length   = a("min_token_length");
     enable_stemming    = a("enable_stemming");
+    synonym_file       = a("synonym_file");
 
     text               = a("text");
     meta               = a("meta");
