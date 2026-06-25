@@ -148,14 +148,21 @@ graphdb:pregel(G, ComputeFun, Opts).          %% 整图 BSP，算完回写
 
 ---
 
-## 8. libbitcask v1.1.0 收益
+## 8. libbitcask v3.0.0 收益
 
-热路径是纯 BEAM，libbitcask 价值集中在 **load / checkpoint 吞吐**：
+热路径是纯 BEAM，libbitcask 价值集中在 **load / checkpoint 吞吐**（累积自 v1.1.0）：
 
 - **单 `pread` 取值** → 整图加载一次 syscall。
 - **多读者 + 256 分片 keydir（`std::mutex`，消写者偏好停车）** → 多图**并行加载**不互锁。
 - **稠密扁平 keydir（`ankerl::unordered_dense`）** → 海量 GraphId 时每 key 内存低。
 - **merge 不阻塞 writer** → 频繁检查点产生的 dead bytes 后台回收。
+
+v3.0.0（随 libbitcask v1.2.0 引擎）新增、对图层直接相关：
+
+- **`Cask` handle 多线程安全** → 同一句柄可被多个 owner actor 共享：写路径内部
+  串行化、读/搜索并发、`close()` fail-fast；无需每图一实例即可并发加载。
+- **`parallel_scan` 全表并行扫描** → 一次快照 live key 分 N 段并发取值 + 回调，
+  正合「整库重建图索引 / 批量导出」类离线作业。
 
 ---
 

@@ -98,6 +98,10 @@ ok
 
 > 在**未指定分析器**的 cask 上调用任何 `search_*` 函数将返回 `{error, no_index}`。
 
+> **同义词**（v3.0.0）：open 时加 `{synonym_file, Path}`（每行逗号分隔一组同义词），
+> 查询自动展开。open-time 不可变配置（取代已删除的运行期 `set_synonym_map/2`）——
+> 运行期更换词典需重开库。
+
 **HNSW 向量搜索** — 向量搜索需索引模式（`{analyzer, ...}`）。**推荐流程：open
 时把 embedder 作为 `{Provider, Cfg}` 传入，open 内部建 ctx 并自动把集合维度设为
 embedder 的 `vector_dim`——无需外部 `new`、也无需单独写 `{vector_dim, N}`。** 之后
@@ -156,7 +160,6 @@ ok
 | `search_near/3,4`, `search_fuzzy/3,4`, `search_wildcard/2,3` | 近邻 / 模糊（编辑距离）/ 通配符搜索 |
 | `search_vector/2,3,4,5`, `search_hybrid/2,3,4,5` | HNSW 向量近邻 / RRF 混合检索（BM25 + 向量）；查询传 `{text,_}`（vector）或 `auto`（hybrid）自动 embed；`/5` 末参为 meta filter |
 | `embed/2` | 用句柄 embedder 把文本编码成向量（`{ok, Vec}`/`{error, no_embedder}`） |
-| `set_synonym_map/2` | 加载同义词词典 |
 | `is_empty_estimate/1`, `is_frozen/1`, `close_write_file/1` | 工具函数 |
 
 ## 文档

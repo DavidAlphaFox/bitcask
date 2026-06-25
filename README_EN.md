@@ -99,6 +99,11 @@ ok
 > Calling any `search_*` on a cask opened **without** an analyzer returns
 > `{error, no_index}`.
 
+> **Synonyms** (v3.0.0): pass `{synonym_file, Path}` at open (one comma-separated
+> synonym group per line); queries expand automatically. It is an open-time immutable
+> config (replacing the removed runtime `set_synonym_map/2`) — swapping dictionaries
+> at runtime requires reopening the database.
+
 **HNSW vector search** — requires index mode (`{analyzer, ...}`). **Recommended
 flow: pass the embedder as `{Provider, Cfg}` at open time; open builds the ctx
 internally and auto-sets the collection dimension to the embedder's `vector_dim`
@@ -159,7 +164,6 @@ ok
 | `search_near/3,4`, `search_fuzzy/3,4`, `search_wildcard/2,3` | Proximity / fuzzy (edit-distance) / wildcard search |
 | `search_vector/2,3,4,5`, `search_hybrid/2,3,4,5` | HNSW vector NN / RRF hybrid (BM25+vector); pass `{text,_}` (vector) or `auto` (hybrid) to auto-embed the query; `/5` takes a trailing meta filter |
 | `embed/2` | Encode text to a vector via the handle's embedder (`{ok, Vec}`/`{error, no_embedder}`) |
-| `set_synonym_map/2` | Load a synonym dictionary |
 | `is_empty_estimate/1`, `is_frozen/1`, `close_write_file/1` | Utilities |
 
 ## Documentation
