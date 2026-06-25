@@ -6,6 +6,31 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 3.0.0 shipped
+
+### libbitcask upgrade to v3.0.0 ✅
+
+The submodule advances from v1.1.0 to **v3.0.0** (libbitcask unifies its three version
+numbers: CHANGELOG = library `VERSION` = C API = `3.0.0`, `SOVERSION` 1 → 3); this repo
+aligns to 3.0.0 in lockstep. The v1.2.0 engine capabilities it brings are especially
+relevant to graph workloads: a **thread-safe `Cask` handle** (one handle shared across
+actors: internally serialized writes, concurrent reads/search, fail-fast `close()`),
+**`parallel_scan`** full-table parallel scan (analytics / export / reindex — a fit for
+parallel whole-graph loading), batch retrieval, and the async-index MapReduce pipeline;
+on-disk meta bumped to v2.
+
+Consumer-side adaptation (breaking): **the runtime `bitcask:set_synonym_map/2` is
+removed**; the synonym dictionary becomes the open-time immutable `open/2` option
+`{synonym_file, Path}` (mirrors libbitcask `CaskOptions::synonym_map`: loaded once at
+open, immutable thereafter → naturally concurrency-safe for queries). The NIF is
+recompiled/relinked (ABI `SOVERSION` 1 → 3).
+
+> ⚠️ ABI break: soname `libbitcask.so.1` → `libbitcask.so.3`; downstream must
+> recompile/relink. On-disk: KV data/hint (meta v2) compatible; swapping synonym
+> dictionaries at runtime now requires reopening the database.
+
+---
+
 ## 2.2.0 plan
 
 ### libcask standalone extraction ✅

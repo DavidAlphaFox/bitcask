@@ -6,11 +6,32 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 3.0.0 落地
+
+### libbitcask 升级到 v3.0.0 ✅
+
+submodule 由 v1.1.0 升至 **v3.0.0**（libbitcask 三套版本号统一：CHANGELOG = 库
+`VERSION` = C API = `3.0.0`，`SOVERSION` 1 → 3）。本仓库版本同步对齐 3.0.0。随库
+引入的 v1.2.0 引擎能力对图工作负载尤为相关：**`Cask` handle 多线程安全**（同一句柄
+可被多 actor 共享：写路径内部串行化、读/搜索并发、`close()` fail-fast）、
+**`parallel_scan` 全表并行扫描**（analytics / export / reindex，正合并行整图加载）、
+批量检索、异步索引 MapReduce 流水线；meta 格式升至 v2。
+
+消费侧适配（破坏性）：**移除运行期 `bitcask:set_synonym_map/2`**，同义词词典改为
+`open/2` 的 open-time 不可变选项 `{synonym_file, Path}`（对齐 libbitcask
+`CaskOptions::synonym_map`：开库一次性加载、构造后不可变 → 并发查询天然安全）。
+NIF 重新编译链接（ABI `SOVERSION` 1 → 3）。
+
+> ⚠️ ABI 破坏：soname `libbitcask.so.1` → `libbitcask.so.3`，下游须重新编译链接。
+> 盘上格式：KV data/hint（meta v2）兼容；同义词运行期更换需重开库。
+
+---
+
 ## 2.2.1 规划
 
 ### libbitcask 升级到 v1.1.0 ✅
 
-submodule 由 v1.0.0 升至 v1.1.0（当前 libbitcask 最高版本）。对图工作负载（读多、
+submodule 由 v1.0.0 升至 v1.1.0（当时 libbitcask 最高版本；现已升至 v3.0.0，见上节）。对图工作负载（读多、
 整图加载密集）的收益：稠密扁平 keydir（`ankerl::unordered_dense`，海量 key 省内存）、
 256 分片锁改 `std::mutex`（多图并行加载不互锁）、单 `pread` 取值（整图一次 syscall）、
 fstats 无锁发布 + `thread_local` scratch 复用。

@@ -227,6 +227,20 @@ WAL `.f{i}.inv.wal→.f{i}.wal`；常量 `kKeydirSnapName`/`kIndexSidecarName`/
 
 ---
 
+## M — libbitcask 升级 v1.1.0 → v3.0.0（API 破坏性迁移）
+
+submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本仓库 `vsn` → 3.0.0。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M1** | submodule pin v1.1.0 → v3.0.0 + 嵌套子模块同步（注意：rebar `pre_hook` 跑 `git submodule update --init --recursive`，父仓 gitlink 须先 `git add` 暂存，否则被回滚到旧 tag）。 | ✅ |
+| **M2** | 同义词运行期 setter → open-time 选项：删 `nif_cask_set_synonym_map` + `nif_main` 声明/注册 + atom `load_failed`；`nif_options.cpp` 新增 `{synonym_file, Path}` 解析 → `CaskOptions::synonym_map`（搜索类键，自动开索引模式）。 | ✅ |
+| **M3** | Erlang facade：删 `bitcask:set_synonym_map/2` + `bitcask_cpp_nifs:cask_set_synonym_map/2`；`open/2` 加 `synonym_file` 白名单 + `maybe_binarize_synonym_file/1`（string→binary）+ 选项文档。 | ✅ |
+| **M4** | 回归：`rebar3 compile`（链接 v3.0.0 通过）+ `rebar3 eunit`（64/64）+ 同义词新选项端到端冒烟（带 `synonym_file` 搜 quick 命中 rapid 文档；对照组空）。 | ✅ |
+| **M5** | 文档：CHANGELOG（中/英）[3.0.0] 条目 + ROADMAP（中/英）升级条目 + README 表删行 + graph-layer §8 + `CMakeLists.txt` 注释。 | ✅ |
+
+---
+
 ## 明确排除（V7+ 或永久取消）
 
 | 条目 | 决策 | 理由 |
