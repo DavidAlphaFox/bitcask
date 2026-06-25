@@ -53,13 +53,13 @@ R = bitcask:open("/tmp/db", [read_write, {analyzer, ngram}]).
 3> bitcask:put(R, <<"doc2">>, <<"Shanghai Pudong area">>).
 4> bitcask:put(R, <<"doc3">>, <<"Beijing Chaoyang is a district">>).
 
-%% BM25 词袋搜索
+%% BM25 词袋搜索（结果为 {Key, Ord, Score} 三元组，分数降序）
 5> bitcask:search_text(R, <<"Beijing">>, 10).
-{ok,[{<<"doc1">>,0.288},{<<"doc3">>,0.288}]}
+{ok,[{<<"doc1">>,0,0.288},{<<"doc3">>,2,0.288}]}
 
 %% BM25 短语搜索（词元必须相邻）
 6> bitcask:search_phrase(R, <<"Beijing Chaoyang">>, 10).
-{ok,[{<<"doc1">>,0.287}]}
+{ok,[{<<"doc1">>,0,0.287}]}
 
 7> bitcask:close(R).
 ```
@@ -72,9 +72,49 @@ R = bitcask:open("/tmp/db", [read_write, {analyzer, ngram}]).
 | `jieba`     | 中文分词（需要 `{dict_path, Path}`） |
 | `whitespace`| 简单空格分词             |
 
-**返回格式：** `[{Key :: binary(), Score :: float()}]`
+**返回格式：** `{ok, [{Key :: binary(), Ord :: non_neg_integer(), Score :: float()}]}`（分数降序；`Ord` 为内部文档序号）
 
 **模式约束：** `search_text`/`search_phrase` 要求 Cask 以索引模式打开（bitcask.meta 中 `mode=kIndex`）。KV 模式返回 `{error, no_index}`。
+
+**其它文本检索方式**（同为索引模式、返回 `{ok, [{Key, Ord, Score}]}`）：
+
+| 函数 | 方式 |
+|------|------|
+| `search_fields(R, Query[, K])` | 多字段，`field:term^boost` 加权 |
+| `search_near(R, Query, Slop[, K])` | 近邻：按序且间隙 ≤ Slop（Slop=0 即短语） |
+| `search_fuzzy(R, Query, MaxEdit[, K])` | 模糊：Levenshtein 编辑距离 ≤ MaxEdit |
+| `search_wildcard(R, Pattern[, K])` | 通配符 `*` / `?` |
+
+同义词（v3.0.0）：open 时加 `{synonym_file, Path}`（每行逗号分隔一组），查询自动展开。
+
+### 向量 / 混合检索（向量模式）
+
+向量检索需索引模式 + 向量配置（open 配 `{embedder, {Provider, Cfg}}`，或低层 `{vector_dim, N}` + 自带向量）。`search_vector` 是纯向量近邻，`search_hybrid` 是 BM25 + 向量 RRF 融合。两者 arity 都是缺省项逐级展开。
+
+```erlang
+%% open 配 embedder（put #{text=>...} 与查询都自动 embed）
+1> H = bitcask:open("/tmp/vec", [read_write, {analyzer, whitespace},
+1>     {embedder, {openai, #{url => "http://localhost:8080/v1/embeddings",
+1>                           model => <<"qwen3-embedding">>, dim => 2560}}}]).
+2> bitcask:put(H, <<"d1">>, #{text => <<"a rapid brown fox">>}).
+
+%% 纯向量近邻：search_vector(H, Query[, K[, Ef[, Filter]]])
+3> bitcask:search_vector(H, {text, <<"fast animal">>}).        % 默认 K=10、Ef=0
+3> bitcask:search_vector(H, VecBin, 20, 128).                  % 显式向量 + 调大 Ef 提召回
+3> bitcask:search_vector(H, {text, <<"fast">>}, 10, 0,
+3>     #{op => eq, field => <<"category">>, value => <<"tech">>}). % + meta filter
+
+%% 混合 RRF：search_hybrid(H, Text[, VecOrAuto[, K[, Filter]]])
+4> bitcask:search_hybrid(H, <<"fast brown animal">>).          % 全自动：文本既做 BM25 又 embed
+4> bitcask:search_hybrid(H, <<"fast">>, MyVecBin, 10).         % 文本走 BM25、向量显式给
+4> bitcask:search_hybrid(H, <<"fast">>, <<>>, 10).             % 单路退化：只 BM25
+4> bitcask:search_hybrid(H, <<>>, MyVecBin, 10).               % 单路退化：只向量
+5> bitcask:close(H).
+```
+
+- `Query`/向量位接受 `VecBin`（f32 LE，`vector_dim*4` 字节）或文本自动 embed（`search_vector` 传 `{text, Bin}`、`search_hybrid` 向量位传 `auto`），需 open 配 embedder。
+- `K` 默认 10；`Ef` 默认 `max(K,64)`（越大越准越慢）；`Filter` 为结构化 meta 过滤。
+- 详尽参数/arity 展开表见 [`doc/api-zh.md`](api-zh.md) 向量/混合检索节。
 
 ### 流式 Fold
 
@@ -301,9 +341,9 @@ ok      = bitcask_cpp_nifs:cask_put(R, K, V).
 {ok, K, V}      = bitcask_cpp_nifs:cask_fold_next(IR).        % 或 `done`
 ok              = bitcask_cpp_nifs:cask_fold_release(IR).
 
-%% 搜索（仅索引模式）
-{ok, [{K,S}]}   = bitcask_cpp_nifs:cask_search_text(R, <<"query">>, 10).
-{ok, [{K,S}]}   = bitcask_cpp_nifs:cask_search_phrase(R, <<"query">>, 10).
+%% 搜索（仅索引模式；结果为 {Key, Ord, Score} 三元组）
+{ok, [{K,Ord,S}]} = bitcask_cpp_nifs:cask_search_text(R, <<"query">>, 10).
+{ok, [{K,Ord,S}]} = bitcask_cpp_nifs:cask_search_phrase(R, <<"query">>, 10).
 
 ok = bitcask_cpp_nifs:cask_close(R).
 ```

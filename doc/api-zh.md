@@ -179,23 +179,64 @@ O(1) 估算；写过任何 key 后恒 `false`。
 用句柄配置的 embedder 把 `Text` 编码成向量。未配 → `{error, no_embedder}`。
 
 ### `search_vector(H, Query[, K[, Ef[, Filter]]])`
-`Query` 为 `VecBin` 或 `{text, Bin}`（用句柄自动 embed）。
+HNSW 向量近邻检索。四个 arity 是同一调用、缺省项逐级展开：
+
+| Arity | 签名 | 等价于 |
+|-------|------|--------|
+| `/2` | `search_vector(H, Query)` | `/3`，`K=10` |
+| `/3` | `search_vector(H, Query, K)` | `/4`，`Ef=0` |
+| `/4` | `search_vector(H, Query, K, Ef)` | 调引擎（无 filter） |
+| `/5` | `search_vector(H, Query, K, Ef, Filter)` | 调引擎（带 meta filter） |
+
+参数：
+- `Query` —— `VecBin`（f32 LE，`vector_dim*4` 字节）或 `{text, Bin}`（用句柄
+  embedder 自动 embed；未配 embedder → `{error, no_embedder}`）。每个 arity 通用。
 - `K` —— top-K（默认 10）。
 - `Ef` —— HNSW 搜索宽度 / candidate list 大小（`0` = 引擎默认 `max(K, 64)`；越大越准越慢）。
 - `Filter` —— meta filter。
 
 返回 `{ok, [{Key, Ord, Score}]}`（Score = 该度量下的相似度）。
 
+```erlang
+search_vector(H, VecBin).                 %% 默认 K=10、Ef 默认
+search_vector(H, VecBin, 20).             %% 指定 K
+search_vector(H, VecBin, 20, 128).        %% 调大 Ef 提召回
+search_vector(H, {text, <<"机器学习">>}, 10, 0,
+              #{op => eq, field => <<"category">>, value => <<"tech">>}). %% 文本自动 embed + 过滤
+```
+
 ### `search_hybrid(H, Text[, VecOrAuto[, K[, Filter]]])`
-对 BM25 路（基于 `Text`）与向量路做 RRF 融合。第 3 个参数选向量来源：
+对 BM25 文本路（基于 `Text`）与向量路做 RRF 融合（`1/(60+rank)`，平局 `ord` 小者
+在前）。第 3 个参数选向量来源：
 - 省略（`/2`）或传原子 **`auto`** → 用句柄 embedder 把 `Text` 编码成查询向量
   （一段文本驱动两路）。要同时传 `K`/`Filter` 必须用 `auto`。
 - 传 **`VecBin`** → 显式查询向量。
 
-形态：`search_hybrid(H, Text)` · `(H, Text, VecBin)` · `(H, Text, auto|VecBin, K)`
-· `(H, Text, auto|VecBin, K, Filter)`。任一路可空（`Text = <<>>` 或
-`VecBin = <<>>`）做单路退化；两路都空 → `{error, _}`。每路内部取 `max(K*4, 64)`
-个候选，融合后返回 top `K`。
+四个 arity 缺省项逐级展开：
+
+| Arity | 签名 | 等价于 |
+|-------|------|--------|
+| `/2` | `search_hybrid(H, Text)` | `/4`，向量位 `auto`、`K=10`（全自动） |
+| `/3` | `search_hybrid(H, Text, VecBin)` | `/4`，`K=10`（显式向量） |
+| `/4` | `search_hybrid(H, Text, auto\|VecBin, K)` | 调引擎（`auto` 先自动 embed） |
+| `/5` | `search_hybrid(H, Text, auto\|VecBin, K, Filter)` | 调引擎 + meta filter |
+
+任一路可空（`Text = <<>>` 或 `VecBin = <<>>`）做单路退化；两路都空 →
+`{error, _}`。每路内部取 `max(K*4, 64)` 个候选，融合后返回 top `K`，结果为
+`{ok, [{Key, Ord, RrfScore}]}`。
+
+```erlang
+search_hybrid(H, <<"机器学习入门">>).                %% 全自动：文本既做 BM25 又 embed
+search_hybrid(H, <<"机器学习入门">>, auto, 20).      %% 自动 embed + 指定 K
+search_hybrid(H, <<"机器学习">>, MyVecBin, 10).      %% 文本走 BM25、向量显式给
+search_hybrid(H, <<"机器学习">>, auto, 10,
+              #{op => eq, field => <<"category">>, value => <<"tech">>}). %% + 过滤
+search_hybrid(H, <<"机器学习">>, <<>>, 10).          %% 单路退化：只 BM25
+search_hybrid(H, <<>>, MyVecBin, 10).                %% 单路退化：只向量
+```
+
+> `search_vector` 是**纯向量**近邻（分数为向量相似度）；`search_hybrid` 是
+> **BM25 + 向量两路 RRF 融合**（分数为融合 rank 分），兼顾关键词精确匹配与语义召回。
 
 ---
 

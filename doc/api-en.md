@@ -187,7 +187,20 @@ Encode `Text` with the handle's configured embedder. `{error, no_embedder}` if
 none was configured at open.
 
 ### `search_vector(H, Query[, K[, Ef[, Filter]]])`
-`Query` is either a `VecBin` or `{text, Bin}` (auto-embedded via the handle).
+HNSW vector nearest-neighbor search. The four arities are one call with defaults
+filled in progressively:
+
+| Arity | Signature | Equivalent to |
+|-------|-----------|---------------|
+| `/2` | `search_vector(H, Query)` | `/3` with `K=10` |
+| `/3` | `search_vector(H, Query, K)` | `/4` with `Ef=0` |
+| `/4` | `search_vector(H, Query, K, Ef)` | calls the engine (no filter) |
+| `/5` | `search_vector(H, Query, K, Ef, Filter)` | calls the engine (with meta filter) |
+
+Parameters:
+- `Query` — a `VecBin` (f32 LE, `vector_dim*4` bytes) or `{text, Bin}` (auto-embedded
+  via the handle's embedder; `{error, no_embedder}` if none configured). Accepted by
+  every arity.
 - `K` — top-K (default 10).
 - `Ef` — HNSW search width / candidate list size (`0` = engine default
   `max(K, 64)`; larger = more accurate, slower).
@@ -195,17 +208,47 @@ none was configured at open.
 
 Returns `{ok, [{Key, Ord, Score}]}` (Score = similarity under the metric).
 
+```erlang
+search_vector(H, VecBin).                 %% default K=10, default Ef
+search_vector(H, VecBin, 20).             %% set K
+search_vector(H, VecBin, 20, 128).        %% raise Ef for higher recall
+search_vector(H, {text, <<"machine learning">>}, 10, 0,
+              #{op => eq, field => <<"category">>, value => <<"tech">>}). %% auto-embed + filter
+```
+
 ### `search_hybrid(H, Text[, VecOrAuto[, K[, Filter]]])`
-RRF fusion of a BM25 leg (over `Text`) and a vector leg. The 3rd argument selects
-the vector source:
+RRF fusion (`1/(60+rank)`, ties broken by smaller `ord`) of a BM25 leg (over `Text`)
+and a vector leg. The 3rd argument selects the vector source:
 - omit it (`/2`) or pass the atom **`auto`** → embed `Text` via the handle's
   embedder (one text drives both legs). `auto` is required to also pass `K`/`Filter`.
 - pass a **`VecBin`** → explicit query vector.
 
-Forms: `search_hybrid(H, Text)` · `(H, Text, VecBin)` · `(H, Text, auto|VecBin, K)`
-· `(H, Text, auto|VecBin, K, Filter)`. Either leg may be empty (`Text = <<>>` or
-`VecBin = <<>>`) for single-leg; both empty → `{error, _}`. Each leg fetches
-`max(K*4, 64)` candidates internally, then returns top `K` after fusion.
+The four arities fill defaults progressively:
+
+| Arity | Signature | Equivalent to |
+|-------|-----------|---------------|
+| `/2` | `search_hybrid(H, Text)` | `/4` with vector slot `auto`, `K=10` (fully auto) |
+| `/3` | `search_hybrid(H, Text, VecBin)` | `/4` with `K=10` (explicit vector) |
+| `/4` | `search_hybrid(H, Text, auto\|VecBin, K)` | calls the engine (`auto` embeds first) |
+| `/5` | `search_hybrid(H, Text, auto\|VecBin, K, Filter)` | engine + meta filter |
+
+Either leg may be empty (`Text = <<>>` or `VecBin = <<>>`) for single-leg; both empty
+→ `{error, _}`. Each leg fetches `max(K*4, 64)` candidates internally, then returns
+top `K` after fusion as `{ok, [{Key, Ord, RrfScore}]}`.
+
+```erlang
+search_hybrid(H, <<"intro to machine learning">>).        %% fully auto: text drives BM25 + embed
+search_hybrid(H, <<"intro to machine learning">>, auto, 20). %% auto-embed + set K
+search_hybrid(H, <<"machine learning">>, MyVecBin, 10).   %% text → BM25, explicit vector
+search_hybrid(H, <<"machine learning">>, auto, 10,
+              #{op => eq, field => <<"category">>, value => <<"tech">>}). %% + filter
+search_hybrid(H, <<"machine learning">>, <<>>, 10).       %% single-leg: BM25 only
+search_hybrid(H, <<>>, MyVecBin, 10).                     %% single-leg: vector only
+```
+
+> `search_vector` is **pure vector** NN (score = vector similarity); `search_hybrid`
+> is **BM25 + vector RRF fusion** (score = fused rank), balancing exact keyword
+> matching with semantic recall.
 
 ---
 
