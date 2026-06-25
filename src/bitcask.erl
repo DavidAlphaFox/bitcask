@@ -53,8 +53,7 @@
            search_vector/2, search_vector/3, search_vector/4, search_vector/5,
            search_hybrid/2, search_hybrid/3, search_hybrid/4, search_hybrid/5,
            embed/2,
-           encode_meta/1,
-           set_synonym_map/2]).
+           encode_meta/1]).
 
 -include("bitcask.hrl").
 
@@ -69,7 +68,7 @@
     small_file_threshold, expiry_grace_time,
     max_merge_size,
     analyzer, dict_path, enable_stop_words,
-    min_n, max_n, min_token_length, enable_stemming,
+    min_n, max_n, min_token_length, enable_stemming, synonym_file,
     vector_dim, vector_metric, vector_quantized, vector_inmem_int8
 ]).
 
@@ -96,6 +95,9 @@ open(Dirname) -> open(Dirname, []).
 %%     {analyzer, Type}     — ngram | whitespace | jieba（必填）
 %%     {dict_path, Path}    — jieba 分词词典路径（jieba 时必填）
 %%     {enable_stop_words, true} — 启用停用词过滤
+%%     {synonym_file, Path} — 同义词词典文件路径（v3.0.0：open-time 不可变
+%%                            配置，取代已删除的运行期 set_synonym_map/2；
+%%                            查询时自动展开同义词。文件打不开 → 静默不展开）
 %%
 %%   向量模式选项：
 %%     {embedder, {Provider, Cfg}} — 推荐。Provider = openai | anthropic |
@@ -152,7 +154,8 @@ open(Dirname, Opts) ->
                          undefined -> Extra0;
                          _         -> [{vector_dim, VDim} | Extra0]
                      end,
-            Extra = maybe_default_dict_path(Extra1),
+            Extra2 = maybe_default_dict_path(Extra1),
+            Extra = maybe_binarize_synonym_file(Extra2),
             case bitcask_cpp_nifs:cask_open(Dirname, Base ++ Extra) of
                 {ok, CaskRef}  -> {CaskRef, EmbedderCtx};
                 {error, _} = E -> E;
@@ -196,6 +199,16 @@ maybe_default_dict_path(Opts) ->
                             [{dict_path, list_to_binary(Path)} | Opts]
                     end
             end;
+        _ -> Opts
+    end.
+
+%% v3.0.0：{synonym_file, Path} 是 open-time 同义词词典选项。NIF 侧走
+%% enif_inspect_binary，路径必须是 binary——给个 string（iolist）就替调用方转一下。
+maybe_binarize_synonym_file(Opts) ->
+    case proplists:get_value(synonym_file, Opts) of
+        Path when is_list(Path) ->
+            lists:keyreplace(synonym_file, 1, Opts,
+                             {synonym_file, list_to_binary(Path)});
         _ -> Opts
     end.
 
@@ -697,10 +710,6 @@ search_hybrid(Handle, TextQuery, auto, K, Filter) ->
     end;
 search_hybrid(Handle, TextQuery, VecBin, K, Filter) when is_binary(VecBin) ->
     bitcask_cpp_nifs:cask_search_hybrid(ref(Handle), TextQuery, VecBin, K, Filter).
-
-%% 设置同义词词典（S8.2）：从文件加载，查询时自动展开。
-set_synonym_map(Handle, FilePath) ->
-    bitcask_cpp_nifs:cask_set_synonym_map(ref(Handle), FilePath).
 
 %% V5:把 map 或 proplist 编码成 put_doc 可用的 meta 二进制 blob。给
 %% 业务方 / 测试一个轻量入口,生产路径下通常自己编码更高效。Value 类型:
