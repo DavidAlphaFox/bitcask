@@ -3,6 +3,43 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [3.1.0] — 2026-07-01
+
+**升级到 libbitcask v3.1.0**：submodule 由 v3.0.0 升至 **v3.1.0**（S12 全库审计批次；
+`SOVERSION` 保持 **3**、ABI 未破坏——向后兼容的功能新增）。NIF 已重新编译链接；
+本仓库版本同步对齐为 **3.1.0**。
+
+> ⚠️ **盘上格式前向不兼容**：libbitcask v3.1.0 把 `bitcask.meta` 升至 **v3**（加
+> CRC32）。本版写出的库**不能被旧 3.0.0 打开**（旧读端只认 v2 → "unsupported meta
+> version"）；**反向兼容**——本版能读旧库（v2 meta 兼容读、legacy field.schema 自动
+> 原子升级为 FSCH v1）。升级请单向进行。
+
+### 新增
+
+- **`open/2` 选项 `{max_read_handles, unlimited}`**：透传 libbitcask v3.1.0 的
+  `kUnlimitedReadHandles` 哨兵（显式不限、旧默认行为）。
+- **`open/2` 选项 `{auto_compact_dead_ratio, R}`（索引模式）**：透传
+  `SearchLayerConfig::auto_compact_dead_ratio`。`0.0`（默认）= 关；`R ∈ (0.0, 1.0]`
+  = 开——reducer 线程内按 per-list 死占比自动 compaction，posting list 内存随 churn
+  有界，不再依赖 merge 才回收（libbitcask S12-2）。仅索引模式（带 `{analyzer, _}`）
+  生效。
+- **错误原子 `closed`**：NIF 把 libbitcask 新增的 `CaskError::kClosed`（对已 close
+  的 handle 发起调用，S12-5）映射为 `{error, closed}`，与通用 `{error, error}` 区分。
+
+### 变更
+
+- **`third_party/libbitcask` 子模块**：v3.0.0 → **v3.1.0**（`SOVERSION` 保持 3，
+  soname `libbitcask.so.3` 不变；ABI 增量安全——新符号 + 枚举末尾加值）。随库引入：
+  read 句柄默认上限（防 fd/mmap 无界）、reducer 线程内自动 compaction、field.schema
+  加 FSCH v1 格式头 + CRC、`bitcask.meta` v2 → v3 加 CRC、C API 批量检索 ×3 +
+  `parallel_scan` + `BITCASK_ERR_CLOSED`、`-Werror` 库构建护栏。引擎细节见
+  [libbitcask CHANGELOG](third_party/libbitcask/CHANGELOG.md)。
+- **`{max_read_handles, N}` 语义变更（随 libbitcask v3.1.0）**：默认 `0` 由「不限」
+  改为**按 `RLIMIT_NOFILE` 软上限自动推导**（约一半、下限 64）。小/中库行为不变；
+  大库由 fd 耗尽 crash 改为 graceful 句柄淘汰。需旧「不限」行为改传 `unlimited`。
+- **构建**：根 `CMakeLists.txt` 版本/格式注释对齐 v3.1.0；`bitcask.app.src`
+  `vsn` 3.0.0 → 3.1.0。
+
 ## [3.0.0] — 2026-06-25
 
 **升级到 libbitcask v3.0.0**：submodule 由 v1.1.0 升至 **v3.0.0**（libbitcask 自此

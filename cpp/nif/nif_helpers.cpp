@@ -148,6 +148,7 @@ ERL_NIF_TERM fault_to_term(ErlNifEnv* env, const CaskFault& f) noexcept {
         case CaskError::kWriteLocked:    tag = atoms().write_locked; break;
         case CaskError::kNoIndex:        return atoms().no_index;
         case CaskError::kModeMismatch:  return atoms().mode_mismatch;
+        case CaskError::kClosed:         return atoms().closed;
         case CaskError::kAnalyzerMismatch:
         case CaskError::kInvalidOption:
         default:                          tag = atoms().error; break;

@@ -69,6 +69,7 @@
     max_merge_size,
     analyzer, dict_path, enable_stop_words,
     min_n, max_n, min_token_length, enable_stemming, synonym_file,
+    auto_compact_dead_ratio,
     vector_dim, vector_metric, vector_quantized, vector_inmem_int8
 ]).
 
@@ -85,8 +86,11 @@ open(Dirname) -> open(Dirname, []).
 %%     read_write           — 写权限；竞争 bitcask.write.lock
 %%     {expiry_secs, N}     — N 秒前的 entry 视作过期
 %%     {max_file_size, N}   — 写满 N 字节切下一个 active data file
-%%     {max_read_handles, N}— read 句柄缓存上限（0=不限，默认）；超额按近似 LRU
-%%                            淘汰空闲只读句柄，控 fd / mmap 数（大库防撞 ulimit；P9）
+%%     {max_read_handles, N | unlimited} — read 句柄缓存上限；超额按近似 LRU
+%%                            淘汰空闲只读句柄，控 fd / mmap 数（大库防撞 ulimit；P9）。
+%%                            v3.1.0 语义变更：默认 0 = 按 RLIMIT_NOFILE 自动推导
+%%                            （约软上限一半、下限 64；不再是「不限」）；atom
+%%                            `unlimited` = 显式不限（旧默认行为，caller 自负 fd 预算）
 %%     {sync_strategy, X}   — none（默认，靠 OS 刷盘）| o_sync（每条写 durable）
 %%                            | {puts, N}（单写者组提交：每 N 次写 fsync 一次）
 %%     {tombstone_version, V} — 1 或 2，控制墓碑编码（默认 2）
@@ -98,6 +102,11 @@ open(Dirname) -> open(Dirname, []).
 %%     {synonym_file, Path} — 同义词词典文件路径（v3.0.0：open-time 不可变
 %%                            配置，取代已删除的运行期 set_synonym_map/2；
 %%                            查询时自动展开同义词。文件打不开 → 静默不展开）
+%%     {auto_compact_dead_ratio, R} — v3.1.0：reducer 线程内自动 compaction 的
+%%                            per-list 死占比阈值。0.0（默认）= 关（索引流水线零
+%%                            开销）；R ∈ (0.0, 1.0] = 开，posting list 内存随
+%%                            churn 有界，不再依赖 merge 才回收（S12-2）。仅索引
+%%                            模式生效（须同时带 {analyzer, _}）
 %%
 %%   向量模式选项：
 %%     {embedder, {Provider, Cfg}} — 推荐。Provider = openai | anthropic |

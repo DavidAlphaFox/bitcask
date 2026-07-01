@@ -39,6 +39,23 @@ bool opt_u64(ErlNifEnv* env, ERL_NIF_TERM t, std::uint64_t* out) noexcept {
     return true;
 }
 
+// 取 [0,1] 的比率选项值（如 auto_compact_dead_ratio）。接受 float 或整数 0/1；
+// 越界或类型不符则保持默认（沿用「无效选项值静默跳过」语义）。
+bool opt_ratio(ErlNifEnv* env, ERL_NIF_TERM t, double* out) noexcept {
+    double d = 0.0;
+    int i = 0;
+    if (enif_get_double(env, t, &d)) {
+        // ok
+    } else if (enif_get_int(env, t, &i)) {
+        d = static_cast<double>(i);
+    } else {
+        return false;
+    }
+    if (d < 0.0 || d > 1.0) return false;
+    *out = d;
+    return true;
+}
+
 // 取 uint32 选项值，要求 ≥ min_val（如 min_n ≥ 1、expiry_grace_time ≥ 0）。
 bool opt_u32_min(ErlNifEnv* env, ERL_NIF_TERM t, int min_val, std::uint32_t* out) noexcept {
     int v = 0;
@@ -100,6 +117,11 @@ void parse_analyzer_option(ErlNifEnv* env, const ERL_NIF_TERM* tup, CaskOptions&
         opt_u32_min(env, val, 1, &ac.min_token_length);
     } else if (key == atoms().enable_stemming) {
         if (val == atoms().atom_true) ac.enable_stemming = true;
+    } else if (key == atoms().auto_compact_dead_ratio) {
+        // v3.1.0 S12-2：reducer 线程内自动 compaction 的 per-list 死占比阈值。
+        // 0（默认）=关（索引流水线零开销）；(0,1]=开，posting list 内存随 churn
+        // 有界（不再依赖 merge 才回收）。作用于 SearchLayerConfig（搜索模式生效）。
+        opt_ratio(env, val, &o.search_config->auto_compact_dead_ratio);
     } else if (key == atoms().synonym_file) {
         // v3.0.0：同义词词典改为 open-time 不可变配置（取代已删除的运行期
         // set_synonym_map）。从文件加载一次，构造后只读 → 并发查询安全。
@@ -121,7 +143,7 @@ bool is_analyzer_key(ERL_NIF_TERM key) {
         || key == atoms().enable_stop_words
         || key == atoms().min_n || key == atoms().max_n
         || key == atoms().min_token_length || key == atoms().enable_stemming
-        || key == atoms().synonym_file;
+        || key == atoms().synonym_file || key == atoms().auto_compact_dead_ratio;
 }
 
 // 二元组选项总分发：general → merge → analyzer。
@@ -133,9 +155,15 @@ void parse_2tuple_option(ErlNifEnv* env, const ERL_NIF_TERM* tup, CaskOptions& o
     } else if (key == atoms().max_file_size) {
         opt_u64(env, val, &o.max_file_size);
     } else if (key == atoms().max_read_handles) {
-        // P9:read 句柄缓存上限(0=不限)。
-        std::uint64_t n = 0;
-        if (opt_u64(env, val, &n)) o.max_read_handles = static_cast<std::size_t>(n);
+        // P9:read 句柄缓存上限。v3.1.0 语义变更：0 = 按 RLIMIT_NOFILE 自动推导
+        // （不再是「不限」）；atom `unlimited` = 显式不限（kUnlimitedReadHandles，
+        // 旧默认行为）；正整数 = 显式上限。
+        if (val == atoms().unlimited) {
+            o.max_read_handles = CaskOptions::kUnlimitedReadHandles;
+        } else {
+            std::uint64_t n = 0;
+            if (opt_u64(env, val, &n)) o.max_read_handles = static_cast<std::size_t>(n);
+        }
     } else if (key == atoms().expiry_secs) {
         opt_u32_min(env, val, 1, &o.expiry_secs);
     } else if (key == atoms().tombstone_version) {

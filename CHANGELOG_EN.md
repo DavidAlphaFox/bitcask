@@ -3,6 +3,48 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [3.1.0] — 2026-07-01
+
+**Upgrade to libbitcask v3.1.0**: the submodule advances from v3.0.0 to **v3.1.0**
+(the S12 whole-library audit batch; `SOVERSION` stays **3**, ABI unbroken—a
+backward-compatible feature addition). The NIF has been recompiled and relinked, and
+this repo's version is aligned to **3.1.0** in lockstep.
+
+> ⚠️ **On-disk format is forward-incompatible**: libbitcask v3.1.0 bumps `bitcask.meta`
+> to **v3** (adds CRC32). Databases written by this version **cannot be opened by the old
+> 3.0.0** (old readers only accept v2 → "unsupported meta version"). It **is**
+> backward-compatible—this version reads old databases (v2 meta compat-read, legacy
+> field.schema auto-upgraded to FSCH v1 in place). Upgrade one-way only.
+
+### Added
+
+- **`open/2` option `{max_read_handles, unlimited}`**: passes through libbitcask
+  v3.1.0's `kUnlimitedReadHandles` sentinel (explicit no-limit, the old default).
+- **`open/2` option `{auto_compact_dead_ratio, R}` (index mode)**: passes through
+  `SearchLayerConfig::auto_compact_dead_ratio`. `0.0` (default) = off; `R ∈ (0.0, 1.0]`
+  = on—automatic compaction inside the reducer thread by per-list dead ratio, bounding
+  posting-list memory under churn without waiting for merge (libbitcask S12-2). Effective
+  in index mode only (with `{analyzer, _}`).
+- **Error atom `closed`**: the NIF maps libbitcask's new `CaskError::kClosed` (a call on
+  an already-closed handle, S12-5) to `{error, closed}`, distinct from generic
+  `{error, error}`.
+
+### Changed
+
+- **`third_party/libbitcask` submodule**: v3.0.0 → **v3.1.0** (`SOVERSION` stays 3,
+  soname `libbitcask.so.3` unchanged; ABI-additive—new symbols + enum values appended).
+  Brings: default read-handle cap (bounds fd/mmap), reducer-thread auto compaction,
+  FSCH v1 header + CRC on field.schema, `bitcask.meta` v2 → v3 with CRC, C API batch
+  search ×3 + `parallel_scan` + `BITCASK_ERR_CLOSED`, `-Werror` library-build guard. See
+  the [libbitcask CHANGELOG](third_party/libbitcask/CHANGELOG.md) for engine details.
+- **`{max_read_handles, N}` semantics change (with libbitcask v3.1.0)**: the default `0`
+  changes from "unlimited" to **auto-derived from the `RLIMIT_NOFILE` soft limit** (about
+  half, floor 64). Small/medium databases are unaffected; large databases move from
+  fd-exhaustion crashes to graceful handle eviction. Pass `unlimited` for the old
+  unbounded behavior.
+- **Build**: root `CMakeLists.txt` version/format comments aligned to v3.1.0;
+  `bitcask.app.src` `vsn` 3.0.0 → 3.1.0.
+
 ## [3.0.0] — 2026-06-25
 
 **Upgrade to libbitcask v3.0.0**: the submodule advances from v1.1.0 to **v3.0.0**

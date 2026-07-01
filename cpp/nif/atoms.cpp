@@ -32,6 +32,7 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     merge_only      = a("merge_only");
     max_file_size   = a("max_file_size");
     max_read_handles = a("max_read_handles");
+    unlimited       = a("unlimited");
     sync_strategy   = a("sync_strategy");
     expiry_secs     = a("expiry_secs");
     tombstone_version = a("tombstone_version");
@@ -42,6 +43,7 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     bad_crc         = a("bad_crc");
     no_index        = a("no_index");
     mode_mismatch   = a("mode_mismatch");
+    closed          = a("closed");
 
     frag_merge_trigger       = a("frag_merge_trigger");
     dead_bytes_merge_trigger = a("dead_bytes_merge_trigger");
@@ -62,6 +64,7 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     min_token_length   = a("min_token_length");
     enable_stemming    = a("enable_stemming");
     synonym_file       = a("synonym_file");
+    auto_compact_dead_ratio = a("auto_compact_dead_ratio");
 
     text               = a("text");
     meta               = a("meta");

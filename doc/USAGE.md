@@ -87,6 +87,10 @@ R = bitcask:open("/tmp/db", [read_write, {analyzer, ngram}]).
 
 同义词（v3.0.0）：open 时加 `{synonym_file, Path}`（每行逗号分隔一组），查询自动展开。
 
+自动 compaction（v3.1.0，索引模式）：open 时加 `{auto_compact_dead_ratio, R}`
+（`R ∈ (0.0, 1.0]`，默认 `0.0`=关）——reducer 线程内按 per-list 死占比自动压实 posting
+list，churn 下内存有界，不再依赖 merge 才回收。
+
 ### 向量 / 混合检索（向量模式）
 
 向量检索需索引模式 + 向量配置（open 配 `{embedder, {Provider, Cfg}}`，或低层 `{vector_dim, N}` + 自带向量）。`search_vector` 是纯向量近邻，`search_hybrid` 是 BM25 + 向量 RRF 融合。两者 arity 都是缺省项逐级展开。
@@ -225,9 +229,12 @@ application:set_env(bitcask, frag_threshold,     50).
 ```
 
 完整的透传选项列表：
-`max_file_size`, `expiry_secs`, `frag_merge_trigger`,
+`max_file_size`, `max_read_handles`, `expiry_secs`, `frag_merge_trigger`,
 `dead_bytes_merge_trigger`, `frag_threshold`, `dead_bytes_threshold`,
 `small_file_threshold`, `expiry_grace_time`, `max_merge_size`。
+
+> `{max_read_handles, N | unlimited}`（v3.1.0）：read 句柄缓存上限。默认 `0` =
+> 按 `RLIMIT_NOFILE` 自动推导（不再是「不限」）；`unlimited` = 显式不限。
 
 ### 活跃写入者被排除
 
