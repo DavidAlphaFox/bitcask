@@ -112,11 +112,12 @@ handle usable (next `put`/`delete` re-acquires the lock and starts a new file).
 `Value` forms:
 
 - **binary()** — raw KV value.
-- **doc map** (index mode) — `#{text => binary(), fields => [{Field, Text}],
+- **doc map** (index mode) — `#{text => binary(), fields => #{Field => Text},
   vector => binary(), meta => binary()}`. All keys optional:
   - `text` — analyzed into the default BM25 field.
-  - `fields` — list of `{FieldName::binary(), Text::binary()}` for multi-field
+  - `fields` — map of `#{FieldName::binary() => Text::binary()}` for multi-field
     indexing; also merged into the default field so `search_text` still hits.
+    A non-map (e.g. a proplist) → `badarg`.
   - `vector` — f32 little-endian binary, length `vector_dim * 4` bytes.
   - `meta` — structured metadata blob from `encode_meta/1` (for filters).
 - **`tombstone`** — legacy alias for `delete`.

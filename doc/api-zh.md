@@ -107,11 +107,11 @@ finalize 当前 active 文件并释放 `bitcask.write.lock`，但句柄仍可用
 `Value` 形态：
 
 - **binary()** —— 原始 KV 值。
-- **doc map**（索引模式）—— `#{text => binary(), fields => [{Field, Text}],
+- **doc map**（索引模式）—— `#{text => binary(), fields => #{Field => Text},
   vector => binary(), meta => binary()}`，所有键可选：
   - `text` —— 分词进默认 BM25 字段。
-  - `fields` —— `{字段名::binary(), 文本::binary()}` 列表，多字段索引；同时并入
-    默认字段，使 `search_text` 也能命中。
+  - `fields` —— `#{字段名::binary() => 文本::binary()}` map，多字段索引；同时并入
+    默认字段，使 `search_text` 也能命中。非 map（如 proplist）→ `badarg`。
   - `vector` —— f32 小端二进制，长度 `vector_dim * 4` 字节。
   - `meta` —— 由 `encode_meta/1` 产出的结构化元数据 blob（供 filter）。
 - **`tombstone`** —— 历史别名，等价 `delete`。

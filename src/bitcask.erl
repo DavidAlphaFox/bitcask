@@ -160,8 +160,9 @@ open(Dirname) -> open(Dirname, []).
 %%   MRL：embedder Cfg 里 dim = 模型原生维度，vector_dim = 截断落库维度
 %%   （≤ dim，缺省 = dim）；二者不一致时 embed 请求自动带 dimensions。
 %%
-%%   索引模式的 put 可接受 binary 或 #{text=>binary(), vector=>binary(),
-%%   meta=>binary()}。配 embedder 后 put #{text=>...} 自动 embed（显式 vector 跳过）。
+%%   索引模式的 put 可接受 binary 或 #{text=>binary(), fields=>#{Name=>Text},
+%%   vector=>binary(), meta=>binary()}（fields 是 map，非 map → badarg）。
+%%   配 embedder 后 put #{text=>...} 自动 embed（显式 vector 跳过）。
 %%   索引模式下调 search_text/search_phrase 进行 BM25 检索。
 %%
 %%   返回:
