@@ -35,11 +35,27 @@ NIF 已重新编译链接；本仓库版本同步对齐为 **4.0.0**。
   65536；`0` = 关。
 - **`search_vector` 的 `Ef` 参数按引擎解释**：HNSW = candidate list 大小；ivfrq =
   查询探簇数 nprobe；diskann = 查询 beam 宽。
+- **`examples/` Wikipedia 检索库示例**：用真实 Wikipedia dump 构建「BM25 +
+  向量 + 混合 RRF」检索库，`wiki_hnsw.escript` / `wiki_diskann.escript` 分别
+  演示两种向量引擎（只差 `vector_engine` 一个选项，逻辑共享于
+  `wiki_common.erl`）。数据提取方案移植自 wiser-cpp：SAX 流式解析（十几 GB
+  dump 不进内存）+ wiki 标记两遍清洗 + key=标题/正文进 text/标题进 title
+  字段；open 配 embedder 后 put 自动 embed 导语。embedding 端点经环境变量
+  `WIKI_EMBED_URL`（必填）/ `WIKI_EMBED_MODEL` / `WIKI_EMBED_DIM` 配置，
+  不写死在代码里。用法见 `examples/README.md`。
+
+### 修正
+
+- **`put` doc map 的 `fields` 文档更正（×3 处）**：NIF 实际要求 **map**
+  （`#{字段名 => 文本}`，非 map → `badarg`），但 `bitcask.erl` 注释与中英
+  API 文档均误写为 `[{Field, Text}]` proplist——该路径此前无测试/示例覆盖，
+  首个真实调用方（examples）即踩中。三处文档已对齐实现。
 
 ### 变更
 
 - **`third_party/libbitcask` 子模块**：v3.1.0 → **v4.0.0**（soname
-  `libbitcask.so.3` → `libbitcask.so.4`）。随库引入：IVF-RaBitQ-lite 引擎
+  `libbitcask.so.3` → `libbitcask.so.4`；上游后续重打 v4.0.0 标签追加了一次
+  文档同步，指针已跟进至 `e814e4d`，无代码/ABI 变更）。随库引入：IVF-RaBitQ-lite 引擎
   （100k/384d 查询 36.5µs、召回损失 ≤0.08pt）、DiskANN 引擎（实验性）、AVX2 int8
   点积内核（VNNI512→VNNI256→AVX2 分发，非 VNNI 机器全 int8 路径激活）、向量 ckpt
   崩溃恢复有界（最坏 ~4.2M 条 → ≤320K 条）、HNSW `.qc8` 码字 mmap 化 +

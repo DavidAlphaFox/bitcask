@@ -46,11 +46,33 @@ aligned to **4.0.0** in lockstep.
 - **`search_vector`'s `Ef` parameter is interpreted per engine**: HNSW =
   candidate list size; ivfrq = query probe count (nprobe); diskann = query
   beam width.
+- **`examples/` Wikipedia search-database examples**: build a "BM25 + vector +
+  hybrid RRF" search database from a real Wikipedia dump.
+  `wiki_hnsw.escript` / `wiki_diskann.escript` demonstrate the two vector
+  engines (they differ only in the `vector_engine` option; all logic is shared
+  in `wiki_common.erl`). The data-extraction scheme is ported from wiser-cpp:
+  streaming SAX parsing (a dump of tens of GB never enters memory), two-pass
+  wiki-markup stripping, and the key=title / body→text / title→field
+  convention; with an embedder configured at open, `put` auto-embeds the
+  article lead. The embedding endpoint is configured via environment
+  variables — `WIKI_EMBED_URL` (required) / `WIKI_EMBED_MODEL` /
+  `WIKI_EMBED_DIM` — never hard-coded. See `examples/README.md`.
+
+### Fixed
+
+- **`put` doc-map `fields` documentation corrected (×3 places)**: the NIF
+  actually requires a **map** (`#{FieldName => Text}`; a non-map → `badarg`),
+  but the `bitcask.erl` comment and both API docs described it as a
+  `[{Field, Text}]` proplist. The path had no test or example coverage, so the
+  first real caller (the examples) hit it immediately. All three places now
+  match the implementation.
 
 ### Changed
 
 - **`third_party/libbitcask` submodule**: v3.1.0 → **v4.0.0** (soname
-  `libbitcask.so.3` → `libbitcask.so.4`). Ships with the library: the
+  `libbitcask.so.3` → `libbitcask.so.4`; upstream later re-tagged v4.0.0 with
+  one extra docs-sync commit — the pointer now tracks `e814e4d`, no code/ABI
+  change). Ships with the library: the
   IVF-RaBitQ-lite engine (100k/384d queries at 36.5µs, recall loss ≤0.08pt),
   the DiskANN engine (experimental), AVX2 int8 dot-product kernels
   (VNNI512→VNNI256→AVX2 dispatch; full int8 path now active on non-VNNI
