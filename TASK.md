@@ -241,6 +241,38 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## M3 — libbitcask 升级 v3.0.0 → v3.1.0（ABI 兼容增量）
+
+> submodule 升至 v3.1.0（S12 全库审计批次；`SOVERSION` 保持 3，ABI 未破坏）；
+> 本仓库 `vsn` → 3.1.0。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M3-1** | submodule pin v3.0.0 → v3.1.0 + 嵌套子模块同步。 | ✅ |
+| **M3-2** | NIF 适配：`{max_read_handles, unlimited}` 选项透传 + `{auto_compact_dead_ratio, R}` 选项透传（索引模式）+ `CaskError::kClosed` → `{error, closed}` 错误原子映射。 | ✅ |
+| **M3-3** | Erlang facade：`open/2` 选项白名单加 `max_read_handles`（含 `unlimited` 哨兵）/ `auto_compact_dead_ratio`；选项文档更新。 | ✅ |
+| **M3-4** | 回归：`rebar3 compile`（链接 v3.1.0 通过）+ `rebar3 eunit` 全绿。 | ✅ |
+| **M3-5** | 文档：CHANGELOG（中/英）[3.1.0] 条目 + ROADMAP（中/英）升级条目 + `CMakeLists.txt` / `bitcask.app.src` 版本对齐。 | ✅ |
+
+---
+
+## M4 — libbitcask 升级 v3.1.0 → v4.0.0（ABI 破坏，源码兼容）
+
+> submodule 升至 v4.0.0（S32 向量双引擎 + S29-11-②④ AVX2 int8 内核 + 磁盘段 UB
+> 审计；`SOVERSION` 3 → 4，`bitcask_options_t` 布局变更 ×2 = ABI 破坏，源码级完全
+> 向后兼容——NIF 重编即正确）；本仓库 `vsn` → 4.0.0。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M4-1** | submodule pin v3.1.0 → v4.0.0 + 嵌套子模块同步（指针跟进至 `e814e4d`）。 | ✅ |
+| **M4-2** | NIF 适配：`nif_options.cpp` / `nif_helpers.cpp` 改 include `search_config.hpp`（libbitcask v4.0.0 已删除旧 `search_layer.hpp`）；`{vector_engine, hnsw\|ivfrq\|diskann}` + 向量引擎调优选项（`hnsw_m` / `hnsw_ef_construction` / `hnsw_build_nav_int8` / `vector_rebase_min_docs` / `vector_ivf_nlist` / `vector_ivf_nprobe` / `vector_diskann_r` / `vector_diskann_l_build`）透传 + `{auto_checkpoint_min_docs, N}` 透传。 | ✅ |
+| **M4-3** | Erlang facade：`open/2` 选项白名单加 `vector_engine` / 各引擎调优参数 / `auto_checkpoint_min_docs`；选项文档更新。 | ✅ |
+| **M4-4** | 回归：`rebar3 compile`（链接 v4.0.0 通过）+ `rebar3 eunit` 全绿。 | ✅ |
+| **M4-5** | examples：Wikipedia 检索库示例（`wiki_hnsw.escript` / `wiki_diskann.escript` / `wiki_common.erl`，移植自 wiser-cpp，embedding 端点经环境变量配置）。 | ✅ |
+| **M4-6** | 文档：CHANGELOG（中/英）[4.0.0] 条目 + ROADMAP（中/英）升级条目 + README（中/英）项目状态 / API 表 / 向量双引擎说明 + `CMakeLists.txt` / `bitcask.app.src` 版本对齐。 | ✅ |
+
+---
+
 ## 明确排除（V7+ 或永久取消）
 
 | 条目 | 决策 | 理由 |
