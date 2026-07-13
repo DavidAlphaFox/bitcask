@@ -79,6 +79,20 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     l2                 = a("l2");
     dot                = a("dot");
 
+    vector_engine      = a("vector_engine");
+    hnsw               = a("hnsw");
+    ivfrq              = a("ivfrq");
+    diskann            = a("diskann");
+    hnsw_m             = a("hnsw_m");
+    hnsw_ef_construction   = a("hnsw_ef_construction");
+    hnsw_build_nav_int8    = a("hnsw_build_nav_int8");
+    vector_rebase_min_docs = a("vector_rebase_min_docs");
+    vector_ivf_nlist       = a("vector_ivf_nlist");
+    vector_ivf_nprobe      = a("vector_ivf_nprobe");
+    vector_diskann_r       = a("vector_diskann_r");
+    vector_diskann_l_build = a("vector_diskann_l_build");
+    auto_checkpoint_min_docs = a("auto_checkpoint_min_docs");
+
     filter             = a("filter");
     key                = a("key");
     op                 = a("op");

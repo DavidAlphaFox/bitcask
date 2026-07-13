@@ -18,7 +18,7 @@ set(BITCASK_PRIV_DIR "${CMAKE_SOURCE_DIR}/priv")
 file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 
 # ---------------------------------------------------------------------------
-# libbitcask — git submodule at third_party/libbitcask (tag v3.1.0)。
+# libbitcask — git submodule at third_party/libbitcask (tag v4.0.0)。
 # 提供 C++ 核心库全部 target（bitcask_cask, bitcask_keydir, ...）。
 #
 # libbitcask 的 CMakeLists.txt 用 CMAKE_SOURCE_DIR 引用 third_party/
@@ -30,6 +30,12 @@ file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 # v3.1.0：向后兼容功能新增（SOVERSION 保持 3、ABI 未破坏）——read 句柄默认上限
 # （max_read_handles=0 改为按 RLIMIT_NOFILE 自动推导，unlimited 显式不限）、reducer
 # 线程内自动 compaction（auto_compact_dead_ratio）、CaskError::kClosed。
+# v4.0.0：破坏性 ABI 变更（SOVERSION 3→4，bitcask_options_t 布局变更；源码级
+# 向后兼容，重编即可）——向量双引擎 vector_engine（hnsw 默认 / ivfrq 磁盘档 /
+# diskann 实验性，建库选定持久化进 meta，不符 → mode_mismatch）、AVX2 int8
+# 内核 + HNSW 混合精度建图导航（hnsw_build_nav_int8，默认开）、向量 ckpt
+# 崩溃恢复有界（vector_rebase_min_docs）、search_layer.hpp 拆分为
+# search_config.hpp（NIF include 已随迁）。
 # ⚠️ 盘上格式：bitcask.meta 升至 v3（加 CRC），本版写出的库不能被 3.0.0 打开（反向
 # 兼容旧库读）。升级请单向进行。
 # ---------------------------------------------------------------------------

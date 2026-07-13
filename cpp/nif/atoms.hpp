@@ -90,6 +90,26 @@ struct Atoms {
     ERL_NIF_TERM l2;
     ERL_NIF_TERM dot;
 
+    // v4.0.0 S32：向量双引擎。{vector_engine, hnsw|ivfrq|diskann}，建库一次性
+    // 选定并持久化进 bitcask.meta，重开不符 → mode_mismatch。
+    ERL_NIF_TERM vector_engine;
+    ERL_NIF_TERM hnsw;
+    ERL_NIF_TERM ivfrq;
+    ERL_NIF_TERM diskann;
+
+    // v4.0.0 向量引擎调优（SearchLayerConfig 字段；0 = 各自动默认）。
+    ERL_NIF_TERM hnsw_m;
+    ERL_NIF_TERM hnsw_ef_construction;
+    ERL_NIF_TERM hnsw_build_nav_int8;     // S29-11-②：默认 true，false = 全 f32 回退闸
+    ERL_NIF_TERM vector_rebase_min_docs;  // S32-M1：崩溃恢复重放窗口门
+    ERL_NIF_TERM vector_ivf_nlist;        // S32-M3：IVFRQ 簇数
+    ERL_NIF_TERM vector_ivf_nprobe;       // S32-M3：IVFRQ 查询探簇数
+    ERL_NIF_TERM vector_diskann_r;        // S32-M5：DiskANN 邻接容量
+    ERL_NIF_TERM vector_diskann_l_build;  // S32-M5：DiskANN 建图 beam 宽
+
+    // v4.0.0 S14-1/S31.5：自动 checkpoint 的 ord 增量锚点（0 = 关）。
+    ERL_NIF_TERM auto_checkpoint_min_docs;
+
     // V5:metadata filter 解析所需的 atom。
     //   filter/conditions/children = 嵌套 MetaFilter 的 map 字段;
     //   key/op/value/values = 单条 MetaCondition 的字段;

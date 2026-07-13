@@ -120,6 +120,13 @@ list，churn 下内存有界，不再依赖 merge 才回收。
 - `K` 默认 10；`Ef` 默认 `max(K,64)`（越大越准越慢）；`Filter` 为结构化 meta 过滤。
 - 详尽参数/arity 展开表见 [`doc/api-zh.md`](api-zh.md) 向量/混合检索节。
 
+向量引擎（v4.0.0）：open 时加 `{vector_engine, hnsw | ivfrq | diskann}`——
+`hnsw`（默认，内存图，≤ 数 M 向量）、`ivfrq`（IVF-RaBitQ 磁盘档，10M-100M 推荐，
+要求 cosine/dot）、`diskann`（实验性）。建库一次性选定并持久化，重开不符 →
+`{error, mode_mismatch}`；调优选项（`vector_ivf_nlist`/`vector_ivf_nprobe`、
+`hnsw_m`/`hnsw_ef_construction`/`hnsw_build_nav_int8`、`vector_rebase_min_docs`
+等）见 [`doc/api-zh.md`](api-zh.md)。
+
 ### 流式 Fold
 
 通过生产者/消费者模型进行流式迭代：

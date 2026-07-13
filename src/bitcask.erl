@@ -69,8 +69,12 @@
     max_merge_size,
     analyzer, dict_path, enable_stop_words,
     min_n, max_n, min_token_length, enable_stemming, synonym_file,
-    auto_compact_dead_ratio,
-    vector_dim, vector_metric, vector_quantized, vector_inmem_int8
+    auto_compact_dead_ratio, auto_checkpoint_min_docs,
+    vector_dim, vector_metric, vector_quantized, vector_inmem_int8,
+    vector_engine,
+    hnsw_m, hnsw_ef_construction, hnsw_build_nav_int8,
+    vector_rebase_min_docs, vector_ivf_nlist, vector_ivf_nprobe,
+    vector_diskann_r, vector_diskann_l_build
 ]).
 
 %% =========================================================================
@@ -107,6 +111,10 @@ open(Dirname) -> open(Dirname, []).
 %%                            开销）；R ∈ (0.0, 1.0] = 开，posting list 内存随
 %%                            churn 有界，不再依赖 merge 才回收（S12-2）。仅索引
 %%                            模式生效（须同时带 {analyzer, _}）
+%%     {auto_checkpoint_min_docs, N} — v4.0.0：自上次 checkpoint 的文档增量 ≥ N
+%%                            即异步落 keydir 快照 + search ckpt，崩溃恢复重放
+%%                            窗口恒 ≤ N（分词重放是恢复主成本）。默认 65536；
+%%                            0 = 关。仅索引模式生效
 %%
 %%   向量模式选项：
 %%     {embedder, {Provider, Cfg}} — 推荐。Provider = openai | anthropic |
@@ -127,6 +135,27 @@ open(Dirname) -> open(Dirname, []).
 %%                            recall@10 约 −3%；仅 cosine/dot，l2 拒绝；P5b）。
 %%                            与 vector_quantized 正交（盘/内存可分别开）。面向
 %%                            内存受限/大规模；创建即固定，重开须一致。
+%%     {vector_engine, E}   — v4.0.0：向量引擎。hnsw（默认，内存图，≤ 数 M
+%%                            向量档）| ivfrq（IVF-RaBitQ 磁盘档，10M-100M 推荐，
+%%                            要求 cosine/dot）| diskann（Vamana 图，实验性，
+%%                            真实语料验证前不建议生产）。建库一次性选定并持久化
+%%                            进 bitcask.meta；重开不符 → mode_mismatch；运行期
+%%                            不可切换（离线工具 vec_engine_migrate 只改 meta，
+%%                            首次 open 全量重建，可回滚）。
+%%
+%%   向量引擎调优选项（v4.0.0；0 = 各自动默认，一般无需设置）：
+%%     {hnsw_m, N}                 — HNSW 图出度（0 = 库默认）
+%%     {hnsw_ef_construction, N}   — HNSW 建图 ef（0 = 库默认）
+%%     {hnsw_build_nav_int8, B}    — HNSW 混合精度建图导航（默认 true，插入
+%%                                   +29%~75%、recall@10 零损失；false = 全 f32 回退闸）
+%%     {vector_rebase_min_docs, N} — 向量 base rebase 窗口门（崩溃恢复重放上界，
+%%                                   全引擎；默认 262144；0 = 关，仅链长门）
+%%     {vector_ivf_nlist, N}       — ivfrq：簇数（0 = 自动 4·√N）
+%%     {vector_ivf_nprobe, N}      — ivfrq：查询探簇数（0 = 自动；search_vector
+%%                                   的 ef 参数非 0 时按 nprobe 解释）
+%%     {vector_diskann_r, N}       — diskann：邻接容量（0 = 32）
+%%     {vector_diskann_l_build, N} — diskann：建图 beam 宽（0 = max(64, 2R)；
+%%                                   查询 beam 宽走 search_vector 的 ef 参数）
 %%
 %%   MRL：embedder Cfg 里 dim = 模型原生维度，vector_dim = 截断落库维度
 %%   （≤ dim，缺省 = dim）；二者不一致时 embed 请求自动带 dimensions。

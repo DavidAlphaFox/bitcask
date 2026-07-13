@@ -3,6 +3,54 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [4.0.0] — 2026-07-13
+
+**升级到 libbitcask v4.0.0**：submodule 由 v3.1.0 升至 **v4.0.0**（S32 向量双引擎 +
+S29-11-②④ AVX2 int8 内核 + 磁盘段 UB 审计；`SOVERSION` 3 → **4**，
+`bitcask_options_t` 布局变更 ×2 = ABI 破坏，**源码级完全向后兼容**——NIF 重编即正确）。
+NIF 已重新编译链接；本仓库版本同步对齐为 **4.0.0**。
+
+> ⚠️ 升级本身对 Erlang 调用方**无破坏性 API 变更**：现有 `open/2` 选项与检索
+> API 原样可用，未传新选项时行为不变（向量引擎默认仍为 HNSW）。
+
+### 新增
+
+- **`open/2` 选项 `{vector_engine, hnsw | ivfrq | diskann}`（向量模式）**：透传
+  libbitcask v4.0.0 的向量双引擎（S32）。`hnsw`（默认，内存图，≤ 数 M 向量档）、
+  `ivfrq`（IVF-RaBitQ 磁盘档，10M-100M 推荐，要求 cosine/dot 度量）、`diskann`
+  （Vamana 图，**实验性**，真实语料验证前不建议生产）。建库一次性选定并持久化进
+  `bitcask.meta`；重开不符 → `{error, mode_mismatch}`；运行期不可切换（离线工具
+  `vec_engine_migrate` 只改 meta，首次 open 全量 fold 重建，可回滚）。
+- **`open/2` 向量引擎调优选项**（`0` = 各自动默认，一般无需设置）：
+  `{hnsw_m, N}` / `{hnsw_ef_construction, N}`（HNSW 图出度 / 建图 ef）、
+  `{hnsw_build_nav_int8, B}`（S29-11-②：HNSW int8 混合精度建图导航，默认 `true`
+  ——插入 +29%~75%、recall@10 零损失；`false` = 全 f32 回退闸）、
+  `{vector_rebase_min_docs, N}`（S32-M1：向量 ckpt 崩溃恢复重放上界，全引擎，
+  默认 262144）、`{vector_ivf_nlist, N}` / `{vector_ivf_nprobe, N}`（ivfrq 簇数 /
+  查询探簇数）、`{vector_diskann_r, N}` / `{vector_diskann_l_build, N}`（diskann
+  邻接容量 / 建图 beam 宽）。
+- **`open/2` 选项 `{auto_checkpoint_min_docs, N}`（索引模式）**：透传
+  `CaskOptions::auto_checkpoint_min_docs`（S14-1/S31.5）。自上次 checkpoint 的文档
+  增量 ≥ N 即异步落 keydir 快照 + search ckpt，崩溃恢复重放窗口恒 ≤ N。默认
+  65536；`0` = 关。
+- **`search_vector` 的 `Ef` 参数按引擎解释**：HNSW = candidate list 大小；ivfrq =
+  查询探簇数 nprobe；diskann = 查询 beam 宽。
+
+### 变更
+
+- **`third_party/libbitcask` 子模块**：v3.1.0 → **v4.0.0**（soname
+  `libbitcask.so.3` → `libbitcask.so.4`）。随库引入：IVF-RaBitQ-lite 引擎
+  （100k/384d 查询 36.5µs、召回损失 ≤0.08pt）、DiskANN 引擎（实验性）、AVX2 int8
+  点积内核（VNNI512→VNNI256→AVX2 分发，非 VNNI 机器全 int8 路径激活）、向量 ckpt
+  崩溃恢复有界（最坏 ~4.2M 条 → ≤320K 条）、HNSW `.qc8` 码字 mmap 化 +
+  `clone_live` payload 外溢（merge 重建堆峰值不再翻倍）、磁盘段结构边界校验修复
+  （可信盘模式 OOB 读 UB）、IO 循环 EINTR 重试、`parallel_for` 异常安全。引擎细节见
+  [libbitcask CHANGELOG](third_party/libbitcask/CHANGELOG.md)。
+- **NIF 内部**：`search_layer.hpp` 拆分随迁——`nif_options.cpp` / `nif_helpers.cpp`
+  改 include `search_config.hpp`（libbitcask v4.0.0 已删除旧头）。
+- **构建**：根 `CMakeLists.txt` 版本注释对齐 v4.0.0；`bitcask.app.src` `vsn`
+  3.1.0 → 4.0.0。
+
 ## [3.1.0] — 2026-07-01
 
 **升级到 libbitcask v3.1.0**：submodule 由 v3.0.0 升至 **v3.1.0**（S12 全库审计批次；

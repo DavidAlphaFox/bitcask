@@ -3,7 +3,8 @@
 //
 // 分发结构：
 //   裸 atom            → parse_atom_option   （read_write / merge_only）
-//   {Key, Value} 二元组 → parse_2tuple_option → 再细分到 merge / analyzer 处理器
+//   {Key, Value} 二元组 → parse_2tuple_option → 再细分到 merge / analyzer /
+//                         vector-cfg 处理器
 // 不识别的键静默跳过，与 legacy 语义一致。
 //
 // 线程模型：纯函数式，只读 caller 的 env/term，无共享可变状态；可重入、无锁。
@@ -13,7 +14,7 @@
 #include "atoms.hpp"
 #include "bitcask/analyzer.hpp"
 #include "bitcask/cask.hpp"
-#include "bitcask/search_layer.hpp"
+#include "bitcask/search_config.hpp"
 #include "bitcask/synonym_map.hpp"
 #include "term_conv.hpp"
 
@@ -146,6 +147,36 @@ bool is_analyzer_key(ERL_NIF_TERM key) {
         || key == atoms().synonym_file || key == atoms().auto_compact_dead_ratio;
 }
 
+// v4.0.0：向量引擎调优（SearchLayerConfig 字段，与 C API bitcask_options_t
+// 的透传一一对应）。0 = 各自动默认；仅索引模式生效（键出现即创建
+// search_config，与 analyzer 键同语义——向量本就要求 enable_search）。
+void parse_vector_cfg_option(ErlNifEnv* env, const ERL_NIF_TERM* tup,
+                             search::SearchLayerConfig& sc) {
+    const ERL_NIF_TERM key = tup[0];
+    const ERL_NIF_TERM val = tup[1];
+    if      (key == atoms().hnsw_m)               opt_u32_min(env, val, 0, &sc.hnsw_m);
+    else if (key == atoms().hnsw_ef_construction) opt_u32_min(env, val, 0, &sc.hnsw_ef_construction);
+    else if (key == atoms().hnsw_build_nav_int8) {
+        // S29-11-②：默认 true；{hnsw_build_nav_int8, false} = 全 f32 回退闸。
+        if      (val == atoms().atom_true)  sc.hnsw_build_nav_int8 = true;
+        else if (val == atoms().atom_false) sc.hnsw_build_nav_int8 = false;
+    }
+    else if (key == atoms().vector_rebase_min_docs) opt_u32_min(env, val, 0, &sc.vector_rebase_min_docs);
+    else if (key == atoms().vector_ivf_nlist)       opt_u32_min(env, val, 0, &sc.vector_ivf_nlist);
+    else if (key == atoms().vector_ivf_nprobe)      opt_u32_min(env, val, 0, &sc.vector_ivf_nprobe);
+    else if (key == atoms().vector_diskann_r)       opt_u32_min(env, val, 0, &sc.vector_diskann_r);
+    else if (key == atoms().vector_diskann_l_build) opt_u32_min(env, val, 0, &sc.vector_diskann_l_build);
+}
+
+// 判断某二元组键是否属于「向量引擎调优」类。
+bool is_vector_cfg_key(ERL_NIF_TERM key) {
+    return key == atoms().hnsw_m || key == atoms().hnsw_ef_construction
+        || key == atoms().hnsw_build_nav_int8
+        || key == atoms().vector_rebase_min_docs
+        || key == atoms().vector_ivf_nlist || key == atoms().vector_ivf_nprobe
+        || key == atoms().vector_diskann_r || key == atoms().vector_diskann_l_build;
+}
+
 // 二元组选项总分发：general → merge → analyzer。
 void parse_2tuple_option(ErlNifEnv* env, const ERL_NIF_TERM* tup, CaskOptions& o) {
     const ERL_NIF_TERM key = tup[0];
@@ -201,9 +232,24 @@ void parse_2tuple_option(ErlNifEnv* env, const ERL_NIF_TERM* tup, CaskOptions& o
         if      (val == atoms().cosine) o.vector_metric = meta::VectorMetric::kCosineNormalized;
         else if (val == atoms().l2)     o.vector_metric = meta::VectorMetric::kL2;
         else if (val == atoms().dot)    o.vector_metric = meta::VectorMetric::kDot;
+    } else if (key == atoms().vector_engine) {
+        // v4.0.0 S32:{vector_engine, hnsw|ivfrq|diskann}。建库一次性选定并持久化
+        // 进 bitcask.meta;重开不符 → mode_mismatch;运行期不可切换（离线工具
+        // vec_engine_migrate）。ivfrq=磁盘档（10M-100M 推荐,要求 cosine/dot）;
+        // diskann=实验性。未知值静默跳过（沿用默认 hnsw）。
+        if      (val == atoms().hnsw)    o.vector_engine = meta::VectorEngine::kHnsw;
+        else if (val == atoms().ivfrq)   o.vector_engine = meta::VectorEngine::kIvfRq;
+        else if (val == atoms().diskann) o.vector_engine = meta::VectorEngine::kDiskann;
+    } else if (key == atoms().auto_checkpoint_min_docs) {
+        // v4.0.0 S14-1/S31.5:自上次 ckpt 的 ord 增量 ≥ N 即异步落 keydir 快照 +
+        // search ckpt,崩溃恢复重放窗口恒 ≤ N。默认 65536;0 = 关。仅索引模式生效。
+        opt_u32_min(env, val, 0, &o.auto_checkpoint_min_docs);
     } else if (is_analyzer_key(key)) {
         if (!o.search_config) o.search_config.emplace();
         parse_analyzer_option(env, tup, o);
+    } else if (is_vector_cfg_key(key)) {
+        if (!o.search_config) o.search_config.emplace();
+        parse_vector_cfg_option(env, tup, *o.search_config);
     } else {
         parse_merge_option(env, tup, o.policy);
     }

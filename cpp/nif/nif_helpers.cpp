@@ -10,7 +10,7 @@
 #include "atoms.hpp"
 #include "bitcask/cask.hpp"
 #include "bitcask/meta_filter.hpp"
-#include "bitcask/search_layer.hpp"
+#include "bitcask/search_config.hpp"
 #include "resources.hpp"
 #include "term_conv.hpp"
 

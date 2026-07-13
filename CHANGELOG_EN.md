@@ -3,6 +3,69 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [4.0.0] — 2026-07-13
+
+**Upgrade to libbitcask v4.0.0**: the submodule advances from v3.1.0 to **v4.0.0**
+(S32 vector dual-engine + S29-11-②④ AVX2 int8 kernels + disk-segment UB audit;
+`SOVERSION` 3 → **4** — two `bitcask_options_t` layout changes make this an ABI
+break, while staying **fully source-compatible**: recompiling the NIF is all it
+takes). The NIF has been recompiled and relinked, and this repo's version is
+aligned to **4.0.0** in lockstep.
+
+> ⚠️ The upgrade itself carries **no breaking API change for Erlang callers**:
+> every existing `open/2` option and search API works as before, and behavior is
+> unchanged when the new options are not passed (the vector engine still
+> defaults to HNSW).
+
+### Added
+
+- **`open/2` option `{vector_engine, hnsw | ivfrq | diskann}` (vector mode)**:
+  passes through libbitcask v4.0.0's vector dual-engine (S32). `hnsw` (default,
+  in-memory graph, up to a few M vectors), `ivfrq` (IVF-RaBitQ disk tier,
+  recommended for 10M-100M, requires cosine/dot metric), `diskann` (Vamana
+  graph, **experimental** — not recommended for production until validated on
+  real corpora). Picked once at creation and persisted in `bitcask.meta`;
+  reopening with a different engine → `{error, mode_mismatch}`; no runtime
+  switching (the offline `vec_engine_migrate` tool rewrites only the meta; the
+  next open rebuilds via a full fold, and the switch is reversible).
+- **`open/2` vector-engine tuning options** (`0` = engine-specific auto
+  default, normally not needed): `{hnsw_m, N}` / `{hnsw_ef_construction, N}`
+  (HNSW graph degree / build ef), `{hnsw_build_nav_int8, B}` (S29-11-②: HNSW
+  int8 mixed-precision build navigation, default `true` — insert +29%~75% with
+  zero recall@10 loss; `false` = full-f32 fallback gate),
+  `{vector_rebase_min_docs, N}` (S32-M1: vector checkpoint crash-recovery
+  replay bound, all engines, default 262144), `{vector_ivf_nlist, N}` /
+  `{vector_ivf_nprobe, N}` (ivfrq cluster count / query probe count),
+  `{vector_diskann_r, N}` / `{vector_diskann_l_build, N}` (diskann adjacency
+  capacity / build beam width).
+- **`open/2` option `{auto_checkpoint_min_docs, N}` (index mode)**: passes
+  through `CaskOptions::auto_checkpoint_min_docs` (S14-1/S31.5). Once the doc
+  delta since the last checkpoint reaches N, a keydir snapshot + search ckpt
+  are persisted asynchronously, bounding the crash-recovery replay window to
+  ≤ N. Default 65536; `0` = off.
+- **`search_vector`'s `Ef` parameter is interpreted per engine**: HNSW =
+  candidate list size; ivfrq = query probe count (nprobe); diskann = query
+  beam width.
+
+### Changed
+
+- **`third_party/libbitcask` submodule**: v3.1.0 → **v4.0.0** (soname
+  `libbitcask.so.3` → `libbitcask.so.4`). Ships with the library: the
+  IVF-RaBitQ-lite engine (100k/384d queries at 36.5µs, recall loss ≤0.08pt),
+  the DiskANN engine (experimental), AVX2 int8 dot-product kernels
+  (VNNI512→VNNI256→AVX2 dispatch; full int8 path now active on non-VNNI
+  machines), bounded vector-checkpoint crash recovery (worst case ~4.2M →
+  ≤320K entries), HNSW `.qc8` codeword mmap + `clone_live` payload spill
+  (merge rebuilds no longer double peak heap), disk-segment bounds-check fixes
+  (OOB-read UB in trusted-disk mode), EINTR retry in IO loops, and
+  exception-safe `parallel_for`. Engine details in the
+  [libbitcask CHANGELOG](third_party/libbitcask/CHANGELOG.md).
+- **NIF internals**: followed the `search_layer.hpp` split —
+  `nif_options.cpp` / `nif_helpers.cpp` now include `search_config.hpp`
+  (libbitcask v4.0.0 removed the old header).
+- **Build**: root `CMakeLists.txt` version notes aligned to v4.0.0;
+  `bitcask.app.src` `vsn` 3.1.0 → 4.0.0.
+
 ## [3.1.0] — 2026-07-01
 
 **Upgrade to libbitcask v3.1.0**: the submodule advances from v3.0.0 to **v3.1.0**

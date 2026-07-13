@@ -61,6 +61,17 @@ reference。后续所有调用都传整个元组。未配 embedder 时 `Embedder
 | `{embedder, {Provider, Cfg}}` | **推荐。** open 内部经 `bitcask_embedder:new(Provider, Cfg)` 建 ctx，并自动用 embedder 的 `vector_dim` 作为集合维度；启用 `put`/查询的自动 embed。 | `Provider = openai \| anthropic \| {custom, Mod}`；`Cfg` 是 map。预建 ctx map 会被**拒绝**（`{error, {bad_embedder, _}}`）。在场时 `{vector_dim, N}` 由 embedder 接管。 |
 | `{vector_dim, N}` | 向量维度——仅手动向量路径（不配 embedder）需要 | `N > 0`；重开须与磁盘 meta 一致 |
 | `{vector_metric, M}` | 距离/相似度度量——见下 | `cosine`（默认）\| `l2` \| `dot`；**创建时固定**（重开换度量 → `mode_mismatch`） |
+| `{vector_engine, E}` | v4.0.0：向量引擎——`hnsw`（内存图，≤ 数 M 向量档）\| `ivfrq`（IVF-RaBitQ 磁盘档，10M-100M 推荐）\| `diskann`（Vamana 图，**实验性**） | 默认 `hnsw`；**建库时固定**并持久化进 `bitcask.meta`（重开不符 → `mode_mismatch`）；磁盘档引擎要求 `cosine`/`dot`（`l2` → `{error, _}`）；离线切换用 libbitcask 的 `vec_engine_migrate` 工具 |
+
+*向量引擎调优*（v4.0.0；`0` = 各自动默认，一般无需设置）：
+`{hnsw_m, N}`、`{hnsw_ef_construction, N}`（HNSW 图出度 / 建图 ef）；
+`{hnsw_build_nav_int8, B}`（HNSW int8 混合精度建图导航，默认 `true`，插入
++29%~75%、recall@10 零损失；`false` = 全 f32 回退闸）；
+`{vector_rebase_min_docs, N}`（向量 ckpt 崩溃恢复重放上界，全引擎，默认
+262144）；`{vector_ivf_nlist, N}`、`{vector_ivf_nprobe, N}`（ivfrq 簇数 /
+查询探簇数，`0` = 自动；`search_vector` 的 `Ef` 参数非 0 时按 nprobe 解释）；
+`{vector_diskann_r, N}`、`{vector_diskann_l_build, N}`（diskann 邻接容量 /
+建图 beam 宽；查询 beam 宽走 `Ef` 参数）。
 
 **`vector_metric` 详解。** 决定 HNSW 如何比较向量。三种度量返回的 `Score` 都统一为
 **越大 = 越相似/越近**（结果按 `Score` 降序）：
@@ -179,7 +190,8 @@ O(1) 估算；写过任何 key 后恒 `false`。
 用句柄配置的 embedder 把 `Text` 编码成向量。未配 → `{error, no_embedder}`。
 
 ### `search_vector(H, Query[, K[, Ef[, Filter]]])`
-HNSW 向量近邻检索。四个 arity 是同一调用、缺省项逐级展开：
+向量近邻检索（引擎由建库时的 `{vector_engine, E}` 决定，默认 HNSW）。四个
+arity 是同一调用、缺省项逐级展开：
 
 | Arity | 签名 | 等价于 |
 |-------|------|--------|
@@ -192,7 +204,9 @@ HNSW 向量近邻检索。四个 arity 是同一调用、缺省项逐级展开�
 - `Query` —— `VecBin`（f32 LE，`vector_dim*4` 字节）或 `{text, Bin}`（用句柄
   embedder 自动 embed；未配 embedder → `{error, no_embedder}`）。每个 arity 通用。
 - `K` —— top-K（默认 10）。
-- `Ef` —— HNSW 搜索宽度 / candidate list 大小（`0` = 引擎默认 `max(K, 64)`；越大越准越慢）。
+- `Ef` —— 搜索宽度，按引擎解释：HNSW = candidate list 大小（`0` = 引擎默认
+  `max(K, 64)`）；ivfrq = 查询探簇数 nprobe（`0` = 自动）；diskann = 查询 beam
+  宽。越大越准越慢。
 - `Filter` —— meta filter。
 
 返回 `{ok, [{Key, Ord, Score}]}`（Score = 该度量下的相似度）。

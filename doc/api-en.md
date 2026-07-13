@@ -62,6 +62,18 @@ on-disk meta), `{bad_embedder, _}`, `{bad_opt, _}`.
 | `{embedder, {Provider, Cfg}}` | **Recommended.** open builds the ctx via `bitcask_embedder:new(Provider, Cfg)` and auto-derives the collection dimension from the embedder's `vector_dim`. Enables auto-embed on `put`/queries. | `Provider = openai \| anthropic \| {custom, Mod}`; `Cfg` is a map. Pre-built ctx maps are **rejected** (`{error, {bad_embedder, _}}`). When present, `{vector_dim, N}` is taken over by the embedder. |
 | `{vector_dim, N}` | Vector dimension — manual-vector path only (no embedder) | `N > 0`; must match on-disk meta on reopen |
 | `{vector_metric, M}` | Distance/similarity metric — see below | `cosine` (default) \| `l2` \| `dot`; **fixed at creation** (reopen with a different metric → `mode_mismatch`) |
+| `{vector_engine, E}` | v4.0.0: vector engine — `hnsw` (in-memory graph, up to a few M vectors) \| `ivfrq` (IVF-RaBitQ disk tier, recommended for 10M-100M) \| `diskann` (Vamana graph, **experimental**) | Default `hnsw`; **fixed at creation** and persisted in `bitcask.meta` (reopen with a different engine → `mode_mismatch`); disk-tier engines require `cosine`/`dot` (`l2` → `{error, _}`); offline switching via libbitcask's `vec_engine_migrate` tool |
+
+*Vector engine tuning* (v4.0.0; `0` = engine-specific auto default, normally not needed):
+`{hnsw_m, N}`, `{hnsw_ef_construction, N}` (HNSW graph degree / build ef);
+`{hnsw_build_nav_int8, B}` (HNSW int8 mixed-precision build navigation, default
+`true` — insert +29%~75% with zero recall@10 loss; `false` = full-f32 fallback
+gate); `{vector_rebase_min_docs, N}` (vector checkpoint crash-recovery replay
+bound, all engines, default 262144); `{vector_ivf_nlist, N}`,
+`{vector_ivf_nprobe, N}` (ivfrq cluster count / query probe count, `0` = auto;
+a non-zero `Ef` in `search_vector` is interpreted as nprobe);
+`{vector_diskann_r, N}`, `{vector_diskann_l_build, N}` (diskann adjacency
+capacity / build beam width; query beam width uses the `Ef` parameter).
 
 **`vector_metric` in detail.** Picks how the HNSW index compares vectors. For all
 three, the returned `Score` is ordered so that **higher = more similar/closer**
@@ -187,7 +199,8 @@ Encode `Text` with the handle's configured embedder. `{error, no_embedder}` if
 none was configured at open.
 
 ### `search_vector(H, Query[, K[, Ef[, Filter]]])`
-HNSW vector nearest-neighbor search. The four arities are one call with defaults
+Vector nearest-neighbor search (the engine is the one picked at creation via
+`{vector_engine, E}`, default HNSW). The four arities are one call with defaults
 filled in progressively:
 
 | Arity | Signature | Equivalent to |
@@ -202,8 +215,9 @@ Parameters:
   via the handle's embedder; `{error, no_embedder}` if none configured). Accepted by
   every arity.
 - `K` — top-K (default 10).
-- `Ef` — HNSW search width / candidate list size (`0` = engine default
-  `max(K, 64)`; larger = more accurate, slower).
+- `Ef` — search width, interpreted per engine: HNSW = candidate list size
+  (`0` = engine default `max(K, 64)`); ivfrq = query probe count nprobe
+  (`0` = auto); diskann = query beam width. Larger = more accurate, slower.
 - `Filter` — meta filter.
 
 Returns `{ok, [{Key, Ord, Score}]}` (Score = similarity under the metric).
