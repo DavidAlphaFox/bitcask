@@ -6,6 +6,61 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 4.0.0 shipped
+
+### libbitcask upgrade to v4.0.0 ✅
+
+The submodule advances from v3.1.0 to **v4.0.0** (S32 vector dual-engine +
+S29-11-②④ AVX2 int8 kernels + disk-segment UB audit; `SOVERSION` 3 → **4** —
+two `bitcask_options_t` layout changes make this an ABI break, while staying
+**fully source-compatible**: recompiling the NIF is all it takes). This repo
+aligns to 4.0.0 in lockstep.
+
+New `open/2` option `{vector_engine, hnsw | ivfrq | diskann}` (vector dual-engine,
+picked once at creation and persisted in `bitcask.meta`), vector-engine tuning
+options (`hnsw_m` / `hnsw_ef_construction` / `hnsw_build_nav_int8` /
+`vector_rebase_min_docs` / `vector_ivf_nlist` / `vector_ivf_nprobe` /
+`vector_diskann_r` / `vector_diskann_l_build`), and
+`{auto_checkpoint_min_docs, N}` (bounded crash-recovery replay window). The
+library ships with the IVF-RaBitQ-lite engine (100k/384d queries at 36.5µs,
+recall loss ≤0.08pt), the DiskANN engine (experimental), AVX2 int8 dot-product
+kernels (VNNI512→VNNI256→AVX2 dispatch; full int8 path active on non-VNNI
+machines), bounded vector-checkpoint crash recovery (worst case ~4.2M → ≤320K
+entries), and HNSW `.qc8` codeword mmap + `clone_live` payload spill. The
+`examples/` directory gains a Wikipedia search-database example (`wiki_hnsw` /
+`wiki_diskann` dual-engine comparison).
+
+> ⚠️ ABI break: soname `libbitcask.so.3` → `libbitcask.so.4`; downstream must
+> recompile/relink. No breaking API change for Erlang callers — behavior is
+> unchanged when the new options are not passed (vector engine still defaults
+> to HNSW).
+
+---
+
+## 3.1.0 shipped
+
+### libbitcask upgrade to v3.1.0 ✅
+
+The submodule advances from v3.0.0 to **v3.1.0** (the S12 whole-library audit
+batch; `SOVERSION` stays **3**, ABI unbroken — a backward-compatible feature
+addition). This repo aligns to 3.1.0 in lockstep.
+
+New `open/2` option `{max_read_handles, unlimited}` (explicit no-limit),
+`{auto_compact_dead_ratio, R}` (index-mode auto compaction inside the reducer
+thread, bounding posting-list memory under churn), and error atom `closed`
+(calls on an already-closed handle return `{error, closed}`). The library
+brings: default read-handle cap (`{max_read_handles, N}` default `0` changes
+from "unlimited" to auto-derived from `RLIMIT_NOFILE`), `bitcask.meta` v2 → v3
+with CRC32, field.schema FSCH v1 header + CRC, C API batch search ×3 +
+`parallel_scan` + `BITCASK_ERR_CLOSED`, and a `-Werror` library-build guard.
+
+> ⚠️ On-disk format is forward-incompatible: `bitcask.meta` bumps to v3 (adds
+> CRC32). Databases written by this version cannot be opened by the old 3.0.0;
+> backward-compatible — this version reads old databases (v2 meta compat-read,
+> legacy field.schema auto-upgraded to FSCH v1). Upgrade one-way only.
+
+---
+
 ## 3.0.0 shipped
 
 ### libbitcask upgrade to v3.0.0 ✅
