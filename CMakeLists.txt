@@ -18,7 +18,9 @@ set(BITCASK_PRIV_DIR "${CMAKE_SOURCE_DIR}/priv")
 file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 
 # ---------------------------------------------------------------------------
-# libbitcask — git submodule at third_party/libbitcask (tag v4.0.0)。
+# libbitcask — git submodule at third_party/libbitcask (v4.1.0, commit 66924e3)。
+# ⚠️ 上游 v4.1.0 只有 release commit、**未打 tag**（git describe = v4.0.0-32-g66924e3），
+# 故此处按 commit 固定；上游补 tag 后可改回 tag 引用。
 # 提供 C++ 核心库全部 target（bitcask_cask, bitcask_keydir, ...）。
 #
 # libbitcask 的 CMakeLists.txt 用 CMAKE_SOURCE_DIR 引用 third_party/
@@ -38,6 +40,13 @@ file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 # search_config.hpp（NIF include 已随迁）。
 # ⚠️ 盘上格式：bitcask.meta 升至 v3（加 CRC），本版写出的库不能被 3.0.0 打开（反向
 # 兼容旧库读）。升级请单向进行。
+# v4.1.0：纯修复 + 内部重构（SOVERSION 保持 4、ABI 未破坏、盘上格式不变）——
+# Phase 5/6 深度审计：IndexPool::submit 计数泄漏 + unregister_lib 无界 flush
+# 导致的进程级挂死、RowChunks/MmapSegment 分配抛出泄漏、hnsw 三处原子写
+# rename 前补 fdatasync（此前无 sync，崩溃即半截文件）。公开 API 零变更，
+# NIF 无需改动（仅被移除的 meta_codec::detail::vbyte_* / to_codepoints_reuse
+# 等内部符号，NIF 全未引用）。
+
 # ---------------------------------------------------------------------------
 foreach(_dep utf8proc cppjieba limonp googletest benchmark oneTBB unordered_dense)
     set(_src "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libbitcask/third_party/${_dep}")
