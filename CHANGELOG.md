@@ -3,6 +3,42 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [4.1.0] — 2026-07-15
+
+**升级到 libbitcask v4.1.0**：submodule 由 v4.0.0 升至 **v4.1.0**（Phase 5/6 深度审计：
+8 项修复 + 4 项重构）。`SOVERSION` 保持 **4**、ABI 未破坏、盘上格式不变；本仓库版本
+同步对齐为 **4.1.0**。NIF 已重新编译链接，eunit 64/64 通过。
+
+> 本次升级对 Erlang 调用方**无任何 API 变更**：无新增/废弃 `open/2` 选项，无行为变更。
+> 收益全部来自 C++ 核心库的稳定性修复——调用方无需改动代码，重编即得。
+
+> ⚠️ 上游 v4.1.0 只有 release commit、**未打 tag**，submodule 按 commit `66924e3`
+> 固定（`git describe` = `v4.0.0-32-g66924e3`）。上游补 tag 后可改回 tag 引用。
+
+### 修复（继承自 libbitcask v4.1.0）
+
+以下均为 C++ 核心库内部修复，对应 Erlang 侧的可观测症状：
+
+- **进程级永久挂死**（P6-MEM-1 + P6-DL-1）：`IndexPool::submit` 先递增 `in_flight`
+  再入队，队列内部分配抛 `bad_alloc` 即泄漏计数 → `flush()` 谓词永假；叠加
+  `unregister_lib` 的无超时 `flush()`，`close/1` 卸载路径可**永久挂死** VM 调度器。
+  修复双向闭合：submit 补偿 `dec_in_flight` 后重抛（根因）+ 拆卸路径 flush 有界 30s
+  （兜底）。
+- **持久性——hnsw 原子写无 fsync**（P6-DUR-1）：`save` / `save_vec_payload` /
+  `write_bcq8` 三处 rename 前无任何 sync，**崩溃后旧好文件已被覆盖成半截文件**
+  （向量索引损坏 → 重开全量重建）。现补 `fflush` + `fdatasync` 且两个返回值都检查。
+- **资源泄漏**：`RowChunks::ensure_slot` 槽泄漏（P6-MEM-2）、`MmapSegment::open`
+  fd 泄漏（P6-MEM-3）、`OrdSkipGuard` 析构抛出触发 `std::terminate`（P5-MEM-1）。
+- **checkpoint 水位不一致**：`last_ckpt_ord_` 三处漏更新（P5-MEM-2）。
+
+### 内部（无 Erlang 侧可见影响）
+
+- `file_util.hpp` 归并整读 ×6 + 原子写 ×9 站点，fsync 纪律 4 套收敛为 1 套（T21）。
+- Analyzer 双出口归并 + 3 例对拍测试（T22）；死代码清理（T25、P5-DL-3）。
+- 上游验收：ASan 644/644 + TSan 全量零告警。
+
+---
+
 ## [4.0.0] — 2026-07-13
 
 **升级到 libbitcask v4.0.0**：submodule 由 v3.1.0 升至 **v4.0.0**（S32 向量双引擎 +

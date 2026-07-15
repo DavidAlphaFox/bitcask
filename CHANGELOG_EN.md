@@ -3,6 +3,54 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [4.1.0] — 2026-07-15
+
+**Upgrade to libbitcask v4.1.0**: the submodule advances from v4.0.0 to **v4.1.0**
+(Phase 5/6 deep audit: 8 fixes + 4 refactors). `SOVERSION` stays **4**, the ABI is
+unbroken, and the on-disk format is unchanged; this repo's version is aligned to
+**4.1.0** in lockstep. The NIF has been recompiled and relinked; eunit 64/64 passes.
+
+> This upgrade carries **no API change whatsoever for Erlang callers**: no added or
+> deprecated `open/2` options, no behavioral change. The entire benefit comes from
+> stability fixes in the C++ core — callers need no code changes, just a rebuild.
+
+> ⚠️ Upstream v4.1.0 exists only as a release commit and is **not tagged**, so the
+> submodule is pinned by commit `66924e3` (`git describe` = `v4.0.0-32-g66924e3`).
+> This can revert to a tag reference once upstream pushes one.
+
+### Fixed (inherited from libbitcask v4.1.0)
+
+All of the following are internal C++ core fixes; the symptoms they map to on the
+Erlang side:
+
+- **Process-wide permanent hang** (P6-MEM-1 + P6-DL-1): `IndexPool::submit`
+  incremented `in_flight` before enqueuing, so a `bad_alloc` from the queue's
+  internal allocation leaked the count and left `flush()`'s predicate forever false.
+  Combined with the untimed `flush()` in `unregister_lib`, the `close/1` teardown
+  path could **hang a VM scheduler forever**. Closed from both ends: `submit` now
+  compensates with `dec_in_flight` before rethrowing (root cause), and the teardown
+  `flush` is bounded at 30s (backstop).
+- **Durability — hnsw atomic writes had no fsync** (P6-DUR-1): `save`,
+  `save_vec_payload`, and `write_bcq8` performed no sync before `rename`, so **a
+  crash left the previously-good file already overwritten by a truncated one**
+  (corrupt vector index → full rebuild on reopen). Now `fflush` + `fdatasync`, with
+  both return values checked.
+- **Resource leaks**: slot leak in `RowChunks::ensure_slot` (P6-MEM-2), fd leak in
+  `MmapSegment::open` (P6-MEM-3), and `std::terminate` when `OrdSkipGuard`'s
+  destructor threw (P5-MEM-1).
+- **Inconsistent checkpoint watermark**: three missing `last_ckpt_ord_` updates
+  (P5-MEM-2).
+
+### Internal (no Erlang-visible impact)
+
+- `file_util.hpp` consolidates 6 whole-file-read and 9 atomic-write sites; fsync
+  discipline converges from 4 variants to 1 (T21).
+- Analyzer dual-exit consolidation plus 3 differential tests (T22); dead-code
+  removal (T25, P5-DL-3).
+- Upstream acceptance: ASan 644/644, TSan clean across the full suite.
+
+---
+
 ## [4.0.0] — 2026-07-13
 
 **Upgrade to libbitcask v4.0.0**: the submodule advances from v3.1.0 to **v4.0.0**
