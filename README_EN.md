@@ -154,6 +154,17 @@ ok
 > query. E.g. `vector_dim=4`, doc `[1,0,0,0]`, query `[0.9,0.1,0,0]` →
 > `search_vector(H, V)` returns `{ok,[{<<"d1">>,0,0.99388}]}` (cosine = 0.9/√0.82).
 
+> **Vector dual-engine** (v4.0.0): pass `{vector_engine, hnsw | ivfrq | diskann}` at
+> open to select the engine (default `hnsw`, in-memory graph, up to a few M vectors;
+> `ivfrq` IVF disk tier, recommended for 10M-100M; `diskann` Vamana graph,
+> experimental). Picked once at creation and persisted in `bitcask.meta`; reopening
+> with a different engine → `{error, mode_mismatch}`; no runtime switching (the
+> offline `vec_engine_migrate` tool rewrites only the meta; the next open rebuilds
+> via a full fold, and the switch is reversible). Per-engine tuning options
+> (`hnsw_m` / `hnsw_ef_construction` / `hnsw_build_nav_int8` / `vector_ivf_nlist` /
+> `vector_ivf_nprobe` / `vector_diskann_r` / `vector_diskann_l_build`) use `0` for
+> auto defaults.
+
 ## API highlights
 
 | Function | Description |
@@ -165,7 +176,7 @@ ok
 | `merge/1,2,3`, `needs_merge/1,2`, `status/1` | Merge management |
 | `search_text/2,3`, `search_phrase/2,3`, `search_fields/2,3` | BM25 search (full-text / phrase / `field:term^boost`) |
 | `search_near/3,4`, `search_fuzzy/3,4`, `search_wildcard/2,3` | Proximity / fuzzy (edit-distance) / wildcard search |
-| `search_vector/2,3,4,5`, `search_hybrid/2,3,4,5` | Vector NN (engine fixed by `{vector_engine, _}` at open) / RRF hybrid (BM25+vector); pass `{text,_}` (vector) or `auto` (hybrid) to auto-embed the query; `/5` takes a trailing meta filter |
+| `search_vector/2,3,4,5`, `search_hybrid/2,3,4,5` | Vector NN (HNSW / IVF-RaBitQ / DiskANN — selected at `open` via `{vector_engine, ...}`) / RRF hybrid (BM25+vector); pass `{text,_}` (vector) or `auto` (hybrid) to auto-embed the query; `/5` takes a trailing meta filter |
 | `embed/2` | Encode text to a vector via the handle's embedder (`{ok, Vec}`/`{error, no_embedder}`) |
 | `is_empty_estimate/1`, `is_frozen/1`, `close_write_file/1` | Utilities |
 
@@ -187,7 +198,7 @@ ok
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
 | `doc/unified-architecture-plan-zh.md` | 统一架构计划（已实施） |
 | `doc/libcask-extraction-zh.md` | **libcask standalone extraction feasibility** (2.2.0 plan) |
-| `ROADMAP_EN.md` / `ROADMAP.md` | **Roadmap**: 2.1.1 shipped (P5–P15) + 2.2.0 plan (libcask extraction / V7+ vector optimization) (EN/中) |
+| `ROADMAP_EN.md` / `ROADMAP.md` | **Roadmap**: 4.0.0 / 3.1.0 / 3.0.0 shipped + 2.1.1 shipped (P5–P15) + 2.2.0 plan (libcask extraction / V7+ vector optimization) (EN/中) |
 | `TASK.md` | Detailed task breakdown & history |
 
 ## Project status
@@ -202,8 +213,10 @@ ok
 - **Unified architecture** — Cask and Collection are merged into a single engine; KV vs. index mode selected via `{analyzer, ...}` option
 - **2.1.1 system optimizations** (2026-06) — HNSW int8-only memory mode (vector memory −80%), sealed-file mmap zero-copy reads, read-handle fd-budget LRU, unified `search.ckpt` recovery path, global little-endian unification + `migrate_le` tool ([docs](doc/migrate-le-en.md)), hybrid two-leg parallelism, merge I/O tuning, on-open background merge; see [`CHANGELOG_EN.md`](CHANGELOG_EN.md)
 - **Concurrency hardening** (2026-06 audit) — search read path is safe against the async index worker: `meta_blob`/search-cache copy under lock without escaping pointers, inverted-index snapshot uses safe iteration, cross-thread scalars are atomic, IndexPool consumer is exception-safe; see [`doc/concurrency-zh.md` §6](doc/concurrency-zh.md)
-- **4.0.0 vector dual-engine** (2026-07) — `{vector_engine, _}` engine selection, AVX2 int8 kernels, and HNSW mixed-precision build navigation (`hnsw_build_nav_int8`: +29%~75% insert throughput at zero recall@10 loss), plus bounded vector-ckpt crash recovery (`vector_rebase_min_docs`). ⚠️ ABI break (`SOVERSION` 3→4) and on-disk `bitcask.meta` bumped to v3 (adds CRC) — **upgrade one-way only**
-- **4.1.0 stability audit** (2026-07, current) — tracks libbitcask v4.1.0: fixes a process-wide permanent hang on the `close/1` teardown path (`IndexPool` count leak + unbounded `flush`), adds `fdatasync` before `rename` to hnsw's three atomic writes (previously a crash left a truncated file), and closes several resource leaks. `SOVERSION` stays 4, **ABI and on-disk format both unchanged**, no API change for Erlang callers — just rebuild; see [`CHANGELOG_EN.md`](CHANGELOG_EN.md)
+- **3.0.0** (2026-06-25) — libbitcask v3.0.0 upgrade (ABI break, `SOVERSION` 1→3): synonym dictionary becomes the open-time immutable option `{synonym_file, Path}` (runtime `set_synonym_map/2` removed); ships with thread-safe `Cask` handle, `parallel_scan` full-table parallel scan, async-index MapReduce pipeline, batch retrieval
+- **3.1.0** (2026-07-01) — libbitcask v3.1.0 upgrade (ABI unbroken): `{max_read_handles, unlimited}` / `{auto_compact_dead_ratio, R}` options, `closed` error atom; ships with default read-handle cap (auto-derived from `RLIMIT_NOFILE`), `bitcask.meta` v3 with CRC32, field.schema FSCH v1 header + CRC
+- **4.0.0** (2026-07-13) — libbitcask v4.0.0 upgrade (ABI break, `SOVERSION` 3→4, source-compatible): `{vector_engine, hnsw|ivfrq|diskann}` vector dual-engine + tuning options, `{auto_checkpoint_min_docs, N}` bounded crash-recovery replay; ships with IVF-RaBitQ-lite engine, DiskANN engine (experimental), AVX2 int8 kernels, HNSW `.qc8` codeword mmap; `examples/` Wikipedia search-database example
+- **4.1.0** (2026-07-15, current) — libbitcask v4.1.0 upgrade (ABI unbroken, `SOVERSION` stays 4, on-disk format unchanged): **no API change** for Erlang callers — just rebuild; ships with the Phase 5/6 deep audit — fixes a process-wide permanent hang on the `close/1` teardown path (`IndexPool` count leak + unbounded `flush` in `unregister_lib`), adds `fdatasync` before `rename` to hnsw's three atomic writes (previously a crash left a truncated file), closes `RowChunks`/`MmapSegment` resource leaks; `file_util` consolidation converges fsync discipline from 4 variants to 1
 
 ## License
 

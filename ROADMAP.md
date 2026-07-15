@@ -6,6 +6,50 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 4.0.0 落地
+
+### libbitcask 升级到 v4.0.0 ✅
+
+submodule 由 v3.1.0 升至 **v4.0.0**（S32 向量双引擎 + S29-11-②④ AVX2 int8 内核 +
+磁盘段 UB 审计；`SOVERSION` 3 → **4**，`bitcask_options_t` 布局变更 ×2 = ABI 破坏，
+**源码级完全向后兼容**——NIF 重编即正确）。本仓库版本同步对齐 4.0.0。
+
+新增 `open/2` 选项 `{vector_engine, hnsw | ivfrq | diskann}`（向量双引擎，建库时
+选定并持久化进 `bitcask.meta`）、向量引擎调优选项（`hnsw_m` / `hnsw_ef_construction` /
+`hnsw_build_nav_int8` / `vector_rebase_min_docs` / `vector_ivf_nlist` / `vector_ivf_nprobe` /
+`vector_diskann_r` / `vector_diskann_l_build`）、`{auto_checkpoint_min_docs, N}`（崩溃恢复
+重放窗口有界）。随库引入 IVF-RaBitQ-lite 引擎（100k/384d 查询 36.5µs、召回损失 ≤0.08pt）、
+DiskANN 引擎（实验性）、AVX2 int8 点积内核（VNNI512→VNNI256→AVX2 分发，非 VNNI 机器全
+int8 路径激活）、向量 ckpt 崩溃恢复有界（最坏 ~4.2M 条 → ≤320K 条）、HNSW `.qc8` 码字
+mmap 化 + `clone_live` payload 外溢。`examples/` 增加 Wikipedia 检索库示例
+（`wiki_hnsw` / `wiki_diskann` 双引擎对比）。
+
+> ⚠️ ABI 破坏：soname `libbitcask.so.3` → `libbitcask.so.4`，下游须重新编译链接。
+> 对 Erlang 调用方无破坏性 API 变更——未传新选项时行为不变（向量引擎默认仍 HNSW）。
+
+---
+
+## 3.1.0 落地
+
+### libbitcask 升级到 v3.1.0 ✅
+
+submodule 由 v3.0.0 升至 **v3.1.0**（S12 全库审计批次；`SOVERSION` 保持 **3**，
+ABI 未破坏——向后兼容的功能新增）。本仓库版本同步对齐 3.1.0。
+
+新增 `open/2` 选项 `{max_read_handles, unlimited}`（显式不限）、
+`{auto_compact_dead_ratio, R}`（索引模式 reducer 线程内自动 compaction，posting list
+内存随 churn 有界）、错误原子 `closed`（对已 close 的 handle 调用返回 `{error, closed}`）。
+随库引入 read 句柄默认上限（`{max_read_handles, N}` 默认 `0` 由「不限」改为按
+`RLIMIT_NOFILE` 自动推导）、`bitcask.meta` v2 → v3 加 CRC32、field.schema 加 FSCH v1
+格式头 + CRC、C API 批量检索 ×3 + `parallel_scan` + `BITCASK_ERR_CLOSED`、`-Werror`
+库构建护栏。
+
+> ⚠️ 盘上格式前向不兼容：`bitcask.meta` 升至 v3（加 CRC32）。本版写出的库不能被
+> 旧 3.0.0 打开；反向兼容——本版能读旧库（v2 meta 兼容读、legacy field.schema
+> 自动升级为 FSCH v1）。升级请单向进行。
+
+---
+
 ## 3.0.0 落地
 
 ### libbitcask 升级到 v3.0.0 ✅
