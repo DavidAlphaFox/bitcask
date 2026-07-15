@@ -1,4 +1,4 @@
-# Bitcask — A Log-Structured Hash Table for Fast Key/Value Data with BM25 Full-Text Search & HNSW Vector Retrieval
+# Bitcask — A Log-Structured Hash Table for Fast Key/Value Data with BM25 Full-Text Search & Vector Retrieval
 
 [中文](README.md) | [![CI](https://github.com/basho/bitcask/workflows/CI/badge.svg)](https://github.com/basho/bitcask/actions)
 
@@ -8,8 +8,9 @@ Bitcask is a log-structured hash table for fast key/value data, written in C++23
 with an Erlang NIF interface. On-disk format uses typed records (`kDoc`/`kTombstone`)
 with per-write ordinal numbers and optional DocValue encoding (text + vector + metadata).
 
-Features include BM25 full-text search, HNSW approximate nearest-neighbor vector
-retrieval, and RRF hybrid search that fuses both ranking signals.
+Features include BM25 full-text search, approximate nearest-neighbor vector
+retrieval (three selectable engines: `hnsw` in-memory graph / `ivfrq` disk tier /
+`diskann` experimental), and RRF hybrid search that fuses both ranking signals.
 
 The implementation is a single C++23 NIF (`cpp/`) with a thin Erlang facade (`src/bitcask.erl`).
 All operations go through `bitcask_cpp_nifs` → `priv/bitcask_cpp.so`.
@@ -104,7 +105,9 @@ ok
 > config (replacing the removed runtime `set_synonym_map/2`) — swapping dictionaries
 > at runtime requires reopening the database.
 
-**HNSW vector search** — requires index mode (`{analyzer, ...}`). **Recommended
+**Vector search** — requires index mode (`{analyzer, ...}`); the engine defaults to
+`hnsw`, add `{vector_engine, ivfrq | diskann}` at open for a disk tier (fixed at
+creation, not switchable at runtime). **Recommended
 flow: pass the embedder as `{Provider, Cfg}` at open time; open builds the ctx
 internally and auto-sets the collection dimension to the embedder's `vector_dim`
 — no external `new`, no separate `{vector_dim, N}`.** Then `put #{text => ...}`
@@ -162,7 +165,7 @@ ok
 | `merge/1,2,3`, `needs_merge/1,2`, `status/1` | Merge management |
 | `search_text/2,3`, `search_phrase/2,3`, `search_fields/2,3` | BM25 search (full-text / phrase / `field:term^boost`) |
 | `search_near/3,4`, `search_fuzzy/3,4`, `search_wildcard/2,3` | Proximity / fuzzy (edit-distance) / wildcard search |
-| `search_vector/2,3,4,5`, `search_hybrid/2,3,4,5` | HNSW vector NN / RRF hybrid (BM25+vector); pass `{text,_}` (vector) or `auto` (hybrid) to auto-embed the query; `/5` takes a trailing meta filter |
+| `search_vector/2,3,4,5`, `search_hybrid/2,3,4,5` | Vector NN (engine fixed by `{vector_engine, _}` at open) / RRF hybrid (BM25+vector); pass `{text,_}` (vector) or `auto` (hybrid) to auto-embed the query; `/5` takes a trailing meta filter |
 | `embed/2` | Encode text to a vector via the handle's embedder (`{ok, Vec}`/`{error, no_embedder}`) |
 | `is_empty_estimate/1`, `is_frozen/1`, `close_write_file/1` | Utilities |
 
@@ -191,14 +194,16 @@ ok
 
 - **C++ NIF** covers all core KV operations (`get`/`put`/`delete`/`sync`/`fold`/`merge`)
 - **BM25 full-text search** — text / phrase / fields / proximity / fuzzy / wildcard, plus synonyms and snippet highlighting
-- **HNSW vector retrieval** — approximate nearest-neighbor search with configurable metric (cosine / L2 / dot), per-node locking for concurrent reads, BCVS snapshot persistence, and merge rebuild for dead-node eviction
-- **RRF hybrid search** — fuses BM25 and HNSW via Reciprocal Rank Fusion (`score = Σ 1/(60+rank)`)
+- **Vector retrieval (three engines)** — approximate nearest-neighbor search; the engine is chosen at open via `{vector_engine, hnsw | ivfrq | diskann}` and persisted into `bitcask.meta` (**fixed at creation**; reopening with a different engine → `{error, mode_mismatch}`): `hnsw` (default, in-memory graph, up to a few M vectors, cosine / L2 / dot, per-node locking for concurrent reads, BCVS snapshot persistence, merge rebuild for dead-node eviction), `ivfrq` (IVF-RaBitQ disk tier, recommended for 10M–100M), `diskann` (Vamana on-disk graph, **experimental**); disk-tier engines require cosine / dot
+- **RRF hybrid search** — fuses the BM25 and vector legs via Reciprocal Rank Fusion (`score = Σ 1/(60+rank)`, each leg taking `K' = max(K×4, 64)`)
 - **Embedder behaviour** — `bitcask_embedder` callback with OpenAI-compatible reference implementation
 - **Jieba Chinese analyzer** integrated (whitespace / n-gram / jieba)
 - **Typed record format** (`kDoc`/`kTombstone` with per-write ordinal) is the default
 - **Unified architecture** — Cask and Collection are merged into a single engine; KV vs. index mode selected via `{analyzer, ...}` option
 - **2.1.1 system optimizations** (2026-06) — HNSW int8-only memory mode (vector memory −80%), sealed-file mmap zero-copy reads, read-handle fd-budget LRU, unified `search.ckpt` recovery path, global little-endian unification + `migrate_le` tool ([docs](doc/migrate-le-en.md)), hybrid two-leg parallelism, merge I/O tuning, on-open background merge; see [`CHANGELOG_EN.md`](CHANGELOG_EN.md)
 - **Concurrency hardening** (2026-06 audit) — search read path is safe against the async index worker: `meta_blob`/search-cache copy under lock without escaping pointers, inverted-index snapshot uses safe iteration, cross-thread scalars are atomic, IndexPool consumer is exception-safe; see [`doc/concurrency-zh.md` §6](doc/concurrency-zh.md)
+- **4.0.0 vector dual-engine** (2026-07) — `{vector_engine, _}` engine selection, AVX2 int8 kernels, and HNSW mixed-precision build navigation (`hnsw_build_nav_int8`: +29%~75% insert throughput at zero recall@10 loss), plus bounded vector-ckpt crash recovery (`vector_rebase_min_docs`). ⚠️ ABI break (`SOVERSION` 3→4) and on-disk `bitcask.meta` bumped to v3 (adds CRC) — **upgrade one-way only**
+- **4.1.0 stability audit** (2026-07, current) — tracks libbitcask v4.1.0: fixes a process-wide permanent hang on the `close/1` teardown path (`IndexPool` count leak + unbounded `flush`), adds `fdatasync` before `rename` to hnsw's three atomic writes (previously a crash left a truncated file), and closes several resource leaks. `SOVERSION` stays 4, **ABI and on-disk format both unchanged**, no API change for Erlang callers — just rebuild; see [`CHANGELOG_EN.md`](CHANGELOG_EN.md)
 
 ## License
 

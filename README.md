@@ -1,4 +1,4 @@
-# Bitcask — 日志结构哈希表，支持 BM25 全文检索与 HNSW 向量近邻搜索
+# Bitcask — 日志结构哈希表，支持 BM25 全文检索与向量近邻搜索
 
 [![CI](https://github.com/basho/bitcask/workflows/CI/badge.svg)](https://github.com/basho/bitcask/actions)
 
@@ -8,8 +8,8 @@ Bitcask 是一个日志结构（log-structured）的哈希表键值存储引擎�
 通过 Erlang NIF 接口对外暴露。磁盘格式采用带类型记录（`kDoc`/`kTombstone`）与
 逐次写入序号（ordinal），可选 DocValue 编码（text + vector + metadata）。
 
-主要特性：BM25 全文检索、HNSW 近似最近邻向量搜索、RRF 混合检索（融合文本与向量
-两路排序信号）。
+主要特性：BM25 全文检索、向量近似最近邻搜索（三引擎可选：`hnsw` 内存图 /
+`ivfrq` 磁盘档 / `diskann` 实验性）、RRF 混合检索（融合文本与向量两路排序信号）。
 
 实现为单一 C++23 NIF（`cpp/`）+ 薄 Erlang 门面（`src/bitcask.erl`），所有操作经由
 `bitcask_cpp_nifs` → `priv/bitcask_cpp.so`。
@@ -102,7 +102,8 @@ ok
 > 查询自动展开。open-time 不可变配置（取代已删除的运行期 `set_synonym_map/2`）——
 > 运行期更换词典需重开库。
 
-**HNSW 向量搜索** — 向量搜索需索引模式（`{analyzer, ...}`）。**推荐流程：open
+**向量搜索** — 向量搜索需索引模式（`{analyzer, ...}`）；引擎缺省 `hnsw`，如需磁盘档
+在 open 时加 `{vector_engine, ivfrq | diskann}`（建库固定，不可运行期切换）。**推荐流程：open
 时把 embedder 作为 `{Provider, Cfg}` 传入，open 内部建 ctx 并自动把集合维度设为
 embedder 的 `vector_dim`——无需外部 `new`、也无需单独写 `{vector_dim, N}`。** 之后
 `put #{text => ...}` / 查询都自动 embed。`open` 返回 `{CaskRef, EmbedderCtx}`
@@ -158,7 +159,7 @@ ok
 | `merge/1,2,3`, `needs_merge/1,2`, `status/1` | 合并管理 |
 | `search_text/2,3`, `search_phrase/2,3`, `search_fields/2,3` | BM25 检索（全文 / 短语 / `field:term^boost`） |
 | `search_near/3,4`, `search_fuzzy/3,4`, `search_wildcard/2,3` | 近邻 / 模糊（编辑距离）/ 通配符搜索 |
-| `search_vector/2,3,4,5`, `search_hybrid/2,3,4,5` | HNSW 向量近邻 / RRF 混合检索（BM25 + 向量）；查询传 `{text,_}`（vector）或 `auto`（hybrid）自动 embed；`/5` 末参为 meta filter |
+| `search_vector/2,3,4,5`, `search_hybrid/2,3,4,5` | 向量近邻（引擎由 open 的 `{vector_engine, _}` 选定）/ RRF 混合检索（BM25 + 向量）；查询传 `{text,_}`（vector）或 `auto`（hybrid）自动 embed；`/5` 末参为 meta filter |
 | `embed/2` | 用句柄 embedder 把文本编码成向量（`{ok, Vec}`/`{error, no_embedder}`） |
 | `is_empty_estimate/1`, `is_frozen/1`, `close_write_file/1` | 工具函数 |
 
@@ -187,14 +188,16 @@ ok
 
 - **C++ NIF** 覆盖全部核心 KV 操作（`get`/`put`/`delete`/`sync`/`fold`/`merge`）
 - **BM25 全文检索** — 文本 / 短语 / 多字段 / 近邻 / 模糊 / 通配符，外加同义词与高亮
-- **HNSW 向量检索** — 近似最近邻搜索，支持 cosine / L2 / dot 距离度量，per-node 锁实现并发读，BCVS 快照持久化，merge 重建物理清死
-- **RRF 混合检索** — 经 Reciprocal Rank Fusion 融合 BM25 与 HNSW（`score = Σ 1/(60+rank)`）
+- **向量检索（三引擎）** — 近似最近邻搜索，open 时经 `{vector_engine, hnsw | ivfrq | diskann}` 选定并持久化进 `bitcask.meta`（**建库固定**，重开不符 → `{error, mode_mismatch}`）：`hnsw`（默认，内存图，≤ 数 M 向量，支持 cosine / L2 / dot，per-node 锁并发读，BCVS 快照持久化，merge 重建物理清死）、`ivfrq`（IVF-RaBitQ 磁盘档，10M–100M 推荐）、`diskann`（Vamana 盘上图，**实验性**）；磁盘档引擎要求 cosine / dot
+- **RRF 混合检索** — 经 Reciprocal Rank Fusion 融合 BM25 与向量两路（`score = Σ 1/(60+rank)`，每路取 `K' = max(K×4, 64)`）
 - **Embedder behaviour** — `bitcask_embedder` 回调 + OpenAI 兼容参考实现
 - **Jieba 中文分析器** 已集成（whitespace / ngram / jieba）
 - **带类型记录格式**（`kDoc`/`kTombstone` + 逐次写入序号）为默认格式
 - **统一架构** — Cask 与 Collection 已合并为单一引擎，按配置（`{analyzer, ...}`）启用 KV 或索引模式
 - **2.1.1 系统优化**（2026-06）— HNSW int8-only 内存模式（向量内存 −80%）、sealed 文件 mmap 零拷贝读、read 句柄 fd 预算 LRU、统一 `search.ckpt` 恢复路径、全盘字节序统一小端 + `migrate_le` 迁移工具（[文档](doc/migrate-le.md)）、hybrid 两路并行、merge I/O 顺序优化、open 后台 merge；详见 [`CHANGELOG.md`](CHANGELOG.md)
 - **并发加固**（2026-06 审计）— 索引读路径与异步索引 worker 并发安全：`meta_blob`/搜索缓存锁内拷贝不逃逸、倒排索引快照安全遍历、跨线程标量原子化、IndexPool 消费者异常兜底；详见 [`doc/concurrency-zh.md` §6](doc/concurrency-zh.md)
+- **4.0.0 向量双引擎**（2026-07）— `{vector_engine, _}` 三引擎选型 + AVX2 int8 内核 + HNSW 混合精度建图导航（`hnsw_build_nav_int8`，插入 +29%~75%、recall@10 零损失）、向量 ckpt 崩溃恢复有界（`vector_rebase_min_docs`）。⚠️ ABI 破坏（`SOVERSION` 3→4）+ 盘上 `bitcask.meta` 升至 v3（加 CRC），**升级请单向进行**
+- **4.1.0 稳定性审计**（2026-07，当前版本）— 随 libbitcask v4.1.0 升级：修复 `close/1` 拆卸路径的进程级永久挂死（`IndexPool` 计数泄漏 + 无界 `flush`）、hnsw 三处原子写 rename 前补 `fdatasync`（此前崩溃即半截文件）、若干资源泄漏。`SOVERSION` 保持 4、**ABI 与盘上格式均未变**，对 Erlang 调用方无 API 变更，重编即得；详见 [`CHANGELOG.md`](CHANGELOG.md)
 
 ## 许可证
 
