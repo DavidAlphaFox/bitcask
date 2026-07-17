@@ -18,9 +18,7 @@ set(BITCASK_PRIV_DIR "${CMAKE_SOURCE_DIR}/priv")
 file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 
 # ---------------------------------------------------------------------------
-# libbitcask — git submodule at third_party/libbitcask (v4.1.0, commit 66924e3)。
-# ⚠️ 上游 v4.1.0 只有 release commit、**未打 tag**（git describe = v4.0.0-32-g66924e3），
-# 故此处按 commit 固定；上游补 tag 后可改回 tag 引用。
+# libbitcask — git submodule at third_party/libbitcask (v5.0.0, commit aaac44c)。
 # 提供 C++ 核心库全部 target（bitcask_cask, bitcask_keydir, ...）。
 #
 # libbitcask 的 CMakeLists.txt 用 CMAKE_SOURCE_DIR 引用 third_party/
