@@ -3,6 +3,52 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [5.0.0] — 2026-07-17
+
+**升级到 libbitcask v5.0.0**：submodule 由 v4.1.0 升至 **v5.0.0**（64 位时间戳
+flag-day：`tstamp` / `expiry_at` 全链路 `uint32_t` → `uint64_t`，Y2038 前瞻；
+`SOVERSION` 4 → **5**，ABI + **盘上格式**双破坏）。本仓库版本同步对齐为 **5.0.0**。
+NIF 已重新编译链接，eunit 64/64 通过，另做盘上格式逐字节验证与旧库门禁冒烟。
+
+> 本次升级对 Erlang 调用方**无 API 变更**：`fold_keys` 等返回的 `tstamp` 本就是
+> 任意精度整数，只是自此可承载 > 2^32（2106 年后）的秒值。`{expiry_secs, N}` /
+> `{expiry_grace_time, N}` 选项上游仍为 u32（时长而非时刻），不受影响。
+
+> ⚠️ **盘上格式不向后兼容**：`bitcask.meta` v3 → **v4** 门禁——v5.0.0 打开旧
+> u32 纪元库（meta v1/v2/v3）时**干净拒开**（当前 NIF 映射为 `{error, unknown}`，
+> 上游把门禁错误包成 `kIo`/errnum 0，详情字符串未透出）。旧库**不必重灌**：
+> 上游统一迁移工具 `bitcask_migrate tstamp64 <src> <dst>` 提供非破坏性离线迁移
+> （只读 src、只写 dst；`detect` 子命令可先探测纪元）。
+
+> 上游已补 v4.1.0 tag，此前按 commit `66924e3` 固定的说明作废；本次起 submodule
+> 恢复按 tag 引用（v5.0.0 = `aaac44c`）。
+
+### 变更（继承自 libbitcask v5.0.0）
+
+- **64 位时间戳全链路**：C/C++ API + 盘上 data record header（23B → **27B**）+
+  DocValue（v3 → **v4**，ExpiryAt 段 u32 → u64）+ hint（`BCH3` → **`BCH4`**）+
+  keydir 快照（BCKS v2 → **v3**）+ docmap sidecar 等全部 tstamp 载体同步扩宽。
+- **修复 u32 求和 wrap**：`expiry_secs` 极大（如 `0xFFFFFFFF`）时
+  `tstamp + expiry_secs` 在 u32 域回绕，导致**全库 key 误判过期**；现全部在
+  u64 域运算。
+- **`now_sec_default()` 返回 u64**：不再把 `tv_sec` 截断到 u32。
+
+### NIF 适配（本仓库）
+
+- `nif_cask_iter.cpp` ×2：迭代器返回 `tstamp` 由 `enif_make_uint`（32 位，u64
+  传入会静默截断）改为 `enif_make_uint64`——`fold_keys` / `iterator_next` 的
+  `#bitcask_entry.tstamp` 自此 2106 年后仍正确。其余触点为零：写路径均走默认
+  tstamp（源码级无感），Erlang 侧整数无位宽。
+
+### 回归
+
+- `rebar3 compile`（链接 v5.0.0）+ `rebar3 eunit` **64/64**。
+- 盘上格式逐字节抽查：data header 27B / tstamp u64 / DocValue Ver=4 /
+  meta `BCME 04` / hint `BCH4` 全部为新纪元格式。
+- 门禁冒烟：v4.1.0 写出的旧库以 v5.0.0 打开被干净拒绝，不会按新偏移读坏旧字节。
+
+---
+
 ## [4.1.0] — 2026-07-15
 
 **升级到 libbitcask v4.1.0**：submodule 由 v4.0.0 升至 **v4.1.0**（Phase 5/6 深度审计：

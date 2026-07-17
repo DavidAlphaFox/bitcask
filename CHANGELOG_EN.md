@@ -3,6 +3,62 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [5.0.0] — 2026-07-17
+
+**Upgrade to libbitcask v5.0.0**: the submodule advances from v4.1.0 to **v5.0.0**
+(64-bit timestamp flag-day: `tstamp` / `expiry_at` widen from `uint32_t` to
+`uint64_t` end to end, for Y2038 readiness; `SOVERSION` 4 → **5**, breaking both
+the ABI and the **on-disk format**). This repo's version is aligned to **5.0.0**
+in lockstep. The NIF has been recompiled and relinked; eunit 64/64 passes, plus a
+byte-level on-disk format verification and an old-database gate smoke test.
+
+> This upgrade carries **no API change for Erlang callers**: the `tstamp` returned
+> by `fold_keys` and friends was always an arbitrary-precision integer — it can now
+> simply carry second values > 2^32 (past year 2106). The `{expiry_secs, N}` /
+> `{expiry_grace_time, N}` options remain u32 upstream (durations, not instants)
+> and are unaffected.
+
+> ⚠️ **The on-disk format is not backward compatible**: `bitcask.meta` v3 → **v4**
+> gate — v5.0.0 **cleanly refuses** to open old u32-era databases (meta v1/v2/v3);
+> the NIF currently surfaces this as `{error, unknown}` (upstream wraps the gate
+> error as `kIo`/errnum 0, dropping the detail string). Old databases need **no
+> re-ingest**: upstream's unified migration tool `bitcask_migrate tstamp64 <src>
+> <dst>` performs a non-destructive offline migration (reads src only, writes dst
+> only; the `detect` subcommand probes the era first).
+
+> Upstream has retro-tagged v4.1.0, so the previous pin-by-commit (`66924e3`) note
+> is obsolete; from this release on the submodule is referenced by tag again
+> (v5.0.0 = `aaac44c`).
+
+### Changed (inherited from libbitcask v5.0.0)
+
+- **64-bit timestamps end to end**: C/C++ API + on-disk data record header (23B →
+  **27B**) + DocValue (v3 → **v4**, ExpiryAt segment u32 → u64) + hint (`BCH3` →
+  **`BCH4`**) + keydir snapshot (BCKS v2 → **v3**) + docmap sidecar — every tstamp
+  carrier widened in lockstep.
+- **u32 wraparound fix**: with a huge `expiry_secs` (e.g. `0xFFFFFFFF`),
+  `tstamp + expiry_secs` wrapped in the u32 domain, **misjudging every key in the
+  database as expired**; all expiry arithmetic now runs in the u64 domain.
+- **`now_sec_default()` returns u64**: `tv_sec` is no longer truncated to u32.
+
+### NIF adaptation (this repo)
+
+- `nif_cask_iter.cpp` ×2: iterator `tstamp` returns switch from `enif_make_uint`
+  (32-bit — a u64 argument would truncate silently) to `enif_make_uint64`, so
+  `#bitcask_entry.tstamp` from `fold_keys` / `iterator_next` stays correct past
+  2106. No other touch points: all write paths use the default tstamp
+  (source-level no-op), and Erlang integers have no fixed width.
+
+### Regression
+
+- `rebar3 compile` (linked against v5.0.0) + `rebar3 eunit` **64/64**.
+- Byte-level on-disk spot check: data header 27B / tstamp u64 / DocValue Ver=4 /
+  meta `BCME 04` / hint `BCH4` — all in the new era format.
+- Gate smoke test: a database written by v4.1.0 is cleanly rejected when opened
+  with v5.0.0 — old bytes are never silently misread at the new offsets.
+
+---
+
 ## [4.1.0] — 2026-07-15
 
 **Upgrade to libbitcask v4.1.0**: the submodule advances from v4.0.0 to **v4.1.0**
