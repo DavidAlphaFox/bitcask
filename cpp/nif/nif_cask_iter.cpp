@@ -117,7 +117,7 @@ ERL_NIF_TERM nif_cask_fold_next_full(ErlNifEnv* env, int /*argc*/, const ERL_NIF
         enif_make_uint(env, e->file_id),
         enif_make_uint64(env, e->offset),
         enif_make_uint(env, e->total_sz),
-        enif_make_uint(env, e->tstamp),
+        enif_make_uint64(env, e->tstamp),
         e->is_tombstone ? atoms().atom_true : atoms().atom_false,
     };
     return enif_make_tuple_from_array(env, tup, 8);
@@ -204,7 +204,7 @@ ERL_NIF_TERM nif_cask_iterator_next(ErlNifEnv* env, int /*argc*/, const ERL_NIF_
         enif_make_uint(env, e->file_id),
         enif_make_uint64(env, e->offset),
         enif_make_uint(env, e->total_sz),
-        enif_make_uint(env, e->tstamp),
+        enif_make_uint64(env, e->tstamp),
     };
     return enif_make_tuple_from_array(env, tup, 7);
 }
