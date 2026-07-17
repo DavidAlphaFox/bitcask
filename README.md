@@ -190,7 +190,7 @@ ok
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
 | `doc/unified-architecture-plan-zh.md` | 统一架构计划（已实施） |
 | `doc/libcask-extraction-zh.md` | **libcask 独立库拆分可行性评估**（2.2.0 规划） |
-| `ROADMAP.md` / `ROADMAP_EN.md` | **路线图**：4.0.0 / 3.1.0 / 3.0.0 落地 + 2.1.1 已落地（P5–P15）+ 2.2.0 规划（libcask 独立 / V7+ 向量优化）（中/英） |
+| `ROADMAP.md` / `ROADMAP_EN.md` | **路线图**：5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 落地 + 2.1.1 已落地（P5–P15）+ 2.2.0 规划（libcask 独立 / V7+ 向量优化）（中/英） |
 | `TASK.md` | 详细任务拆分与历史 |
 
 ## 项目状态
@@ -208,7 +208,8 @@ ok
 - **3.0.0**（2026-06-25）— 升级 libbitcask v3.0.0（ABI 破坏，`SOVERSION` 1→3）：同义词词典改为 open-time 不可变选项 `{synonym_file, Path}`（移除运行期 `set_synonym_map/2`）；随库引入 `Cask` handle 多线程安全、`parallel_scan` 全表并行扫描、异步索引 MapReduce 流水线、批量检索
 - **3.1.0**（2026-07-01）— 升级 libbitcask v3.1.0（ABI 不破坏）：`{max_read_handles, unlimited}` / `{auto_compact_dead_ratio, R}` 选项、错误原子 `closed`；随库引入 read 句柄默认上限（按 `RLIMIT_NOFILE` 自动推导）、`bitcask.meta` v3 加 CRC32、field.schema FSCH v1 头 + CRC
 - **4.0.0**（2026-07-13）— 升级 libbitcask v4.0.0（ABI 破坏，`SOVERSION` 3→4，源码级兼容）：`{vector_engine, hnsw|ivfrq|diskann}` 向量双引擎 + 调优选项、`{auto_checkpoint_min_docs, N}` 崩溃恢复重放有界；随库引入 IVF-RaBitQ-lite 引擎、DiskANN 引擎（实验性）、AVX2 int8 内核、HNSW `.qc8` mmap 化；`examples/` Wikipedia 检索库示例
-- **4.1.0**（2026-07-15，当前版本）— 升级 libbitcask v4.1.0（ABI 不破坏，`SOVERSION` 保持 4，盘上格式不变）：对 Erlang 调用方**无 API 变更**，重编即得；随库引入 Phase 5/6 深度审计成果——修复 `close/1` 拆卸路径的进程级永久挂死（`IndexPool` 计数泄漏 + `unregister_lib` 无界 `flush`）、hnsw 三处原子写 rename 前补 `fdatasync`（此前崩溃即半截文件）、`RowChunks`/`MmapSegment` 资源泄漏；`file_util` 归并使 fsync 纪律 4 套收敛为 1 套
+- **4.1.0**（2026-07-15）— 升级 libbitcask v4.1.0（ABI 不破坏，`SOVERSION` 保持 4，盘上格式不变）：对 Erlang 调用方**无 API 变更**，重编即得；随库引入 Phase 5/6 深度审计成果——修复 `close/1` 拆卸路径的进程级永久挂死（`IndexPool` 计数泄漏 + `unregister_lib` 无界 `flush`）、hnsw 三处原子写 rename 前补 `fdatasync`（此前崩溃即半截文件）、`RowChunks`/`MmapSegment` 资源泄漏；`file_util` 归并使 fsync 纪律 4 套收敛为 1 套
+- **5.0.0**（2026-07-17，当前版本）— 升级 libbitcask v5.0.0（64 位时间戳 flag-day，ABI + **盘上格式**双破坏，`SOVERSION` 4→5）：`tstamp`/`expiry_at` 全链路 u32→u64（Y2038 前瞻），修复极大 `expiry_secs` 下 u32 求和回绕致全库误判过期；对 Erlang 调用方**无 API 变更**（`tstamp` 本就是任意精度整数）；`bitcask.meta` v4 门禁干净拒开旧 u32 纪元库，存量库用上游 `bitcask_migrate tstamp64` 非破坏性离线迁移，无须重灌
 
 ## 许可证
 

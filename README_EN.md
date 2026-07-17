@@ -198,7 +198,7 @@ ok
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
 | `doc/unified-architecture-plan-zh.md` | 统一架构计划（已实施） |
 | `doc/libcask-extraction-zh.md` | **libcask standalone extraction feasibility** (2.2.0 plan) |
-| `ROADMAP_EN.md` / `ROADMAP.md` | **Roadmap**: 4.0.0 / 3.1.0 / 3.0.0 shipped + 2.1.1 shipped (P5–P15) + 2.2.0 plan (libcask extraction / V7+ vector optimization) (EN/中) |
+| `ROADMAP_EN.md` / `ROADMAP.md` | **Roadmap**: 5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 shipped + 2.1.1 shipped (P5–P15) + 2.2.0 plan (libcask extraction / V7+ vector optimization) (EN/中) |
 | `TASK.md` | Detailed task breakdown & history |
 
 ## Project status
@@ -216,7 +216,8 @@ ok
 - **3.0.0** (2026-06-25) — libbitcask v3.0.0 upgrade (ABI break, `SOVERSION` 1→3): synonym dictionary becomes the open-time immutable option `{synonym_file, Path}` (runtime `set_synonym_map/2` removed); ships with thread-safe `Cask` handle, `parallel_scan` full-table parallel scan, async-index MapReduce pipeline, batch retrieval
 - **3.1.0** (2026-07-01) — libbitcask v3.1.0 upgrade (ABI unbroken): `{max_read_handles, unlimited}` / `{auto_compact_dead_ratio, R}` options, `closed` error atom; ships with default read-handle cap (auto-derived from `RLIMIT_NOFILE`), `bitcask.meta` v3 with CRC32, field.schema FSCH v1 header + CRC
 - **4.0.0** (2026-07-13) — libbitcask v4.0.0 upgrade (ABI break, `SOVERSION` 3→4, source-compatible): `{vector_engine, hnsw|ivfrq|diskann}` vector dual-engine + tuning options, `{auto_checkpoint_min_docs, N}` bounded crash-recovery replay; ships with IVF-RaBitQ-lite engine, DiskANN engine (experimental), AVX2 int8 kernels, HNSW `.qc8` codeword mmap; `examples/` Wikipedia search-database example
-- **4.1.0** (2026-07-15, current) — libbitcask v4.1.0 upgrade (ABI unbroken, `SOVERSION` stays 4, on-disk format unchanged): **no API change** for Erlang callers — just rebuild; ships with the Phase 5/6 deep audit — fixes a process-wide permanent hang on the `close/1` teardown path (`IndexPool` count leak + unbounded `flush` in `unregister_lib`), adds `fdatasync` before `rename` to hnsw's three atomic writes (previously a crash left a truncated file), closes `RowChunks`/`MmapSegment` resource leaks; `file_util` consolidation converges fsync discipline from 4 variants to 1
+- **4.1.0** (2026-07-15) — libbitcask v4.1.0 upgrade (ABI unbroken, `SOVERSION` stays 4, on-disk format unchanged): **no API change** for Erlang callers — just rebuild; ships with the Phase 5/6 deep audit — fixes a process-wide permanent hang on the `close/1` teardown path (`IndexPool` count leak + unbounded `flush` in `unregister_lib`), adds `fdatasync` before `rename` to hnsw's three atomic writes (previously a crash left a truncated file), closes `RowChunks`/`MmapSegment` resource leaks; `file_util` consolidation converges fsync discipline from 4 variants to 1
+- **5.0.0** (2026-07-17, current) — libbitcask v5.0.0 upgrade (64-bit timestamp flag-day, breaking both ABI and **on-disk format**, `SOVERSION` 4→5): `tstamp`/`expiry_at` widen u32→u64 end to end (Y2038 readiness), fixing a u32 wraparound with huge `expiry_secs` that misjudged every key as expired; **no API change** for Erlang callers (`tstamp` was always an arbitrary-precision integer); the `bitcask.meta` v4 gate cleanly refuses old u32-era databases — migrate existing ones offline and non-destructively with upstream's `bitcask_migrate tstamp64`, no re-ingest needed
 
 ## License
 
