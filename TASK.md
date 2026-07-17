@@ -273,6 +273,22 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## M5 — libbitcask 升级 v4.1.0 → v5.0.0（ABI + 盘上格式双破坏）
+
+> submodule 升至 v5.0.0（64 位时间戳 flag-day：`tstamp` / `expiry_at` 全链路
+> u32 → u64，Y2038 前瞻；`SOVERSION` 4 → 5；`bitcask.meta` v4 门禁拒开旧 u32
+> 纪元库，存量库经上游 `bitcask_migrate tstamp64` 非破坏性离线迁移）；
+> 本仓库 `vsn` → 5.0.0。上游已补 v4.1.0 tag，submodule 恢复按 tag 引用。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M5-1** | submodule pin v4.1.0（`66924e3`）→ v5.0.0（`aaac44c`）+ 嵌套子模块同步。⚠️ 踩坑复现：`rebar.config` pre-hook 的 `git submodule update` 按父仓库 index 里的 gitlink 复位子模块——checkout 后必须先 `git add third_party/libbitcask` 再编译，且编译**之后**验证 `git describe`（详见 build_system 备忘）。 | ✅ |
+| **M5-2** | NIF 适配：`nif_cask_iter.cpp` ×2 迭代器 `tstamp` 返回 `enif_make_uint` → `enif_make_uint64`（u32 版对 u64 实参静默截断）。其余触点为零：写路径均走默认 tstamp；`expiry_secs` / `expiry_grace_time` 上游仍 u32（时长非时刻）；Erlang 侧 tstamp 本就是任意精度整数。 | ✅ |
+| **M5-3** | 回归：`rebar3 compile`（链接 v5.0.0 通过）+ `rebar3 eunit` 64/64 + 盘上格式逐字节抽查（data header 27B / DocValue v4 / meta `BCME 04` / hint `BCH4`）+ 旧库门禁冒烟（v4.1.0 库拒开；NIF 现映射 `{error, unknown}`——上游把门禁错误包成 `kIo`/errnum 0，可提 issue 争取独立错误码）。 | ✅ |
+| **M5-4** | 文档：CHANGELOG（中/英）[5.0.0] 条目 + ROADMAP（中/英）升级条目 + README（中/英）发布条目 + `CMakeLists.txt` / `bitcask.app.src` 版本对齐。 | ✅ |
+
+---
+
 ## 明确排除（V7+ 或永久取消）
 
 | 条目 | 决策 | 理由 |

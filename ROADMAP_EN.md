@@ -6,6 +6,30 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 5.0.0 shipped
+
+### libbitcask upgrade to v5.0.0 ✅
+
+The submodule advances from v4.1.0 to **v5.0.0** (64-bit timestamp flag-day:
+`tstamp` / `expiry_at` widen from u32 to u64 end to end, for Y2038 readiness;
+`SOVERSION` 4 → **5**, breaking both the ABI and the **on-disk format**). This
+repo aligns to 5.0.0 in lockstep.
+
+The on-disk format turns over wholesale: data record header 23B → 27B, DocValue
+v3 → v4, hint `BCH3` → `BCH4`, keydir snapshot BCKS v2 → v3, and `bitcask.meta`
+v3 → **v4** (a gate that cleanly refuses old u32-era databases — old bytes are
+never silently misread at the new offsets). The library also fixes a u32
+wraparound where a huge `expiry_secs` misjudged every key in the database as
+expired. NIF adaptation is 2 lines (iterator `tstamp` returns switch to
+`enif_make_uint64`); no API change for Erlang callers.
+
+> ⚠️ Migrating existing databases: upstream's unified migration tool
+> `bitcask_migrate tstamp64 <src> <dst>` performs a non-destructive offline
+> migration (probe the era first with the `detect` subcommand); no re-ingest
+> needed.
+
+---
+
 ## 4.0.0 shipped
 
 ### libbitcask upgrade to v4.0.0 ✅

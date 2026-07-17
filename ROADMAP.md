@@ -6,6 +6,25 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 5.0.0 落地
+
+### libbitcask 升级到 v5.0.0 ✅
+
+submodule 由 v4.1.0 升至 **v5.0.0**（64 位时间戳 flag-day：`tstamp` / `expiry_at`
+全链路 u32 → u64，Y2038 前瞻；`SOVERSION` 4 → **5**，ABI + **盘上格式**双破坏）。
+本仓库版本同步对齐 5.0.0。
+
+盘上格式全面换代：data record header 23B → 27B、DocValue v3 → v4、hint `BCH3` →
+`BCH4`、keydir 快照 BCKS v2 → v3、`bitcask.meta` v3 → **v4**（门禁：旧 u32 纪元库
+干净拒开，绝不按新偏移静默读坏旧字节）。随库修复极大 `expiry_secs` 下 u32 求和
+回绕致全库 key 误判过期。NIF 适配仅 2 处（迭代器 `tstamp` 返回改
+`enif_make_uint64`）；对 Erlang 调用方无 API 变更。
+
+> ⚠️ 存量旧库迁移：上游统一迁移工具 `bitcask_migrate tstamp64 <src> <dst>`
+> 非破坏性离线迁移（`detect` 子命令先探测纪元），无须重灌数据。
+
+---
+
 ## 4.0.0 落地
 
 ### libbitcask 升级到 v4.0.0 ✅
