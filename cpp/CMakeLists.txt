@@ -45,3 +45,9 @@ if(Erlang_INCLUDE_DIR)
             VERBATIM)
     endif()
 endif()
+
+# 本地嵌入 NIF（priv/bitcask_llama.so）。默认关；开关与 llama.cpp 的构建配置
+# 在根 CMakeLists 的 BITCASK_WITH_LLAMA 一节。与上面的 bitcask_cpp 互不依赖。
+if(BITCASK_WITH_LLAMA)
+    add_subdirectory(llama)
+endif()

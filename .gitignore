@@ -2,6 +2,10 @@
 deps/*
 ebin
 priv/*.so
+# vendored ggml/llama runtime libs flattened into priv/ by the opt-in
+# BITCASK_WITH_LLAMA build. They carry SONAME suffixes (libggml-base.so.0,
+# libllama.so.0.0.1, ...) which `priv/*.so` above does NOT match.
+priv/*.so.*
 priv/dict/
 *.o
 *.beam

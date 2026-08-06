@@ -148,6 +148,15 @@ ok
 > 例如 `vector_dim=4`、库里 `[1,0,0,0]`、查 `[0.9,0.1,0,0]` →
 > `search_vector(H, V)` 返回 `{ok,[{<<"d1">>,0,0.99388}]}`（cosine = 0.9/√0.82）。
 
+> **本地嵌入（可选，默认不构建）**：`{custom, bitcask_embedder_llama}` 在 BEAM
+> 进程内用 llama.cpp 直接算 embedding，不经 HTTP 端点。`BITCASK_WITH_LLAMA=1
+> rebar3 compile` 打开；产物是独立的第二个 NIF（`priv/bitcask_llama.so` + 一组
+> vendored ggml/llama 共享库），核心 `bitcask_cpp.so` 不受影响。
+> ⚠️ 这是**另开一档**不是替换 HTTP 端点：CPU 上跑得动的是 0.6B/1024 维这一类，
+> 换档 = 落库维度变了 = 全量重建索引；而且 ggml 的 `abort()` 会带走整个 node。
+> 取舍、实测数字（查询 35 ms；`n_threads` 超订会慢 20 倍）与排错见
+> [doc/local-embedding-zh.md](doc/local-embedding-zh.md)。
+
 > **向量双引擎**（v4.0.0）：open 时加 `{vector_engine, hnsw | ivfrq | diskann}`
 > 选定引擎（默认 `hnsw`，内存图，≤数 M 向量；`ivfrq` IVF 磁盘段，10M-100M 推荐；
 > `diskann` Vamana 图，实验性）。建库一次性选定并持久化进 `bitcask.meta`；重开

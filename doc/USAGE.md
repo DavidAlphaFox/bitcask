@@ -120,6 +120,21 @@ list，churn 下内存有界，不再依赖 merge 才回收。
 - `K` 默认 10；`Ef` 默认 `max(K,64)`（越大越准越慢）；`Filter` 为结构化 meta 过滤。
 - 详尽参数/arity 展开表见 [`doc/api-zh.md`](api-zh.md) 向量/混合检索节。
 
+**本地嵌入（不经 HTTP 端点，可选）** — `BITCASK_WITH_LLAMA=1 rebar3 compile`
+构建后可用 `{custom, bitcask_embedder_llama}` 在 BEAM 进程内直接算：
+
+```erlang
+1> H = bitcask:open("/tmp/vec", [read_write, {analyzer, whitespace},
+1>     {embedder, {{custom, bitcask_embedder_llama},
+1>                 #{model_path => <<"/models/Qwen3-Embedding-0.6B-Q8_0.gguf">>,
+1>                   pooling => last,   % Qwen3-Embedding 要 last；BERT/BGE 要 cls
+1>                   n_ctx   => 512}}}]).   % 性能旋钮，不只是长度上限
+```
+
+其余用法（put / search_vector / search_hybrid）与上面完全一致。⚠️ 这是另开一档
+不是替换 HTTP：换档 = 落库维度变了 = 全量重建索引，且 ggml 的 `abort()` 会带走
+整个 node。取舍、实测数字与排错见 [`doc/local-embedding-zh.md`](local-embedding-zh.md)。
+
 向量引擎（v4.0.0）：open 时加 `{vector_engine, hnsw | ivfrq | diskann}`——
 `hnsw`（默认，内存图，≤ 数 M 向量）、`ivfrq`（IVF-RaBitQ 磁盘档，10M-100M 推荐，
 要求 cosine/dot）、`diskann`（实验性）。建库一次性选定并持久化，重开不符 →

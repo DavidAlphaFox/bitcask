@@ -1,3 +1,8 @@
 [submodule "third_party/libbitcask"]
 	path = third_party/libbitcask
 	url = https://github.com/TTalkPro/libbitcask.git
+[submodule "third_party/llama.cpp"]
+	path = third_party/llama.cpp
+	url = https://github.com/ggml-org/llama.cpp
+	shallow = true
+	branch = b10257
