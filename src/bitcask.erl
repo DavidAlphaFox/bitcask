@@ -449,8 +449,14 @@ with_stream(Handle, Fun) -> bitcask_stream:with_stream(ref(Handle), Fun).
 %%                          小窗口反而可能被线程创建成本吃掉，故默认关。
 %%   {prefetch_threads, N}  0（默认）= min(在线核数, 4)。
 %%
-%% 目录没有 OKI（只读打开一个从未写过的库 / 重建失败）→ {error, no_index}；
-%% 这时候调用方应回落到 fold + 前缀过滤。
+%% OKI 不可用时按成因分两个码（6.1.0）——补救方式不同：
+%%   {error, no_index}             索引在本句柄上**本就不建**（只读 / merge_only
+%%                                 打开一个从未建过 OKI 的目录）。读写方式重开即
+%%                                 自动建，或回落到 fold + 前缀过滤。
+%%   {error, index_rebuild_failed} 可写 open 时**试建而败**（IO/环境问题，见 log）。
+%%                                 ⚠️ 库里**有数据**，只是索引没建起来——别当成
+%%                                 空库。修完环境重开重试。
+%% 两种情况下 get/put/fold 全部照常，只有 range 不可用（OKI 只是派生缓存）。
 %% =========================================================================
 
 %% 收集 [Lo, Hi) 的全部 {Key, Value}，按 key 字典序。

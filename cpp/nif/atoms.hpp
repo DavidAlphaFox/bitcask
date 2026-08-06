@@ -48,6 +48,10 @@ struct Atoms {
     ERL_NIF_TERM write_locked;
     ERL_NIF_TERM bad_crc;
     ERL_NIF_TERM no_index;
+    // v6.1.0：`CaskError::kIndexRebuildFailed` —— OKI **试建而败**（可写 open
+    // 时重建撞 IO/环境问题），与 `no_index` 的「本就不建」区分：前者要先修
+    // 环境再重开，后者读写方式重开即建。
+    ERL_NIF_TERM index_rebuild_failed;
     ERL_NIF_TERM mode_mismatch;
     ERL_NIF_TERM closed;  // v3.1.0：CaskError::kClosed —— 对已 close 的 handle 调用
     ERL_NIF_TERM invalid_option;  // v6.0.0：CaskError::kInvalidOption 的带 detail 形态

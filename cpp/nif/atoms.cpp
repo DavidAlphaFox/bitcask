@@ -42,6 +42,7 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     write_locked    = a("write_locked");
     bad_crc         = a("bad_crc");
     no_index        = a("no_index");
+    index_rebuild_failed = a("index_rebuild_failed");
     mode_mismatch   = a("mode_mismatch");
     closed          = a("closed");
     invalid_option  = a("invalid_option");

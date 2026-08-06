@@ -18,7 +18,7 @@ set(BITCASK_PRIV_DIR "${CMAKE_SOURCE_DIR}/priv")
 file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 
 # ---------------------------------------------------------------------------
-# libbitcask — git submodule at third_party/libbitcask (6.0.0, commit 3480d0f)。
+# libbitcask — git submodule at third_party/libbitcask (6.1.0, commit 056127b)。
 # 提供 C++ 核心库全部 target（bitcask_cask, bitcask_keydir, ...）。
 #
 # libbitcask 的 CMakeLists.txt 用 CMAKE_SOURCE_DIR 引用 third_party/
@@ -57,6 +57,11 @@ file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 # 非破坏性（data 硬链接、字节零改动，只重生成 hint + meta），幂等可重跑。
 # 6.0.0 自身新增的 BCOK v2 / BCOM v2-v3 / BCKS v4 都是派生缓存演进，旧版遇到
 # 即弃用重建，不需要迁移。
+# 6.1.0：MINOR，纯增量（新枚举值**追加在 CaskError 尾部**，既有值不动 →
+# C API 映射不偏移，ABI 未破坏）。OKI 不可用按成因拆两个码：
+# kNoIndex（RO/merge_only 打开无 OKI 的目录 = 本就不建）与新增的
+# kIndexRebuildFailed（可写 open 试建而败 = IO/环境问题）。NIF 侧新增
+# `index_rebuild_failed` atom 映射；无盘上格式变更、无迁移。
 
 # ---------------------------------------------------------------------------
 foreach(_dep utf8proc cppjieba limonp googletest benchmark oneTBB unordered_dense)

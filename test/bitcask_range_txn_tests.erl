@@ -169,6 +169,34 @@ range_readonly_populated_test_() ->
         end)
     end}.
 
+range_rebuild_failed_test_() ->
+    {"OKI 试建而败 → {error, index_rebuild_failed}，与 no_index 区分（6.1.0）",
+     fun() ->
+        with_dir(fun(D) ->
+            RW = open_seeded(D),
+            bitcask:close(RW),
+            %% 制造一次重建失败：删掉 OKI 让它想重建，同时在 manifest 路径上
+            %% 放一个**目录**——manifest 是 OKI 的唯一 commit point，原子写
+            %% rename 到目录上必失败。
+            %% ⚠️ 这个 fixture 依赖上游的 OKI 文件名；名字变了本例会失败
+            %%（而不是静默失效），那正是想要的信号。
+            [file:delete(F) || F <- filelib:wildcard(D ++ "/kv.oki.seg-*")],
+            file:delete(D ++ "/kv.oki.manifest"),
+            ok = file:make_dir(D ++ "/kv.oki.manifest"),
+
+            R = bitcask:open(D, [read_write]),
+            %% KV 路径不受影响——OKI 只是派生缓存
+            ?assertEqual({ok, <<"v">>}, bitcask:get(R, <<"k042">>)),
+            %% range 报「试建而败」，不是「本就不建」
+            ?assertEqual({error, index_rebuild_failed},
+                         bitcask:range(R, {undefined, undefined})),
+            ?assertEqual({error, index_rebuild_failed},
+                         bitcask:range_fold(R, {undefined, undefined}, [],
+                                            fun(_K, _V, _T, _O, A) -> A end, [])),
+            bitcask:close(R)
+        end)
+    end}.
+
 range_after_close_test_() ->
     {"父 cask 已 close 后再 next → {error, closed}（而不是段错误）",
      fun() ->

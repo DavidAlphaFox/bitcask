@@ -154,6 +154,13 @@ ERL_NIF_TERM fault_to_term(ErlNifEnv* env, const CaskFault& f) noexcept {
         case CaskError::kReadOnly:       tag = atoms().read_only; break;
         case CaskError::kWriteLocked:    tag = atoms().write_locked; break;
         case CaskError::kNoIndex:        return atoms().no_index;
+        // v6.1.0：新错误码，**没有 legacy 包袱**，所以直接给正规的
+        // `{error, Tag}` 形态，不跟着 kNoIndex 传播那个裸 atom 的历史疙瘩。
+        // 不附 detail：上游那条消息是常量（真正的成因在 log 里），atom 本身
+        // 已经说清「试建而败」，附上只会让它和 `{error, no_index}` 形态不对称
+        // ——而这两个码调用方通常写在同一个 case 里分流。
+        case CaskError::kIndexRebuildFailed:
+                                         tag = atoms().index_rebuild_failed; break;
         case CaskError::kModeMismatch:  return atoms().mode_mismatch;
         case CaskError::kClosed:         return atoms().closed;
         case CaskError::kAnalyzerMismatch:

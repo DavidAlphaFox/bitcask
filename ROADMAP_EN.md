@@ -6,6 +6,37 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 6.1.0 shipped
+
+### "OKI unavailable" split by cause ✅
+
+`range`'s "index unavailable" goes from one `no_index` to two codes:
+
+- `{error, no_index}` — the index **was never built for this handle** (a
+  read-only / `merge_only` open of a directory with no OKI). Reopen read-write
+  and it builds automatically.
+- `{error, index_rebuild_failed}` (new) — a writable open **attempted a rebuild
+  and it failed** (IO / environment problem; details in the log). Fix the
+  environment and reopen to retry.
+
+> The split exists because **the remedies differ**, not for the sake of
+> precision. With a single code, the only sensible caller reaction is "no index →
+> fall back to a full scan" — reasonable for both causes, but the second one is
+> actually a broken environment worth alerting on, and the merged code erased
+> that signal.
+>
+> ⚠️ Neither is collapsed into an empty result `[]`: `index_rebuild_failed` means
+> **the data is there and the index is not**, so returning empty would be a
+> genuine phantom-data-loss. The OKI is only a derived cache — in both cases
+> `get` / `put` / `fold` keep working; only range is unavailable.
+
+Upstream 6.1.0 is a MINOR, purely additive release: the new enumerator is
+**appended to the end** of `CaskError`, leaving existing values untouched — the C
+API's numeric mapping does not shift, the ABI is intact (`SOVERSION` stays 6),
+and there is no on-disk format change.
+
+---
+
 ## 6.0.0 shipped
 
 ### libbitcask v5.0.0 → 6.0.0 upgrade ✅

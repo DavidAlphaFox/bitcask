@@ -136,7 +136,9 @@ cask_merge(_Ref, _Files)      -> erlang:nif_error({error, not_loaded}).
 %%
 %% Opts :: [{lo, binary()} | {hi, binary()} |
 %%          {prefetch, non_neg_integer()} | {prefetch_threads, non_neg_integer()}]
-%% 目录没有 OKI（只读打开一个从未写过的库 / 重建失败）→ {error, no_index}。
+%% OKI 不可用按成因拆两个码（6.1.0）：本就不建 → `no_index`（裸 atom，见下）；
+%% 可写 open 试建而败 → `{error, index_rebuild_failed}`（新码无 legacy 包袱，
+%% 直接给正规元组）。后者意味着**库里有数据、只是索引没建起来**。
 %% -----------------------------------------------------------------------
 %% ⚠️ **失败可能是裸 atom，不一定是 `{error, _}`。** `fault_to_term` 对
 %% `no_index` / `closed` / `mode_mismatch` / `not_found` / `already_exists`

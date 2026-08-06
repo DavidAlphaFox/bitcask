@@ -3,6 +3,51 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [6.1.0] — 2026-08-06
+
+**Upgrade libbitcask 6.0.0 → 6.1.0**: "OKI unavailable" is now split into two
+error codes by cause. Submodule `3480d0f` → `056127b` (tag `6.1.0`). This repo's
+version is aligned to **6.1.0**.
+
+> **Purely additive, no migration.** Upstream **appended** the new enumerator to
+> the end of `CaskError`, leaving existing values untouched — so the C API's
+> numeric mapping does not shift and the ABI is intact (`SOVERSION` stays `6`).
+> No on-disk format change.
+
+### Changed
+
+- **"Index unavailable" from `range/2,3` and `range_fold/5` is now two distinct
+  errors**, because the remedies are entirely different:
+
+  | Return | Cause | What to do |
+  |--------|-------|-----------|
+  | `{error, no_index}` | The index **was never built for this handle**: a read-only / `merge_only` open of a directory with no OKI | Reopen `read_write` and it builds automatically; or fall back to `fold` + prefix filtering |
+  | `{error, index_rebuild_failed}` (**new**) | A writable open **attempted a rebuild and it failed** (IO / environment problem; details in the log) | Fix the environment, then reopen to retry |
+
+  ⚠️ The crucial difference is that `index_rebuild_failed` means **the data is
+  there and only the index is missing**. Under 6.0.0 both collapsed into
+  `no_index`; treating that as "no index, fall back to a full scan" was correct,
+  but gave callers no way to know the environment was actually broken and worth
+  alerting on.
+- The new code is emitted as a proper `{error, index_rebuild_failed}` tuple from
+  the NIF, **not** following `no_index`'s bare-atom legacy shape — a brand-new
+  code carries no historical baggage, so there is no reason to propagate that
+  wart. After facade normalization both are `{error, Reason}`, so callers can
+  branch on them in a single `case`.
+
+### Verified
+
+- `rebar3 eunit` **158/158** (adds `range_rebuild_failed_test_`), xref and
+  dialyzer clean.
+- The new code was **actually triggered**, not just mapped from the enum by
+  inspection: build a directory with its OKI deleted and a **directory** placed
+  at the `kv.oki.manifest` path (the manifest is the OKI's only commit point, so
+  the atomic-write rename onto a directory always fails) → the writable open's rebuild
+  fails → `range` returns `{error, index_rebuild_failed}` while `get` keeps
+  working (the OKI is only a derived cache).
+
+---
+
 ## [6.0.0] — 2026-08-06
 
 **Upgrade libbitcask v5.0.0 → 6.0.0** (spanning two upstream releases: 5.1.0 and

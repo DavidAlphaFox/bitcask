@@ -3,6 +3,41 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [6.1.0] — 2026-08-06
+
+**升级 libbitcask 6.0.0 → 6.1.0**：OKI 不可用按成因拆成两个错误码。
+submodule `3480d0f` → `056127b`（tag `6.1.0`）。本仓库版本对齐 **6.1.0**。
+
+> **纯增量，无迁移。** 上游把新枚举值**追加在 `CaskError` 尾部**，既有值不动
+> → C API 数值映射不偏移，ABI 未破坏（`SOVERSION` 保持 `6`）。盘上格式零变更。
+
+### 变更
+
+- **`range/2,3` 与 `range_fold/5` 的「索引不可用」拆成两个错误码**，因为补救
+  方式根本不同：
+
+  | 返回 | 成因 | 怎么办 |
+  |------|------|--------|
+  | `{error, no_index}` | 索引在**本句柄上本就不建**：只读 / `merge_only` 打开一个从未建过 OKI 的目录 | 以 `read_write` 重开即自动建；或回落到 `fold` + 前缀过滤 |
+  | `{error, index_rebuild_failed}`（**新增**） | 可写 open 时 OKI **试建而败**（IO / 环境问题，细节在 log 里） | 先修环境再重开重试 |
+
+  ⚠️ 关键区别是 `index_rebuild_failed` 意味着**库里有数据、只是索引没建起来**。
+  6.0.0 时两者共用 `no_index`，调用方按「没索引就回落到全表扫」处理是对的，
+  但无从知道这次其实是环境坏了、值得告警。
+- 新错误码在 NIF 侧直接给正规的 `{error, index_rebuild_failed}` 元组，**不跟随
+  `no_index` 的裸 atom legacy 形态**——新码没有历史包袱，没必要传播那个疙瘩。
+  两者经门面归一后都是 `{error, Reason}`，调用方可以写在同一个 `case` 里分流。
+
+### 验证
+
+- `rebar3 eunit` **158/158**（新增 `range_rebuild_failed_test_`）+ xref/dialyzer 干净。
+- 新错误码是**真触发过**的，不是照着枚举写的映射：构造一个删掉 OKI、并在
+  `kv.oki.manifest` 路径上放一个**目录**的库（manifest 是 OKI 唯一的 commit
+  point，原子写 rename 到目录上必失败）→ 可写 open 时重建失败 → `range` 返回
+  `{error, index_rebuild_failed}`，同时 `get` 照常（OKI 只是派生缓存）。
+
+---
+
 ## [6.0.0] — 2026-08-06
 
 **升级 libbitcask v5.0.0 → 6.0.0**（跨两个上游版本：5.1.0 + 6.0.0），并把这两版

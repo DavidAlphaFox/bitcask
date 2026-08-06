@@ -350,6 +350,26 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## M9 — libbitcask 升级 6.0.0 → 6.1.0（OKI 不可用拆码）
+
+> submodule `3480d0f` → `056127b`（tag `6.1.0`）。MINOR、纯增量：新枚举值
+> **追加在 `CaskError` 尾部**，既有值不动 → C API 数值映射不偏移，ABI 未破坏
+>（`SOVERSION` 保持 6），盘上格式零变更、无迁移。本仓库 `vsn` → 6.1.0。
+>
+> 起因是 M8 期间发现的歧义：`make_read_view()` 失败有「本就没建」和「试建而败」
+> 两种成因，6.0.0 合成一个 `kNoIndex`。当时的判断是「合成码比压成 `[]` 安全」
+> ——那个判断没错，但**上游给了更好的第三选项**：保留报错、按成因拆码。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M9-1** | submodule pin 6.0.0 → 6.1.0 + `git add` 暂存 gitlink（M5-1/M8-1 那个 pre_hook 复位坑，这次一开始就按顺序做了）。 | ✅ |
+| **M9-2** | 错误映射：新增 `index_rebuild_failed` atom + `fault_to_term` 的 `kIndexRebuildFailed` 分支。⚠️ 新码**不跟随 `no_index` 的裸 atom legacy 形态**——直接给 `{error, Tag}`；新码没有历史包袱，没理由传播那个疙瘩。⚠️ 也**不附 detail**：上游那条消息是常量（真成因在 log 里），附上只会让它与 `{error, no_index}` 形态不对称，而这两个码调用方通常写在同一个 `case` 里分流。 | ✅ |
+| **M9-3** | 新码**真触发过**再写文档，不是照枚举写映射：删掉 OKI + 在 `kv.oki.manifest` 路径放一个**目录**（manifest 是 OKI 唯一 commit point，原子写 rename 到目录上必失败）→ 可写 open 重建失败 → `range` 得 `{error, index_rebuild_failed}`，`get` 照常。测试 `range_rebuild_failed_test_` 固化；⚠️ 该 fixture 依赖上游 OKI 文件名，名字变了本例会**失败**（不是静默失效），那正是想要的信号。 | ✅ |
+| **M9-4** | 回归：`rebar3 eunit` **158/158** + xref / dialyzer 干净。 | ✅ |
+| **M9-5** | 文档：CHANGELOG / ROADMAP / README（中英）+ `api-zh/en.md` 的 range 错误表 + `USAGE.md` 常见错误表 + `bitcask.erl` / `bitcask_cpp_nifs.erl` 头注释 + `CMakeLists.txt` 版本注释 + `bitcask.app.src`。**把 M8 时写的「为什么不拆码」那段推翻重写**——上游已经拆了，留着旧论证会误导。 | ✅ |
+
+---
+
 ## 明确排除（V7+ 或永久取消）
 
 | 条目 | 决策 | 理由 |

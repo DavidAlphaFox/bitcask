@@ -7,9 +7,14 @@
 //               （与 parallel_scan 同档）——迭代期间的并发写可能部分可见。
 //               需要快照语义的调用点应该继续用 fold。
 //
-// 权威来源是 OKI（有序 key 索引，派生缓存）。只读打开一个没有 OKI 的目录、
-// 或重建失败时，make_range_iter 返回 kNoIndex → 这里翻成 {error, no_index}；
-// 调用方按需回退到 fold + 前缀过滤。
+// 权威来源是 OKI（有序 key 索引，派生缓存）。OKI 不可用时上游按成因拆两个码
+//（6.1.0），这里原样翻译，**不合并**——两者的补救方式不同：
+//   kNoIndex             本就不建（RO / merge_only 打开一个没有 OKI 的目录）
+//                        → {error, no_index}，读写方式重开即建，或回退到
+//                          fold + 前缀过滤。
+//   kIndexRebuildFailed  试建而败（可写 open 撞 IO/环境问题）
+//                        → {error, index_rebuild_failed}。⚠️ 这条意味着**库里
+//                          有数据、只是索引没建起来**，当成「空库」是错的。
 //
 // 生命周期：资源 keep 住父 CaskHandle（见 resources.hpp 的
 // CaskRangeIterHandle 注释），并在每次 next 前检查父 cask 是否已 close。

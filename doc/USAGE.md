@@ -231,8 +231,11 @@ key 索引，代价降到 **O(range)**。
 > ⚠️ **`range` 不是快照。** 一致性是 per-key 弱一致（与 `parallel_scan` 同档）：
 > 迭代期间的并发写可能部分可见。要快照语义就继续用 `fold`。
 >
-> ⚠️ 只读打开一个从未写过的目录没有 OKI → `{error, no_index}`，此时回落到
-> `fold` + 前缀过滤。
+> ⚠️ OKI 不可用时按成因分两个码（6.1.0）：只读/`merge_only` 打开一个从未建过
+> 索引的目录 → `{error, no_index}`（读写重开即建）；可写 open 重建失败 →
+> `{error, index_rebuild_failed}`（IO/环境问题，修完重开重试）。
+> **后者意味着数据在、只有索引不在**，别当成空库。两种情况下 `get`/`put`/`fold`
+> 都照常，只有 `range` 不可用。
 
 ## 原子批与多键事务（6.0.0）
 
@@ -513,7 +516,8 @@ ok = bitcask_cpp_nifs:cask_close(R).
 | `{error, bad_crc}`      | 读取时磁盘损坏 | 从备份恢复；合并会跳过这些 |
 | `{error, key_too_large}` | 键 > 65 535 字节 | 格式限制；不可配置 |
 | `{error, value_too_large}` | 值 > 4 GiB | 格式限制 |
-| `{error, no_index}`     | 在 KV 模式 Cask 上调用搜索；**或** `range` 时目录没有 OKI（只读打开一个从未写过的库） | 搜索：用 `{analyzer, ...}` 重开。range：改用 `fold` + 前缀过滤，或以 `read_write` 重开让 OKI 建起来 |
+| `{error, no_index}`     | 在 KV 模式 Cask 上调用搜索；**或** `range` 时索引在本句柄上本就不建（只读 / `merge_only` 打开一个从未建过 OKI 的目录） | 搜索：用 `{analyzer, ...}` 重开。range：以 `read_write` 重开让 OKI 建起来，或回落到 `fold` + 前缀过滤 |
+| `{error, index_rebuild_failed}` | **6.1.0**：可写 open 时 OKI **试建而败**（IO/环境问题，细节见 log）。⚠️ 与上一条的区别是**库里有数据**，只是索引没建起来——别当成「空库」 | 看 log 修掉 IO/环境问题，重开重试。期间 `get`/`put`/`fold` 均不受影响，只有 `range` 不可用 |
 | `{error, {io_error, Msg}}` | **6.0.0**：IO 域故障但没有 errno——最常见的是 open 撞上盘上格式纪元门禁 | 读 `Msg`，它带着具体做法。v4 目录 → 跑 `bitcask_migrate hintord <src> <dst>`；v1/v2/v3 → 须重灌 |
 | `{error, {invalid_option, Msg}}` | **6.0.0**：选项或参数校验失败（如事务里 key 重复 / 空批 / `_txn:` 保留前缀） | 读 `Msg`；事务类错误**零副作用**，改正后重提交即可 |
 | `{error, closed}`       | 对已 `close` 的句柄发起调用；或父 cask 已关而仍在用 range 迭代器 | 迭代器必须在 `close` 前用完 |

@@ -199,20 +199,27 @@ filtering the whole table. Backed by the OKI ordered-key index.
 The idiomatic prefix scan sets the upper bound to the **byte after** the prefix:
 `range(H, {<<"user:">>, <<"user;">>})`.
 
-No OKI for the directory → `{error, no_index}`; fall back to `fold` plus prefix
-filtering.
+When the OKI is unavailable, the cause is reported as **one of two distinct
+errors** (since 6.1.0) — they call for different remedies, hence the split:
+
+| Return | Cause | What to do |
+|--------|-------|-----------|
+| `{error, no_index}` | The index **was never built for this handle**: a read-only or `merge_only` open of a directory that has no OKI | Reopen `read_write` and it builds automatically; or fall back to `fold` plus prefix filtering |
+| `{error, index_rebuild_failed}` | A writable open **attempted a rebuild and it failed** (IO / environment problem; details are in the log) | Fix the environment and reopen to retry. Do **not** read this as "no data" — the data is there |
 
 > **Read-only opens of a populated database work fine** — the read-write session
 > already persisted the OKI, so a read-only handle just reads it and never needs
-> (or is allowed) to rebuild. What returns `no_index` is a **never-written, empty
-> directory**, plus the case where the OKI is corrupt and the current handle
-> cannot rebuild it.
+> (or is allowed) to rebuild. What returns `no_index` is a **never-written**
+> directory.
 >
-> ⚠️ Both causes look identical at the engine layer ("no read view available"),
-> which is why they are **not** collapsed into an empty result `[]` — that would
-> make "a populated database silently returns nothing because its index is
-> broken" undetectable. Surfacing the error and letting the caller choose a
-> fallback is the deliberate choice.
+> ⚠️ Neither is collapsed into an empty result `[]`: that would make "a populated
+> database silently returns nothing because its index is broken" undetectable.
+> This matters most for `index_rebuild_failed`, which means the data is present
+> and only the index is missing — reporting it as an empty result would be a
+> genuine phantom-data-loss.
+>
+> ⚠️ The OKI is only a derived cache — in both cases `get` / `put` / `fold` keep
+> working normally; **only range is unavailable**.
 
 ---
 
