@@ -265,6 +265,90 @@ token_count_test_() ->
     end}.
 
 %% ===================================================================
+%% (丙') 独立 embedder 进程 —— 本地模型的推荐形态
+%%
+%% 进程无关的那部分（proxy / open 收进程引用 / 错误路径）在
+%% bitcask_embedder_server_tests 里用 mock provider 测，不需要模型。这里只测
+%% 本地模型**特有**的那两条：权重只装一份、进程退出时释放。
+%% ===================================================================
+
+server_shares_one_model_across_casks_test_() ->
+    {timeout, 600, fun() ->
+        case {bitcask_llama_nifs:available(), model_path()} of
+            {true, Path} when is_list(Path) ->
+                case filelib:is_regular(Path) of
+                    false -> ok;
+                    true  -> run_server_share(Path)
+                end;
+            _ -> ok
+        end
+    end}.
+
+run_server_share(Path) ->
+    {ok, Pid} = bitcask_embedder_server:start_link(
+                  #{provider => {custom, bitcask_embedder_llama},
+                    config   => #{model_path => list_to_binary(Path),
+                                  pooling => last, n_ctx => 512}}),
+    D1 = tmpdir(), D2 = tmpdir(),
+    try
+        %% info 透过 proxy/server 一路问到模型——排错时这条路必须通。
+        {ok, #{dim := Dim}} = bitcask_embedder_server:info(Pid),
+        ?assert(Dim > 0),
+
+        Opts = [read_write, {analyzer, whitespace}, {embedder, Pid}],
+        H1 = bitcask:open(D1, Opts),
+        H2 = bitcask:open(D2, Opts),
+        ok = bitcask:put(H1, <<"a">>, #{text => <<"猫在垫子上睡觉"/utf8>>}),
+        ok = bitcask:put(H2, <<"b">>, #{text => <<"一只狗在奔跑"/utf8>>}),
+        ?assertMatch({ok, [{<<"a">>, _, _}]},
+                     bitcask:search_vector(H1, {text, <<"猫咪"/utf8>>}, 1)),
+
+        %% ⚠️ bitcask:close/1 不该动模型——它归进程管。
+        ok = bitcask:close(H1),
+        ?assertMatch({ok, _}, bitcask_embedder_server:embed(Pid, <<"still alive">>)),
+        ?assertMatch({ok, [{<<"b">>, _, _}]},
+                     bitcask:search_vector(H2, {text, <<"狗"/utf8>>}, 1)),
+        ok = bitcask:close(H2)
+    after
+        os:cmd("rm -rf " ++ D1 ++ " " ++ D2),
+        bitcask_embedder_server:stop(Pid)
+    end.
+
+%% 进程退出 ⇒ terminate/2 释放模型。这是这条路相对 {Provider,Cfg} 的核心差别，
+%% 也是唯一能证明"没泄漏"的可观测点。
+server_terminate_releases_model_test_() ->
+    {timeout, 600, fun() ->
+        case {bitcask_llama_nifs:available(), model_path()} of
+            {true, Path} when is_list(Path) ->
+                case filelib:is_regular(Path) of
+                    false -> ok;
+                    true ->
+                        {ok, M} = bitcask_llama_nifs:model_load(
+                                    list_to_binary(Path),
+                                    #{pooling => last, n_ctx => 512}),
+                        {ok, Pid} = bitcask_embedder_server:start_link(
+                                      #{provider => {custom, bitcask_embedder_llama},
+                                        config   => #{handle => M}}),
+                        ?assertMatch({ok, _}, bitcask_embedder_server:embed(Pid, <<"x">>)),
+                        ok = bitcask_embedder_server:stop(Pid),
+                        %% handle 是借来的（owned=false），进程退出**不该**关它。
+                        ?assertMatch({ok, _},
+                                     bitcask_llama_nifs:embed(M, <<"x">>, true, false)),
+                        ok = bitcask_llama_nifs:model_close(M),
+                        ?assertEqual({error, closed},
+                                     bitcask_llama_nifs:embed(M, <<"x">>, true, false))
+                end;
+            _ -> ok
+        end
+    end}.
+
+tmpdir() ->
+    D = "/tmp/bitcask_llama_" ++ os:getpid() ++ "_" ++
+        integer_to_list(erlang:unique_integer([positive])),
+    ok = filelib:ensure_path(D),
+    D.
+
+%% ===================================================================
 %% helpers
 %% ===================================================================
 

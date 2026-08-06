@@ -148,6 +148,13 @@ ok
 > 例如 `vector_dim=4`、库里 `[1,0,0,0]`、查 `[0.9,0.1,0,0]` →
 > `search_vector(H, V)` 返回 `{ok,[{<<"d1">>,0,0.99388}]}`（cosine = 0.9/√0.82）。
 
+> **独立 embedder 进程**：`{embedder, ServerRef}` 接受一个
+> `bitcask_embedder_server` 进程（pid / 注册名 / `{global,_}` / `{via,_,_}`）。
+> provider 状态归那个进程：**多个 cask 共用一份**，生命周期跟着进程走
+> （`terminate/2` 释放）。有状态 provider（尤其是下面的本地模型）应当走这条——
+> `{Provider, Cfg}` 是每 open 一次建一份 ctx，而 `bitcask:close/1` **不释放**
+> embedder。不配置就不启动，也**不挂在 `bitcask_sup` 下**。
+
 > **本地嵌入（可选，默认不构建）**：`{custom, bitcask_embedder_llama}` 在 BEAM
 > 进程内用 llama.cpp 直接算 embedding，不经 HTTP 端点。`BITCASK_WITH_LLAMA=1
 > rebar3 compile` 打开；产物是独立的第二个 NIF（`priv/bitcask_llama.so` + 一组

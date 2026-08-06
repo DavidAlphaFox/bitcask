@@ -58,7 +58,8 @@ reference。后续所有调用都传整个元组。未配 embedder 时 `Embedder
 
 | 选项 | 含义 | 限制 |
 |------|------|------|
-| `{embedder, {Provider, Cfg}}` | **推荐。** open 内部经 `bitcask_embedder:new(Provider, Cfg)` 建 ctx，并自动用 embedder 的 `vector_dim` 作为集合维度；启用 `put`/查询的自动 embed。 | `Provider = openai \| anthropic \| {custom, Mod}`；`Cfg` 是 map。预建 ctx map 会被**拒绝**（`{error, {bad_embedder, _}}`）。在场时 `{vector_dim, N}` 由 embedder 接管。 |
+| `{embedder, {Provider, Cfg}}` | open 内部经 `bitcask_embedder:new(Provider, Cfg)` 建 ctx，并自动用 embedder 的 `vector_dim` 作为集合维度；启用 `put`/查询的自动 embed。ctx **本句柄独占**。 | `Provider = openai \| anthropic \| {custom, Mod}`；`Cfg` 是 map。预建 ctx map 会被**拒绝**（`{error, {bad_embedder, _}}`）。在场时 `{vector_dim, N}` 由 embedder 接管。 |
+| `{embedder, ServerRef}` | **有状态 provider 推荐。** 一个 [`bitcask_embedder_server`](../src/bitcask_embedder_server.erl) 进程；行为同上，但 provider 状态归那个进程：**多 cask 共用一份**，生命周期跟着进程走（`terminate/2` 释放）。⚠️ 本地模型（`bitcask_embedder_llama`）应走这条——`{Provider,Cfg}` 是每 open 一份权重，且 `bitcask:close/1` **不释放** embedder。 | `ServerRef = pid() \| 注册名 \| {global,_} \| {via,M,N}`。进程未起 → `{error, {embedder_not_running, Ref}}`；运行中挂掉 → `put` 得 `{error, {embedder_not_running,_}}`，**不会**带走调用方。见 [`doc/local-embedding-zh.md`](local-embedding-zh.md)。 |
 | `{vector_dim, N}` | 向量维度——仅手动向量路径（不配 embedder）需要 | `N > 0`；重开须与磁盘 meta 一致 |
 | `{vector_metric, M}` | 距离/相似度度量——见下 | `cosine`（默认）\| `l2` \| `dot`；**创建时固定**（重开换度量 → `mode_mismatch`） |
 | `{vector_engine, E}` | v4.0.0：向量引擎——`hnsw`（内存图，≤ 数 M 向量档）\| `ivfrq`（IVF-RaBitQ 磁盘档，10M-100M 推荐）\| `diskann`（Vamana 图，**实验性**） | 默认 `hnsw`；**建库时固定**并持久化进 `bitcask.meta`（重开不符 → `mode_mismatch`）；磁盘档引擎要求 `cosine`/`dot`（`l2` → `{error, _}`）；离线切换用 libbitcask 的 `vec_engine_migrate` 工具 |

@@ -127,6 +127,14 @@ open(Dirname) -> open(Dirname, []).
 %%                            search_hybrid(.,auto,.) 自动 embed 查询；
 %%                            bitcask:embed/2 直接编码。embedder 在场时
 %%                            {vector_dim,N} 由 embedder 接管（用户值被忽略）。
+%%     {embedder, ServerRef} — 一个 bitcask_embedder_server 进程（pid / 注册名 /
+%%                            {global,_} / {via,_,_}）。行为与上面完全一致，
+%%                            区别是 provider 状态归那个进程：**多个 cask 共用
+%%                            一份**，生命周期跟着进程走（supervisor 关停时
+%%                            terminate/2 释放）。
+%%                            ⚠️ 本地模型（bitcask_embedder_llama）应当走这条。
+%%                               {Provider,Cfg} 那条是每 open 一次装一份权重，
+%%                               而 bitcask:close/1 **不会**释放 embedder。
 %%     {vector_dim, N}      — 仅手动向量路径（不配 embedder）时需要：向量维度。
 %%     {vector_metric, M}   — cosine | l2 | dot（默认 cosine）
 %%     {vector_quantized, true} — 向量落盘 int8 量化（4× 磁盘，有损精度；P3b）。
@@ -204,21 +212,38 @@ open(Dirname, Opts) ->
             end
     end.
 
-%% 解析 embedder 选项。新形 {Provider, ConfigMap}：内部调 bitcask_embedder:new
-%% 建 ctx，并从中推出 vector_dim（= MRL 落库维度）作为集合维度，免去外部
-%% 先 new、再单独写 {vector_dim,N}。无 embedder → {ok, undefined, undefined}。
-%% 返回 {ok, Ctx, VectorDim} | {error, Reason}。
+%% 解析 embedder 选项。两种形态，都从建好的 ctx 里推出 vector_dim（= MRL 落库
+%% 维度）作为集合维度，免去外部先 new、再单独写 {vector_dim,N}：
+%%
+%%   {Provider, ConfigMap} — 内部调 bitcask_embedder:new 建 ctx，**本句柄独占**。
+%%
+%%   ServerRef             — 一个 bitcask_embedder_server 进程（pid / 注册名 /
+%%                           {global,_} / {via,_,_}）。ctx 只是一层代理，真正的
+%%                           provider 状态归那个进程。
+%%                           ⚠️ 本地模型（llama）应该走这条：{Provider,Cfg} 是
+%%                              每 open 一次装一份权重，而且 close/1 不会释放它。
+%%
+%% 无 embedder → {ok, undefined, undefined}。返回 {ok, Ctx, VectorDim} | {error,_}。
 resolve_embedder(Opts) ->
     case proplists:get_value(embedder, Opts) of
         undefined ->
             {ok, undefined, undefined};
         {Provider, Cfg} when is_map(Cfg) ->
-            case bitcask_embedder:new(Provider, Cfg) of
-                {ok, Ctx}      -> {ok, Ctx, bitcask_embedder:vector_dim(Ctx)};
-                {error, _} = E -> E
-            end;
+            new_embedder(Provider, Cfg);
+        Ref when is_pid(Ref); is_atom(Ref) ->
+            new_embedder({custom, bitcask_embedder_proxy}, #{server => Ref});
+        {global, _} = Ref ->
+            new_embedder({custom, bitcask_embedder_proxy}, #{server => Ref});
+        {via, M, _} = Ref when is_atom(M) ->
+            new_embedder({custom, bitcask_embedder_proxy}, #{server => Ref});
         _Other ->
-            {error, {bad_embedder, expected_provider_config_tuple}}
+            {error, {bad_embedder, expected_provider_config_tuple_or_server_ref}}
+    end.
+
+new_embedder(Provider, Cfg) ->
+    case bitcask_embedder:new(Provider, Cfg) of
+        {ok, Ctx}      -> {ok, Ctx, bitcask_embedder:vector_dim(Ctx)};
+        {error, _} = E -> E
     end.
 
 %% analyzer=jieba 且未显式指定 dict_path 时，默认指向 priv/dict
