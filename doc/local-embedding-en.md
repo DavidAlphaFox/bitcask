@@ -335,26 +335,58 @@ copies stacked on one card.
       config    => #{model_path => <<"...gguf">>, pooling => last}}}]}.
 ```
 
-`instances` accepts **only an explicit list of cards (or card groups)**:
+The three forms of `instances`:
 
-| Form | Meaning |
-|---|---|
-| `[0, 1, 2, 3]` | 4 instances, one card each (model fits on one card — **preferred**) |
-| `[[0,1], [2,3]]` | 2 instances, each spanning 2 cards (when it does not fit) |
-| `[[0,1,2,3]]` | 1 instance across 4 cards (very large model; degenerates to no concurrency) |
+| Form | Meaning | If one fails to start |
+|---|---|---|
+| `[0, 1, 2, 3]` | 4 instances, one card each | **All must start**, or the application does not start |
+| `[[0,1], [2,3]]` | 2 instances spanning 2 cards each | Same |
+| `auto` | Probed by the provider: cards that are **enumerated and can fit the model**, one instance each | **Best effort**: a failing one is skipped; only zero started counts as failure |
 
-The flat form is shorthand for "one card per group". A group larger than one card
-switches `split_mode` to `layer` by default; override it explicitly in `config`.
-⚠️ `split_mode => none` with several cards is self-contradictory and is rejected
-outright (rather than quietly using only the first card).
+`per_gpu => K` (default 1) then replicates each instance K times — K contexts on
+the same card. ⚠️ A context serves one forward at a time, so several on one card
+does add concurrency; but they contend for the same SMs, the gain is **not
+necessarily linear**, and VRAM grows with the copy count. There is **no measured
+data** for this, so it is an explicit option and never a default.
 
-> ⚠️ **There is deliberately no `auto`** (size the pool from the machine's card
-> count): on a shared box other tenants use the GPUs too, and an embedded library
-> should not claim every card by default. The deployment states which ones.
+#### The two rules behind `auto`
+
+**Which cards: enumerated ∩ fits.**
+
+- "Enumerated" — which GPUs this process can see is already an **operator-side
+  standard**: `GGML_CUDA_DEVICES` / `CUDA_VISIBLE_DEVICES` /
+  `GGML_VK_VISIBLE_DEVICES` / a container's device passthrough. We do not invent
+  a second mechanism, nor pretend to know better than the operator.
+- "Fits" — reuses the pre-load coarse check (GGUF size vs that card's free VRAM).
+  This incidentally handles "a card someone else is already using": it is skipped
+  rather than OOMing halfway in.
+  ⚠️ Still only a coarse check (no compute buffer or KV cache), so it filters
+  rather than guarantees.
+
+If no card qualifies → it degenerates to **one instance with no card bound** (pure
+CPU). ⚠️ Not erroring is deliberate: `auto` means "use whatever is there", so it
+should still work on a machine with no GPU rather than failing the whole
+application.
+
+**The failure policy is deliberately asymmetric.** Writing down a card number is a
+**statement of intent** — you said card 2, so if it will not start, the
+configuration disagrees with reality and should say so loudly. `auto`, by
+contrast, means "use whatever is there", and one busy card should not take down
+the application.
+
+> ⚠️ **"Best effort" must come with "says so"**: with 1 of 8 cards up, the
+> workload gets one eighth of the throughput while everything looks fine. Every
+> skipped instance logs a warning, and the state is queryable:
 >
-> ⚠️ The same card appearing in two instances is rejected — two copies of the
-> weights fighting over one card's VRAM, whose only symptom is mysterious OOM or
-> slowness.
+> ```erlang
+> {ok, #{requested := 8, started := 6, missing := [pool_2, pool_5]}} =
+>     bitcask_embedder_pool:status(my_embedder).
+> ```
+>
+> ⚠️ When a provider does not implement `auto_instances/1` (the HTTP tier, for
+> instance, has no notion of cards) `auto` is **rejected outright**
+> (`{error, {instances_auto_unsupported, _}}`) rather than quietly degrading to a
+> single instance — which would make `instances => auto` look as if it had worked.
 
 **No coordinator on the hot path.** `bitcask_embedder_pool` is a **supervisor**
 and forwards no `embed`: workers register under stable names (`my_embedder_0` /
