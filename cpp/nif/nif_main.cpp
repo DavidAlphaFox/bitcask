@@ -63,6 +63,14 @@ ERL_NIF_TERM nif_cask_is_frozen         (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_status            (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_needs_merge       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_merge             (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+// v5.1.0 S33-5：OKI 有序 range 迭代器（nif_cask_range.cpp）
+ERL_NIF_TERM nif_cask_range_start       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_range_next        (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_range_next_batch  (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_range_release     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+// v5.1.0 S34/S35：引擎原子批 + 多键事务（nif_cask_batch.cpp）
+ERL_NIF_TERM nif_cask_put_batch_atomic  (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_txn_commit        (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 
 namespace {
 
@@ -109,6 +117,20 @@ ErlNifFunc kNifFuncs[] = {
     {"cask_status",            1, nif_cask_status,           0},
     {"cask_needs_merge",       1, nif_cask_needs_merge,      0},
     {"cask_merge",             2, nif_cask_merge,            ERL_NIF_DIRTY_JOB_IO_BOUND},
+
+    // --- v5.1.0 range 迭代器 ---
+    // start 要为每个 OKI run 建游标 + seek（每路一次 pread），next_batch 一次
+    // 最多跑 1024 条取值——两者都可能远超 1ms，挂 dirty IO。单条 next 与
+    // cask_fold_next 同档，留在主调度线程。
+    {"cask_range_start",       2, nif_cask_range_start,      ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"cask_range_next",        1, nif_cask_range_next,       0},
+    {"cask_range_next_batch",  2, nif_cask_range_next_batch, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"cask_range_release",     1, nif_cask_range_release,    0},
+
+    // --- v5.1.0 原子批 / 多键事务 ---
+    // 批大小无上界 + 提交点可能 fsync，一律 dirty IO。
+    {"cask_put_batch_atomic",  2, nif_cask_put_batch_atomic, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"cask_txn_commit",        3, nif_cask_txn_commit,       ERL_NIF_DIRTY_JOB_IO_BOUND},
 };
 
 int on_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM /*load_info*/) {

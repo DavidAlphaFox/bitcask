@@ -24,7 +24,11 @@ ERL_NIF_TERM nif_cask_open(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv
     CaskOptions opts = parse_options(env, argv[1]);
     auto* p = priv(env);
     auto c = Cask::open(dir, opts, &p->cask_registry);
-    if (!c) return fault_to_term(env, c.error());
+    // v6.0.0：open 走带 detail 的翻译。纪元门禁（meta v4 → v5 的
+    // `bitcask_migrate hintord` 提示、v1/v2/v3 的「须重建」提示）与选项校验
+    // 失败都只带消息，塌成裸 atom 等于把升级路径藏起来。其余故障形态不变
+    //（write_locked / mode_mismatch / read_only ... 仍是裸 atom）。
+    if (!c) return fault_to_term_detailed(env, c.error());
 
     auto term = make_resource<CaskHandle>(env, g_cask_resource_type,
                                            std::move(*c), nullptr);

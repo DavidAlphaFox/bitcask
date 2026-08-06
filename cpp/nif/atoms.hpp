@@ -50,6 +50,8 @@ struct Atoms {
     ERL_NIF_TERM no_index;
     ERL_NIF_TERM mode_mismatch;
     ERL_NIF_TERM closed;  // v3.1.0：CaskError::kClosed —— 对已 close 的 handle 调用
+    ERL_NIF_TERM invalid_option;  // v6.0.0：CaskError::kInvalidOption 的带 detail 形态
+    ERL_NIF_TERM io_error;        // v6.0.0：kIo 但无 errno（纪元门禁等）的带 detail 形态
 
     // 合并策略阈值
     ERL_NIF_TERM frag_merge_trigger;
@@ -109,6 +111,25 @@ struct Atoms {
 
     // v4.0.0 S14-1/S31.5：自动 checkpoint 的 ord 增量锚点（0 = 关）。
     ERL_NIF_TERM auto_checkpoint_min_docs;
+
+    // v6.0.0 S36-4：keydir 磁盘驻留 Level B 的热点缓存条目预算
+    // （0 = 不限 = 全内存，默认）。
+    ERL_NIF_TERM keydir_cache_entries;
+
+    // v5.1.0 S33-5：range 迭代器（OKI 有序范围查询）的选项键。
+    // lo/hi = 区间边界二进制（空 = 无界）；prefetch/prefetch_threads = 值预取。
+    ERL_NIF_TERM lo;
+    ERL_NIF_TERM hi;
+    ERL_NIF_TERM prefetch;
+    ERL_NIF_TERM prefetch_threads;
+
+    // v5.1.0 S34/S35：原子批 / 多键事务。
+    //   put/remove = 批内操作标签（{put,K,V} / {remove,K}）；
+    //   sync_on_commit/no_sync = TxnSyncPolicy 取值。
+    ERL_NIF_TERM put;
+    ERL_NIF_TERM remove;
+    ERL_NIF_TERM sync_on_commit;
+    ERL_NIF_TERM no_sync;
 
     // V5:metadata filter 解析所需的 atom。
     //   filter/conditions/children = 嵌套 MetaFilter 的 map 字段;

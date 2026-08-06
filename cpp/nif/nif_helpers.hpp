@@ -26,6 +26,7 @@ namespace bitcask::nif {
 
 struct CaskHandle;
 struct CaskIterHandle;
+struct CaskRangeIterHandle;
 
 // 跨 .cpp 共享的内部辅助函数。
 namespace detail {
@@ -45,6 +46,9 @@ CaskHandle* checked_cask_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept;
 // 从 NIF term 取出 CaskIterHandle 指针；类型不对返回 nullptr。
 CaskIterHandle* cask_iter_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept;
 
+// v5.1.0：从 NIF term 取出 CaskRangeIterHandle 指针；类型不对返回 nullptr。
+CaskRangeIterHandle* cask_range_iter_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept;
+
 // 解析 [{Key, Value} | atom, ...] 形态的选项 proplist 到 CaskOptions。
 // 不识别的键静默跳过，与 legacy 语义一致。
 CaskOptions parse_options(ErlNifEnv* env, ERL_NIF_TERM list);
@@ -52,6 +56,19 @@ CaskOptions parse_options(ErlNifEnv* env, ERL_NIF_TERM list);
 // CaskFault → Erlang 错误 term。
 // kNotFound / kAlreadyExists 返回裸 atom（legacy 契约），其余返回 {error, Tag}。
 ERL_NIF_TERM fault_to_term(ErlNifEnv* env, const CaskFault& f) noexcept;
+
+// v6.0.0：带 detail 的 CaskFault → Erlang 错误 term。
+//
+// 动机：libbitcask 有两类**只有消息、没有 errno/专用枚举**的故障——
+// `kIo(errnum == 0)` 与 `kInvalidOption`。它们经 fault_to_term 分别塌成
+// `{error, unknown}` 与 `{error, error}`，信息全丢。5.1.0 的 meta v4→v5
+// flag-day 正好走这条路：open 一个旧纪元目录，用户看到的应该是那句
+// 「run `bitcask_migrate hintord <src> <dst>`」，而不是 `{error, unknown}`。
+//
+// 本函数只对这两类附加 detail，形态 `{error, {Tag, DetailBinary}}`；
+// **其余全部原样委托 fault_to_term**（尤其 kWriteLocked 保持裸
+// `{error, write_locked}` —— bitcask.erl 的 merge_locked 映射精确匹配它）。
+ERL_NIF_TERM fault_to_term_detailed(ErlNifEnv* env, const CaskFault& f) noexcept;
 
 // 从 Erlang map 中提取 DocInput（text 和可选 meta 字段）。
 // map 必须包含 text 二进制字段，meta 二进制字段可选。

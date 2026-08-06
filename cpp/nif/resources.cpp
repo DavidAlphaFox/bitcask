@@ -2,8 +2,9 @@
 
 namespace bitcask::nif {
 
-ErlNifResourceType* g_cask_resource_type      = nullptr;
-ErlNifResourceType* g_cask_iter_resource_type = nullptr;
+ErlNifResourceType* g_cask_resource_type            = nullptr;
+ErlNifResourceType* g_cask_iter_resource_type       = nullptr;
+ErlNifResourceType* g_cask_range_iter_resource_type = nullptr;
 
 void cask_resource_dtor(ErlNifEnv* /*env*/, void* obj) noexcept {
     static_cast<CaskHandle*>(obj)->~CaskHandle();
@@ -11,6 +12,10 @@ void cask_resource_dtor(ErlNifEnv* /*env*/, void* obj) noexcept {
 
 void cask_iter_resource_dtor(ErlNifEnv* /*env*/, void* obj) noexcept {
     static_cast<CaskIterHandle*>(obj)->~CaskIterHandle();
+}
+
+void cask_range_iter_resource_dtor(ErlNifEnv* /*env*/, void* obj) noexcept {
+    static_cast<CaskRangeIterHandle*>(obj)->~CaskRangeIterHandle();
 }
 
 bool register_resources(ErlNifEnv* env) noexcept {
@@ -26,6 +31,11 @@ bool register_resources(ErlNifEnv* env) noexcept {
         env, /*module_str*/ nullptr, "bitcask_cpp_cask_iter_resource",
         &cask_iter_resource_dtor, flags, nullptr);
     if (!g_cask_iter_resource_type) return false;
+
+    g_cask_range_iter_resource_type = enif_open_resource_type(
+        env, /*module_str*/ nullptr, "bitcask_cpp_cask_range_iter_resource",
+        &cask_range_iter_resource_dtor, flags, nullptr);
+    if (!g_cask_range_iter_resource_type) return false;
 
     return true;
 }

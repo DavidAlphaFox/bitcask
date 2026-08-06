@@ -5,6 +5,7 @@
 #include "nif_helpers.hpp"
 
 #include <cstring>
+#include <span>
 #include <variant>
 
 #include "atoms.hpp"
@@ -30,6 +31,7 @@ T* get_resource_handle(ErlNifEnv* env, ERL_NIF_TERM term, ErlNifResourceType* rt
 
 template CaskHandle* get_resource_handle<CaskHandle>(ErlNifEnv*, ERL_NIF_TERM, ErlNifResourceType*) noexcept;
 template CaskIterHandle* get_resource_handle<CaskIterHandle>(ErlNifEnv*, ERL_NIF_TERM, ErlNifResourceType*) noexcept;
+template CaskRangeIterHandle* get_resource_handle<CaskRangeIterHandle>(ErlNifEnv*, ERL_NIF_TERM, ErlNifResourceType*) noexcept;
 
 CaskHandle* cask_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept {
     return get_resource_handle<CaskHandle>(env, term, g_cask_resource_type);
@@ -42,6 +44,11 @@ CaskHandle* checked_cask_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept {
 
 CaskIterHandle* cask_iter_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept {
     return get_resource_handle<CaskIterHandle>(env, term, g_cask_iter_resource_type);
+}
+
+CaskRangeIterHandle* cask_range_iter_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept {
+    return get_resource_handle<CaskRangeIterHandle>(
+        env, term, g_cask_range_iter_resource_type);
 }
 
 // 注：open/2 的选项解析（parse_options 及其 parse_*_option 辅助）已拆到
@@ -154,6 +161,24 @@ ERL_NIF_TERM fault_to_term(ErlNifEnv* env, const CaskFault& f) noexcept {
         default:                          tag = atoms().error; break;
     }
     return enif_make_tuple2(env, atoms().error, tag);
+}
+
+ERL_NIF_TERM fault_to_term_detailed(ErlNifEnv* env, const CaskFault& f) noexcept {
+    const bool message_only =
+        (f.kind == CaskError::kIo && f.errnum == 0) ||
+        f.kind == CaskError::kInvalidOption;
+    if (!message_only || f.detail.empty()) return fault_to_term(env, f);
+
+    // errnum == 0 走不到 errno 表（erl_errno_id(0) = `unknown`，纯噪音），
+    // 用 io_error 明确「是 IO 域故障，但没有 errno」。
+    const ERL_NIF_TERM tag = (f.kind == CaskError::kInvalidOption)
+                                 ? atoms().invalid_option
+                                 : atoms().io_error;
+    ERL_NIF_TERM detail = make_binary_checked(
+        env, std::as_bytes(std::span<const char>(f.detail.data(), f.detail.size())));
+    if (!detail) return fault_to_term(env, f);  // OOM：退回无 detail 形态
+    return enif_make_tuple2(env, atoms().error,
+                            enif_make_tuple2(env, tag, detail));
 }
 
 // ---------------------------------------------------------------------------

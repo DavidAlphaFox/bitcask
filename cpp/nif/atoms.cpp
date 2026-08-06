@@ -44,6 +44,8 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     no_index        = a("no_index");
     mode_mismatch   = a("mode_mismatch");
     closed          = a("closed");
+    invalid_option  = a("invalid_option");
+    io_error        = a("io_error");
 
     frag_merge_trigger       = a("frag_merge_trigger");
     dead_bytes_merge_trigger = a("dead_bytes_merge_trigger");
@@ -92,6 +94,17 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     vector_diskann_r       = a("vector_diskann_r");
     vector_diskann_l_build = a("vector_diskann_l_build");
     auto_checkpoint_min_docs = a("auto_checkpoint_min_docs");
+    keydir_cache_entries     = a("keydir_cache_entries");
+
+    lo                 = a("lo");
+    hi                 = a("hi");
+    prefetch           = a("prefetch");
+    prefetch_threads   = a("prefetch_threads");
+
+    put                = a("put");
+    remove             = a("remove");
+    sync_on_commit     = a("sync_on_commit");
+    no_sync            = a("no_sync");
 
     filter             = a("filter");
     key                = a("key");

@@ -28,6 +28,7 @@ namespace bitcask::nif {
 
 extern ErlNifResourceType* g_cask_resource_type;
 extern ErlNifResourceType* g_cask_iter_resource_type;
+extern ErlNifResourceType* g_cask_range_iter_resource_type;
 
 // 包住 C++ Cask 对象的 NIF 资源。Cask 自己持有 KeyDir 和 active write/hint
 // file，析构会顺序释放它们。
@@ -43,6 +44,32 @@ struct CaskHandle {
 // 对象自行收尾，不持有对父 cask 的引用（父 cask 的生命周期由 BEAM 管）。
 struct CaskIterHandle {
     std::unique_ptr<CaskIter> iter;
+};
+
+// v5.1.0 S33-5：range 迭代器（OKI 有序范围查询）资源。
+//
+// 与 CaskIterHandle 的关键差别：CaskRangeIter **取值时回调父 Cask 的读路径**
+// （不是 fold 快照自足），所以它的合法期不能超过父 Cask。这里显式把父
+// CaskHandle 资源 keep 住（析构时 release），再逐次 next 前检查 `owner->cask`
+// 是否已被 cask_close 置空——两道闸把「上层先丢 CaskRef / 先 close，再拿
+// 迭代器 next」从段错误降级成 {error, closed}。
+//
+// keep/release 用 enif_keep_resource/enif_release_resource，配对严格：
+// 构造成功即 keep 一次，dtor 里 release 一次。
+struct CaskRangeIterHandle {
+    std::unique_ptr<CaskRangeIter> iter;
+    CaskHandle* owner = nullptr;   // keep 住的父资源，非拥有指针
+
+    CaskRangeIterHandle(std::unique_ptr<CaskRangeIter> it, CaskHandle* o) noexcept
+        : iter(std::move(it)), owner(o) {
+        if (owner) enif_keep_resource(owner);
+    }
+    CaskRangeIterHandle(const CaskRangeIterHandle&)            = delete;
+    CaskRangeIterHandle& operator=(const CaskRangeIterHandle&) = delete;
+    ~CaskRangeIterHandle() {
+        iter.reset();  // 先放迭代器（它 pin 着 keydir），再放父资源
+        if (owner) enif_release_resource(owner);
+    }
 };
 
 // 注册全部资源类型；任一注册失败返回 false。
@@ -69,5 +96,6 @@ ERL_NIF_TERM make_resource(ErlNifEnv* env, ErlNifResourceType* rt, Args&&... arg
 // 调用线程不可预测，禁止内部反向调任何 BEAM 锁或拿任何阻塞资源。
 void cask_resource_dtor(ErlNifEnv* env, void* obj) noexcept;
 void cask_iter_resource_dtor(ErlNifEnv* env, void* obj) noexcept;
+void cask_range_iter_resource_dtor(ErlNifEnv* env, void* obj) noexcept;
 
 }  // namespace bitcask::nif

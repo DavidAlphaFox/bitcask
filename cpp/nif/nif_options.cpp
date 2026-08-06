@@ -244,6 +244,14 @@ void parse_2tuple_option(ErlNifEnv* env, const ERL_NIF_TERM* tup, CaskOptions& o
         // v4.0.0 S14-1/S31.5:自上次 ckpt 的 ord 增量 ≥ N 即异步落 keydir 快照 +
         // search ckpt,崩溃恢复重放窗口恒 ≤ N。默认 65536;0 = 关。仅索引模式生效。
         opt_u32_min(env, val, 0, &o.auto_checkpoint_min_docs);
+    } else if (key == atoms().keydir_cache_entries) {
+        // v6.0.0 S36-4：keydir 磁盘驻留 Level B。0（默认）= 不限 = 现状全内存；
+        // >0 = opt-in 热点缓存条目预算（超预算分片内采样逐出，点查权威
+        // 走缓存 → memdelta → BCOK v2 run）。**首次在未带 Level B 戳的目录上
+        // 开启会全量重建 OKI**（open 慢一次，之后重开快）；merge_only 旁车
+        // 与 Level B 目录互斥（open 直接拒）。
+        std::uint64_t n = 0;
+        if (opt_u64(env, val, &n)) o.keydir_cache_entries = static_cast<std::size_t>(n);
     } else if (is_analyzer_key(key)) {
         if (!o.search_config) o.search_config.emplace();
         parse_analyzer_option(env, tup, o);
