@@ -63,6 +63,43 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   list, one bound per card. An out-of-range `gpu_index` returns
   `{error, {bad_gpu_index, _}}` instead of silently falling back to CPU (which
   would pile the whole pool onto the CPU with nobody noticing).
+- **Multi-GPU data-parallel pool** `bitcask_embedder_pool`: N embedder processes,
+  **all layers on one card, one instance per card**, N requests genuinely
+  concurrent. The application env gains `instances => [0,1,2,3]` (or card groups
+  `[[0,1],[2,3]]` when a model does not fit on one card).
+  ⚠️ **This is not splitting layers across cards**: llama's `split_mode` defaults
+  to `LAYER`, which is a pessimization for embedding models — 0.6B fits on one
+  card, splitting only adds cross-GPU transfers, and **a single `llama_context`
+  serves one forward at a time**, so N cards would still be working on 1 request.
+  ⚠️ **No coordinator on the hot path**: the pool is a **supervisor** and forwards
+  no `embed`. Workers register under stable names and the caller (the proxy)
+  **talks to a worker directly**, zero hops; routing through a process that
+  `gen_server:call`s the workers would make that process the new serialization
+  point. Dispatch picks the shortest message queue (workers are serial, so queue
+  length is the work owed).
+  ⚠️ **Only an explicit card list; no `auto`**: on a shared box other tenants use
+  the GPUs too, and an embedded library should not claim every card by default.
+  The same card in two instances is rejected.
+  ⚠️ **Startup is sequential** (N model loads; 542 ms measured for 0.6B).
+  Deliberately not parallel or lazy — that would let a worker's startup failure
+  bypass the supervisor's start-time check, and the "a configured embedder that
+  fails to start kills the application" policy depends on synchronous start-time
+  failure.
+- **`split_mode` promoted to an explicit config option** (`none` | `layer` |
+  `row`) and `gpu_index` now accepts a **card group** (`[0,1]`). A group larger
+  than one card switches `split_mode` to `layer` by default; ⚠️ `split_mode =>
+  none` with several cards is self-contradictory and is rejected outright rather
+  than quietly using only the first card.
+- **Coarse pre-check for "does not fit"**: before loading, the GGUF file size is
+  compared against the group's total free VRAM, and an obvious mismatch returns
+  `{error, {model_too_large, _}}` listing the three ways out (partial offload via
+  `n_gpu_layers => N`, across cards via `instances => [[0,1]]`, or a smaller
+  quantization).
+  ⚠️ Coarse only — **never used to pick `n_gpu_layers` automatically**, since
+  llama's real footprint also includes the compute buffer and KV cache and
+  guessing low means silently offloading too few layers. Without this check,
+  "does not fit" shows up as llama OOM → fallback retries `ngl=0` → **the whole
+  model goes back to CPU**, throwing away the 90% of layers that would have fitted.
 - **Build-time / run-time split diagnostics**: the build-time facts (was CUDA /
   Vulkan compiled in, toolkit version, architecture list) are baked into the
   `.so` and reported by `build_info/0`; the run-time facts come from

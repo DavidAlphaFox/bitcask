@@ -24,6 +24,14 @@
 %%           config   => #{model_path => <<"/models/qwen3-emb.gguf">>,
 %%                         pooling => last, n_ctx => 512}}}]}
 %%
+%%   多卡（数据并行，一卡一个 instance）加 instances，此时 name 必填：
+%%
+%%     {bitcask, [{embedder,
+%%         #{name      => my_embedder,
+%%           provider  => {custom, bitcask_embedder_llama},
+%%           instances => [0, 1, 2, 3],   %% 或 [[0,1],[2,3]]（单卡装不下时）
+%%           config    => #{model_path => ..., pooling => last}}}]}
+%%
 %%   **没配就没有这个 child**——bitcask 不依赖 embedder，绝大多数部署不配。
 %%
 %%   ⚠️ **配了却起不来（路径写错、pooling 解析成 NONE …）会让整个 bitcask
@@ -67,15 +75,30 @@ embedder_children() ->
         {ok, undefined} -> [];
         {ok, Spec} when is_map(Spec) ->
             Opts = maps:without([name], Spec),
-            case maps:get(name, Spec, undefined) of
-                undefined ->
-                    [bitcask_embedder_server:child_spec(bitcask_embedder, Opts)];
-                Name when is_atom(Name) ->
-                    [bitcask_embedder_server:child_spec(
-                       bitcask_embedder, {local, Name}, Opts)];
-                Name ->
-                    %% {global,_} / {via,_,_} 原样透给 gen_server:start_link/4
-                    [bitcask_embedder_server:child_spec(bitcask_embedder, Name, Opts)]
+            Name = maps:get(name, Spec, undefined),
+            case maps:is_key(instances, Spec) of
+                true ->
+                    %% 池：N 个各绑一张（组）卡的 worker，数据并行。
+                    %% ⚠️ 必须有注册名——worker 的稳定名字由池名派生。
+                    case Name of
+                        N when is_atom(N), N =/= undefined ->
+                            [bitcask_embedder_pool:child_spec(
+                               bitcask_embedder, {local, N}, Opts)];
+                        _ ->
+                            erlang:error({bad_embedder_env,
+                                          {instances_requires_name, Name}})
+                    end;
+                false ->
+                    case Name of
+                        undefined ->
+                            [bitcask_embedder_server:child_spec(bitcask_embedder, Opts)];
+                        N when is_atom(N) ->
+                            [bitcask_embedder_server:child_spec(
+                               bitcask_embedder, {local, N}, Opts)];
+                        N ->
+                            %% {global,_} / {via,_,_} 原样透给 gen_server:start_link/4
+                            [bitcask_embedder_server:child_spec(bitcask_embedder, N, Opts)]
+                    end
             end;
         {ok, Bad} ->
             %% 配错了就当场死，别静静地不起——这条与"配了模型却起不来要死掉"

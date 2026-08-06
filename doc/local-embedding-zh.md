@@ -270,39 +270,87 @@ scripts/detect-llama-backends.sh             # 两段都跑
 > 一张卡当成两张去切分模型层。表现不是报错，是显存被重复占用 + 莫名其妙的慢或
 > OOM。
 
-#### 多卡：默认只用一张，要的是数据并行
+#### 多卡：一卡跑全部 layer，N 个 instance（数据并行）
 
 **不会自动做多卡负载，这是有意的。** llama 的 `split_mode` 默认是 `LAYER`——把
-模型的层切到所有卡上（模型并行）。对**嵌入模型**那是个反优化：
+模型的层切到所有卡上（模型并行）。对**嵌入模型**那是反优化：
 
-- 0.6B 权重一张卡装得下，切开之后每次前向都要跨卡传输，而一次前向本来只有几十毫秒；
-- 更糟的是它把 N 张卡的并行能力浪费在**一条串行**的请求路径上（一个
-  `llama_context` 同时只服务一次前向）。
+- 0.6B 权重一张卡装得下，切开之后每层边界都要跨卡传输，而一次前向本来只有几十毫秒；
+- 更要命的是**一个 `llama_context` 同时只服务一次前向**，切完之后 N 张卡仍然只
+  在处理 1 个请求——等于把 N 张卡的算力当 1 张用。
 
-嵌入要的是**数据并行**：一卡一个 context，N 路并发。这正好对上本 NIF 的结构
-（一句柄 = 一 `llama_context` = 串行，N 句柄 = N 路并行）：
+要的是**数据并行**：一卡跑全部 layer，N 个 instance 各占一卡，N 个请求真并发。
 
-```erlang
-{ok, #{devices := Devs}} = bitcask_llama_nifs:backend_info(),
-Gpus = [D || #{type := gpu} = D <- Devs],
-[bitcask_embedder_server:start_link(
-   {local, list_to_atom("emb_" ++ integer_to_list(I))},
-   #{provider => {custom, bitcask_embedder_llama},
-     config   => #{model_path => Path, pooling => last,
-                   n_ctx => 512, gpu_index => I}})
- || I <- lists:seq(0, length(Gpus) - 1)].
+```
+   请求A → worker_0 → [卡0: 全部 layer]
+   请求B → worker_1 → [卡1: 全部 layer]     ← 真并发
+   请求C → worker_2 → [卡2: 全部 layer]
 ```
 
-每个进程各占一份权重的显存（0.6B Q8_0 ≈ 640 MB，多数卡装得下多份）。上层按轮询
-或"取空闲"分发即可。
+单卡显存占用仍是**一份**权重（各在各的卡上），不是 N 份叠在一张卡上。
 
-| 选项 | 默认 | 说明 |
-|---|---|---|
-| `gpu_index` | `0` | 绑选中族里的第几张卡。`all` = 全部（仅在 `split_mode /= none` 时有意义） |
-| `split_mode` | `none` | `none`（单卡）\| `layer` \| `row`。只有**大模型单卡装不下**才用后两个 |
+```erlang
+{bitcask, [{embedder,
+    #{name      => my_embedder,
+      provider  => {custom, bitcask_embedder_llama},
+      instances => [0, 1, 2, 3],     %% 4 卡，各一个 instance
+      config    => #{model_path => <<"...gguf">>, pooling => last}}}]}.
+```
 
-> ⚠️ `gpu_index` 越界（写了 2 但只有 2 张卡）报 `{error, {bad_gpu_index, _}}`，
-> **不静默退回 CPU**——那会让整池 worker 都挤在 CPU 上而没人发现。
+`instances` 只接受**显式的卡（组）列表**：
+
+| 写法 | 含义 |
+|---|---|
+| `[0, 1, 2, 3]` | 4 个 instance，各占 1 张卡（模型单卡装得下，**首选**） |
+| `[[0,1], [2,3]]` | 2 个 instance，各横跨 2 张卡（单卡装不下时） |
+| `[[0,1,2,3]]` | 1 个 instance 跨 4 张卡（极大模型，退化成无并发） |
+
+扁平写法是"每组一张卡"的简写。组内多于一张时 `split_mode` 缺省自动变成 `layer`；
+可在 `config` 里显式覆盖。⚠️ `split_mode => none` 配多张卡是自相矛盾，会被当场
+拒绝（而不是默默只用第一张）。
+
+> ⚠️ **不提供 `auto`（按机器上的卡数自动开）是有意的**：共享机器上别的租户也在
+> 用 GPU，一个被嵌入的库默认把整机的卡全占了不合适。要用哪几张由部署方写明。
+>
+> ⚠️ 同一张卡出现在两个 instance 里会被拒绝——两份权重挤一张卡互相抢显存，而
+> 表现只是"莫名其妙的 OOM 或慢"。
+
+**热路径上没有协调者。** `bitcask_embedder_pool` 是个 **supervisor**，不转发任何
+`embed`：worker 用稳定注册名（`my_embedder_0` / `_1` …）注册，调用方拿到名字列表
+后**直接打 worker**。让一个进程去 `gen_server:call` worker 的话，那个进程自己就
+成了新的串行点，N 个 worker 等于白开。选谁：取消息队列最短的那个（worker 是串行
+的，队列长度就是它欠的活）。
+
+> ⚠️ **启动是串行的**：supervisor 顺序起 child，每个在 init 里同步加载模型。
+> N 个 instance = N 次加载（0.6B 实测 542 ms/次，8 卡 ≈ 4.3 s；8B 会是几十秒）。
+> 故意没改成并行/懒加载——那样 worker 的启动失败会绕过 supervisor 的启动期检查，
+> 而「配了 embedder 却起不来就让 application 死」这条策略正是靠启动期同步失败才
+> 成立的。用容量换确定性。
+
+#### 单卡装不下怎么办
+
+三条出路，按优先级：
+
+1. **部分卸载（单卡，首选）**——`n_gpu_layers => N` 给具体数字，能塞多少层塞多少，
+   剩下的留 CPU。塞进 80% 的层通常已经拿到大部分加速。
+2. **模型并行（跨卡）**——`instances => [[0,1]]`，一个 instance 横跨 2 张卡。代价
+   是这一组卡同时只服务一个请求，拿并发换容量。
+3. **换量化档**——Q8 → Q4 直接砍一半显存。这是你的选择，库不替你做。
+
+加载前会做一次**粗检**（GGUF 文件大小 vs 组内可用显存之和），明显装不下时提前报：
+
+```erlang
+{error, {model_too_large, <<"GGUF is 8.2 GiB but the selected 1 GPU(s) have 5.6 GiB free. "
+                            "Options: n_gpu_layers => N ... or split_mode => layer ...">>}}
+```
+
+> ⚠️ **只是粗检，不是精确预测，也绝不用它去自动决定 `n_gpu_layers`。** llama 的
+> 实际占用还包括 compute buffer 与 KV cache，都随 `n_ctx` / `n_batch` 变。它的定位
+> 是"明显装不下时提前拦住并指出出路"——真正的判据仍然是 llama 自己那次尝试。
+> 自动算 N 的代价是静默地少卸载几层，又是一种没人发现的慢。
+>
+> 不做这一步的话，装不下的表现是：llama OOM → 回落重试 `ngl=0` → **整体退回纯
+> CPU**，90% 本来装得下的层被白白挪回 CPU。
 
 #### 两件与部署有关的事
 
@@ -380,7 +428,7 @@ maps:with([gpu_layers_requested, gpu_layers_effective,
 | `n_ctx` | `2048` | **性能旋钮**，见 §6 |
 | `n_threads` | `max(1, 可用核数-2)` | 见 §6 |
 | `backend` | `auto` | `auto`（CUDA > Vulkan > CPU）\| `cuda` \| `vulkan` \| `cpu`。见 §3.4 |
-| `gpu_index` | `0` | 绑第几张卡；多卡用数据并行，见 §3.4 |
+| `gpu_index` | `0` | 绑第几张卡；也可给卡组 `[0,1]` 或 `all`。多卡见 §3.4 |
 | `split_mode` | `none` | `none` \| `layer` \| `row`。大模型单卡装不下才用后两个 |
 | `n_gpu_layers` | `auto` | 有 GPU 就全卸载，没有就 0。见 §3.4 |
 | `dim` | — | 给了就与模型实际维度核对，不符直接报错 |
@@ -509,6 +557,8 @@ bitcask_llama_nifs:last_error().      %% llama/ggml 打的最后一条 error
 | 本地嵌入慢一个数量级 | `n_threads` 超订，见 §6 |
 | 配了 GPU 却还是慢 | 查 `info/1` 的 `fell_back_to_cpu` / `gpu_fallback_reason`，见 §3.4 |
 | `gpu_status()` 返回 `cpu_only_build` | 包里没编 CUDA —— **重新构建**，装驱动没用 |
+| `{error, {model_too_large, _}}` | 单卡装不下——见 §3.4「单卡装不下怎么办」的三条出路 |
+| `{error, {bad_opt, {instances, duplicate_gpu}}}` | 同一张卡出现在两个 instance 里 |
 | `{error, {bad_gpu_index, _}}` | `gpu_index` 超出这台机器的卡数 —— 按 `backend_info()` 的设备表开池 |
 | `{error, {bad_backend, _}}` / `{error, {bad_split_mode, _}}` | 取值只能是 auto\|cuda\|vulkan\|cpu / none\|layer\|row |
 | `gpu_status()` 返回 `no_gpu_device` | 包里有 CUDA 但机器上没卡 —— 装驱动 / 容器透传 / 查依赖，跑 `scripts/detect-llama-backends.sh --runtime` |

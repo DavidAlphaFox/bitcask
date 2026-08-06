@@ -95,6 +95,40 @@ wants data parallelism — size a pool of embedder processes from
 exactly onto "one handle = one context = serial". Model parallelism
 (`split_mode => layer`) is only for a large model that does not fit on one card.
 
+**Multiple GPUs: all layers on one card, N instances (data parallelism).**
+`bitcask_embedder_pool` starts N embedder processes from the application env's
+`instances => [0,1,2,3]`, one bound per card. llama's `split_mode` defaults to
+`LAYER` (split layers across every card), which is a pessimization for embedding
+models: 0.6B fits on one card, splitting only adds cross-GPU transfers, and **a
+single `llama_context` serves one forward at a time** — after splitting, N cards
+are still working on 1 request. Data parallelism is what you want: N requests
+genuinely concurrent, and per-card VRAM is still one copy of the weights.
+
+> ⚠️ **No coordinator on the hot path.** The pool is a **supervisor** and
+> forwards no `embed`: workers register under stable names (unchanged across
+> restarts, so caches stay valid) and callers talk to a worker directly, zero
+> hops. Routing through a process that `gen_server:call`s the workers would make
+> that process the new serialization point, rendering the N workers pointless.
+>
+> ⚠️ **Only an explicit list of cards (or groups); no `auto`** — other tenants on
+> a shared box use the GPUs too. `[[0,1],[2,3]]` denotes groups (for a model that
+> does not fit on one card); a group larger than one card implies
+> `split_mode => layer`.
+>
+> ⚠️ **Startup is sequential** (N model loads). Deliberately not parallel or lazy
+> — that would let a worker's startup failure bypass the supervisor's start-time
+> check, which is exactly what the "configured but failing kills the application"
+> policy rests on.
+
+**Three ways out when it does not fit on one card**: partial offload
+(`n_gpu_layers => N`, preferred), across cards (`instances => [[0,1]]`,
+concurrency traded for capacity), or a smaller quantization. A **coarse
+pre-check** before loading returns `{error, {model_too_large, _}}` with those
+options when it clearly will not fit — but it is never used to pick
+`n_gpu_layers` automatically (guessing low means silently offloading too few
+layers). Without it, "does not fit" shows up as llama OOM → fallback → **the
+whole model back on CPU**.
+
 The build-time SDK probe `scripts/detect-llama-backends.sh`: CMake only says "not
 found"; the script says **which package is missing** and prints the build command
 pre-filled with whichever switches it detected.
@@ -122,9 +156,16 @@ pre-filled with whichever switches it detected.
   `bitcask:close/1` release a ctx built via the `{Provider, Cfg}` path. Currently
   side-stepped by the process form, and touching the core API has no obvious
   payoff.
-- **Automatic multi-GPU dispatch** (gated): pools are built by hand via
-  `gpu_index` today. A round-robin / pick-an-idle scheduler above that is the
-  natural next step, but it needs measurements on a real multi-GPU box first.
+- **`instances => auto`** (gated): the cards to use must be spelled out today.
+  Sizing the pool from the machine's card count first requires deciding whether a
+  library should claim every GPU by default, and whether the "a failing embedder
+  kills the application" policy should be relaxed when one worker in a pool fails
+  to start. Both are policy questions, not implementation ones.
+- **Real multi-GPU measurement** (gated): the pool mechanism is thoroughly tested
+  with the mock provider, but **real GPU behaviour on a multi-card box has never
+  been exercised** (no card on the development machine). The `gpu_index` range
+  check, the card group's `mp.devices` plumbing and the actual effect of
+  `split_mode` have only been verified along the parameter path.
 - **ROCm / SYCL backends** (gated): ggml has both, wired the same way as Vulkan.
   Whether to add them depends on whether such cards show up in real deployments.
 

@@ -73,6 +73,30 @@ ggml 静默跳过 → 降级纯 CPU"这一整类不报错的故障。
 各绑一张卡（`gpu_index`），正好对上"一句柄 = 一 context = 串行"的结构。真需要模型
 并行（大模型单卡装不下）才配 `split_mode => layer`。
 
+**多卡：一卡跑全部 layer，N 个 instance（数据并行）。** `bitcask_embedder_pool`
+按 application env 的 `instances => [0,1,2,3]` 起 N 个 embedder 进程，各绑一张卡。
+llama 的 `split_mode` 默认 `LAYER`（把层切到所有卡上）对嵌入模型是反优化：0.6B
+一张卡装得下，切开只多出跨卡传输，而且**一个 `llama_context` 同时只服务一次前向**
+——切完之后 N 张卡仍然只在处理 1 个请求。数据并行才是要的：N 个请求真并发，单卡
+显存占用仍是一份权重。
+
+> ⚠️ **协调者不在热路径上。** 池是个 **supervisor**，不转发任何 `embed`：worker
+> 用稳定注册名注册（重启后名字不变，缓存不失效），调用方直接打 worker，中间零跳。
+> 让一个进程去 `gen_server:call` worker 的话，它自己就成了新的串行点，N 个 worker
+> 等于白开。
+>
+> ⚠️ **只接受显式卡（组）列表，不提供 `auto`**：共享机器上别的租户也在用 GPU。
+> `[[0,1],[2,3]]` 表示卡组（单卡装不下时），组内多于一张自动 `split_mode => layer`。
+>
+> ⚠️ **启动串行**（N 次模型加载）。故意没做并行/懒加载——那样 worker 的启动失败会
+> 绕过 supervisor 的启动期检查，而"配了却起不来就让 application 死"正是靠它成立的。
+
+**单卡装不下的三条出路**：部分卸载（`n_gpu_layers => N`，首选）/ 跨卡
+（`instances => [[0,1]]`，拿并发换容量）/ 换量化档。加载前有一次**粗检**，明显
+装不下时报 `{error, {model_too_large, _}}` 并列出出路——但绝不用它自动决定
+`n_gpu_layers`（算错就是静默少卸载几层）。不做这一步的话，装不下的表现是 llama
+OOM → 回落 → **整体退回纯 CPU**。
+
 构建期 SDK 探测脚本 `scripts/detect-llama-backends.sh`：CMake 只会说"没找到"，它说
 **缺哪个包**并给出带上探到的开关的构建命令。
 
@@ -92,8 +116,12 @@ ggml 静默跳过 → 降级纯 CPU"这一整类不报错的故障。
 - **`bitcask_embedder` 加可选 `close/1` 回调**（按 gate）：让 `bitcask:close/1`
   能自动释放 `{Provider, Cfg}` 那条路建的 ctx。当前用进程形态规避，动核心 API
   的收益不明显。
-- **多卡自动分发**（按 gate）：现在按 `gpu_index` 手工开池。上层加一个轮询/取空闲
-  的调度器是自然的下一步，但需要先有多卡机器上的实测数据。
+- **`instances => auto`**（按 gate）：现在必须写明用哪几张卡。按机器上的卡数自动
+  开池需要先决定"一个库该不该默认占满整机的 GPU"，以及池内某个 worker 起不来时
+  是否放宽"整个 application 死"那条策略。两个都是策略问题，不是实现问题。
+- **多卡实测**（按 gate）：池的机制已用 mock provider 测透，但**多卡上的真实 GPU
+  行为没跑过**（开发机无卡）。`gpu_index` 越界检查、卡组的 `mp.devices` 传递、
+  `split_mode` 的实际效果都只验证了参数路径。
 - **ROCm / SYCL 后端**（按 gate）：ggml 都有，与 Vulkan 同一个接法。要不要加取决于
   实际部署里有没有这类卡。
 

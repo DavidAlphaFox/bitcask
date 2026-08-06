@@ -303,44 +303,105 @@ You can force it: `backend => cuda | vulkan | cpu`. An unknown value returns
 > splits the model's layers across what it thinks are two cards. That does not
 > error; it double-books VRAM and produces mysterious slowness or OOM.
 
-#### Multiple GPUs: one card by default; what you want is data parallelism
+#### Multiple GPUs: all layers on one card, N instances (data parallelism)
 
 **Multi-GPU load spreading does not happen automatically, on purpose.** llama's
 `split_mode` defaults to `LAYER` — splitting the model's layers across every card
 (model parallelism). For an **embedding model** that is a pessimization:
 
-- 0.6B of weights fits on a single card, so splitting only adds cross-GPU
-  transfers to every forward pass — and a forward pass is only tens of ms to
-  begin with;
-- worse, it spends N cards' worth of parallelism on **one serial** request path
-  (a single `llama_context` serves one forward at a time).
+- 0.6B of weights fits on a single card, so splitting adds a cross-GPU transfer
+  at every layer boundary, while a whole forward pass is only tens of ms;
+- worse, **a single `llama_context` serves one forward at a time**, so after
+  splitting, N cards are still working on 1 request — N cards' worth of compute
+  used as one.
 
-Embedding wants **data parallelism**: one context per card, N concurrent. That
-maps exactly onto this NIF's structure (one handle = one `llama_context` = serial,
-so N handles = N-way parallel):
+What you want is **data parallelism**: all layers on one card, N instances each
+holding one card, N requests genuinely concurrent.
 
-```erlang
-{ok, #{devices := Devs}} = bitcask_llama_nifs:backend_info(),
-Gpus = [D || #{type := gpu} = D <- Devs],
-[bitcask_embedder_server:start_link(
-   {local, list_to_atom("emb_" ++ integer_to_list(I))},
-   #{provider => {custom, bitcask_embedder_llama},
-     config   => #{model_path => Path, pooling => last,
-                   n_ctx => 512, gpu_index => I}})
- || I <- lists:seq(0, length(Gpus) - 1)].
+```
+   request A → worker_0 → [card 0: all layers]
+   request B → worker_1 → [card 1: all layers]     ← genuinely concurrent
+   request C → worker_2 → [card 2: all layers]
 ```
 
-Each process holds its own copy of the weights in VRAM (0.6B Q8_0 ≈ 640 MB; most
-cards fit several). Dispatch round-robin or pick-an-idle-one above that.
+Per-card VRAM is still **one** copy of the weights (each on its own card), not N
+copies stacked on one card.
 
-| Option | Default | Meaning |
-|---|---|---|
-| `gpu_index` | `0` | Which card within the selected family. `all` = every card (only meaningful with `split_mode /= none`) |
-| `split_mode` | `none` | `none` (single card) \| `layer` \| `row`. Use the latter two only when **a large model does not fit on one card** |
+```erlang
+{bitcask, [{embedder,
+    #{name      => my_embedder,
+      provider  => {custom, bitcask_embedder_llama},
+      instances => [0, 1, 2, 3],     %% 4 cards, one instance each
+      config    => #{model_path => <<"...gguf">>, pooling => last}}}]}.
+```
 
-> ⚠️ An out-of-range `gpu_index` (you wrote 2 but there are only 2 cards) returns
-> `{error, {bad_gpu_index, _}}` and does **not** silently fall back to CPU — that
-> would pile the whole worker pool onto the CPU with nobody noticing.
+`instances` accepts **only an explicit list of cards (or card groups)**:
+
+| Form | Meaning |
+|---|---|
+| `[0, 1, 2, 3]` | 4 instances, one card each (model fits on one card — **preferred**) |
+| `[[0,1], [2,3]]` | 2 instances, each spanning 2 cards (when it does not fit) |
+| `[[0,1,2,3]]` | 1 instance across 4 cards (very large model; degenerates to no concurrency) |
+
+The flat form is shorthand for "one card per group". A group larger than one card
+switches `split_mode` to `layer` by default; override it explicitly in `config`.
+⚠️ `split_mode => none` with several cards is self-contradictory and is rejected
+outright (rather than quietly using only the first card).
+
+> ⚠️ **There is deliberately no `auto`** (size the pool from the machine's card
+> count): on a shared box other tenants use the GPUs too, and an embedded library
+> should not claim every card by default. The deployment states which ones.
+>
+> ⚠️ The same card appearing in two instances is rejected — two copies of the
+> weights fighting over one card's VRAM, whose only symptom is mysterious OOM or
+> slowness.
+
+**No coordinator on the hot path.** `bitcask_embedder_pool` is a **supervisor**
+and forwards no `embed`: workers register under stable names (`my_embedder_0` /
+`_1` / …) and callers **talk to a worker directly**. Routing through a process
+that `gen_server:call`s the workers would make that process the new serialization
+point, and the N workers would be pointless. Which worker: the one with the
+shortest message queue (workers are serial, so queue length *is* the work owed).
+
+> ⚠️ **Startup is sequential**: the supervisor starts children in order and each
+> loads its model synchronously in `init`. N instances = N loads (542 ms measured
+> for 0.6B, so ≈ 4.3 s for 8 cards; tens of seconds for an 8B model). This was
+> deliberately *not* made parallel or lazy — that would let a worker's startup
+> failure bypass the supervisor's start-time check, and the "a configured
+> embedder that fails to start kills the application" policy depends on
+> synchronous start-time failure. Capacity traded for determinism.
+
+#### When it does not fit on one card
+
+Three ways out, in order of preference:
+
+1. **Partial offload (single card, preferred)** — give `n_gpu_layers => N` an
+   explicit number: fit as many layers as you can and leave the rest on CPU.
+   Getting 80% of the layers on the GPU usually captures most of the speedup.
+2. **Model parallelism (across cards)** — `instances => [[0,1]]`, one instance
+   spanning 2 cards. The cost is that this group serves one request at a time:
+   concurrency traded for capacity.
+3. **A smaller quantization** — Q8 → Q4 halves the VRAM. That is your call; the
+   library does not make it for you.
+
+A **coarse pre-check** runs before loading (GGUF file size vs the group's total
+free VRAM) and reports early when it clearly will not fit:
+
+```erlang
+{error, {model_too_large, <<"GGUF is 8.2 GiB but the selected 1 GPU(s) have 5.6 GiB free. "
+                            "Options: n_gpu_layers => N ... or split_mode => layer ...">>}}
+```
+
+> ⚠️ **It is only a coarse check, not a precise prediction, and it is never used
+> to pick `n_gpu_layers` automatically.** llama's real footprint also includes the
+> compute buffer and KV cache, both of which scale with `n_ctx` / `n_batch`. Its
+> job is to stop you early when it obviously will not fit and point at the ways
+> out — the real verdict is still llama's own attempt. Auto-computing N would risk
+> silently offloading a few layers too few: another slowness nobody notices.
+>
+> Without this check, "does not fit" shows up as: llama OOMs → the fallback
+> retries with `ngl=0` → **the whole model goes back to CPU**, throwing away the
+> 90% of layers that would have fitted.
 
 #### Two deployment facts
 
@@ -428,7 +489,7 @@ When VRAM is insufficient the NIF **falls back to CPU rather than erroring**
 | `n_ctx` | `2048` | **A performance knob**, see §6 |
 | `n_threads` | `max(1, available cores - 2)` | See §6 |
 | `backend` | `auto` | `auto` (CUDA > Vulkan > CPU) \| `cuda` \| `vulkan` \| `cpu`. See §3.4 |
-| `gpu_index` | `0` | Which card to bind; use data parallelism for multi-GPU, see §3.4 |
+| `gpu_index` | `0` | Which card to bind; also a group `[0,1]` or `all`. Multi-GPU: see §3.4 |
 | `split_mode` | `none` | `none` \| `layer` \| `row`. Latter two only when a large model does not fit one card |
 | `n_gpu_layers` | `auto` | Offload everything if there is a GPU, else 0. See §3.4 |
 | `dim` | — | If given, checked against the model's actual dimension; mismatch is an error |
@@ -575,6 +636,8 @@ default they are all swallowed, keeping only the most recent error for
 | Local embedding an order of magnitude slow | `n_threads` oversubscribed, see §6 |
 | GPU configured but still slow | Check `fell_back_to_cpu` / `gpu_fallback_reason` from `info/1`, see §3.4 |
 | `gpu_status()` returns `cpu_only_build` | No CUDA in the package — **rebuild**; installing a driver will not help |
+| `{error, {model_too_large, _}}` | Does not fit on one card — see the three ways out in §3.4 |
+| `{error, {bad_opt, {instances, duplicate_gpu}}}` | The same card appears in two instances |
 | `{error, {bad_gpu_index, _}}` | `gpu_index` exceeds this machine's card count — size the pool from `backend_info()`'s device list |
 | `{error, {bad_backend, _}}` / `{error, {bad_split_mode, _}}` | Values are auto\|cuda\|vulkan\|cpu / none\|layer\|row |
 | `gpu_status()` returns `no_gpu_device` | CUDA is in the package but no GPU here — driver / container passthrough / dependency resolution; run `scripts/detect-llama-backends.sh --runtime` |

@@ -62,6 +62,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
+#include <sys/stat.h>
 #include <mutex>
 #include <new>
 #include <string>
@@ -258,7 +260,8 @@ bool iequals(const char* a, const char* b) {
 //   "cuda" / "vulkan" —— 只用指定族；该族没有设备就退回 CPU（并说明）。
 //   "cpu"  —— 不用任何 GPU。
 //
-// gpu_index：在选中族内取第几张卡。< 0 表示"全都要"（模型并行，见下）。
+// indexes：在选中族内取哪几张卡（**卡组**）。空 = {0}（第一张）；{-1} = 全都要。
+//           组内多于一张时才谈得上模型并行，由 split_mode 决定怎么切。
 //
 // ⚠️ **多卡默认只用一张，这是有意的。**
 //    llama 的 split_mode 默认是 LAYER —— 把模型的层切分到所有传进去的设备上。
@@ -272,7 +275,7 @@ bool iequals(const char* a, const char* b) {
 //
 // 返回选中的设备（NULL 结尾由调用方补），并回填实际选中的族名。
 std::vector<ggml_backend_dev_t> select_devices(const std::string& pref,
-                                               int32_t gpu_index,
+                                               const std::vector<int32_t>& indexes,
                                                std::string& chosen_family) {
     chosen_family.clear();
     std::vector<ggml_backend_dev_t> out;
@@ -291,11 +294,18 @@ std::vector<ggml_backend_dev_t> select_devices(const std::string& pref,
         return v;
     };
 
-    // gpu_index >= 0 时只留那一张；越界返回空（上层会报 bad_gpu_index）。
-    auto narrow = [&](std::vector<ggml_backend_dev_t> v) {
-        if (gpu_index < 0) return v;                       // 全都要（模型并行）
-        if (static_cast<size_t>(gpu_index) >= v.size()) return std::vector<ggml_backend_dev_t>{};
-        return std::vector<ggml_backend_dev_t>{v[static_cast<size_t>(gpu_index)]};
+    // 按 indexes 收窄。⚠️ 顺序按 indexes 给的来，不按枚举顺序——调用方写
+    //    [2,0] 就是想让 2 号做 main_gpu，那是它的事。
+    //    任一越界返回空清单，上层报 bad_gpu_index（不静默退 CPU：那会让整池
+    //    worker 都挤在 CPU 上而没人发现）。
+    auto narrow = [&](std::vector<ggml_backend_dev_t> v) -> std::vector<ggml_backend_dev_t> {
+        if (indexes.size() == 1 && indexes[0] < 0) return v;   // {-1} = 全都要
+        std::vector<ggml_backend_dev_t> picked;
+        for (int32_t idx : indexes) {
+            if (idx < 0 || static_cast<size_t>(idx) >= v.size()) return {};
+            picked.push_back(v[static_cast<size_t>(idx)]);
+        }
+        return picked;
     };
 
     if (pref == "auto") {
@@ -619,14 +629,25 @@ ERL_NIF_TERM nif_model_load(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     }
 
     std::string path, backend_pref, split_pref;
-    int pooling = -1, n_threads = 0, n_ctx_req = 0, n_gpu_layers = 0, gpu_index = 0;
+    int pooling = -1, n_threads = 0, n_ctx_req = 0, n_gpu_layers = 0;
+    std::vector<int32_t> gpu_indexes;
     if (!get_bin_str(env, argv[0], path))          return enif_make_badarg(env);
     if (!enif_get_int(env, argv[1], &pooling))     return enif_make_badarg(env);
     if (!enif_get_int(env, argv[2], &n_threads))   return enif_make_badarg(env);
     if (!enif_get_int(env, argv[3], &n_ctx_req))   return enif_make_badarg(env);
     if (!enif_get_int(env, argv[4], &n_gpu_layers))return enif_make_badarg(env);
     if (!get_bin_str(env, argv[5], backend_pref))  return enif_make_badarg(env);
-    if (!enif_get_int(env, argv[6], &gpu_index))   return enif_make_badarg(env);
+    {   // argv[6]：卡组（int 列表）。空列表 = {0}。
+        ERL_NIF_TERM list = argv[6], head, tail;
+        while (enif_get_list_cell(env, list, &head, &tail)) {
+            int v = 0;
+            if (!enif_get_int(env, head, &v)) return enif_make_badarg(env);
+            gpu_indexes.push_back(v);
+            list = tail;
+        }
+        if (!enif_is_empty_list(env, list)) return enif_make_badarg(env);
+        if (gpu_indexes.empty()) gpu_indexes.push_back(0);
+    }
     if (!get_bin_str(env, argv[7], split_pref))    return enif_make_badarg(env);
     if (path.empty()) return mk_err(env, "empty_path");
     if (backend_pref.empty()) backend_pref = "auto";
@@ -650,21 +671,71 @@ ERL_NIF_TERM nif_model_load(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         return mk_err_msg(env, "bad_split_mode",
                           "split_mode must be none | layer | row, got: " + split_pref);
     }
-    // split_mode /= none 才有理由要多张卡；none 下 gpu_index<0 没有意义。
-    if (split_pref == "none" && gpu_index < 0) gpu_index = 0;
+    // ⚠️ split_mode=none 是**单卡**语义，给了多张卡是自相矛盾的配置——当场拒绝，
+    //    不要默默只用第一张（那会让"我配了 4 张卡"变成一句空话）。
+    if (split_pref == "none" && gpu_indexes.size() > 1) {
+        return mk_err_msg(env, "bad_split_mode",
+                          "split_mode=none is single-GPU but " +
+                          std::to_string(gpu_indexes.size()) +
+                          " GPUs were given; use split_mode=layer|row for model "
+                          "parallelism, or one GPU per instance for data parallelism");
+    }
 
     std::string chosen_family;
     std::vector<ggml_backend_dev_t> devs =
-        select_devices(backend_pref, gpu_index, chosen_family);
+        select_devices(backend_pref, gpu_indexes, chosen_family);
 
-    // ⚠️ 把"卡不够"与"根本没有卡"分开：前者是配置错（写了 gpu_index=3 但只有
-    //    2 张），静默退回 CPU 会让整池 worker 都挤在 CPU 上而没人发现。
-    if (devs.empty() && gpu_index > 0) {
+    // ------------------------------------------------------------------
+    // 装不下的**提前粗检**。
+    //
+    // 不做这一步的话，"模型比显存大"的表现是：llama OOM → 我们的回落重试
+    // ngl=0 → **整体退回纯 CPU**。而 90% 的层本来装得下，只因最后 10% 放不下
+    // 就把整个模型挪回 CPU，中间那一大截被跳过了。
+    //
+    // ⚠️ **这只是粗检，不是精确预测，也绝不用它去自动决定 n_gpu_layers。**
+    //    llama 的实际占用还包括 compute buffer 与 KV cache，都随 n_ctx /
+    //    n_batch 变。这里比的是 GGUF 文件大小 vs 组内可用显存之和 —— 只在
+    //    「明显装不下」时提前拦住并指出两条出路。真正的判据仍然是 llama 自己
+    //    那次尝试（算错的代价是静默地少卸载几层，又是一种没人发现的慢）。
+    // ------------------------------------------------------------------
+    if (!devs.empty() && n_gpu_layers != 0) {
+        struct stat st {};
+        if (::stat(path.c_str(), &st) == 0 && st.st_size > 0) {
+            uint64_t free_sum = 0;
+            for (ggml_backend_dev_t d : devs) {
+                size_t f = 0, t = 0;
+                ggml_backend_dev_memory(d, &f, &t);
+                free_sum += f;
+            }
+            const uint64_t need = static_cast<uint64_t>(st.st_size);
+            if (free_sum > 0 && need > free_sum) {
+                char buf[512];
+                std::snprintf(buf, sizeof buf,
+                    "GGUF is %.1f GiB but the selected %zu GPU(s) have %.1f GiB free. "
+                    "Options: n_gpu_layers => N (partial offload, keep the rest on CPU), "
+                    "or split_mode => layer across more GPUs, or a smaller quantization. "
+                    "Set n_gpu_layers => 0 to force CPU and silence this.",
+                    need / 1073741824.0, devs.size(), free_sum / 1073741824.0);
+                return mk_err_msg(env, "model_too_large", buf);
+            }
+        }
+    }
+
+    // ⚠️ 把"卡不够"与"根本没有卡"分开：前者是配置错（写了 3 号卡但只有 2 张），
+    //    静默退回 CPU 会让整池 worker 都挤在 CPU 上而没人发现。
+    if (devs.empty() && backend_pref != "cpu") {
         const int32_t have = family_gpu_count(backend_pref);
-        if (have > 0) {
+        bool asked_specific = !(gpu_indexes.size() == 1 &&
+                                (gpu_indexes[0] == 0 || gpu_indexes[0] < 0));
+        if (have > 0 && asked_specific) {
+            std::string want;
+            for (size_t i = 0; i < gpu_indexes.size(); i++) {
+                if (i) want += ",";
+                want += std::to_string(gpu_indexes[i]);
+            }
             return mk_err_msg(env, "bad_gpu_index",
-                              "gpu_index=" + std::to_string(gpu_index) +
-                              " but only " + std::to_string(have) +
+                              "gpu_indexes=[" + want + "] but only " +
+                              std::to_string(have) +
                               " GPU(s) available for backend=" + backend_pref);
         }
     }
@@ -827,10 +898,13 @@ ERL_NIF_TERM nif_model_load(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     r->backend_requested = backend_pref;
     r->backend_chosen    = (n_gpu_dev > 0 && !fell_back) ? chosen_family : std::string();
     if (n_gpu_dev > 0 && !fell_back) {
-        r->gpu_index_used = gpu_index;
-        r->gpu_device     = dev_backend_name(devs[0]);
-        const char* dn = ggml_backend_dev_name(devs[0]);
-        if (dn) r->gpu_device = dn;
+        r->gpu_index_used = gpu_indexes.empty() ? 0 : gpu_indexes[0];
+        // 组内所有设备名，逗号分隔——模型并行时"到底占了哪几张卡"必须可查。
+        for (size_t i = 0; i < devs.size(); i++) {
+            const char* dn = ggml_backend_dev_name(devs[i]);
+            if (i) r->gpu_device += ",";
+            r->gpu_device += dn ? dn : "";
+        }
     }
     r->gpu_layers_requested = n_gpu_layers_req;
     if (backend_pref == "cpu") {

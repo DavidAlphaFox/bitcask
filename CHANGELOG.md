@@ -51,6 +51,30 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
   **一条串行**的请求路径上。嵌入要的是数据并行——按 `backend_info/0` 的设备表开
   N 个 embedder 进程、各绑一张卡。`gpu_index` 越界报 `{error,{bad_gpu_index,_}}`，
   不静默退回 CPU（那会让整池 worker 挤在 CPU 上没人发现）。
+- **多卡数据并行池** `bitcask_embedder_pool`：N 个 embedder 进程，**一卡跑全部
+  layer、一个 instance 占一卡**，N 个请求真并发。application env 加
+  `instances => [0,1,2,3]`（或 `[[0,1],[2,3]]` 卡组，用于单卡装不下时）。
+  ⚠️ **不是把 layer 切到多张卡上**：llama 的 `split_mode` 默认 `LAYER`，对嵌入
+  模型是反优化——0.6B 一张卡装得下，切开只多出跨卡传输，而且**一个
+  `llama_context` 同时只服务一次前向**，切完之后 N 张卡仍然只在处理 1 个请求。
+  ⚠️ **协调者不在热路径上**：池是个 **supervisor**，不转发任何 `embed`。worker
+  用稳定注册名注册，调用方（proxy）拿到名字列表后**直接打 worker**，中间零跳；
+  让一个进程去 `gen_server:call` worker 的话，它自己就成了新的串行点。派发取
+  消息队列最短的 worker（worker 串行，队列长度就是它欠的活）。
+  ⚠️ **只接受显式卡列表，不提供 `auto`**：共享机器上别的租户也在用 GPU，一个被
+  嵌入的库默认把整机的卡全占了不合适。同一张卡出现在两个 instance 里会被拒绝。
+  ⚠️ **启动是串行的**（N 次模型加载，0.6B 实测 542 ms/次）。故意没做并行/懒加载
+  ——那样 worker 的启动失败会绕过 supervisor 的启动期检查，而"配了 embedder 却
+  起不来就让 application 死"这条策略正是靠启动期同步失败才成立的。
+- **`split_mode` 提为显式配置项**（`none` | `layer` | `row`）+ `gpu_index` 支持
+  **卡组**（`[0,1]`）。组内多于一张卡时 `split_mode` 缺省自动变 `layer`；
+  ⚠️ `split_mode => none` 配多张卡是自相矛盾，当场拒绝而不是默默只用第一张。
+- **装不下的提前粗检**：加载前比 GGUF 文件大小与组内可用显存，明显装不下时报
+  `{error, {model_too_large, _}}` 并列出三条出路（部分卸载 `n_gpu_layers => N` /
+  跨卡 `instances => [[0,1]]` / 换量化档）。
+  ⚠️ 只是粗检，**绝不用它自动决定 `n_gpu_layers`**——llama 的实际占用还含 compute
+  buffer 与 KV cache，算错的代价是静默少卸载几层。不做这一步的话，装不下的表现
+  是 llama OOM → 回落 `ngl=0` → **整体退回纯 CPU**，90% 本来装得下的层白白挪回去。
 - **构建期 / 运行期分离诊断**：构建期事实（编没编 CUDA / Vulkan、toolkit 版本、
   架构列表）烧进 `.so` 由 `build_info/0` 自报；运行期事实由 `backend_info/0` 给
   （设备表带 `type` / `backend` / 显存）；`gpu_status/0` 把两者对到一起产出

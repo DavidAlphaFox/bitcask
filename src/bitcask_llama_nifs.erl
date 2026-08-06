@@ -207,8 +207,11 @@ gpu_status() ->
 %%                    ⚠️ **必须只选一族**：CUDA 与 Vulkan 同时编进包里时，两者
 %%                       各自枚举同一张物理卡，全都用上等于把一张卡当成两张去
 %%                       切分模型层——显存重复占用 + 莫名其妙的慢/OOM，而且不报错。
-%%     gpu_index    — 默认 0 = 绑选中族里的第 0 张卡。`all` = 全部卡（仅在
-%%                    split_mode /= none 时有意义）。
+%%     gpu_index    — 默认 0 = 绑选中族里的第 0 张卡。也可给**卡组**
+%%                    （`[0,1]` = 这个句柄横跨 0/1 两张卡），或 `all` = 全部。
+%%                    ⚠️ 卡组多于一张时 split_mode 缺省自动变成 `layer`——
+%%                       `none` 是单卡语义，配多张卡是自相矛盾，会被当场拒绝
+%%                       （而不是默默只用第一张，那会让"我配了 4 张卡"成为空话）。
 %%                    ⚠️ **多卡机器上默认只用一张，这是有意的**：llama 的
 %%                       split_mode 默认把模型的层切到所有卡上，对嵌入模型是
 %%                       反优化（0.6B 一张卡装得下，切开只多出跨卡传输，还把
@@ -217,8 +220,9 @@ gpu_status() ->
 %%                       卡（`gpu_index => 0|1|2…`），N 路并发。
 %%                    ⚠️ 越界（写了 2 但只有 2 张卡）报 {error,{bad_gpu_index,_}}，
 %%                       不静默退回 CPU——那会让整池 worker 都挤在 CPU 上没人发现。
-%%     split_mode   — none（默认，单卡）| layer | row。只有大模型单卡装不下时
-%%                    才用后两个（模型并行）。
+%%     split_mode   — none（单卡，缺省当卡组只有一张时）| layer | row。
+%%                    只有**大模型单卡装不下**时才用后两个（模型并行）——那时
+%%                    这一组卡同时只服务一个请求，是拿并发换容量。
 %%     n_gpu_layers — 默认 auto：有 GPU 就全部层卸载到显存，没有就 0。
 %%                    也可给具体数字，或 0 = 强制纯 CPU。
 %%                    ⚠️ 显存不够时会**自动回落纯 CPU 而不是报错**（宁可慢也别
@@ -239,12 +243,19 @@ model_load(Path, Opts) when is_binary(Path), is_map(Opts) ->
     Backend = atom_to_binary(maps:get(backend, Opts, auto), utf8),
     %% 多卡：默认绑第 0 张（单卡 NONE）。gpu_index 让上层按设备表开池，
     %% 一卡一句柄 = 数据并行。split_mode 非 none 才是模型并行（大模型单卡装不下）。
-    GpuIdx  = case maps:get(gpu_index, Opts, 0) of
-                  all              -> -1;
-                  I when is_integer(I) -> I
+    %% 卡组：整数 = 单卡简写；列表 = 卡组；all = 全部（模型并行）。
+    Gpus    = case maps:get(gpu_index, Opts, 0) of
+                  all                     -> [-1];
+                  I when is_integer(I)    -> [I];
+                  L when is_list(L)       -> L
               end,
-    Split   = atom_to_binary(maps:get(split_mode, Opts, none), utf8),
-    model_load(Path, Pooling, Threads, NCtx, Ngl, Backend, GpuIdx, Split).
+    %% split_mode 缺省按卡组大小推：一张卡 = none（单卡跑全部层），多张卡 =
+    %% layer（模型并行）。显式给了就以显式为准。
+    Split   = atom_to_binary(
+                maps:get(split_mode, Opts,
+                         case length(Gpus) > 1 of true -> layer; false -> none end),
+                utf8),
+    model_load(Path, Pooling, Threads, NCtx, Ngl, Backend, Gpus, Split).
 
 %% 留 2 核：见 model_load/2 的注释。核数拿不到时退到 1（宁可慢，也不要因为
 %% 超订而慢一个数量级——下面那张表说明代价是不对称的）。

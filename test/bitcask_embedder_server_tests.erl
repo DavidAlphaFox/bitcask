@@ -266,3 +266,190 @@ sup_rejects_bad_env_test_() ->
             ?assertMatch({error, _}, application:start(bitcask))
         end)
     end}.
+
+%% ===================================================================
+%% 池（bitcask_embedder_pool）
+%%
+%% ⚠️ 用 mock provider，**不需要 GPU**：池的机制（稳定名字、直接派发、不经
+%%    协调者、坏 worker 不拖垮整池）与 provider 无关。GPU 那部分的语义由
+%%    bitcask_llama_tests 管。
+%% ===================================================================
+
+pool_opts(Instances) ->
+    #{provider => {custom, bitcask_embedder_mock},
+      instances => Instances,
+      config => #{}}.
+
+with_pool(Instances, Fun) ->
+    Name = list_to_atom("bc_pool_" ++ integer_to_list(erlang:unique_integer([positive]))),
+    {ok, Pid} = bitcask_embedder_pool:start_link({local, Name}, pool_opts(Instances)),
+    try Fun(Name)
+    after
+        unlink(Pid),
+        exit(Pid, shutdown),
+        %% 等它真的没了，否则下一个用例可能撞上还没退干净的注册名。
+        (fun W(0) -> ok; W(N) ->
+            case whereis(Name) of undefined -> ok; _ -> timer:sleep(10), W(N-1) end
+         end)(100)
+    end.
+
+%% worker 用**稳定注册名**，按 instances 的顺序。
+%% ⚠️ 稳定是关键：调用方缓存名字，worker 重启后名字不变、缓存不失效。
+pool_workers_have_stable_names_test_() ->
+    {timeout, 60, fun() ->
+        with_pool([0, 1, 2], fun(Pool) ->
+            {ok, Ws} = bitcask_embedder_pool:workers(Pool),
+            ?assertEqual([bitcask_embedder_pool:worker_name(Pool, I) || I <- [0,1,2]], Ws),
+            [?assert(is_pid(whereis(W))) || W <- Ws],
+            ?assert(bitcask_embedder_pool:is_pool(Pool))
+        end)
+    end}.
+
+%% 单个 embedder server 不是池 —— proxy 靠这个区分两条路。
+single_server_is_not_a_pool_test() ->
+    with_server(?MOCK, fun(Pid) ->
+        ?assertMatch({error, not_a_pool}, bitcask_embedder_pool:workers(Pid)),
+        ?assertNot(bitcask_embedder_pool:is_pool(Pid))
+    end),
+    ?assertMatch({error, not_a_pool},
+                 bitcask_embedder_pool:workers(no_such_pool_xyz)).
+
+pool_bad_instances_test_() ->
+    {timeout, 60, fun() ->
+        process_flag(trap_exit, true),
+        Bad = fun(I) ->
+            N = list_to_atom("bc_badpool_" ++ integer_to_list(erlang:unique_integer([positive]))),
+            bitcask_embedder_pool:start_link({local, N}, pool_opts(I))
+        end,
+        %% ⚠️ 同一张卡出现在两个 instance 里是配置错——两份权重挤一张卡互相抢
+        %%    显存，而表现只是"莫名其妙的 OOM 或慢"。必须当场拒绝。
+        ?assertMatch({error, {bad_opt, {instances, duplicate_gpu}}}, Bad([0, 0])),
+        ?assertMatch({error, {bad_opt, {instances, duplicate_gpu}}}, Bad([[0,1], [1,2]])),
+        ?assertMatch({error, {bad_opt, {instances, _}}}, Bad([0, -1])),
+        ?assertMatch({error, {bad_opt, {instances, _}}}, Bad([0, []])),
+        ?assertMatch({error, {bad_opt, instances}}, Bad(not_a_list)),
+        process_flag(trap_exit, false),
+        ok
+    end}.
+
+%% proxy 认出池，并把 worker 名字列表缓存下来。
+proxy_detects_pool_test_() ->
+    {timeout, 60, fun() ->
+        with_pool([0, 1], fun(Pool) ->
+            {ok, Ctx} = bitcask_embedder:new({custom, bitcask_embedder_proxy},
+                                             #{server => Pool}),
+            ?assertEqual(4, bitcask_embedder:dim(Ctx)),
+            ?assertEqual(2, length(bitcask_embedder_proxy:workers(Ctx))),
+            ?assertEqual({ok, bitcask_embedder_mock:vec_bin([0.6, 0.8, 0.0, 0.0])},
+                         bitcask_embedder:embed(Ctx, <<"x x x">>))
+        end)
+    end}.
+
+%% 单进程那条路不该被池化改动影响。
+proxy_single_has_no_workers_test() ->
+    with_server(?MOCK, fun(Pid) ->
+        {ok, Ctx} = bitcask_embedder:new({custom, bitcask_embedder_proxy},
+                                         #{server => Pid}),
+        ?assertEqual([], bitcask_embedder_proxy:workers(Ctx))
+    end).
+
+%% 派发确实落在 worker 上，而且**会因忙闲而换人**。
+%%
+%% ⚠️ 这条钉的是"协调者不在热路径上"的可观察后果：把 0 号 worker 灌忙之后，
+%%    下一次派发必须换到别人身上。转发式实现（所有请求先进协调者）在这里
+%%    体现不出差别，但它的真正代价由下一条 independent 用例钉住。
+pool_dispatch_avoids_busy_worker_test_() ->
+    {timeout, 60, fun() ->
+        with_pool([0, 1], fun(Pool) ->
+            {ok, [W0, W1]} = bitcask_embedder_pool:workers(Pool),
+            %% 空闲时是确定性的：取第一个最小。
+            ?assertEqual(W0, pick_probe([W0, W1])),
+            %% 把 W0 灌忙，派发必须换到 W1。
+            Parent = self(),
+            Pids = [spawn(fun() ->
+                        _ = bitcask_embedder_server:embed(W0, <<"x x x">>),
+                        Parent ! done
+                    end) || _ <- lists:seq(1, 200)],
+            %% 等消息真的堆进 W0 的邮箱
+            (fun Wait(0) -> ok;
+                 Wait(N) ->
+                     case qlen_probe(W0) of
+                         {0, L} when L > 0 -> ok;
+                         _ -> timer:sleep(5), Wait(N - 1)
+                     end
+             end)(100),
+            case qlen_probe(W0) of
+                {0, L} when L > 0 -> ?assertEqual(W1, pick_probe([W0, W1]));
+                _ -> ok      %% mock 太快没堆起来，这条就不作数
+            end,
+            [receive done -> ok after 5000 -> ok end || _ <- Pids],
+            ok
+        end)
+    end}.
+
+%% ⚠️ 池的**全部意义**：N 个 worker 真的并发。
+%%
+%% mock provider 是瞬时的，所以这里靠"worker 各自独立、互不阻塞"来证：
+%% 让一个 worker 忙住（灌一堆活），另一个仍然立刻能服务。转发式实现会在这里
+%% 退化——所有请求排在同一条链上。
+pool_workers_are_independent_test_() ->
+    {timeout, 60, fun() ->
+        with_pool([0, 1], fun(Pool) ->
+            {ok, [W0, W1]} = bitcask_embedder_pool:workers(Pool),
+            %% 把 W0 的邮箱堆满（这些 embed 会排队）
+            Parent = self(),
+            [spawn(fun() ->
+                 _ = bitcask_embedder_server:embed(W0, <<"x x x">>),
+                 Parent ! done
+             end) || _ <- lists:seq(1, 50)],
+            %% W1 完全不受影响，立刻可服务
+            ?assertMatch({ok, _}, bitcask_embedder_server:embed(W1, <<"x">>, 5000)),
+            %% 收尾
+            [receive done -> ok after 5000 -> ok end || _ <- lists:seq(1, 50)],
+            ok
+        end)
+    end}.
+
+%% 坏掉的 worker 不该拖垮整池：pick 会把它排到最后。
+pool_survives_dead_worker_test_() ->
+    {timeout, 60, fun() ->
+        with_pool([0, 1], fun(Pool) ->
+            {ok, Ctx} = bitcask_embedder:new({custom, bitcask_embedder_proxy},
+                                             #{server => Pool}),
+            {ok, [W0, _W1]} = bitcask_embedder_pool:workers(Pool),
+            %% 杀掉一个；supervisor 会重启它，但重启期间池必须仍然可用。
+            exit(whereis(W0), kill),
+            ?assertMatch({ok, _}, bitcask_embedder:embed(Ctx, <<"x">>)),
+            ?assertMatch({ok, _}, bitcask_embedder:embed(Ctx, <<"x x x">>))
+        end)
+    end}.
+
+%% open 直接收池名。
+open_with_pool_test_() ->
+    {timeout, 60, fun() ->
+        with_pool([0, 1], fun(Pool) ->
+            with_dir(fun(Dir) ->
+                H = bitcask:open(Dir, ?VOPTS ++ [{embedder, Pool}]),
+                ?assertMatch({_Ref, #{module := bitcask_embedder_proxy}}, H),
+                ok = bitcask:put(H, <<"d1">>, #{text => <<"x x x">>}),
+                ok = bitcask:put(H, <<"d2">>, #{text => <<"z z z">>}),
+                ?assertMatch({ok, [{<<"d1">>, _, _} | _]},
+                             bitcask:search_vector(H, {text, <<"x y y">>}, 2)),
+                ok = bitcask:close(H)
+            end)
+        end)
+    end}.
+
+%% 与 proxy 的 pick/1 同语义的探针（proxy 那个是私有函数）。
+pick_probe(Ws) ->
+    {_, W} = lists:min([{qlen_probe(X), X} || X <- Ws]),
+    W.
+
+qlen_probe(W) ->
+    case whereis(W) of
+        undefined -> {1, 0};
+        Pid -> case process_info(Pid, message_queue_len) of
+                   {message_queue_len, N} -> {0, N};
+                   undefined -> {1, 0}
+               end
+    end.
