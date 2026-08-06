@@ -490,8 +490,22 @@ worker 喂，K 张卡里同时只有一张在算。某个 worker 那一段失败
 
 `embed_batch/2` 是 `bitcask_embedder` 的**可选**回调。provider 没实现时框架自动
 退化成逐条 `embed/2`，结果形状完全一致——调用方不必知道 provider 支不支持。
-目前只有 llama 后端实现了原生批量；HTTP 档（openai 的 `/v1/embeddings` 接受数组）
-是个自然的候选，还没做。
+
+**HTTP 档（`openai` / `anthropic`）也实现了原生批量**：一次请求带一个数组，
+`max_batch`（默认 64）控制一次最多几条（端点对数组长度与总 token 都有上限，超了
+是**整个请求**失败，所以按它切块）。
+
+> ⚠️ **响应按 `index` 字段归位，不按返回顺序 zip。** OpenAI 兼容响应的每个对象
+> 都带 `index`，而"data 与 input 同序"只是常见实现的行为、不是协议保证
+> （vLLM / TEI / llama.cpp server 各家不同，并发实现尤其容易乱序）。按顺序 zip
+> 的后果是**把向量配到别的文档上**——不报错、维度也对，只是检索结果从此不对，
+> 而且查不出来。index 不是 `0..N-1` 的排列时宁可整批报错，也不猜映射。
+>
+> ⚠️ 空串在客户端就挡掉，不发给端点：OpenAI 兼容端点对数组里的空串会让**整个
+> 请求**报 400，一条空文档就把同批的另外 63 条一起废掉。
+
+解析逻辑是纯函数（`bitcask_embedder_util:parse_embedding_batch/3`），有不打网络的
+单测（`test/bitcask_embedder_util_tests.erl`）——包括故意乱序返回的那一条。
 
 
 ---

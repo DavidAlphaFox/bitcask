@@ -26,7 +26,7 @@
 -behaviour(bitcask_embedder).
 
 %% Provider behaviour API
--export([init/1, embed/2]).
+-export([init/1, embed/2, embed_batch/2]).
 
 %% 可选项默认值（均为正整数；可在 new/2 的 Opts 里覆盖，缺省用这些）：
 %%   max_input_bytes    — embed 前输入的字节级保守上限，约对应 32K token
@@ -87,30 +87,27 @@ validate_limits(Opts) ->
 %% ===================================================================
 
 -spec embed(map(), binary()) -> {ok, binary()} | {error, term()}.
-embed(#{url := Url, model := Model} = Cfg, Text) when is_binary(Text) ->
-    {ok, _} = application:ensure_all_started(inets),
-    MaxIn = maps:get(max_input_bytes, Cfg, ?DEFAULT_MAX_INPUT_BYTES),
-    Input = bitcask_embedder_util:truncate_utf8(Text, MaxIn),
-    Dim  = maps:get(dim, Cfg, undefined),
-    VDim = maps:get(vector_dim, Cfg, Dim),
-    Body0 = #{<<"model">> => Model, <<"input">> => Input},
-    Body1 = case is_integer(VDim) andalso VDim =/= Dim of
-                true  -> Body0#{<<"dimensions">> => VDim};
-                false -> Body0
-            end,
-    Headers = build_headers(maps:get(api_key, Cfg, undefined)),
-    Req = {Url, Headers, "application/json", iolist_to_binary(json_encode(Body1))},
-    HttpOpts = [{timeout, maps:get(timeout_ms, Cfg, ?DEFAULT_TIMEOUT_MS)},
-                {connect_timeout, maps:get(connect_timeout_ms, Cfg, ?DEFAULT_CONNECT_TIMEOUT_MS)}],
-    case httpc:request(post, Req, HttpOpts, [{body_format, binary}]) of
-        {ok, {{_, 200, _}, _Hdrs, RespBody}} ->
-            parse_embedding(RespBody, VDim);
-        {ok, {{_, Code, Reason}, _Hdrs, RespBody}} ->
-            {error, {http_status, Code, Reason, RespBody}};
-        {error, Reason} ->
-            {error, {http_error, Reason}}
-    end.
+embed(#{url := _, model := _} = Cfg, Text) when is_binary(Text) ->
+    bitcask_embedder_util:http_embed(
+      Cfg, Text, build_headers(maps:get(api_key, Cfg, undefined)),
+      ?DEFAULT_MAX_INPUT_BYTES).
 
+%% ===================================================================
+%% embed_batch/2（bitcask_embedder 的可选回调）—— 一次请求带一个数组
+%%
+%% ⚠️ 逐条结果，顺序与输入一一对应。响应按 `index` 字段归位，**不按返回顺序
+%%    zip** —— 详见 bitcask_embedder_util:parse_embedding_batch/3 的注释：
+%%    按顺序 zip 的后果是把向量配到别的文档上，不报错、维度也对。
+%%
+%% 可选项 max_batch（默认 64）：一次请求最多几条。端点对数组长度与总 token
+%% 都有上限，超了是**整个请求**失败，所以按它切块。
+%% ===================================================================
+-spec embed_batch(map(), [binary()]) ->
+          {ok, [{ok, binary()} | {error, term()}]} | {error, term()}.
+embed_batch(#{url := _, model := _} = Cfg, Texts) when is_list(Texts) ->
+    bitcask_embedder_util:http_embed_batch(
+      Cfg, Texts, build_headers(maps:get(api_key, Cfg, undefined)),
+      ?DEFAULT_MAX_INPUT_BYTES).
 %% ===================================================================
 %% Internal
 %% ===================================================================
@@ -126,26 +123,7 @@ build_headers(ApiKey) when is_list(ApiKey) ->
     [{"x-api-key", ApiKey},
      {"anthropic-version", "2023-06-01"}].
 
-%% 解析 Anthropic embedding 响应。
-%% 预期格式与 OpenAI 兼容：#{<<"data">> := [#{<<"embedding">> := [float()]}]}。
-%% 待 Anthropic 公布实际 API 后，按实际格式调整此处。
-parse_embedding(RespBody, Expect) ->
-    try json_decode(RespBody) of
-        #{<<"data">> := [#{<<"embedding">> := Floats} | _]} when is_list(Floats) ->
-            Got = length(Floats),
-            case Expect =:= undefined orelse Got =:= Expect of
-                true  -> {ok, << <<X:32/float-little>> || X <- Floats >>};
-                false -> {error, {dim_mismatch, Got, Expect}}
-            end;
-        Other ->
-            {error, {unexpected_response, Other}}
-    catch
-        _:Reason -> {error, {bad_json, Reason}}
-    end.
 
-%% OTP 27+ 内置 json。
-json_encode(Term) -> json:encode(Term).
-json_decode(Bin)  -> json:decode(Bin).
 
 to_bin(B) when is_binary(B) -> B;
 to_bin(L) when is_list(L)   -> list_to_binary(L).

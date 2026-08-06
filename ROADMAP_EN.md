@@ -135,6 +135,14 @@ callback, so providers without it fall back to sequential encoding transparently
 With a pool, a batch is split and dispatched concurrently across workers.
 ⚠️ `n_ctx` must be multiplied by `batch_size` (llama's `n_ctx` is shared across
 sequences), or enabling batching silently shrinks each text's usable length N-fold.
+The HTTP tier (openai / anthropic) implements native batching too: one request
+carries an array, chunked by `max_batch`. ⚠️ Responses are **placed by the `index`
+field, not zipped in return order** — zipping by order attaches vectors to the
+wrong documents with no error and correct dimensions. The two HTTP providers'
+formerly identical request/parse code moved into `bitcask_embedder_util`, with the
+parsing exposed as a pure function and 14 network-free unit tests added (it
+previously had only a manual, skipped-by-default case).
+
 **Off by default**: measured 7.0x on short texts and 2.9x on medium ones, but the
 measurement box had external load which inflates the ratio, and the long-text case
 has no trustworthy data — measure on your own hardware before enabling.
@@ -172,9 +180,6 @@ pre-filled with whichever switches it detected.
   box with external load, which inflates the ratio, and the long-text case has no
   conclusion. A re-measure on a quiet machine is needed before recommending a
   default.
-- **Native batching for the HTTP tier** (gated): OpenAI's `/v1/embeddings` accepts
-  an array; wiring it up would make one request cover many texts. Today it falls
-  back to one HTTP request per text.
 - **Real multi-GPU measurement** (gated): the pool mechanism is thoroughly tested
   with the mock provider, but **real GPU behaviour on a multi-card box has never
   been exercised** (no card on the development machine). The `gpu_index` range

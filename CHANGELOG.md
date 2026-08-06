@@ -68,6 +68,19 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
   **默认 `batch_size = 1`（不开）**：实测收益随文本变短而增大（短文本 7.0x、
   中文本 2.9x），但测量时机器上有别的满载进程，超订会放大批量摊薄的那部分开销，
   安静机器上倍数会小得多；长文本档没有可信数据。开之前在自己的硬件上量一遍。
+- **HTTP 档的原生批量**：`openai` / `anthropic` 的 `embed_batch/2` 一次请求带一个
+  数组，新增 `max_batch`（默认 64）切块（端点对数组长度与总 token 都有上限，超了
+  是**整个请求**失败）。
+  ⚠️ **响应按 `index` 字段归位，不按返回顺序 zip**——每个对象都带 `index`，而
+  "data 与 input 同序"只是常见实现的行为、不是协议保证。按顺序 zip 的后果是
+  **把向量配到别的文档上**：不报错、维度也对，只是检索结果从此不对且查不出来。
+  index 不是 `0..N-1` 的排列时整批报错，不猜映射。
+  ⚠️ 空串在客户端挡掉不发给端点——OpenAI 兼容端点对数组里的空串会让整个请求
+  400，一条空文档废掉同批另外 63 条。
+- **HTTP 档的请求/解析收进 `bitcask_embedder_util`**：openai 与 anthropic 的请求体、
+  超时、响应解析此前**完全一样**（只有认证 header 不同），现在只剩一份。解析做成
+  **纯函数并导出**，新增 `test/bitcask_embedder_util_tests.erl` 14 条不打网络的单测
+  ——这段路径此前只有一个默认跳过的手动用例（要真实端点），等于没测过。
 - **多卡数据并行池** `bitcask_embedder_pool`：N 个 embedder 进程，**一卡跑全部
   layer、一个 instance 占一卡**，N 个请求真并发。application env 加
   `instances => [0,1,2,3]`（或 `[[0,1],[2,3]]` 卡组，用于单卡装不下时）。
@@ -125,6 +138,12 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 - `backend_info/0` 的 devices 增加 `type`（`cpu`/`gpu`/`accel`），顶层增加
   `gpu_count`。
 - application env 增加 `{embedder, undefined}`（默认不启动 embedder 进程）。
+- `rebar.config` 增加 `{dialyzer, [{plt_extra_apps, [inets]}]}`，消掉
+  `httpc:request/4` 的 "Unknown function" 警告。
+  ⚠️ 用 `plt_extra_apps` 而**不是**把 `inets` 加进 `applications`：inets 只被
+  HTTP 档的 embedder 用到，而绝大多数部署不配 embedder，不该为此把它变成
+  bitcask 的启动依赖（用到时由 `application:ensure_all_started/1` 拉起）。
+  这一项只让 dialyzer 看得见它，**运行期依赖不变**。
 
 ### 修复
 
@@ -143,8 +162,9 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 
 ### 回归
 
-- `rebar3 eunit` **100/100**（其中 17 条本地嵌入 + 17 条 embedder 进程；NIF 未
-  构建时相关用例优雅跳过），`rebar3 xref` 干净。
+- `rebar3 eunit` **132/132**（23 条本地嵌入 + 31 条 embedder 进程/池/批量 +
+  14 条 HTTP 解析单测；NIF 未构建时相关用例优雅跳过），`rebar3 xref` 干净，
+  `rebar3 dialyzer` **零警告**。
 - **Vulkan 构建路径已实测**：开发机上有 Vulkan SDK（1.4.309），AUTO 探测到并
   编入，`priv/libggml-vulkan.so` 落地，运行期 `build_info` 自报
   `vulkan_built => true`。因为这台机器没有 GPU，`gpu_status/0` 给出的是

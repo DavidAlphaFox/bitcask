@@ -567,8 +567,30 @@ one decode per text: same results, no speedup.
 `embed_batch/2` is an **optional** `bitcask_embedder` callback. When a provider
 does not implement it the framework falls back to sequential `embed/2` with an
 identical result shape — callers never need to know whether the provider supports
-it. Only the llama backend has a native implementation today; the HTTP tier
-(OpenAI's `/v1/embeddings` accepts an array) is a natural candidate, not done yet.
+it.
+
+**The HTTP tier (`openai` / `anthropic`) implements native batching too**: one
+request carries an array, and `max_batch` (default 64) caps how many go in each
+one (endpoints limit both array length and total tokens, and exceeding either
+fails the **whole request**, so it chunks on that).
+
+> ⚠️ **Responses are placed by the `index` field, not zipped in return order.**
+> Every object in an OpenAI-compatible response carries `index`, and "data is in
+> input order" is merely how common implementations behave — not a protocol
+> guarantee (vLLM / TEI / llama.cpp server all differ, and concurrent
+> implementations reorder readily). Zipping by order **attaches vectors to the
+> wrong documents** — no error, correct dimensions, and retrieval quietly wrong
+> from then on with no way to notice. If the indices are not a permutation of
+> `0..N-1`, the whole batch errors rather than guessing a mapping.
+>
+> ⚠️ Empty strings are filtered client-side and never sent: an OpenAI-compatible
+> endpoint fails the **entire request** with a 400 on an empty string in the
+> array, so one empty document would waste the other 63 in the batch.
+
+The parsing is a pure function
+(`bitcask_embedder_util:parse_embedding_batch/3`) with network-free unit tests
+(`test/bitcask_embedder_util_tests.erl`), including a deliberately out-of-order
+response.
 
 
 ---

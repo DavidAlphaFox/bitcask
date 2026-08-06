@@ -89,6 +89,26 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   on the measurement box, and oversubscription inflates exactly the overhead
   batching amortizes — expect noticeably less on a quiet machine, and there is no
   trustworthy data for the long-text case. Measure on your own hardware first.
+- **Native batching for the HTTP tier**: `embed_batch/2` on `openai` /
+  `anthropic` sends one request carrying an array, with a new `max_batch`
+  (default 64) to chunk on (endpoints cap both array length and total tokens, and
+  exceeding either fails the **whole request**).
+  ⚠️ **Responses are placed by the `index` field, not zipped in return order** —
+  every object carries `index`, and "data is in input order" is only how common
+  implementations behave, not a protocol guarantee. Zipping by order **attaches
+  vectors to the wrong documents**: no error, correct dimensions, and retrieval
+  quietly wrong from then on with no way to notice. If the indices are not a
+  permutation of `0..N-1` the whole batch errors rather than guessing.
+  ⚠️ Empty strings are filtered client-side and never sent — an OpenAI-compatible
+  endpoint 400s the entire request on an empty array element, wasting the other
+  63 texts in the batch.
+- **The HTTP tier's request/parse moved into `bitcask_embedder_util`**: openai and
+  anthropic previously had **identical** request bodies, timeout handling and
+  response parsing (only the auth header differed); there is now one copy. The
+  parsing is a **pure exported function**, and the new
+  `test/bitcask_embedder_util_tests.erl` adds 14 network-free unit tests — that
+  path previously had only a manual, skipped-by-default case needing a live
+  endpoint, i.e. it was effectively untested.
 - **Multi-GPU data-parallel pool** `bitcask_embedder_pool`: N embedder processes,
   **all layers on one card, one instance per card**, N requests genuinely
   concurrent. The application env gains `instances => [0,1,2,3]` (or card groups
@@ -166,6 +186,14 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 - `backend_info/0` devices gain a `type` (`cpu`/`gpu`/`accel`); the top level
   gains `gpu_count`.
 - Application env gains `{embedder, undefined}` (no embedder process by default).
+- `rebar.config` gains `{dialyzer, [{plt_extra_apps, [inets]}]}`, silencing the
+  "Unknown function `httpc:request/4`" warnings.
+  ⚠️ `plt_extra_apps` rather than adding `inets` to `applications`: inets is only
+  used by the HTTP-tier embedder, and since the vast majority of deployments
+  configure no embedder at all it should not become a start-up dependency of
+  bitcask (it is pulled in by `application:ensure_all_started/1` when needed).
+  This entry only makes dialyzer aware of it; **the runtime dependencies are
+  unchanged**.
 
 ### Fixed
 
@@ -186,9 +214,10 @@ self-check margin (near-synonym − unrelated) 0.59.
 
 ### Regression
 
-- `rebar3 eunit` **100/100** (17 local-embedding cases + 17 embedder-process
-  cases; the model-dependent ones skip gracefully when the NIF is not built),
-  `rebar3 xref` clean.
+- `rebar3 eunit` **132/132** (23 local-embedding cases + 31 embedder
+  process/pool/batch cases + 14 network-free HTTP parsing unit tests; the
+  model-dependent ones skip gracefully when the NIF is not built), `rebar3 xref`
+  clean, `rebar3 dialyzer` **zero warnings**.
 - **The Vulkan build path was exercised for real**: the development box has a
   Vulkan SDK (1.4.309), AUTO detected it and compiled it in,
   `priv/libggml-vulkan.so` was produced, and `build_info` reports

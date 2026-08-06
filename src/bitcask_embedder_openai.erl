@@ -12,6 +12,8 @@
 %%     })
 %%
 %%   可选项（均为正整数，缺省用默认值；非正整数 → {error,{bad_opt,Key}}）：
+%%     max_batch（默认 64）— embed_batch 一次请求最多几条（端点对数组长度与
+%%       总 token 都有上限，超了是整个请求失败）。
 %%     max_input_bytes（默认 32768）— embed 前对输入做字节级保守截断的上限。
 %%       模型上下文有 token 上限，超长输入端点会报错/截断；这里在客户端先按
 %%       字节裁剩（UTF-8 下字节数 ≤ N ⟹ token 数 ≤ N，保守安全）。
@@ -32,7 +34,7 @@
 -behaviour(bitcask_embedder).
 
 %% New context-based API
--export([init/1, embed/2]).
+-export([init/1, embed/2, embed_batch/2]).
 
 %% Legacy API (deprecated — use bitcask_embedder:new/2 + embed/2 + dim/1)
 -export([embed/1, embed/3, dim/0]).
@@ -96,31 +98,27 @@ validate_limits(Opts) ->
 %% ===================================================================
 
 -spec embed(map(), binary()) -> {ok, binary()} | {error, term()}.
-embed(#{url := Url, model := Model} = Cfg, Text) when is_binary(Text) ->
-    {ok, _} = application:ensure_all_started(inets),
-    MaxIn = maps:get(max_input_bytes, Cfg, ?DEFAULT_MAX_INPUT_BYTES),
-    Input = bitcask_embedder_util:truncate_utf8(Text, MaxIn),
-    Dim  = maps:get(dim, Cfg, undefined),
-    VDim = maps:get(vector_dim, Cfg, Dim),
-    %% MRL：vector_dim ≠ dim 时发 dimensions，让服务端按 MRL 截断+重归一。
-    Body0 = #{<<"model">> => Model, <<"input">> => Input},
-    Body1 = case is_integer(VDim) andalso VDim =/= Dim of
-                true  -> Body0#{<<"dimensions">> => VDim};
-                false -> Body0
-            end,
-    Headers = build_headers(maps:get(api_key, Cfg, undefined)),
-    Req = {Url, Headers, "application/json", iolist_to_binary(json_encode(Body1))},
-    HttpOpts = [{timeout, maps:get(timeout_ms, Cfg, ?DEFAULT_TIMEOUT_MS)},
-                {connect_timeout, maps:get(connect_timeout_ms, Cfg, ?DEFAULT_CONNECT_TIMEOUT_MS)}],
-    case httpc:request(post, Req, HttpOpts, [{body_format, binary}]) of
-        {ok, {{_, 200, _}, _Hdrs, RespBody}} ->
-            parse_embedding(RespBody, VDim);
-        {ok, {{_, Code, Reason}, _Hdrs, RespBody}} ->
-            {error, {http_status, Code, Reason, RespBody}};
-        {error, Reason} ->
-            {error, {http_error, Reason}}
-    end.
+embed(#{url := _, model := _} = Cfg, Text) when is_binary(Text) ->
+    bitcask_embedder_util:http_embed(
+      Cfg, Text, build_headers(maps:get(api_key, Cfg, undefined)),
+      ?DEFAULT_MAX_INPUT_BYTES).
 
+%% ===================================================================
+%% embed_batch/2（bitcask_embedder 的可选回调）—— 一次请求带一个数组
+%%
+%% ⚠️ 逐条结果，顺序与输入一一对应。响应按 `index` 字段归位，**不按返回顺序
+%%    zip** —— 详见 bitcask_embedder_util:parse_embedding_batch/3 的注释：
+%%    按顺序 zip 的后果是把向量配到别的文档上，不报错、维度也对。
+%%
+%% 可选项 max_batch（默认 64）：一次请求最多几条。端点对数组长度与总 token
+%% 都有上限，超了是**整个请求**失败，所以按它切块。
+%% ===================================================================
+-spec embed_batch(map(), [binary()]) ->
+          {ok, [{ok, binary()} | {error, term()}]} | {error, term()}.
+embed_batch(#{url := _, model := _} = Cfg, Texts) when is_list(Texts) ->
+    bitcask_embedder_util:http_embed_batch(
+      Cfg, Texts, build_headers(maps:get(api_key, Cfg, undefined)),
+      ?DEFAULT_MAX_INPUT_BYTES).
 %% ===================================================================
 %% Legacy API (deprecated)
 %% ===================================================================
@@ -157,27 +155,6 @@ build_headers(ApiKey) when is_binary(ApiKey) ->
     [{"Authorization", "Bearer " ++ binary_to_list(ApiKey)}];
 build_headers(ApiKey) when is_list(ApiKey) ->
     [{"Authorization", "Bearer " ++ ApiKey}].
-
-%% 解析 OpenAI 兼容响应：#{<<"data">> := [#{<<"embedding">> := [float()]}]}。
-%% Expect = 期望维度（vector_dim）；返回长度不符 → {error,{dim_mismatch,Got,Expect}}
-%% （服务端不支持 dimensions、忽略了 MRL 截断时在此暴露，而非静默写错维度）。
-parse_embedding(RespBody, Expect) ->
-    try json_decode(RespBody) of
-        #{<<"data">> := [#{<<"embedding">> := Floats} | _]} when is_list(Floats) ->
-            Got = length(Floats),
-            case Expect =:= undefined orelse Got =:= Expect of
-                true  -> {ok, << <<X:32/float-little>> || X <- Floats >>};
-                false -> {error, {dim_mismatch, Got, Expect}}
-            end;
-        Other ->
-            {error, {unexpected_response, Other}}
-    catch
-        _:Reason -> {error, {bad_json, Reason}}
-    end.
-
-%% OTP 27+ 内置 json。包一层便于旧 OTP 部署替换实现。
-json_encode(Term) -> json:encode(Term).
-json_decode(Bin)  -> json:decode(Bin).
 
 to_bin(B) when is_binary(B) -> B;
 to_bin(L) when is_list(L)   -> list_to_binary(L).
