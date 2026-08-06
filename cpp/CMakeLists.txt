@@ -16,6 +16,8 @@ if(Erlang_INCLUDE_DIR)
         nif/nif_main.cpp
         nif/nif_cask.cpp
         nif/nif_cask_iter.cpp
+        nif/nif_cask_range.cpp
+        nif/nif_cask_batch.cpp
         nif/nif_cask_admin.cpp
         nif/nif_cask_meta.cpp
         nif/nif_helpers.cpp

@@ -18,7 +18,7 @@ set(BITCASK_PRIV_DIR "${CMAKE_SOURCE_DIR}/priv")
 file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 
 # ---------------------------------------------------------------------------
-# libbitcask — git submodule at third_party/libbitcask (v5.0.0, commit aaac44c)。
+# libbitcask — git submodule at third_party/libbitcask (6.0.0, commit 3480d0f)。
 # 提供 C++ 核心库全部 target（bitcask_cask, bitcask_keydir, ...）。
 #
 # libbitcask 的 CMakeLists.txt 用 CMAKE_SOURCE_DIR 引用 third_party/
@@ -44,6 +44,19 @@ file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 # rename 前补 fdatasync（此前无 sync，崩溃即半截文件）。公开 API 零变更，
 # NIF 无需改动（仅被移除的 meta_codec::detail::vbyte_* / to_codepoints_reuse
 # 等内部符号，NIF 全未引用）。
+# v5.0.0：64 位时间戳 flag-day（SOVERSION 4→5，ABI + 盘上格式双破坏）。
+# 6.0.0：一次跨上游 5.1.0 + 6.0.0 两版。ABI 破坏（CaskOptions 新增
+# keydir_cache_entries → 结构体布局变更，SOVERSION 5→6），但本仓库是源码级
+# 依赖（add_subdirectory），重编即可，不存在链接旧 .so.5 的问题。
+# 新增可用的公开 API：Cask::make_range_iter / CaskRangeIter（OKI 有序范围
+# 查询）、Cask::put_batch_atomic（引擎原子批）、TxnCask（多键事务）——三者
+# 都已在 cpp/nif/nif_cask_range.cpp 与 nif_cask_batch.cpp 里开到 Erlang 侧。
+# ⚠️ 盘上格式：上游 5.1.0 的 hint 内嵌 ord flag-day 把 bitcask.meta v4 → v5，
+# **本仓库 5.x 写出的目录必须先离线迁移**才能被本版打开：
+#     _build/cmake/libbitcask-build/bitcask_migrate hintord <src> <dst>
+# 非破坏性（data 硬链接、字节零改动，只重生成 hint + meta），幂等可重跑。
+# 6.0.0 自身新增的 BCOK v2 / BCOM v2-v3 / BCKS v4 都是派生缓存演进，旧版遇到
+# 即弃用重建，不需要迁移。
 
 # ---------------------------------------------------------------------------
 foreach(_dep utf8proc cppjieba limonp googletest benchmark oneTBB unordered_dense)
