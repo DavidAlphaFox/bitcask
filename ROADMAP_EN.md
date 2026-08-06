@@ -6,6 +6,130 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 5.1.0 shipped
+
+### Local embedding backend (llama.cpp / ggml) ✅
+
+Computes embeddings in-process, with no HTTP endpoint. The artifact is a
+**second, independent NIF**, `priv/bitcask_llama.so`, with no coupling to the
+core `bitcask_cpp.so`; **not built by default** (`BITCASK_WITH_LLAMA=1`), and
+with it off the build output is byte-for-byte what 5.0.0 produced. Adds the
+`third_party/llama.cpp` submodule (tag `b10257`). **No libbitcask upgrade is
+involved**, no ABI change, no on-disk format change.
+
+It is positioned as **a different tier**, not a replacement for the HTTP
+endpoint: what runs on CPU is the 0.6B / 1024-dim class, so switching tiers
+changes the stored dimension and means a full index rebuild. Measured (8 vCPU,
+`Qwen3-Embedding-0.6B-Q8_0`, `n_ctx=512`): query 33–35 ms, document (276 tokens)
+≈ 890 ms.
+
+> ⚠️ **ggml's `GGML_ASSERT` calls `abort()`**, which inside the BEAM takes down
+> the entire node along with every open cask. Splitting into two `.so`s cannot
+> isolate that (same process); all that can be done is catching the predictable
+> failures before llama sees them (path / pooling / token count). True process
+> isolation means a port — which is exactly the existing HTTP endpoint. If that
+> risk is unacceptable, stay on the HTTP tier.
+
+### Standalone embedder process ✅
+
+`bitcask_embedder_server` (gen_server) + `bitcask_embedder_proxy` (provider).
+`{embedder, _}` at `open/2` now also accepts a process reference. Three problems,
+one fix: **one copy of the weights** (previously one ctx per `open`), **the
+lifecycle has an owner** (`bitcask:close/1` does not close the embedder; the
+process's `terminate/2` does), and **serialization was required anyway**
+(`llama_context` is not thread-safe, and a gen_server's single-process semantics
+*are* that constraint).
+
+This also draws the line between the two embedder tiers: the HTTP tier (`openai`
+/ `anthropic`) is stateless and wants concurrency — **no process to configure**;
+the built-in tier is stateful and must be serialized, so it runs in a process.
+Shared logic moved into `bitcask_embedder_util` (openai and anthropic previously
+carried verbatim duplicates).
+
+> ⚠️ An embedder that is configured but fails to start (bad GGUF path, pooling
+> resolving to NONE, …) fails the whole bitcask application, **deliberately** —
+> silently degrading to no embedding capability is only noticed once the search
+> results are wrong, by which point the store is dirty. For the same reason
+> `bitcask:open/2` no longer swallows an `application:start` failure (it returns
+> `{error, {bitcask_app_start_failed, _}}`).
+
+### GPU (NVIDIA CUDA / Vulkan) ✅
+
+The trade-off for a server-side product is **performance first, size is not a
+constraint**: CUDA architecture coverage spans Maxwell..Blackwell rather than
+narrowing to native, and the CUDA runtime is flattened into `priv/` alongside the
+package — removing the silent "target is missing libcublas → ggml skips the
+backend → degrades to CPU" class of failure.
+
+**Build time probes the SDK, run time probes the GPU** — these happen on
+**different machines** (the build box often has no card, the deployment box often
+has no SDK), so they are done separately:
+
+- **Build time**: `BITCASK_LLAMA_CUDA` / `BITCASK_LLAMA_VULKAN`, each
+  `AUTO|ON|OFF` (default AUTO — compiled in whenever the SDK is detected; both
+  can be on). The build-time facts are baked into the `.so` and reported by
+  `build_info/0`. ⚠️ Vulkan's AUTO must confirm **all three** of loader /
+  `glslc` / SPIRV-Headers before enabling — ggml-vulkan declares both of its
+  `find_package` calls `REQUIRED`, so a partial match fails the build outright.
+- **Run time**: Erlang decides **by itself** via `backend => auto`
+  (CUDA > Vulkan > CPU), taking the first family that actually has a GPU;
+  `n_gpu_layers` also defaults to auto. **No per-machine configuration and no
+  script** — a deployment box has neither this repository nor cmake.
+- `gpu_status/0` reconciles the two: `ok` / `cpu_only_build` (rebuild) /
+  `no_gpu_device` (install a driver). Run time alone cannot tell those apart, and
+  they need completely different fixes.
+
+> ⚠️ **Picking exactly one family is a correctness requirement, not a policy.**
+> With CUDA and Vulkan both compiled in, each enumerates the same physical card
+> (one 4090 = `CUDA0` + `Vulkan0`), and `devices=NULL` makes llama split the
+> model's layers across what it thinks are two cards — no error, just
+> double-booked VRAM and mysterious slowness or OOM.
+
+**Multiple GPUs: one card by default, data parallelism.** llama's `split_mode`
+defaults to `LAYER` (split layers across every card). For an embedding model that
+is a pessimization: 0.6B of weights fits on one card, so splitting only adds
+cross-GPU transfers, and it spends N cards' worth of parallelism on **one serial**
+request path (a single `llama_context` serves one forward at a time). Embedding
+wants data parallelism — size a pool of embedder processes from
+`backend_info/0`'s device list, one bound per card (`gpu_index`), which maps
+exactly onto "one handle = one context = serial". Model parallelism
+(`split_mode => layer`) is only for a large model that does not fit on one card.
+
+The build-time SDK probe `scripts/detect-llama-backends.sh`: CMake only says "not
+found"; the script says **which package is missing** and prints the build command
+pre-filled with whichever switches it detected.
+
+> **The Vulkan build path was exercised for real**: the development box has a
+> Vulkan SDK (1.4.309), AUTO detected and compiled it in, and
+> `priv/libggml-vulkan.so` was produced. Since that machine has no GPU,
+> `gpu_status/0` returns `no_gpu_device` rather than `cpu_only_build` — **exactly
+> the distinction the build/run-time split exists to make, demonstrated with real
+> data**.
+>
+> ⚠️ **The CUDA compile and any real GPU runtime path remain unexercised** (no
+> driver and no toolkit on the development box; the Vulkan backend was only
+> compiled, never run against a card). Verified: both AUTO detection branches,
+> build-time macro injection and self-report, honest diagnostics when no GPU is
+> present, and the validation/error paths for `backend` / `gpu_index` /
+> `split_mode`.
+
+### Candidates ⚠️
+
+- **Batch embed entry point** (gated): one text at a time today, which caps
+  indexing throughput. llama's batch interface can take several at once; the gain
+  needs measuring.
+- **Optional `close/1` callback on `bitcask_embedder`** (gated): would let
+  `bitcask:close/1` release a ctx built via the `{Provider, Cfg}` path. Currently
+  side-stepped by the process form, and touching the core API has no obvious
+  payoff.
+- **Automatic multi-GPU dispatch** (gated): pools are built by hand via
+  `gpu_index` today. A round-robin / pick-an-idle scheduler above that is the
+  natural next step, but it needs measurements on a real multi-GPU box first.
+- **ROCm / SYCL backends** (gated): ggml has both, wired the same way as Vulkan.
+  Whether to add them depends on whether such cards show up in real deployments.
+
+---
+
 ## 5.0.0 shipped
 
 ### libbitcask upgrade to v5.0.0 ✅

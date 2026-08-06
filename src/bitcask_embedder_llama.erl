@@ -39,7 +39,18 @@
 %%                    分配，取模型的 n_ctx_train（Qwen3-Embedding 是 32768）会
 %%                    让每次前向都按最坏情况算。设成略大于你的切块长度。
 %%     n_threads    — 默认 max(1, 逻辑核数 - 2)。⚠️ 满核实测比留 2 核慢一倍。
-%%     n_gpu_layers — 默认 0（纯 CPU）。本仓库默认不编 GPU 后端。
+%%     backend      — auto（默认）| cuda | vulkan | cpu。**部署到目标机后由运行期
+%%                    自己决策**：auto 按 CUDA > Vulkan 挑第一个真的有 GPU 的
+%%                    后端族，都没有就 CPU。不需要按机器改配置。
+%%     gpu_index    — 默认 0（绑第 0 张卡）。⚠️ 多卡机器上**默认只用一张**：
+%%                    嵌入模型切层跨卡是反优化。多卡要的是**数据并行**——开 N 个
+%%                    embedder 进程、各绑一张卡（见文件头「多卡」一节）。
+%%     split_mode   — none（默认）| layer | row。只有大模型单卡装不下才用后两个。
+%%     n_gpu_layers — 默认 auto（有 GPU 就全卸载，没有就 0）。也可给具体数字，
+%%                    或 0 = 强制纯 CPU。
+%%                    ⚠️ 显存不够会**自动回落纯 CPU 而不报错**（宁可慢也别不能
+%%                       用），但回落可观测：info/1 报 backend / fell_back_to_cpu /
+%%                       gpu_fallback_reason / gpu_layers_effective。加载后查一次。
 %%     dim          — 可选。给了就与模型实际维度**核对**，不一致直接报错
 %%                    （防的是"换了模型忘了改配置，索引静静地写进错的维度"）。
 %%     vector_dim   — 可选 MRL 截断维度（≤ dim；缺省 = dim）。本地档没有服务端
@@ -51,6 +62,29 @@
 %%                    {error,{too_many_tokens,NTok,NCtx}}；true 截断并继续。
 %%                    ⚠️ 没有"静默截断"这个选项。
 %%     normalize    — 默认 true（L2 归一化；之后余弦 = 点积）。
+%%
+%%   === 多卡 ===
+%%
+%%   **不会自动做多卡负载，这是有意的。** llama 的 split_mode 默认把模型的层切到
+%%   所有卡上（模型并行），对嵌入模型是反优化：0.6B 权重一张卡装得下，切开只多出
+%%   跨卡传输，还把 N 张卡的并行能力浪费在**一条串行**的请求路径上（一个
+%%   llama_context 同时只服务一次前向）。
+%%
+%%   嵌入要的是**数据并行**：一卡一个 context，N 路并发。做法是开 N 个 embedder
+%%   进程、各绑一张卡，再在上层轮询/取空闲：
+%%
+%%       {ok, #{devices := Devs}} = bitcask_llama_nifs:backend_info(),
+%%       Gpus = [D || #{type := gpu} = D <- Devs],
+%%       [bitcask_embedder_server:start_link(
+%%          {local, list_to_atom("emb_" ++ integer_to_list(I))},
+%%          #{provider => {custom, bitcask_embedder_llama},
+%%            config   => #{model_path => Path, pooling => last,
+%%                          n_ctx => 512, gpu_index => I}})
+%%        || I <- lists:seq(0, length(Gpus) - 1)],
+%%
+%%   每个进程各占一份权重的显存（0.6B Q8_0 ≈ 640 MB，多数卡都装得下多份）。
+%%   真需要模型并行（大模型单卡装不下）才配 `split_mode => layer` +
+%%   `gpu_index => all`。
 %%
 %%   Vec 格式 = f32 小端 binary（VDim×4 字节），与 NIF 跨界 / DocValue 存储
 %%   格式一致，与 openai provider 完全相同。
@@ -133,7 +167,8 @@ load_model(Path, Opts) ->
                      <<"ggml loaded 0 backends from priv/; the libggml-cpu-* "
                        "variants are missing or none matched this CPU">>}};
         {ok, _N} ->
-            LoadOpts = maps:with([pooling, n_threads, n_gpu_layers], Opts),
+            LoadOpts = maps:with([pooling, n_threads, n_gpu_layers, backend,
+                                  gpu_index, split_mode], Opts),
             NCtx = maps:get(n_ctx, Opts, ?DEFAULT_N_CTX),
             case bitcask_llama_nifs:model_load(Path, LoadOpts#{n_ctx => NCtx}) of
                 {ok, M}        -> {ok, M, true};

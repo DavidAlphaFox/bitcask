@@ -105,6 +105,124 @@ if(BITCASK_WITH_LLAMA)
     set(LLAMA_OPENSSL          OFF CACHE BOOL "" FORCE)
     set(LLAMA_CURL             OFF CACHE BOOL "" FORCE)
 
+    # -----------------------------------------------------------------------
+    # GPU 后端：CUDA（NVIDIA）
+    #
+    # BITCASK_LLAMA_CUDA = AUTO（默认）| ON | OFF
+    #   AUTO — 找得到 CUDA Toolkit 就开，找不到就静静地只用 CPU（但会打一条
+    #          STATUS 说明，别让"没用上卡"变成无声的事）。
+    #   ON   — 硬要求，找不到 Toolkit 直接 FATAL_ERROR。CI / 发布构建用这个：
+    #          AUTO 在缺 toolkit 的机器上会**悄悄**产出一个纯 CPU 的包，而那种
+    #          包与 GPU 包长得一模一样。
+    #   OFF  — 不编。
+    #
+    # bitcask 是跑在服务器上的产品，取舍是**性能优先，体积不是约束**，所以：
+    #   * 默认 AUTO 而不是 OFF——有卡就用上；
+    #   * CUDA 架构列表用 ggml 的默认值（GGML_NATIVE=OFF 时它给的是
+    #     50/61/70/75/80-virtual + 86/89-real + 90-virtual + Blackwell，覆盖
+    #     Maxwell 到 Blackwell 的一整条线），不收窄成 native。产物大得多，但
+    #     "换一台机器就 SIGILL / 没有可用 kernel"这类事不会发生。
+    #     要收窄自己设 -DCMAKE_CUDA_ARCHITECTURES=89-real 之类。
+    #
+    # ⚠️ **GGML_STATIC 不能用**（试过）：它在 ggml/src/CMakeLists.txt:116 加的是
+    #    全局 `add_link_options(-static)`，与我们必须开的 BUILD_SHARED_LIBS=ON
+    #    直接冲突。所以 libggml-cuda.so 是**动态**链 cudart / cublas /
+    #    cublasLt 的，目标机上必须有这三个 .so —— 见 cpp/llama/CMakeLists.txt
+    #    里把它们平铺进 priv/ 的那一段。
+    # -----------------------------------------------------------------------
+    set(BITCASK_LLAMA_CUDA "AUTO" CACHE STRING
+        "CUDA backend for the local embedder: AUTO | ON | OFF")
+    set_property(CACHE BITCASK_LLAMA_CUDA PROPERTY STRINGS AUTO ON OFF)
+    string(TOUPPER "${BITCASK_LLAMA_CUDA}" _bitcask_cuda_mode)
+
+    if(_bitcask_cuda_mode STREQUAL "AUTO" OR _bitcask_cuda_mode STREQUAL "ON")
+        # 自己先找一遍，**不要**等 ggml 那边 find_package 失败——它那条路的表现
+        # 是"GGML_CUDA=ON 但 ggml-cuda target 根本没建出来"，构建全绿、跑起来
+        # 没有 GPU 后端，正是本文件到处在防的那种静默失败。
+        find_package(CUDAToolkit QUIET)
+        if(CUDAToolkit_FOUND)
+            set(GGML_CUDA ON CACHE BOOL "" FORCE)
+            set(BITCASK_LLAMA_CUDA_ENABLED ON)
+            message(STATUS
+                "bitcask_llama: CUDA backend ON (CUDA Toolkit ${CUDAToolkit_VERSION} "
+                "at ${CUDAToolkit_LIBRARY_ROOT})")
+        elseif(_bitcask_cuda_mode STREQUAL "ON")
+            message(FATAL_ERROR
+                "BITCASK_LLAMA_CUDA=ON 但找不到 CUDA Toolkit。\n"
+                "装上 toolkit（nvcc + cublas 开发包），或者设 "
+                "-DBITCASK_LLAMA_CUDA=OFF / AUTO。\n"
+                "先跑 scripts/detect-llama-backends.sh 看这台机器缺什么。")
+        else()
+            message(STATUS
+                "bitcask_llama: CUDA backend OFF (AUTO: no CUDA Toolkit found). "
+                "CPU only -- run scripts/detect-llama-backends.sh to see why.")
+        endif()
+    endif()
+
+    # -----------------------------------------------------------------------
+    # GPU 后端：Vulkan（非 NVIDIA 卡的路，AMD / Intel / 以及 NVIDIA 也能跑）
+    #
+    # BITCASK_LLAMA_VULKAN = AUTO（默认）| ON | OFF，语义与 CUDA 那组一致。
+    #
+    # ⚠️ **AUTO 必须把两个依赖都确认到位再开。** ggml-vulkan 的 CMakeLists 里
+    #    那两句都是 REQUIRED：
+    #        find_package(Vulkan COMPONENTS glslc REQUIRED)
+    #        find_package(SPIRV-Headers CONFIG REQUIRED)
+    #    只探到其中一个就把 GGML_VULKAN 打开的话，AUTO 会**直接把构建炸掉**
+    #    ——而 AUTO 的全部意义就是"没有就安静地不编"。
+    #
+    # 与 CUDA 同时开是允许的，而且是有意义的（一台机器可能既有 N 卡又有核显）。
+    # ⚠️ 但两个后端会**各自枚举同一张物理卡**，运行期必须显式选设备，不能让
+    #    llama 按 devices=NULL 把同一张卡当成两张去切分 —— 见
+    #    cpp/llama/nif_llama.cpp 的 select_devices()。
+    # -----------------------------------------------------------------------
+    set(BITCASK_LLAMA_VULKAN "AUTO" CACHE STRING
+        "Vulkan backend for the local embedder: AUTO | ON | OFF")
+    set_property(CACHE BITCASK_LLAMA_VULKAN PROPERTY STRINGS AUTO ON OFF)
+    string(TOUPPER "${BITCASK_LLAMA_VULKAN}" _bitcask_vk_mode)
+
+    if(_bitcask_vk_mode STREQUAL "AUTO" OR _bitcask_vk_mode STREQUAL "ON")
+        if(DEFINED ENV{VULKAN_SDK})
+            list(APPEND CMAKE_PREFIX_PATH "$ENV{VULKAN_SDK}")
+        endif()
+        find_package(Vulkan QUIET COMPONENTS glslc)
+        find_package(SPIRV-Headers QUIET CONFIG)
+
+        set(_vk_missing "")
+        if(NOT Vulkan_FOUND)
+            list(APPEND _vk_missing "Vulkan loader/headers")
+        endif()
+        if(NOT Vulkan_glslc_FOUND)
+            list(APPEND _vk_missing "glslc (shaderc)")
+        endif()
+        if(NOT SPIRV-Headers_FOUND)
+            list(APPEND _vk_missing "SPIRV-Headers")
+        endif()
+
+        if(NOT _vk_missing)
+            set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+            set(BITCASK_LLAMA_VULKAN_ENABLED ON)
+            message(STATUS "bitcask_llama: Vulkan backend ON (glslc at ${Vulkan_GLSLC_EXECUTABLE})")
+        elseif(_bitcask_vk_mode STREQUAL "ON")
+            string(REPLACE ";" ", " _vk_missing_str "${_vk_missing}")
+            message(FATAL_ERROR
+                "BITCASK_LLAMA_VULKAN=ON 但缺：${_vk_missing_str}\n"
+                "装 Vulkan SDK（或发行版的 vulkan-headers / shaderc /"
+                " spirv-headers 开发包），或设 -DBITCASK_LLAMA_VULKAN=OFF / AUTO。\n"
+                "先跑 scripts/detect-llama-backends.sh 看这台机器缺什么。")
+        else()
+            string(REPLACE ";" ", " _vk_missing_str "${_vk_missing}")
+            message(STATUS
+                "bitcask_llama: Vulkan backend OFF (AUTO: missing ${_vk_missing_str})")
+        endif()
+    endif()
+
+    if(NOT BITCASK_LLAMA_CUDA_ENABLED AND NOT BITCASK_LLAMA_VULKAN_ENABLED)
+        message(STATUS
+            "bitcask_llama: no GPU backend will be built -- CPU only. "
+            "Run scripts/detect-llama-backends.sh to see what this machine is missing.")
+    endif()
+
     # ⚠️ llama.cpp 的 CMakeLists **没有** set(CMAKE_CXX_STANDARD ...)——它把这件
     #    事留给 LLAMA_STANDALONE 那条路。所以 add_subdirectory 进来时它一声不响
     #    地继承本仓库的 C++23，而它的源码是按 C++17 写的（`u8"..."` 字面量在

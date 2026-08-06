@@ -289,6 +289,33 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## M7 — 本地嵌入后端（llama.cpp）+ 独立 embedder 进程
+
+> **不涉及 libbitcask 升级**（submodule 仍 v5.0.0，无 ABI / 盘上格式变更）。
+> 新增 submodule `third_party/llama.cpp`（tag `b10257`）。默认不构建，
+> `BITCASK_WITH_LLAMA=1` 打开；关掉时构建产物与 5.0.0 一字不差。
+> 本仓库 `vsn` → 5.1.0。参考 `~/workspace/coxswain` 的同类 shim（那边是 Chez
+> Scheme FFI，这边是 Erlang NIF）。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M7-1** | vendor llama.cpp（tag `b10257`，浅克隆）+ CMake 接入：`BITCASK_WITH_LLAMA` 开关、`GGML_NATIVE=OFF` + `GGML_BACKEND_DL=ON` + `GGML_CPU_ALL_VARIANTS=ON` 三件套、`BUILD_SHARED_LIBS` 用后即收（目录作用域会继承，不收回去后面每个 add_subdirectory 都跟着变共享）、变体递归收集平铺进 `priv/` + `add_dependencies` 挂进构建图（`EXCLUDE_FROM_ALL` 下没人依赖 = 不构建，失败是静默的：0 个后端 → 降级）。 | ✅ |
+| **M7-2** | NIF shim `cpp/llama/nif_llama.cpp`：model 资源（`llama_context` 非线程安全 → 每句柄一把互斥量）、`embed` 挂 `DIRTY_JOB_CPU_BOUND`、日志改道、加载期拒绝 pooling=NONE、零范数/空输入报错、**向量长度用 `n_embd_out` 不是 `n_embd`**（coxswain 那份用的是后者，带投影层的模型上是潜在 bug）。⚠️ 自己写出又改掉一处真 bug：错误路径上手工 `~ModelRes()` 后再 `enif_release_resource`，后者引用计数归零会**再调一次析构器**。 | ✅ |
+| **M7-3** | Erlang 侧：`bitcask_llama_nifs`（低阶）+ `bitcask_embedder_llama`（provider）。⚠️ `on_load` 里 `load_nif` 失败**必须仍返回 ok**（记进 persistent_term）——返回非 ok 会让 BEAM 撤掉整个模块，之后连 `available/0` 自己都是 `undef`，探针不可用。冒烟时撞出来的。 | ✅ |
+| **M7-4** | 性能定标。⚠️ `n_threads` 默认值必须用 `logical_processors_available` 而非 `logical_processors`：后者报宿主机核数、不认亲和性掩码（实测机器上 8 vs 128），按后者算出 126 线程比最优**慢 20 倍**且无任何报错。定标结果：查询 33–35 ms、文档（276 tok）≈ 890 ms、`n_ctx` 512→8192 查询 35→57 ms。 | ✅ |
+| **M7-5** | 独立 embedder 进程：`bitcask_embedder_server`（gen_server，`terminate/2` 释放）+ `bitcask_embedder_proxy`（provider）+ `open/2` 的 `{embedder, ServerRef}`；由 `bitcask_sup` 按 app env 启动，配了起不来就让整个 application 死掉（静默降级更危险）。⚠️ 连带修 `bitcask:open/2` 吞掉 `application:start` 失败的问题——不修的话"死掉"是无声的。 | ✅ |
+| **M7-6** | 两档 embedder 分清 + 共享逻辑收口：HTTP 档无状态不需要进程、内置档有状态必须串行；`bitcask_embedder_util` 收掉 openai / anthropic 两份**逐字重复**的 `truncate_utf8` / `strip_partial` / `validate_dims` / `validate_limits`（我一度又加了第三份）。 | ✅ |
+| **M7-7** | GPU 构建期：`BITCASK_LLAMA_CUDA` / `BITCASK_LLAMA_VULKAN` 各 `AUTO\|ON\|OFF`、`ggml-cuda` / `ggml-vulkan` target 缺失守卫、CUDA 运行时平铺进 `priv/`（`GGML_STATIC` 不能用——它加全局 `-static`，与必须开的 `BUILD_SHARED_LIBS=ON` 冲突）、架构覆盖 Maxwell..Blackwell 不收窄。⚠️ Vulkan 的 AUTO 必须 loader/glslc/SPIRV-Headers **三个都确认**再开：ggml-vulkan 那两个 `find_package` 都是 REQUIRED，只探到一个就打开会直接把构建炸掉，而 AUTO 的意义是"没有就安静地不编"。**Vulkan 构建路径已在本机实测通过**（SDK 1.4.309 → `priv/libggml-vulkan.so`）。 | ✅ |
+| **M7-7b** | GPU 运行期：NIF 加回落（回落必须把**建上下文**也圈进去，最常见的显存不足倒在 compute buffer 上）+ 诚实上报。⚠️ 第一版上报在撒谎：纯 CPU 包上请求 `n_gpu_layers=999`，llama 不报错、默默不卸载，而我按请求值报 `effective=999`；改成按有没有 GPU 设备算。⚠️ 第二个撒谎：改写 `n_gpu_layers` 之后才记 `requested`，"请求 999"被报成"请求 0"（既有测试拦下的）。⚠️ 第三个：包里编了 Vulkan 没编 CUDA 而调用方要 `cuda` 时，给的是通用的"有 GPU 后端但没设备"——改成按**请求的那一族**判。 | ✅ |
+| **M7-7c** | 运行期后端自决策：`backend => auto\|cuda\|vulkan\|cpu`（auto 按 CUDA > Vulkan > CPU）+ `n_gpu_layers => auto`。⚠️ **显式给 `mp.devices` 是正确性要求**：CUDA 与 Vulkan 同时编入时两者各自枚举同一张物理卡，`devices=NULL` 会让 llama 把它当两张去切分——不报错，只是显存重复占用 + 慢/OOM。 | ✅ |
+| **M7-7d** | 多卡：默认单卡 + 数据并行。⚠️ 原实现是错的——把选中族的**全部** GPU 传给 `mp.devices`，而 `split_mode` 默认 `LAYER`，4 卡机器上会把 0.6B 模型切到 4 张卡（跨卡传输 + 把 4 卡并行浪费在一条串行路径上）。改成默认 `split_mode=NONE` + `gpu_index=0`；多卡按 `backend_info` 设备表开 N 个进程各绑一张卡。`gpu_index` 越界报错不静默退回 CPU。 | ✅ |
+| **M7-8** | 构建期 / 运行期分离：构建期事实（编没编 CUDA / Vulkan、toolkit 版本、架构列表）烧进 `.so` 由 `build_info/0` 自报，运行期事实由 `backend_info/0` 给（设备表带 type / backend / 显存），`gpu_status/0` 对齐成 `ok` / `cpu_only_build` / `no_gpu_device`。只看运行期分不清"包里没编"和"机器没驱动"，而两者修法完全不同。**本机恰好给出了这个区分的真实样本**：包里编了 Vulkan、机器没有卡 → `no_gpu_device` 而非 `cpu_only_build`。 | ✅ |
+| **M7-8b** | 探测脚本收敛成**纯构建期工具**（运行期决策已移到 Erlang 侧，部署机上既没这个仓库也没 cmake）。⚠️ 脚本自己有两个 bug：探测工程用 `LANGUAGES NONE` 导致 `find_package(Vulkan)` **假阴性**（真实构建是 CXX，找得到）——探测条件必须与真实构建同条件，否则答案不算数；以及 `set(...) ; if(...) ; endif()` 写成一行，`;` 在 CMake 里是列表分隔符不是语句分隔符，configure 直接失败而三项全判缺失。 | ✅ |
+| **M7-9** | 回归：`rebar3 eunit` **101/101**（19 本地嵌入 + 17 embedder 进程；NIF 未构建时优雅跳过 0.05s）+ `rebar3 xref` 干净 + 端到端（`open` 配 embedder → `put` 自动 embed → `search_vector`/`search_hybrid`）。⚠️ **CUDA 编译与真实 GPU 运行路径未实测**（开发机无驱动无 toolkit；Vulkan 只是编出来、没有卡可跑）——有卡的机器上跑一遍才算真验证。 | ✅ |
+| **M7-10** | 文档：`doc/local-embedding-zh.md` / `-en.md` + CHANGELOG（中/英）[5.1.0] + ROADMAP（中/英）5.1.0 落地 + README（中/英）发布条目 + `api-zh/en.md` 选项表 + `USAGE.md` + `bitcask.app.src` 版本对齐。 | ✅ |
+
+---
+
 ## 明确排除（V7+ 或永久取消）
 
 | 条目 | 决策 | 理由 |

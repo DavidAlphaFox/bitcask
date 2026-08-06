@@ -35,6 +35,8 @@
 
 -export([ensure_backend/0,
          backend_info/0,
+         build_info/0,
+         gpu_status/0,
          model_load/2,
          model_info/1,
          model_close/1,
@@ -130,6 +132,57 @@ ensure_backend() ->
     end.
 
 %% -------------------------------------------------------------------
+%% gpu_status/0 — 把**构建期事实**和**运行期事实**对到一起，给出一个能照做的诊断。
+%%
+%% 这两件事问的是不同的问题，而且可以发生在完全不同的机器上：
+%%
+%%   构建期：这台机器有没有 CUDA SDK？→ 决定 .so 里编不编 CUDA 进去。
+%%           答案烧在 .so 里，由 build_info/0 自报（cuda_built / cuda_version /
+%%           cuda_archs）。
+%%   运行期：这台机器有没有对应的卡？→ 决定用不用得上。
+%%           答案由 backend_info/0 给（ggml 真正枚举到的设备）。
+%%
+%% ⚠️ **分开问是必须的**：只看运行期的话，"0 个 GPU 设备"分不清是包里根本没编
+%%    CUDA、还是包编了但这台机器没驱动/没卡 —— 而两者要修的东西完全不同
+%%    （重新构建 vs 装驱动 / 透传设备）。
+%%
+%% 返回 #{... , status => Status}，Status 是：
+%%   ok                  — 编了 GPU 后端，也真的枚举到了 GPU。
+%%   cpu_only_build      — 包里 CUDA 和 Vulkan 都没编。要 GPU 得**重新构建**，
+%%                         装驱动没用。
+%%   no_gpu_device       — 包里有 GPU 后端，但运行期一个 GPU 都没枚举到。典型原因：
+%%                         没装驱动 / 容器没透传 /dev/nvidia* / libggml-cuda.so
+%%                         的依赖解析不了（ggml 对后端 dlopen 失败是**容忍**的，
+%%                         失败只是跳过，所以这里看起来就是"没有卡"）。
+%%   backend_not_initialized — 还没 ensure_backend/0。
+%% -------------------------------------------------------------------
+-spec gpu_status() -> {ok, map()} | {error, term()}.
+gpu_status() ->
+    case build_info() of
+        {error, _} = E ->
+            E;
+        {ok, Build} ->
+            case backend_info() of
+                {error, backend_not_initialized} ->
+                    {ok, Build#{status => backend_not_initialized,
+                                gpu_count => 0, devices => []}};
+                {error, _} = E ->
+                    E;
+                {ok, Rt} ->
+                    Built = maps:get(cuda_built, Build)
+                            orelse maps:get(vulkan_built, Build, false),
+                    NGpu  = maps:get(gpu_count, Rt, 0),
+                    Status =
+                        if
+                            not Built  -> cpu_only_build;
+                            NGpu > 0   -> ok;
+                            true       -> no_gpu_device
+                        end,
+                    {ok, maps:merge(Build, Rt#{status => Status})}
+            end
+    end.
+
+%% -------------------------------------------------------------------
 %% model_load/2
 %%
 %%   Opts:
@@ -146,15 +199,52 @@ ensure_backend() ->
 %%                       的 n_ctx_train 是 32768，全开会让每次前向都按最坏情况
 %%                       算。按你实际的切块长度设小得多的值。C++ 侧会向下钳到
 %%                       n_ctx_train，实际生效值看 model_info 的 n_ctx。
-%%     n_gpu_layers — 默认 0（纯 CPU）。本仓库默认不编 GPU 后端。
+%%     backend      — auto（默认）| cuda | vulkan | cpu。**运行期自己决策**：
+%%                    auto 按 CUDA > Vulkan 的顺序挑第一个真的有 GPU 的后端族，
+%%                    都没有就用 CPU。不需要部署时告诉它这台机器有什么。
+%%                    ⚠️ 顺序不是随手定的：同一张 N 卡上 CUDA 路径比 Vulkan 快
+%%                       且成熟，Vulkan 是给没有 CUDA 的卡（AMD / Intel）兜底的。
+%%                    ⚠️ **必须只选一族**：CUDA 与 Vulkan 同时编进包里时，两者
+%%                       各自枚举同一张物理卡，全都用上等于把一张卡当成两张去
+%%                       切分模型层——显存重复占用 + 莫名其妙的慢/OOM，而且不报错。
+%%     gpu_index    — 默认 0 = 绑选中族里的第 0 张卡。`all` = 全部卡（仅在
+%%                    split_mode /= none 时有意义）。
+%%                    ⚠️ **多卡机器上默认只用一张，这是有意的**：llama 的
+%%                       split_mode 默认把模型的层切到所有卡上，对嵌入模型是
+%%                       反优化（0.6B 一张卡装得下，切开只多出跨卡传输，还把
+%%                       N 张卡的并行浪费在一条串行路径上）。嵌入要的是**数据
+%%                       并行**——按 backend_info 的设备表开 N 个句柄、各绑一张
+%%                       卡（`gpu_index => 0|1|2…`），N 路并发。
+%%                    ⚠️ 越界（写了 2 但只有 2 张卡）报 {error,{bad_gpu_index,_}}，
+%%                       不静默退回 CPU——那会让整池 worker 都挤在 CPU 上没人发现。
+%%     split_mode   — none（默认，单卡）| layer | row。只有大模型单卡装不下时
+%%                    才用后两个（模型并行）。
+%%     n_gpu_layers — 默认 auto：有 GPU 就全部层卸载到显存，没有就 0。
+%%                    也可给具体数字，或 0 = 强制纯 CPU。
+%%                    ⚠️ 显存不够时会**自动回落纯 CPU 而不是报错**（宁可慢也别
+%%                       不能用），但回落是可观测的：model_info 报 backend /
+%%                       fell_back_to_cpu / gpu_fallback_reason /
+%%                       gpu_layers_effective。
 %% -------------------------------------------------------------------
 -spec model_load(binary(), map()) -> {ok, model()} | {error, term()}.
 model_load(Path, Opts) when is_binary(Path), is_map(Opts) ->
     Pooling = ?POOLING(maps:get(pooling, Opts, unspecified)),
     Threads = maps:get(n_threads, Opts, default_threads()),
     NCtx    = maps:get(n_ctx, Opts, 0),
-    Ngl     = maps:get(n_gpu_layers, Opts, 0),
-    model_load(Path, Pooling, Threads, NCtx, Ngl).
+    %% 负数 = auto（C++ 侧：有 GPU 就全卸载，没有就 0）。
+    Ngl     = case maps:get(n_gpu_layers, Opts, auto) of
+                  auto              -> -1;
+                  N when is_integer(N) -> N
+              end,
+    Backend = atom_to_binary(maps:get(backend, Opts, auto), utf8),
+    %% 多卡：默认绑第 0 张（单卡 NONE）。gpu_index 让上层按设备表开池，
+    %% 一卡一句柄 = 数据并行。split_mode 非 none 才是模型并行（大模型单卡装不下）。
+    GpuIdx  = case maps:get(gpu_index, Opts, 0) of
+                  all              -> -1;
+                  I when is_integer(I) -> I
+              end,
+    Split   = atom_to_binary(maps:get(split_mode, Opts, none), utf8),
+    model_load(Path, Pooling, Threads, NCtx, Ngl, Backend, GpuIdx, Split).
 
 %% 留 2 核：见 model_load/2 的注释。核数拿不到时退到 1（宁可慢，也不要因为
 %% 超订而慢一个数量级——下面那张表说明代价是不对称的）。
@@ -211,7 +301,8 @@ first_int([])                                -> 1.
 %% =============================================================================
 backend_init(_PrivDir)            -> ?NOT_LOADED.
 backend_info()                    -> ?NOT_LOADED.
-model_load(_P, _Pool, _T, _C, _G) -> ?NOT_LOADED.
+build_info()                      -> ?NOT_LOADED.
+model_load(_P, _Pool, _T, _C, _G, _B, _I, _S) -> ?NOT_LOADED.
 model_info(_M)                    -> ?NOT_LOADED.
 model_close(_M)                   -> ?NOT_LOADED.
 tokenize_count(_M, _Text)         -> ?NOT_LOADED.

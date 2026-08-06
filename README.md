@@ -174,6 +174,22 @@ ok
 > 取舍、实测数字（查询 35 ms；`n_threads` 超订会慢 20 倍）与排错见
 > [doc/local-embedding-zh.md](doc/local-embedding-zh.md)。
 
+> **GPU（NVIDIA CUDA / Vulkan）**：**构建期探测 SDK、运行期探测显卡**，两件事在
+> 不同机器上发生所以分开做。构建期两个开关都默认 `AUTO`（`BITCASK_LLAMA_CUDA` /
+> `BITCASK_LLAMA_VULKAN`）；运行期由 Erlang 自己按 CUDA > Vulkan > CPU 挑
+> （`backend => auto`），**不需要按机器改配置、也不需要脚本**。
+> ⚠️ 多卡机器上**默认只用一张**：嵌入模型切层跨卡是反优化，要的是数据并行——
+> 开 N 个 embedder 进程各绑一张卡（`gpu_index`）。
+> 旧描述：默认 `AUTO`——构建机上有 CUDA Toolkit 就编进去
+> （`BITCASK_LLAMA_CUDA=AUTO|ON|OFF`）。发布构建请用 `ON`，AUTO 在缺 toolkit 的
+> 机器上会**悄悄**产出纯 CPU 包。CUDA 运行时（cudart/cublas/cublasLt）默认随包
+> 平铺进 `priv/`——体积不是约束，换掉的是"目标机缺 libcublas → ggml 静默跳过
+> → 降级纯 CPU"这一整类故障。先跑 `scripts/detect-llama-backends.sh` 探测环境
+> 并核对运行时真正枚举到了什么（`--build` 问 SDK、`--runtime` 问显卡，两段可以
+> 在不同机器上跑）。构建期事实烧在 .so 里，运行期用 `bitcask_llama_nifs:gpu_status()`
+> 把两者对到一起——只看运行期的话，"0 个 GPU"分不清是包里没编 CUDA（要重新构建）
+> 还是机器没驱动（要装驱动）。
+
 > **向量双引擎**（v4.0.0）：open 时加 `{vector_engine, hnsw | ivfrq | diskann}`
 > 选定引擎（默认 `hnsw`，内存图，≤数 M 向量；`ivfrq` IVF 磁盘段，10M-100M 推荐；
 > `diskann` Vamana 图，实验性）。建库一次性选定并持久化进 `bitcask.meta`；重开
@@ -217,7 +233,7 @@ ok
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
 | `doc/unified-architecture-plan-zh.md` | 统一架构计划（已实施） |
 | `doc/libcask-extraction-zh.md` | **libcask 独立库拆分可行性评估**（2.2.0 规划） |
-| `ROADMAP.md` / `ROADMAP_EN.md` | **路线图**：5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 落地 + 2.1.1 已落地（P5–P15）+ 2.2.0 规划（libcask 独立 / V7+ 向量优化）（中/英） |
+| `ROADMAP.md` / `ROADMAP_EN.md` | **路线图**：5.1.0 / 5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 落地 + 2.1.1 已落地（P5–P15）+ 2.2.0 规划（libcask 独立 / V7+ 向量优化）（中/英） |
 | `TASK.md` | 详细任务拆分与历史 |
 
 ## 项目状态
@@ -236,7 +252,8 @@ ok
 - **3.1.0**（2026-07-01）— 升级 libbitcask v3.1.0（ABI 不破坏）：`{max_read_handles, unlimited}` / `{auto_compact_dead_ratio, R}` 选项、错误原子 `closed`；随库引入 read 句柄默认上限（按 `RLIMIT_NOFILE` 自动推导）、`bitcask.meta` v3 加 CRC32、field.schema FSCH v1 头 + CRC
 - **4.0.0**（2026-07-13）— 升级 libbitcask v4.0.0（ABI 破坏，`SOVERSION` 3→4，源码级兼容）：`{vector_engine, hnsw|ivfrq|diskann}` 向量双引擎 + 调优选项、`{auto_checkpoint_min_docs, N}` 崩溃恢复重放有界；随库引入 IVF-RaBitQ-lite 引擎、DiskANN 引擎（实验性）、AVX2 int8 内核、HNSW `.qc8` mmap 化；`examples/` Wikipedia 检索库示例
 - **4.1.0**（2026-07-15）— 升级 libbitcask v4.1.0（ABI 不破坏，`SOVERSION` 保持 4，盘上格式不变）：对 Erlang 调用方**无 API 变更**，重编即得；随库引入 Phase 5/6 深度审计成果——修复 `close/1` 拆卸路径的进程级永久挂死（`IndexPool` 计数泄漏 + `unregister_lib` 无界 `flush`）、hnsw 三处原子写 rename 前补 `fdatasync`（此前崩溃即半截文件）、`RowChunks`/`MmapSegment` 资源泄漏；`file_util` 归并使 fsync 纪律 4 套收敛为 1 套
-- **5.0.0**（2026-07-17，当前版本）— 升级 libbitcask v5.0.0（64 位时间戳 flag-day，ABI + **盘上格式**双破坏，`SOVERSION` 4→5）：`tstamp`/`expiry_at` 全链路 u32→u64（Y2038 前瞻），修复极大 `expiry_secs` 下 u32 求和回绕致全库误判过期；对 Erlang 调用方**无 API 变更**（`tstamp` 本就是任意精度整数）；`bitcask.meta` v4 门禁干净拒开旧 u32 纪元库，存量库用上游 `bitcask_migrate tstamp64` 非破坏性离线迁移，无须重灌
+- **5.1.0**（2026-08-06，当前版本）— 本地嵌入后端（llama.cpp / ggml，**默认不构建**）+ 独立 embedder 进程。**不涉及 libbitcask 升级**，无 ABI / 盘上格式变更，关掉时产物与 5.0.0 一字不差：独立第二 NIF `priv/bitcask_llama.so`（`BITCASK_WITH_LLAMA=1` 打开），`bitcask_embedder_server` 让多个 cask 共用一份权重且生命周期跟着进程走，CUDA 支持（`BITCASK_LLAMA_CUDA=AUTO|ON|OFF`）+ 构建期/运行期分离诊断（`build_info/0` / `backend_info/0` / `gpu_status/0`）+ 探测脚本 `scripts/detect-llama-backends.sh`；⚠️ `bitcask:open/2` 不再吞掉 `application:start` 失败（返回 `{error, {bitcask_app_start_failed, _}}`，有意的行为变更）
+- **5.0.0**（2026-07-17）— 升级 libbitcask v5.0.0（64 位时间戳 flag-day，ABI + **盘上格式**双破坏，`SOVERSION` 4→5）：`tstamp`/`expiry_at` 全链路 u32→u64（Y2038 前瞻），修复极大 `expiry_secs` 下 u32 求和回绕致全库误判过期；对 Erlang 调用方**无 API 变更**（`tstamp` 本就是任意精度整数）；`bitcask.meta` v4 门禁干净拒开旧 u32 纪元库，存量库用上游 `bitcask_migrate tstamp64` 非破坏性离线迁移，无须重灌
 
 ## 许可证
 

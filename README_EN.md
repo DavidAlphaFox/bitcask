@@ -192,6 +192,27 @@ ok
 > `n_threads` costs 20×) and troubleshooting are in
 > [doc/local-embedding-en.md](doc/local-embedding-en.md).
 
+> **GPU (NVIDIA CUDA / Vulkan)**: **build time probes the SDK, run time probes the
+> GPU** — different machines, so they are done separately. Both build switches
+> default to `AUTO` (`BITCASK_LLAMA_CUDA` / `BITCASK_LLAMA_VULKAN`); at run time
+> Erlang picks CUDA > Vulkan > CPU by itself (`backend => auto`), with **no
+> per-machine configuration and no script**.
+> ⚠️ On a multi-GPU box **only one card is used by default**: splitting an
+> embedding model's layers across cards is a pessimization; what you want is data
+> parallelism — N embedder processes each bound to a card (`gpu_index`).
+> Previously: defaults to `AUTO` — compiled in whenever the build
+> machine has a CUDA Toolkit (`BITCASK_LLAMA_CUDA=AUTO|ON|OFF`). Use `ON` for
+> release builds; AUTO **silently** produces a CPU-only package on a machine
+> without a toolkit. The CUDA runtime (cudart/cublas/cublasLt) is flattened into
+> `priv/` by default — size is not a constraint, and it removes the whole "target
+> is missing libcublas → ggml silently skips the backend → degrades to CPU" class
+> of failure. Run `scripts/detect-llama-backends.sh` first to probe the
+> environment and verify what the runtime actually enumerates (`--build` asks about
+> the SDK, `--runtime` about the GPU; the two halves can run on different machines).
+> The build-time answer is baked into the .so, and `bitcask_llama_nifs:gpu_status()`
+> reconciles it with the runtime — looking only at run time, "0 GPUs" cannot
+> distinguish "no CUDA in the package" (rebuild) from "no driver" (install one).
+
 > **Vector dual-engine** (v4.0.0): pass `{vector_engine, hnsw | ivfrq | diskann}` at
 > open to select the engine (default `hnsw`, in-memory graph, up to a few M vectors;
 > `ivfrq` IVF disk tier, recommended for 10M-100M; `diskann` Vamana graph,
@@ -237,7 +258,7 @@ ok
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
 | `doc/unified-architecture-plan-zh.md` | 统一架构计划（已实施） |
 | `doc/libcask-extraction-zh.md` | **libcask standalone extraction feasibility** (2.2.0 plan) |
-| `ROADMAP_EN.md` / `ROADMAP.md` | **Roadmap**: 5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 shipped + 2.1.1 shipped (P5–P15) + 2.2.0 plan (libcask extraction / V7+ vector optimization) (EN/中) |
+| `ROADMAP_EN.md` / `ROADMAP.md` | **Roadmap**: 5.1.0 / 5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 shipped + 2.1.1 shipped (P5–P15) + 2.2.0 plan (libcask extraction / V7+ vector optimization) (EN/中) |
 | `TASK.md` | Detailed task breakdown & history |
 
 ## Project status
@@ -256,7 +277,8 @@ ok
 - **3.1.0** (2026-07-01) — libbitcask v3.1.0 upgrade (ABI unbroken): `{max_read_handles, unlimited}` / `{auto_compact_dead_ratio, R}` options, `closed` error atom; ships with default read-handle cap (auto-derived from `RLIMIT_NOFILE`), `bitcask.meta` v3 with CRC32, field.schema FSCH v1 header + CRC
 - **4.0.0** (2026-07-13) — libbitcask v4.0.0 upgrade (ABI break, `SOVERSION` 3→4, source-compatible): `{vector_engine, hnsw|ivfrq|diskann}` vector dual-engine + tuning options, `{auto_checkpoint_min_docs, N}` bounded crash-recovery replay; ships with IVF-RaBitQ-lite engine, DiskANN engine (experimental), AVX2 int8 kernels, HNSW `.qc8` codeword mmap; `examples/` Wikipedia search-database example
 - **4.1.0** (2026-07-15) — libbitcask v4.1.0 upgrade (ABI unbroken, `SOVERSION` stays 4, on-disk format unchanged): **no API change** for Erlang callers — just rebuild; ships with the Phase 5/6 deep audit — fixes a process-wide permanent hang on the `close/1` teardown path (`IndexPool` count leak + unbounded `flush` in `unregister_lib`), adds `fdatasync` before `rename` to hnsw's three atomic writes (previously a crash left a truncated file), closes `RowChunks`/`MmapSegment` resource leaks; `file_util` consolidation converges fsync discipline from 4 variants to 1
-- **5.0.0** (2026-07-17, current) — libbitcask v5.0.0 upgrade (64-bit timestamp flag-day, breaking both ABI and **on-disk format**, `SOVERSION` 4→5): `tstamp`/`expiry_at` widen u32→u64 end to end (Y2038 readiness), fixing a u32 wraparound with huge `expiry_secs` that misjudged every key as expired; **no API change** for Erlang callers (`tstamp` was always an arbitrary-precision integer); the `bitcask.meta` v4 gate cleanly refuses old u32-era databases — migrate existing ones offline and non-destructively with upstream's `bitcask_migrate tstamp64`, no re-ingest needed
+- **5.1.0** (2026-08-06, current) — Local embedding backend (llama.cpp / ggml, **not built by default**) plus a standalone embedder process. **No libbitcask upgrade**, no ABI or on-disk format change, and with the backend off the output is byte-for-byte 5.0.0's: a second independent NIF `priv/bitcask_llama.so` (enable with `BITCASK_WITH_LLAMA=1`), `bitcask_embedder_server` so all casks share one copy of the weights with the lifecycle tied to the process, CUDA support (`BITCASK_LLAMA_CUDA=AUTO|ON|OFF`) with build-time/run-time split diagnostics (`build_info/0` / `backend_info/0` / `gpu_status/0`) and the `scripts/detect-llama-backends.sh` probe; ⚠️ `bitcask:open/2` no longer swallows an `application:start` failure (returns `{error, {bitcask_app_start_failed, _}}` — a deliberate behaviour change)
+- **5.0.0** (2026-07-17) — libbitcask v5.0.0 upgrade (64-bit timestamp flag-day, breaking both ABI and **on-disk format**, `SOVERSION` 4→5): `tstamp`/`expiry_at` widen u32→u64 end to end (Y2038 readiness), fixing a u32 wraparound with huge `expiry_secs` that misjudged every key as expired; **no API change** for Erlang callers (`tstamp` was always an arbitrary-precision integer); the `bitcask.meta` v4 gate cleanly refuses old u32-era databases — migrate existing ones offline and non-destructively with upstream's `bitcask_migrate tstamp64`, no re-ingest needed
 
 ## License
 

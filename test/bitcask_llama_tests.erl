@@ -253,6 +253,175 @@ empty_text_test_() ->
         end)
     end}.
 
+%% 构建期事实（build_info/0）与运行期事实（backend_info/0）必须**分开可问**，
+%% 且 gpu_status/0 把两者对到一起时不能自相矛盾。
+%%
+%% ⚠️ 分开问是必须的：只看运行期的话，"0 个 GPU 设备"分不清是包里根本没编
+%%    CUDA、还是包编了但这台机器没驱动 —— 前者要重新构建，后者要装驱动。
+%% 本用例在带 CUDA 和纯 CPU 两种包上都成立。
+build_vs_runtime_split_test_() ->
+    {timeout, 60, fun() ->
+        case bitcask_llama_nifs:available() of
+            false -> ok;
+            true ->
+                %% 构建期：与这台机器无关，不需要 ensure_backend。
+                {ok, B} = bitcask_llama_nifs:build_info(),
+                #{cuda_built := Built, cuda_version := Ver, cuda_archs := Archs,
+                  vulkan_built := VkBuilt} = B,
+                ?assert(is_boolean(Built)),
+                ?assert(is_boolean(VkBuilt)),
+                ?assert(is_binary(Ver)),
+                ?assert(is_binary(Archs)),
+                %% 没编 CUDA 就不该谎报版本/架构。
+                case Built of
+                    false ->
+                        ?assertEqual(<<>>, Ver),
+                        ?assertEqual(<<>>, Archs);
+                    true ->
+                        ?assert(byte_size(Ver) > 0),
+                        ?assert(byte_size(Archs) > 0)
+                end,
+
+                %% 运行期：ensure_backend 之后才有设备。
+                {ok, _} = bitcask_llama_nifs:ensure_backend(),
+                {ok, Rt} = bitcask_llama_nifs:backend_info(),
+                #{count := Cnt, gpu_count := NGpu, devices := Devs} = Rt,
+                ?assertEqual(Cnt, length(Devs)),
+                ?assert(NGpu =< Cnt),
+                %% gpu_count 必须与 devices 里 type=gpu 的条数一致，否则两个
+                %% 数据源在互相打架。
+                ?assertEqual(NGpu, length([D || #{type := gpu} = D <- Devs])),
+
+                %% 合成诊断不能与两边的事实矛盾。
+                {ok, S} = bitcask_llama_nifs:gpu_status(),
+                AnyGpuBuilt = Built orelse VkBuilt,
+                case maps:get(status, S) of
+                    cpu_only_build -> ?assertEqual(false, AnyGpuBuilt);
+                    ok             -> ?assert(AnyGpuBuilt), ?assert(NGpu > 0);
+                    no_gpu_device  -> ?assert(AnyGpuBuilt), ?assertEqual(0, NGpu)
+                end
+        end
+    end}.
+
+%% 运行期后端选择：部署到目标机后由 Erlang 侧自己决定用 CUDA / Vulkan / CPU。
+%%
+%% ⚠️ 这里钉的不变式在**任何**机器上都成立（有卡、没卡、编了 GPU、没编）：
+%%    显式 backend=cpu 一定不上 GPU；未知 backend / split_mode 报错而不是静默
+%%    当成默认值；auto 在没有 GPU 时是**正常结果**而不是故障（不标 fell_back），
+%%    但要留下"为什么没用上卡"的说明。
+backend_selection_test_() ->
+    {timeout, 600, fun() ->
+        case {bitcask_llama_nifs:available(), model_path()} of
+            {true, Path} when is_list(Path) ->
+                case filelib:is_regular(Path) of
+                    false -> ok;
+                    true  -> run_backend_selection(list_to_binary(Path))
+                end;
+            _ -> ok
+        end
+    end}.
+
+run_backend_selection(Path) ->
+    Base = #{pooling => last, n_ctx => 512},
+    %% 未知取值必须报错——静默当成默认值会让"我配了 cuda"变成一句空话。
+    ?assertMatch({error, {bad_backend, _}},
+                 bitcask_llama_nifs:model_load(Path, Base#{backend => opencl})),
+    ?assertMatch({error, {bad_split_mode, _}},
+                 bitcask_llama_nifs:model_load(Path, Base#{split_mode => tensor})),
+
+    %% 显式 CPU：一定不上 GPU，且不算回落（是明确要求，不是降级）。
+    {ok, H0} = bitcask_llama_nifs:model_load(Path, Base#{backend => cpu}),
+    {ok, I0} = bitcask_llama_nifs:model_info(H0),
+    ?assertEqual(<<"cpu">>, maps:get(backend_requested, I0)),
+    ?assertEqual(<<>>, maps:get(backend, I0)),
+    ?assertEqual(0, maps:get(gpu_layers_effective, I0)),
+    ?assertEqual(false, maps:get(fell_back_to_cpu, I0)),
+    ?assertMatch({ok, _}, bitcask_llama_nifs:embed(H0, <<"hi">>, true, false)),
+    ok = bitcask_llama_nifs:model_close(H0),
+
+    %% auto：结果取决于机器，但不变式处处成立。
+    ok = check_auto_backend(Path, Base).
+
+%% auto 路径的不变式。
+check_auto_backend(Path, Base) ->
+    {ok, H} = bitcask_llama_nifs:model_load(Path, Base),
+    {ok, I} = bitcask_llama_nifs:model_info(H),
+    #{backend := Backend, gpu_layers_effective := Eff,
+      fell_back_to_cpu := Fell, gpu_device := Dev} = I,
+    ?assertEqual(<<"auto">>, maps:get(backend_requested, I)),
+    case Backend of
+        <<>> ->
+            %% 没挑到 GPU：一定 0 层、一定不是"回落"（auto 无卡是正常决策），
+            %% 但必须留下说明。
+            ?assertEqual(0, Eff),
+            ?assertEqual(false, Fell),
+            ?assertEqual(<<>>, Dev),
+            ?assert(byte_size(maps:get(gpu_fallback_reason, I)) > 0);
+        Fam ->
+            %% 挑到了：族名只可能是这两个，设备名非空，且默认只绑一张卡。
+            ?assert(Fam =:= <<"CUDA">> orelse Fam =:= <<"Vulkan">>),
+            ?assert(byte_size(Dev) > 0),
+            ?assertEqual(0, maps:get(gpu_index, I))
+    end,
+    ?assertMatch({ok, _}, bitcask_llama_nifs:embed(H, <<"hi">>, true, false)),
+    ok = bitcask_llama_nifs:model_close(H),
+    ok.
+
+%% ⚠️ **GPU 卸载必须诚实上报。**
+%%
+%% 这条钉的是一个真的会撒谎的场景：纯 CPU 构建上请求 n_gpu_layers=999，llama
+%% **不报错**——没有 GPU 可用就默默一层都不卸载。只按"请求值"上报的话，
+%% model_info 会说 999 层在显存里而实际是 0，比不上报更糟。
+%%
+%% 本用例在有卡和无卡的机器上都成立：
+%%   * 无 GPU → effective 必须是 0 且 fell_back_to_cpu=true，还要给出原因；
+%%   * 有 GPU 且装得下 → effective = requested，fell_back_to_cpu=false；
+%%   * 有 GPU 但显存不够 → 回落，effective=0 且带 llama 的原话。
+%% 三种都要求 effective ≤ requested，且 effective=0 与 fell_back 同真同假。
+gpu_offload_reporting_is_truthful_test_() ->
+    {timeout, 600, fun() ->
+        case {bitcask_llama_nifs:available(), model_path()} of
+            {true, Path} when is_list(Path) ->
+                case filelib:is_regular(Path) of
+                    false -> ok;
+                    true  -> run_gpu_report(list_to_binary(Path))
+                end;
+            _ -> ok
+        end
+    end}.
+
+run_gpu_report(Path) ->
+    %% 不要 GPU：不算回落。
+    {ok, M0} = bitcask_llama_nifs:model_load(
+                 Path, #{pooling => last, n_ctx => 512, n_gpu_layers => 0}),
+    {ok, I0} = bitcask_llama_nifs:model_info(M0),
+    ?assertMatch(#{gpu_layers_requested := 0, gpu_layers_effective := 0,
+                   fell_back_to_cpu := false}, I0),
+    ?assertEqual(<<>>, maps:get(gpu_fallback_reason, I0)),
+    ok = bitcask_llama_nifs:model_close(M0),
+
+    %% 要全部层。结果取决于这台机器，但不变式在任何机器上都成立。
+    {ok, M1} = bitcask_llama_nifs:model_load(
+                 Path, #{pooling => last, n_ctx => 512, n_gpu_layers => 999}),
+    {ok, I1} = bitcask_llama_nifs:model_info(M1),
+    #{gpu_layers_requested := Req,
+      gpu_layers_effective := Eff,
+      fell_back_to_cpu     := Fell,
+      gpu_fallback_reason  := Reason} = I1,
+    ?assertEqual(999, Req),
+    %% 绝不能声称卸载了比请求更多的层。
+    ?assert(Eff =< Req),
+    %% effective=0 ⟺ 回落了。两者不同步就说明上报在撒谎。
+    ?assertEqual(Eff =:= 0, Fell),
+    %% 回落了就必须说得出为什么——"悄悄回落"正是要防的那件事。
+    case Fell of
+        true  -> ?assert(byte_size(Reason) > 0);
+        false -> ?assertEqual(<<>>, Reason)
+    end,
+    %% 无论走哪条路，嵌入本身都得能用。
+    ?assertMatch({ok, _}, bitcask_llama_nifs:embed(M1, <<"hello">>, true, false)),
+    ok = bitcask_llama_nifs:model_close(M1).
+
 token_count_test_() ->
     {timeout, 300, fun() ->
         with_model(fun(Ctx) ->

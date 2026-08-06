@@ -56,11 +56,11 @@ priv/bitcask_llama.so          ← NIF 本体
 priv/libggml-base.so*          ← ggml 核心（必须是共享库）
 priv/libggml-cpu-{x64,sse42,sandybridge,ivybridge,haswell,piledriver,
                   skylakex,cannonlake,cascadelake,icelake,cooperlake,
-                  zen4,alderlake,sapphirerapids}.so   ← 13 个 CPU 变体
+                  zen4,alderlake,sapphirerapids}.so   ← 14 个 CPU 变体（x86；ARM 上另一套）
 priv/libggml.so* priv/libllama.so*
 ```
 
-**13 个变体是运行时按 CPU 微架构 `dlopen` 的**，不是构建期选一个。发行时必须
+**这些变体是运行时按 CPU 微架构 `dlopen` 的**，不是构建期选一个。发行时必须
 全带上——少发一个的表现是"那一档 CPU 的用户悄悄没有本地嵌入"，你这边永远
 测不出来。`rebar3 clean` 会一并清掉。
 
@@ -178,6 +178,196 @@ ok = bitcask_embedder_server:stop(Pid),
 ok = bitcask_llama_nifs:model_close(M).   %% 谁开的谁关
 ```
 
+### 3.4 GPU（NVIDIA CUDA / Vulkan）
+
+bitcask 是跑在服务器上的产品，取舍是**性能优先，体积不是约束**。
+
+**构建期探测 SDK，运行期探测显卡** —— 这两件事在不同的机器上发生，所以分开做：
+构建机决定"编进哪些后端"，目标机上由 Erlang **自己**决定"用哪个后端"，不需要
+脚本、也不需要按机器改配置。
+
+#### 构建期 vs 运行期：分开问
+
+这是两个不同的问题，而且经常发生在**不同的机器**上：
+
+| | 问什么 | 谁回答 | 在哪台机器 |
+|---|---|---|---|
+| **构建期** | 有没有 CUDA **SDK**？ | `find_package(CUDAToolkit)` | 构建机（常常没有卡） |
+| **运行期** | 有没有对应的**卡**？ | ggml 枚举到的设备 | 部署机（常常没有 toolkit） |
+
+构建期的答案会**烧进 .so**，运行期能问出来：
+
+```erlang
+{ok, B} = bitcask_llama_nifs:build_info().
+%% #{cuda_built => true, cuda_version => <<"12.4">>,
+%%   cuda_archs => <<"50-virtual,61-virtual,...,90-virtual">>}
+
+{ok, R} = bitcask_llama_nifs:backend_info().
+%% #{count => 2, gpu_count => 1, devices => [#{type => gpu, ...}, ...]}
+
+{ok, S} = bitcask_llama_nifs:gpu_status().   %% 把两者对到一起
+%% #{status => ok | cpu_only_build | no_gpu_device | backend_not_initialized, ...}
+```
+
+> ⚠️ **只问运行期是不够的。** 看到"0 个 GPU 设备"时，如果不知道这个包编没编
+> CUDA，就分不清病因——而两种病要修的东西完全不同：
+
+| `status` | 意思 | 修什么 |
+|---|---|---|
+| `ok` | 编了 CUDA，也枚举到了 GPU | — |
+| `cpu_only_build` | 包里根本没有 CUDA | **重新构建**（装驱动没用） |
+| `no_gpu_device` | 包里有 CUDA，机器上没枚举到卡 | 装驱动 / 容器 `--gpus all` 透传 / 查 `libggml-cuda.so` 的依赖 |
+| `backend_not_initialized` | 还没 `ensure_backend/0` | 先调它 |
+
+脚本也按这条线切开——两段可以在不同机器上分别跑：
+
+```sh
+scripts/detect-llama-backends.sh --build     # 构建机：有没有 SDK
+scripts/detect-llama-backends.sh --runtime   # 部署机：有没有卡 + 这个包用不用得上
+scripts/detect-llama-backends.sh             # 两段都跑
+```
+
+#### 构建期：探测 SDK，决定编什么
+
+两个 GPU 后端各自一个开关，语义一致，默认都是 `AUTO`（探测到 SDK 就编入）：
+
+| 开关 | 需要的 SDK | 说明 |
+|---|---|---|
+| `BITCASK_LLAMA_CUDA=AUTO\|ON\|OFF` | CUDA Toolkit（nvcc + cublas 开发包） | NVIDIA |
+| `BITCASK_LLAMA_VULKAN=AUTO\|ON\|OFF` | Vulkan loader + `glslc` + SPIRV-Headers | AMD / Intel / 也能跑 N 卡 |
+
+两个可以同时开。发布构建请用 `ON`——`AUTO` 在缺 SDK 的机器上会**悄悄**产出纯 CPU
+的包，而两种包长得一模一样。
+
+> ⚠️ Vulkan 的 `AUTO` 必须把**三个**依赖都确认到位才开：ggml-vulkan 的
+> CMakeLists 里 `find_package(Vulkan COMPONENTS glslc REQUIRED)` 与
+> `find_package(SPIRV-Headers CONFIG REQUIRED)` 都是 `REQUIRED`，只探到一个就
+> 打开 `GGML_VULKAN` 会**直接把构建炸掉**——而 AUTO 的全部意义是"没有就安静地
+> 不编"。
+
+`scripts/detect-llama-backends.sh` 是**构建期工具**：CMake 只会说"没找到"，它会
+说**缺哪个包**，并给出建议的构建命令。
+
+#### 运行期：Erlang 自己决定用哪个后端
+
+部署到目标机之后不需要脚本，也不需要按机器改配置：
+
+```erlang
+%% 默认就是 backend => auto
+{ok, M} = bitcask_llama_nifs:model_load(Path, #{pooling => last, n_ctx => 512}).
+```
+
+`auto` 按 **CUDA > Vulkan > CPU** 的顺序挑第一个**真的有 GPU** 的后端族。顺序不是
+随手定的：同一张 N 卡上 CUDA 路径比 Vulkan 快且成熟，Vulkan 是给没有 CUDA 的卡
+兜底的。`n_gpu_layers` 默认也是 auto（有 GPU 就全卸载，没有就 0）。
+
+也可以强制：`backend => cuda | vulkan | cpu`。未知取值报
+`{error, {bad_backend, _}}` 而不是静默当成默认值。
+
+> ⚠️ **只选一族是正确性要求，不是策略。** CUDA 与 Vulkan 同时编进包里时，两者会
+> **各自枚举同一张物理卡**——一张 4090 会以 `CUDA0` 和 `Vulkan0` 两个设备出现。
+> `llama_model_params.devices` 为 NULL 时"使用全部可用设备"，于是 llama 会把同
+> 一张卡当成两张去切分模型层。表现不是报错，是显存被重复占用 + 莫名其妙的慢或
+> OOM。
+
+#### 多卡：默认只用一张，要的是数据并行
+
+**不会自动做多卡负载，这是有意的。** llama 的 `split_mode` 默认是 `LAYER`——把
+模型的层切到所有卡上（模型并行）。对**嵌入模型**那是个反优化：
+
+- 0.6B 权重一张卡装得下，切开之后每次前向都要跨卡传输，而一次前向本来只有几十毫秒；
+- 更糟的是它把 N 张卡的并行能力浪费在**一条串行**的请求路径上（一个
+  `llama_context` 同时只服务一次前向）。
+
+嵌入要的是**数据并行**：一卡一个 context，N 路并发。这正好对上本 NIF 的结构
+（一句柄 = 一 `llama_context` = 串行，N 句柄 = N 路并行）：
+
+```erlang
+{ok, #{devices := Devs}} = bitcask_llama_nifs:backend_info(),
+Gpus = [D || #{type := gpu} = D <- Devs],
+[bitcask_embedder_server:start_link(
+   {local, list_to_atom("emb_" ++ integer_to_list(I))},
+   #{provider => {custom, bitcask_embedder_llama},
+     config   => #{model_path => Path, pooling => last,
+                   n_ctx => 512, gpu_index => I}})
+ || I <- lists:seq(0, length(Gpus) - 1)].
+```
+
+每个进程各占一份权重的显存（0.6B Q8_0 ≈ 640 MB，多数卡装得下多份）。上层按轮询
+或"取空闲"分发即可。
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `gpu_index` | `0` | 绑选中族里的第几张卡。`all` = 全部（仅在 `split_mode /= none` 时有意义） |
+| `split_mode` | `none` | `none`（单卡）\| `layer` \| `row`。只有**大模型单卡装不下**才用后两个 |
+
+> ⚠️ `gpu_index` 越界（写了 2 但只有 2 张卡）报 `{error, {bad_gpu_index, _}}`，
+> **不静默退回 CPU**——那会让整池 worker 都挤在 CPU 上而没人发现。
+
+#### 两件与部署有关的事
+
+**(1) CUDA 运行时随包走。** `GGML_STATIC` 与我们必须开的 `BUILD_SHARED_LIBS=ON`
+冲突（前者会加全局 `-static`），所以 `libggml-cuda.so` 是**动态**链
+cudart / cublas / cublasLt 的。默认 `BITCASK_LLAMA_CUDA_BUNDLE_RUNTIME=ON` 会把
+这三个库平铺进 `priv/`，和它们的使用者并排、靠 `$ORIGIN` 解析。
+
+> cuBLAS 确实很大（CUDA 12 下几百 MB），但换掉的是一整类"构建机上好好的、到
+> 目标机就没 GPU"的故障——而且那种故障**不报错**：ggml 对后端 `dlopen` 失败是
+> 容忍的，失败只是跳过，于是静默降级成纯 CPU。体积不是约束，这个交换是划算的。
+> 要关掉设 `-DBITCASK_LLAMA_CUDA_BUNDLE_RUNTIME=OFF`（那样目标机必须自己装匹配
+> 版本的 CUDA 运行时）。
+
+**(2) 驱动不随包走，也不能随包走。** `libcuda.so.1` 来自 NVIDIA 驱动，版本要与
+GPU 匹配，只能由目标机提供。容器里还要透传设备（`docker --gpus all`），否则驱动
+库在、GPU 却看不见。
+
+#### CUDA 架构覆盖
+
+因为 `GGML_NATIVE=OFF`，ggml 会编一整条线：`50/61/70/75/80-virtual` +
+`86/89-real` + `90-virtual`（+ Blackwell，取决于 toolkit 版本），覆盖 Maxwell 到
+Blackwell。产物大得多，但**换一台机器就没有可用 kernel** 这类事不会发生——服务器
+产品的正确取舍。要收窄自己设 `-DCMAKE_CUDA_ARCHITECTURES=89-real` 之类。
+
+#### 用
+
+```erlang
+{bitcask, [{embedder, #{name => my_embedder,
+                        provider => {custom, bitcask_embedder_llama},
+                        config => #{model_path => <<"/models/qwen3-emb.gguf">>,
+                                    pooling    => last,
+                                    n_ctx      => 512}}}]}.
+```
+
+`backend` 与 `n_gpu_layers` 默认都是 auto —— 有卡就用，没卡就 CPU，**不用改配置**。
+
+#### ⚠️ 加载之后一定要查一次有没有悄悄回落
+
+```erlang
+{ok, I} = bitcask_embedder_llama:info(Ctx),
+maps:with([gpu_layers_requested, gpu_layers_effective,
+           fell_back_to_cpu, gpu_fallback_reason], I).
+```
+
+显存不够时 NIF 会**自动回落纯 CPU 而不是报错**（宁可慢也别不能用），但回落是
+可观测的。三种情形：
+
+| 情形 | `gpu_layers_effective` | `fell_back_to_cpu` | 说明 |
+|---|---|---|---|
+| `backend => cpu`（明确要 CPU） | 0 | `false` | 不是降级 |
+| auto，但这台机器没有 GPU | 0 | `false` | **正常的自动决策**，不是故障；`gpu_fallback_reason` 仍会说明为什么 |
+| 显式要了 GPU，包/机器没有 | **0** | **`true`** | 原因按**请求的那一族**给 |
+| 要了，显存不够 | **0** | **`true`** | 带 llama 的原话 |
+| 成功 | = requested | `false` | `backend` = `CUDA`/`Vulkan`，`gpu_device` = 设备名 |
+
+> ⚠️ 原因是**按请求的那一族**判的：包里编了 Vulkan 没编 CUDA 而你要 `cuda`，
+> 说"有 GPU 后端但没设备"是错的——你要的那个后端压根不在包里。两种要修的东西
+> 不同（重新构建 vs 装驱动）。
+
+> ⚠️ **`gpu_layers_effective` 是按"有没有 GPU 设备"算的，不是按请求值。**
+> 这不是多此一举：纯 CPU 构建上请求 `n_gpu_layers=999`，llama **不报错**——
+> 没有 GPU 可用就默默一层都不卸载。按请求值上报会说"999 层在显存里"而实际是 0，
+> 比不上报更糟。`gpu_offload_reporting_is_truthful_test_` 钉着这条不变式。
+
 ---
 
 ## 4. 选项
@@ -189,7 +379,10 @@ ok = bitcask_llama_nifs:model_close(M).   %% 谁开的谁关
 | `pooling` | `unspecified` | `last` \| `cls` \| `mean` \| `none` \| `rank`。见 §5 |
 | `n_ctx` | `2048` | **性能旋钮**，见 §6 |
 | `n_threads` | `max(1, 可用核数-2)` | 见 §6 |
-| `n_gpu_layers` | `0` | 本仓库默认不编 GPU 后端 |
+| `backend` | `auto` | `auto`（CUDA > Vulkan > CPU）\| `cuda` \| `vulkan` \| `cpu`。见 §3.4 |
+| `gpu_index` | `0` | 绑第几张卡；多卡用数据并行，见 §3.4 |
+| `split_mode` | `none` | `none` \| `layer` \| `row`。大模型单卡装不下才用后两个 |
+| `n_gpu_layers` | `auto` | 有 GPU 就全卸载，没有就 0。见 §3.4 |
 | `dim` | — | 给了就与模型实际维度核对，不符直接报错 |
 | `vector_dim` | `= dim` | MRL 截断维度（≤ dim），Erlang 侧截断 + 重归一 |
 | `max_input_bytes` | `32768` | embed 前的字节级保守截断（第一道闸） |
@@ -289,10 +482,16 @@ C++ 侧用互斥量保证正确性，同一句柄上的并发 `embed` 会排队�
 ## 7. 排错
 
 ```erlang
+%% 构建期：这个包编进去了什么（与这台机器无关）
+bitcask_llama_nifs:build_info().
+%% 运行期：这台机器上真正枚举到了什么
+bitcask_llama_nifs:backend_info().
+%% 两者对到一起的诊断
+bitcask_llama_nifs:gpu_status().
+
 bitcask_llama_nifs:available().    %% false = 没构建 / .so 没装上
 bitcask_llama_nifs:load_status().  %% load_nif 的原始原因
 bitcask_llama_nifs:ensure_backend().  %% {ok, N}；N=0 就是没有匹配本机 CPU 的变体
-bitcask_llama_nifs:backend_info().    %% 跑在哪个后端上
 bitcask_llama_nifs:last_error().      %% llama/ggml 打的最后一条 error
 ```
 
@@ -308,8 +507,19 @@ bitcask_llama_nifs:last_error().      %% llama/ggml 打的最后一条 error
 | `{error, {dim_mismatch, _}}` | 配置里的 `dim` 与模型实际维度不符 |
 | `{error, closed}` | 句柄已 `close/1` |
 | 本地嵌入慢一个数量级 | `n_threads` 超订，见 §6 |
+| 配了 GPU 却还是慢 | 查 `info/1` 的 `fell_back_to_cpu` / `gpu_fallback_reason`，见 §3.4 |
+| `gpu_status()` 返回 `cpu_only_build` | 包里没编 CUDA —— **重新构建**，装驱动没用 |
+| `{error, {bad_gpu_index, _}}` | `gpu_index` 超出这台机器的卡数 —— 按 `backend_info()` 的设备表开池 |
+| `{error, {bad_backend, _}}` / `{error, {bad_split_mode, _}}` | 取值只能是 auto\|cuda\|vulkan\|cpu / none\|layer\|row |
+| `gpu_status()` 返回 `no_gpu_device` | 包里有 CUDA 但机器上没卡 —— 装驱动 / 容器透传 / 查依赖，跑 `scripts/detect-llama-backends.sh --runtime` |
 
 ## 8. 测试
+
+构建期 SDK 探测（**构建机**上跑；运行期不需要脚本）：
+
+```sh
+scripts/detect-llama-backends.sh
+```
 
 ```sh
 # (甲) 降级路径 —— 总是跑，不需要构建这个后端

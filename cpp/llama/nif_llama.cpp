@@ -56,6 +56,7 @@
 //      或**少读一截**，而两种坏法都不报错，只是向量悄悄不对。
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -204,6 +205,185 @@ void write_f32_le(unsigned char* dst, const float* src, size_t n) {
 std::mutex g_backend_mu;
 bool       g_backend_ready = false;
 
+// 已注册的 GPU 设备数。
+//
+// ⚠️ 这个函数存在的理由是一个**真的会撒谎**的场景：纯 CPU 构建（或 CUDA 后端
+//    没加载成功）时请求 n_gpu_layers=999，llama **不报错**——它没有 GPU 可用，
+//    就默默地一层都不卸载。如果只按"请求值"报告，model_info 会说 999 层在
+//    显存里，而实际是 0。那比不报告更糟。
+//    所以 effective 要按"有没有 GPU 设备"算，不是按请求值。
+int32_t gpu_device_count() {
+    int32_t n = 0;
+    const size_t total = ggml_backend_dev_count();
+    for (size_t i = 0; i < total; i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (d && ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) n++;
+    }
+    return n;
+}
+
+// 设备所属的后端族名："CUDA" / "Vulkan" / "CPU" …
+const char* dev_backend_name(ggml_backend_dev_t d) {
+    if (!d) return "";
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(d);
+    const char* n = reg ? ggml_backend_reg_name(reg) : nullptr;
+    return n ? n : "";
+}
+
+bool iequals(const char* a, const char* b) {
+    if (!a || !b) return false;
+    while (*a && *b) {
+        if (std::tolower(static_cast<unsigned char>(*a)) !=
+            std::tolower(static_cast<unsigned char>(*b))) return false;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
+// ---------------------------------------------------------------------------
+// 运行期设备选择。
+//
+// ⚠️ **这是正确性要求，不只是策略。** CUDA 与 Vulkan 同时编进包里时，两个后端
+//    会**各自枚举同一张物理卡** —— 一张 4090 会以 "CUDA0" 和 "Vulkan0" 两个
+//    设备出现。llama 的 llama_model_params.devices 为 NULL 时"使用全部可用
+//    设备"，于是它会把同一张卡当成两张去切分模型层。表现不是报错，是显存被
+//    重复占用 + 莫名其妙的慢/OOM。
+//    所以只要可能有多个 GPU 后端，就必须显式给一份设备清单。
+//
+// pref：
+//   "auto"（默认）—— 按 CUDA > Vulkan 的顺序挑**第一个有 GPU 的后端族**，
+//                    并只用那一族的设备。为什么是这个顺序：同一张 N 卡上
+//                    CUDA 路径比 Vulkan 快且成熟；Vulkan 是给没有 CUDA 的卡
+//                    （AMD / Intel）兜底的。
+//   "cuda" / "vulkan" —— 只用指定族；该族没有设备就退回 CPU（并说明）。
+//   "cpu"  —— 不用任何 GPU。
+//
+// gpu_index：在选中族内取第几张卡。< 0 表示"全都要"（模型并行，见下）。
+//
+// ⚠️ **多卡默认只用一张，这是有意的。**
+//    llama 的 split_mode 默认是 LAYER —— 把模型的层切分到所有传进去的设备上。
+//    对**嵌入模型**那是个反优化：0.6B 权重一张卡装得下，切开之后每次前向都要
+//    跨卡传输，而一次前向本来只有几十毫秒。更糟的是它把 N 张卡的并行能力浪费
+//    在一条串行的请求路径上。
+//    嵌入要的是**数据并行**：一卡一个 context，N 路并发。这正好对上本 NIF 的
+//    结构（一句柄 = 一 context = 串行，N 句柄 = N 路并行）——上层按
+//    backend_info 的设备表开 N 个句柄、各 pin 一张卡即可。
+//    真需要模型并行（大模型单卡装不下）才把 gpu_index 设成 -1 并配 split_mode。
+//
+// 返回选中的设备（NULL 结尾由调用方补），并回填实际选中的族名。
+std::vector<ggml_backend_dev_t> select_devices(const std::string& pref,
+                                               int32_t gpu_index,
+                                               std::string& chosen_family) {
+    chosen_family.clear();
+    std::vector<ggml_backend_dev_t> out;
+    if (pref == "cpu") return out;
+
+    const size_t total = ggml_backend_dev_count();
+
+    auto collect = [&](const char* family) {
+        std::vector<ggml_backend_dev_t> v;
+        for (size_t i = 0; i < total; i++) {
+            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+            if (!d) continue;
+            if (ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+            if (iequals(dev_backend_name(d), family)) v.push_back(d);
+        }
+        return v;
+    };
+
+    // gpu_index >= 0 时只留那一张；越界返回空（上层会报 bad_gpu_index）。
+    auto narrow = [&](std::vector<ggml_backend_dev_t> v) {
+        if (gpu_index < 0) return v;                       // 全都要（模型并行）
+        if (static_cast<size_t>(gpu_index) >= v.size()) return std::vector<ggml_backend_dev_t>{};
+        return std::vector<ggml_backend_dev_t>{v[static_cast<size_t>(gpu_index)]};
+    };
+
+    if (pref == "auto") {
+        for (const char* fam : {"CUDA", "Vulkan"}) {
+            std::vector<ggml_backend_dev_t> all = collect(fam);
+            if (all.empty()) continue;
+            chosen_family = fam;
+            return narrow(std::move(all));
+        }
+        return out;  // 一个 GPU 都没有 → 空清单 → 纯 CPU
+    }
+
+    // 显式指定某一族。
+    const char* fam = (pref == "cuda") ? "CUDA" : (pref == "vulkan") ? "Vulkan" : nullptr;
+    if (!fam) return out;   // 未知偏好当成没有 GPU，由上层报错
+    std::vector<ggml_backend_dev_t> all = collect(fam);
+    if (all.empty()) return out;
+    chosen_family = fam;
+    return narrow(std::move(all));
+}
+
+// 选中族内的 GPU 总数（用于把"越界"与"没有卡"区分开）。
+int32_t family_gpu_count(const std::string& pref) {
+    const size_t total = ggml_backend_dev_count();
+    int32_t best = 0;
+    for (const char* fam : {"CUDA", "Vulkan"}) {
+        if (pref == "cuda" && !iequals(fam, "CUDA")) continue;
+        if (pref == "vulkan" && !iequals(fam, "Vulkan")) continue;
+        int32_t n = 0;
+        for (size_t i = 0; i < total; i++) {
+            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+            if (d && ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                iequals(dev_backend_name(d), fam)) n++;
+        }
+        if (n > 0) return n;   // auto：第一个有卡的族
+        best = best > n ? best : n;
+    }
+    return best;
+}
+
+#if defined(BITCASK_LLAMA_BUILD_CUDA) && BITCASK_LLAMA_BUILD_CUDA
+constexpr bool kCudaBuilt = true;
+#else
+constexpr bool kCudaBuilt = false;
+#endif
+#if defined(BITCASK_LLAMA_BUILD_VULKAN) && BITCASK_LLAMA_BUILD_VULKAN
+constexpr bool kVulkanBuilt = true;
+#else
+constexpr bool kVulkanBuilt = false;
+#endif
+
+// 没有可用 GPU 时的原因说明。
+//
+// ⚠️ **构建期事实在这里把两种原因分开**，不必并列着猜：包里没编这个后端要
+//    重新构建（装驱动没用），编了却没设备要装驱动 / 透传设备（重编没用）。
+//
+// ⚠️ 显式指定某一族时必须**按那一族**判。包里编了 Vulkan 没编 CUDA，而调用方
+//    要 cuda —— 说"有 GPU 后端但没设备"是错的，它要的那个后端压根不在包里。
+std::string no_gpu_reason(const std::string& pref) {
+    const bool want_cuda   = (pref == "cuda");
+    const bool want_vulkan = (pref == "vulkan");
+
+    if (want_cuda && !kCudaBuilt) {
+        return "backend=cuda was requested but this build has no CUDA backend "
+               "(BITCASK_LLAMA_CUDA=OFF at build time). Installing a driver will "
+               "not help -- rebuild on a machine with a CUDA Toolkit, or use "
+               "backend=auto.";
+    }
+    if (want_vulkan && !kVulkanBuilt) {
+        return "backend=vulkan was requested but this build has no Vulkan "
+               "backend (BITCASK_LLAMA_VULKAN=OFF at build time). Installing a "
+               "driver will not help -- rebuild on a machine with a Vulkan SDK "
+               "(glslc + SPIRV-Headers), or use backend=auto.";
+    }
+    if (!kCudaBuilt && !kVulkanBuilt) {
+        return "this build has no GPU backend at all (BITCASK_LLAMA_CUDA=OFF and "
+               "BITCASK_LLAMA_VULKAN=OFF). Installing a driver will not help -- "
+               "it has to be rebuilt on a machine with a CUDA or Vulkan SDK.";
+    }
+    // 要的那个后端确实编进去了（或 auto 且至少编了一个），但运行期没有设备。
+    std::string which = want_cuda ? "CUDA" : want_vulkan ? "Vulkan" : "GPU";
+    return "this build has the " + which + " backend, but no matching GPU device "
+           "was registered at runtime: no driver, a container without the devices "
+           "passed through (docker --gpus all), or the backend .so could not "
+           "resolve its dependencies -- ggml tolerates a failed backend dlopen, "
+           "so it degrades silently. Rebuilding will not help.";
+}
+
 // ---------------------------------------------------------------------------
 // model 资源
 // ---------------------------------------------------------------------------
@@ -220,6 +400,17 @@ struct ModelRes {
     bool    has_encoder = false;
     uint64_t size_bytes = 0;
     std::string desc;
+
+    // GPU 卸载的实际结果。⚠️ requested 与 effective 不一样时上层要**说出来**：
+    // 悄悄回落 CPU 的表现是"我明明有卡，怎么还是这么慢"，屏幕上没有任何线索。
+    int32_t     gpu_layers_requested = 0;
+    int32_t     gpu_layers_effective = 0;
+    bool        fell_back_to_cpu     = false;
+    std::string gpu_fallback_reason;
+    std::string backend_requested;   // auto | cuda | vulkan | cpu
+    std::string backend_chosen;      // 实际选中的族："CUDA" / "Vulkan" / ""(=CPU)
+    std::string gpu_device;          // 实际绑定的设备名（"CUDA0" …），CPU 时为空
+    int32_t     gpu_index_used = -1;
 
     // 释放两个 llama 对象。调用方必须已持有 mu（或保证独占，如 dtor）。
     void free_locked() {
@@ -313,7 +504,49 @@ ERL_NIF_TERM nif_backend_init(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[
 }
 
 // ---------------------------------------------------------------------------
-// NIF: backend_info() -> #{count => N, devices => [#{name, description}]}
+// NIF: build_info() -> #{cuda_built, cuda_version, cuda_archs}
+//
+// **构建期事实**，与这台机器无关 —— 这个 .so 是带着 CUDA 编出来的吗、用的哪个
+// toolkit、覆盖了哪些架构。由 cpp/llama/CMakeLists.txt 在编译期烧进来。
+//
+// ⚠️ 这是"构建期 / 运行期分开"里的构建期一半。没有它，运行期看到 0 个 GPU
+//    设备时分不清是包里没编、还是这台机器没卡 —— 而两者要修的东西完全不同。
+//    另一半是 backend_info()（运行期真正枚举到了什么）。
+// ---------------------------------------------------------------------------
+ERL_NIF_TERM nif_build_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM[]) {
+    if (argc != 0) return enif_make_badarg(env);
+
+#if defined(BITCASK_LLAMA_BUILD_CUDA) && BITCASK_LLAMA_BUILD_CUDA
+    const bool  cuda_built = true;
+    const char* cuda_ver   = BITCASK_LLAMA_CUDA_VERSION;
+    const char* cuda_archs = BITCASK_LLAMA_CUDA_ARCHS;
+#else
+    const bool  cuda_built = false;
+    const char* cuda_ver   = "";
+    const char* cuda_archs = "";
+#endif
+#if defined(BITCASK_LLAMA_BUILD_VULKAN) && BITCASK_LLAMA_BUILD_VULKAN
+    const bool vulkan_built = true;
+#else
+    const bool vulkan_built = false;
+#endif
+
+    const char* kn[] = {"cuda_built", "cuda_version", "cuda_archs", "vulkan_built"};
+    ERL_NIF_TERM keys[4];
+    for (int i = 0; i < 4; i++) keys[i] = enif_make_atom(env, kn[i]);
+    ERL_NIF_TERM vals[4] = {
+        cuda_built ? g_true : g_false,
+        mk_bin(env, cuda_ver),
+        mk_bin(env, cuda_archs),
+        vulkan_built ? g_true : g_false,
+    };
+    ERL_NIF_TERM m;
+    if (!enif_make_map_from_arrays(env, keys, vals, 4, &m)) return enif_make_badarg(env);
+    return enif_make_tuple2(env, g_ok, m);
+}
+
+// ---------------------------------------------------------------------------
+// NIF: backend_info() -> #{count => N, devices => [#{name, description, type}]}
 // ---------------------------------------------------------------------------
 ERL_NIF_TERM nif_backend_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM[]) {
     if (argc != 0) return enif_make_badarg(env);
@@ -329,22 +562,45 @@ ERL_NIF_TERM nif_backend_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM[]) {
         ggml_backend_dev_t d = ggml_backend_dev_get(i);
         const char* name = d ? ggml_backend_dev_name(d) : "";
         const char* desc = d ? ggml_backend_dev_description(d) : "";
-        ERL_NIF_TERM keys[2] = {enif_make_atom(env, "name"),
-                                enif_make_atom(env, "description")};
-        ERL_NIF_TERM vals[2] = {mk_bin(env, name ? name : ""),
-                                mk_bin(env, desc ? desc : "")};
+        // 设备类型让 Erlang 侧能直接数出 GPU 数，不必再过一次 NIF。
+        const char* type = "unknown";
+        if (d) {
+            switch (ggml_backend_dev_type(d)) {
+                case GGML_BACKEND_DEVICE_TYPE_CPU:   type = "cpu";   break;
+                case GGML_BACKEND_DEVICE_TYPE_GPU:   type = "gpu";   break;
+                case GGML_BACKEND_DEVICE_TYPE_ACCEL: type = "accel"; break;
+                default: break;
+            }
+        }
+        // 后端族名让 Erlang 侧能分清同一张物理卡的 CUDA / Vulkan 两个视图。
+        size_t mem_free = 0, mem_total = 0;
+        if (d) ggml_backend_dev_memory(d, &mem_free, &mem_total);
+        ERL_NIF_TERM keys[6] = {enif_make_atom(env, "name"),
+                                enif_make_atom(env, "description"),
+                                enif_make_atom(env, "type"),
+                                enif_make_atom(env, "backend"),
+                                enif_make_atom(env, "memory_free"),
+                                enif_make_atom(env, "memory_total")};
+        ERL_NIF_TERM vals[6] = {mk_bin(env, name ? name : ""),
+                                mk_bin(env, desc ? desc : ""),
+                                enif_make_atom(env, type),
+                                mk_bin(env, dev_backend_name(d)),
+                                enif_make_uint64(env, mem_free),
+                                enif_make_uint64(env, mem_total)};
         ERL_NIF_TERM m;
-        if (!enif_make_map_from_arrays(env, keys, vals, 2, &m)) return enif_make_badarg(env);
+        if (!enif_make_map_from_arrays(env, keys, vals, 6, &m)) return enif_make_badarg(env);
         devs.push_back(m);
     }
 
-    ERL_NIF_TERM keys[2] = {enif_make_atom(env, "count"),
+    ERL_NIF_TERM keys[3] = {enif_make_atom(env, "count"),
+                            enif_make_atom(env, "gpu_count"),
                             enif_make_atom(env, "devices")};
-    ERL_NIF_TERM vals[2] = {enif_make_uint64(env, n),
+    ERL_NIF_TERM vals[3] = {enif_make_uint64(env, n),
+                            enif_make_int(env, gpu_device_count()),
                             enif_make_list_from_array(env, devs.data(),
                                                       static_cast<unsigned>(devs.size()))};
     ERL_NIF_TERM m;
-    if (!enif_make_map_from_arrays(env, keys, vals, 2, &m)) return enif_make_badarg(env);
+    if (!enif_make_map_from_arrays(env, keys, vals, 3, &m)) return enif_make_badarg(env);
     return enif_make_tuple2(env, g_ok, m);
 }
 
@@ -356,69 +612,169 @@ ERL_NIF_TERM nif_backend_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM[]) {
 // NThreads / NCtx / NGpuLayers: 0 或负数表示"用默认"。
 // ---------------------------------------------------------------------------
 ERL_NIF_TERM nif_model_load(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
-    if (argc != 5) return enif_make_badarg(env);
+    if (argc != 8) return enif_make_badarg(env);
     {
         std::lock_guard<std::mutex> lk(g_backend_mu);
         if (!g_backend_ready) return mk_err(env, "backend_not_initialized");
     }
 
-    std::string path;
-    int pooling = -1, n_threads = 0, n_ctx_req = 0, n_gpu_layers = 0;
+    std::string path, backend_pref, split_pref;
+    int pooling = -1, n_threads = 0, n_ctx_req = 0, n_gpu_layers = 0, gpu_index = 0;
     if (!get_bin_str(env, argv[0], path))          return enif_make_badarg(env);
     if (!enif_get_int(env, argv[1], &pooling))     return enif_make_badarg(env);
     if (!enif_get_int(env, argv[2], &n_threads))   return enif_make_badarg(env);
     if (!enif_get_int(env, argv[3], &n_ctx_req))   return enif_make_badarg(env);
     if (!enif_get_int(env, argv[4], &n_gpu_layers))return enif_make_badarg(env);
+    if (!get_bin_str(env, argv[5], backend_pref))  return enif_make_badarg(env);
+    if (!enif_get_int(env, argv[6], &gpu_index))   return enif_make_badarg(env);
+    if (!get_bin_str(env, argv[7], split_pref))    return enif_make_badarg(env);
     if (path.empty()) return mk_err(env, "empty_path");
+    if (backend_pref.empty()) backend_pref = "auto";
+    if (backend_pref != "auto" && backend_pref != "cuda" &&
+        backend_pref != "vulkan" && backend_pref != "cpu") {
+        return mk_err_msg(env, "bad_backend",
+                          "backend must be auto | cuda | vulkan | cpu, got: " + backend_pref);
+    }
 
     err_clear();
 
-    llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = n_gpu_layers;
+    // ------------------------------------------------------------------
+    // 运行期决策：这台机器上用哪个后端。
+    //
+    // ⚠️ 显式给设备清单是**正确性要求**：CUDA 与 Vulkan 同时编进包里时，两者
+    //    各自枚举同一张物理卡，devices=NULL 会让 llama 把它当成两张去切分。
+    //    详见 select_devices() 上面那段。
+    // ------------------------------------------------------------------
+    if (split_pref.empty()) split_pref = "none";
+    if (split_pref != "none" && split_pref != "layer" && split_pref != "row") {
+        return mk_err_msg(env, "bad_split_mode",
+                          "split_mode must be none | layer | row, got: " + split_pref);
+    }
+    // split_mode /= none 才有理由要多张卡；none 下 gpu_index<0 没有意义。
+    if (split_pref == "none" && gpu_index < 0) gpu_index = 0;
 
-    llama_model* model = llama_model_load_from_file(path.c_str(), mp);
-    if (!model) {
+    std::string chosen_family;
+    std::vector<ggml_backend_dev_t> devs =
+        select_devices(backend_pref, gpu_index, chosen_family);
+
+    // ⚠️ 把"卡不够"与"根本没有卡"分开：前者是配置错（写了 gpu_index=3 但只有
+    //    2 张），静默退回 CPU 会让整池 worker 都挤在 CPU 上而没人发现。
+    if (devs.empty() && gpu_index > 0) {
+        const int32_t have = family_gpu_count(backend_pref);
+        if (have > 0) {
+            return mk_err_msg(env, "bad_gpu_index",
+                              "gpu_index=" + std::to_string(gpu_index) +
+                              " but only " + std::to_string(have) +
+                              " GPU(s) available for backend=" + backend_pref);
+        }
+    }
+
+    // n_gpu_layers < 0 表示"auto"：有 GPU 就全卸载（llama 里负值 = 所有层），
+    // 没 GPU 就 0。这样调用方不必先问一遍有没有卡再决定传什么。
+    //
+    // ⚠️ **原始请求值要留一份**：下面会按实际有没有设备改写 n_gpu_layers，
+    //    而 model_info 报的 gpu_layers_requested 必须是**调用方要的那个数**。
+    //    用改写后的值去报，"我请求了 999"就变成"我请求了 0"——上报又开始撒谎了。
+    const int32_t n_gpu_layers_req = n_gpu_layers;
+    const bool auto_layers = (n_gpu_layers < 0);
+    if (auto_layers) n_gpu_layers = devs.empty() ? 0 : -1;
+    if (devs.empty()) n_gpu_layers = 0;   // 没设备就别声称要卸载
+
+    // llama 要 NULL 结尾的清单；空清单传 nullptr（= 纯 CPU，因为 n_gpu_layers=0）。
+    std::vector<ggml_backend_dev_t> dev_list;
+    if (!devs.empty()) {
+        dev_list = devs;
+        dev_list.push_back(nullptr);
+    }
+
+    // ------------------------------------------------------------------
+    // 装载 + 建上下文，一次尝试。
+    //
+    // ⚠️ **GPU 回落必须把"建上下文"也圈进去。** 最常见的显存不足是倒在
+    //    llama_init_from_model 的 compute buffer 上，那时候权重早就装进显存了
+    //    ——只对 llama_model_load_from_file 做回落，等于对这条最常见的路完全
+    //    没有回落。
+    // ------------------------------------------------------------------
+    struct Loaded {
+        llama_model*   model  = nullptr;
+        llama_context* ctx    = nullptr;
+        int32_t        n_ctx  = 0;
+        int32_t        n_ctx_train = 0;
+    };
+
+    auto try_load = [&](int32_t ngl) -> Loaded {
+        Loaded out;
+        llama_model_params mp = llama_model_default_params();
+        mp.n_gpu_layers = ngl;
+        // ngl==0 的那一遍（回落）不要带设备清单，否则 llama 仍会为这些设备
+        // 建 buffer。
+        mp.devices = (ngl != 0 && !dev_list.empty()) ? dev_list.data() : nullptr;
+        // 默认单卡（NONE）：嵌入模型切层跨卡是反优化，见 select_devices()。
+        mp.split_mode = (split_pref == "layer") ? LLAMA_SPLIT_MODE_LAYER
+                      : (split_pref == "row")   ? LLAMA_SPLIT_MODE_ROW
+                                                : LLAMA_SPLIT_MODE_NONE;
+
+        llama_model* m = llama_model_load_from_file(path.c_str(), mp);
+        if (!m) return out;
+
+        // n_ctx 是一个**真的性能旋钮**，不只是长度上限：计算图按它分配，取
+        // n_ctx_train（Qwen3-Embedding 是 32768）会让每次前向都按最坏情况算。
+        // 调用方给多少用多少，但**向下钳到 n_ctx_train**——嵌入模型超出训练
+        // 长度没有任何正确的语义，钳的结果由 model_info 的 n_ctx 报出来。
+        const int32_t n_ctx_train = llama_model_n_ctx_train(m);
+        int32_t use_ctx = (n_ctx_req > 0) ? n_ctx_req : n_ctx_train;
+        if (n_ctx_train > 0 && use_ctx > n_ctx_train) use_ctx = n_ctx_train;
+        if (use_ctx <= 0) { llama_model_free(m); return out; }
+
+        llama_context_params cp = llama_context_default_params();
+        cp.embeddings = true;  // 要向量，不要 logits
+        cp.n_ctx      = static_cast<uint32_t>(use_ctx);
+        // ⚠️ 一次只喂一条，n_batch/n_ubatch 必须容得下最长的那条，否则
+        //    llama_encode/decode 会**拒绝整条 batch**（返回负值，不是截断）。
+        cp.n_batch    = static_cast<uint32_t>(use_ctx);
+        cp.n_ubatch   = static_cast<uint32_t>(use_ctx);
+        cp.pooling_type = (pooling < 0) ? LLAMA_POOLING_TYPE_UNSPECIFIED
+                                        : static_cast<enum llama_pooling_type>(pooling);
+        if (n_threads > 0) {
+            cp.n_threads       = n_threads;
+            cp.n_threads_batch = n_threads;
+        }
+
+        llama_context* c = llama_init_from_model(m, cp);
+        if (!c) {
+            // ⚠️ 必须把 model 收掉再返回——不收的话回落那一遍会再装一份权重，
+            //    而第一份还占着显存，回落本身把显存又吃满一次。
+            llama_model_free(m);
+            return out;
+        }
+        out.model = m; out.ctx = c; out.n_ctx = use_ctx; out.n_ctx_train = n_ctx_train;
+        return out;
+    };
+
+    bool        fell_back = false;
+    std::string gpu_err;
+    Loaded got = try_load(n_gpu_layers);
+    if (!got.ctx && n_gpu_layers != 0) {
+        // GPU 那次的错误留着——回落之后它是用户唯一能看到的"为什么没用上卡"。
+        gpu_err = err_get();
+        if (gpu_err.empty()) gpu_err = "GPU load failed (no reason reported)";
+        err_clear();
+        got = try_load(0);
+        if (got.ctx) {
+            fell_back = true;
+        } else if (err_get().empty()) {
+            err_set(gpu_err);
+        }
+    }
+    if (!got.ctx) {
         return mk_err_last(env, "model_load_failed",
                            ("failed to load GGUF: " + path).c_str());
     }
 
-    // n_ctx 是一个**真的性能旋钮**，不只是长度上限：计算图按它分配，取
-    // n_ctx_train（Qwen3-Embedding 是 32768）会让每次前向都按最坏情况算。
-    // 调用方给多少用多少，但**向下钳到 n_ctx_train**——嵌入模型超出训练长度
-    // 没有任何正确的语义，钳的结果由 model_info 的 n_ctx 报出来，可观测。
-    const int32_t n_ctx_train = llama_model_n_ctx_train(model);
-    int32_t use_ctx = (n_ctx_req > 0) ? n_ctx_req : n_ctx_train;
-    if (n_ctx_train > 0 && use_ctx > n_ctx_train) use_ctx = n_ctx_train;
-    if (use_ctx <= 0) {
-        llama_model_free(model);
-        return mk_err_msg(env, "bad_n_ctx",
-                          "cannot determine a usable context size (n_ctx_train=" +
-                          std::to_string(n_ctx_train) + ")");
-    }
-
-    llama_context_params cp = llama_context_default_params();
-    cp.embeddings = true;  // 要向量，不要 logits
-    cp.n_ctx      = static_cast<uint32_t>(use_ctx);
-    // ⚠️ 一次只喂一条，n_batch/n_ubatch 必须容得下最长的那条，否则
-    //    llama_encode/decode 会**拒绝整条 batch**（返回负值，不是截断）。
-    cp.n_batch    = static_cast<uint32_t>(use_ctx);
-    cp.n_ubatch   = static_cast<uint32_t>(use_ctx);
-    cp.pooling_type = (pooling < 0) ? LLAMA_POOLING_TYPE_UNSPECIFIED
-                                    : static_cast<enum llama_pooling_type>(pooling);
-    if (n_threads > 0) {
-        cp.n_threads       = n_threads;
-        cp.n_threads_batch = n_threads;
-    }
-
-    llama_context* ctx = llama_init_from_model(model, cp);
-    if (!ctx) {
-        // ⚠️ 必须把 model 收掉再返回——不收就是几百 MB 到几 GB 的泄漏，而且
-        //    调用方重试时会再装一份。
-        llama_model_free(model);
-        return mk_err_last(env, "context_init_failed",
-                           "llama_init_from_model returned NULL "
-                           "(out of memory for the compute buffer?)");
-    }
+    llama_model*   model       = got.model;
+    llama_context* ctx         = got.ctx;
+    const int32_t  use_ctx     = got.n_ctx;
+    const int32_t  n_ctx_train = got.n_ctx_train;
 
     // (乙) NONE 意味着不池化，llama_get_embeddings_seq 会返回 NULL。与其等到
     // 第一次嵌入拿到 NULL，不如**在加载这一步就拒绝**，并且把话说清楚：这几乎
@@ -465,6 +821,42 @@ ERL_NIF_TERM nif_model_load(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     r->pooling     = static_cast<int32_t>(llama_pooling_type(ctx));
     r->has_encoder = llama_model_has_encoder(model);
     r->size_bytes  = llama_model_size(model);
+    // ⚠️ effective 按**实际选中的设备**算，不是按请求值 —— 没有 GPU 时 llama
+    //    对 n_gpu_layers=999 不报错，只是默默不卸载。
+    const int32_t n_gpu_dev = static_cast<int32_t>(devs.size());
+    r->backend_requested = backend_pref;
+    r->backend_chosen    = (n_gpu_dev > 0 && !fell_back) ? chosen_family : std::string();
+    if (n_gpu_dev > 0 && !fell_back) {
+        r->gpu_index_used = gpu_index;
+        r->gpu_device     = dev_backend_name(devs[0]);
+        const char* dn = ggml_backend_dev_name(devs[0]);
+        if (dn) r->gpu_device = dn;
+    }
+    r->gpu_layers_requested = n_gpu_layers_req;
+    if (backend_pref == "cpu") {
+        r->gpu_layers_effective = 0;
+        r->fell_back_to_cpu     = false;   // 明确要 CPU，不算回落
+    } else if (n_gpu_layers_req == 0 && n_gpu_dev == 0) {
+        r->gpu_layers_effective = 0;
+        r->fell_back_to_cpu     = false;   // 本来就没要 GPU，不算回落
+    } else if (auto_layers && n_gpu_dev == 0) {
+        // auto 且这台机器没有可用 GPU —— 这是**正常的自动决策结果**，不是故障，
+        // 所以不标 fell_back，但把原因留下，便于回答"为什么没用上卡"。
+        r->gpu_layers_effective = 0;
+        r->fell_back_to_cpu     = false;
+        r->gpu_fallback_reason  = no_gpu_reason(backend_pref);
+    } else if (n_gpu_dev == 0) {
+        r->gpu_layers_effective = 0;
+        r->fell_back_to_cpu     = true;
+        r->gpu_fallback_reason = no_gpu_reason(backend_pref);
+    } else if (fell_back) {
+        r->gpu_layers_effective = 0;
+        r->fell_back_to_cpu     = true;
+        r->gpu_fallback_reason  = gpu_err;
+    } else {
+        r->gpu_layers_effective = n_gpu_layers;
+        r->fell_back_to_cpu     = false;
+    }
     {
         char buf[256] = {0};
         llama_model_desc(model, buf, sizeof buf);
@@ -487,11 +879,19 @@ ERL_NIF_TERM nif_model_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     std::lock_guard<std::mutex> lk(r->mu);
     if (!r->ctx) return mk_err(env, "closed");
 
+    // gpu_layers_requested / _effective / fell_back_to_cpu / gpu_fallback_reason：
+    // ⚠️ 这四个是给"我明明有卡，怎么还是这么慢"用的。悄悄回落 CPU 的表现就是
+    //    一切正常、只是慢十倍，屏幕上没有任何线索——除非上层去问这四个。
     const char* kn[] = {"dim", "n_embd", "n_ctx", "n_ctx_train",
-                        "pooling_type", "has_encoder", "size_bytes", "description"};
-    ERL_NIF_TERM keys[8];
-    for (int i = 0; i < 8; i++) keys[i] = enif_make_atom(env, kn[i]);
-    ERL_NIF_TERM vals[8] = {
+                        "pooling_type", "has_encoder", "size_bytes", "description",
+                        "gpu_layers_requested", "gpu_layers_effective",
+                        "fell_back_to_cpu", "gpu_fallback_reason",
+                        "backend_requested", "backend",
+                        "gpu_index", "gpu_device"};
+    constexpr int kN = 16;
+    ERL_NIF_TERM keys[kN];
+    for (int i = 0; i < kN; i++) keys[i] = enif_make_atom(env, kn[i]);
+    ERL_NIF_TERM vals[kN] = {
         enif_make_int(env, r->n_embd_out),
         enif_make_int(env, r->n_embd),
         enif_make_int(env, r->n_ctx),
@@ -500,9 +900,18 @@ ERL_NIF_TERM nif_model_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         r->has_encoder ? g_true : g_false,
         enif_make_uint64(env, r->size_bytes),
         mk_bin(env, r->desc),
+        enif_make_int(env, r->gpu_layers_requested),
+        enif_make_int(env, r->gpu_layers_effective),
+        r->fell_back_to_cpu ? g_true : g_false,
+        mk_bin(env, r->gpu_fallback_reason),
+        mk_bin(env, r->backend_requested),
+        // 实际跑在哪个后端上："CUDA" / "Vulkan" / ""（= CPU）
+        mk_bin(env, r->backend_chosen),
+        enif_make_int(env, r->gpu_index_used),
+        mk_bin(env, r->gpu_device),
     };
     ERL_NIF_TERM m;
-    if (!enif_make_map_from_arrays(env, keys, vals, 8, &m)) return enif_make_badarg(env);
+    if (!enif_make_map_from_arrays(env, keys, vals, kN, &m)) return enif_make_badarg(env);
     return enif_make_tuple2(env, g_ok, m);
 }
 
@@ -677,7 +1086,8 @@ ERL_NIF_TERM nif_last_error(ErlNifEnv* env, int argc, const ERL_NIF_TERM[]) {
 ErlNifFunc kNifFuncs[] = {
     {"backend_init",   1, nif_backend_init,   ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"backend_info",   0, nif_backend_info,   0},
-    {"model_load",     5, nif_model_load,     ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"build_info",     0, nif_build_info,     0},
+    {"model_load",     8, nif_model_load,     ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"model_info",     1, nif_model_info,     0},
     {"model_close",    1, nif_model_close,    ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"tokenize_count", 2, nif_tokenize_count, ERL_NIF_DIRTY_JOB_CPU_BOUND},

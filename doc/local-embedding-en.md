@@ -64,11 +64,11 @@ priv/bitcask_llama.so          ← the NIF itself
 priv/libggml-base.so*          ← ggml core (must be a shared library)
 priv/libggml-cpu-{x64,sse42,sandybridge,ivybridge,haswell,piledriver,
                   skylakex,cannonlake,cascadelake,icelake,cooperlake,
-                  zen4,alderlake,sapphirerapids}.so   ← 13 CPU variants
+                  zen4,alderlake,sapphirerapids}.so   ← 14 CPU variants (x86; ARM has its own set)
 priv/libggml.so* priv/libllama.so*
 ```
 
-**The 13 variants are `dlopen`ed at runtime by CPU microarchitecture**, not
+**These variants are `dlopen`ed at runtime by CPU microarchitecture**, not
 picked at build time. Ship all of them — dropping one shows up as "users on that
 one CPU tier silently have no local embedding", which you will never reproduce
 on your side. `rebar3 clean` removes them along with everything else.
@@ -199,6 +199,223 @@ ok = bitcask_embedder_server:stop(Pid),
 ok = bitcask_llama_nifs:model_close(M).   %% whoever opened it closes it
 ```
 
+### 3.4 GPU (NVIDIA CUDA / Vulkan)
+
+bitcask is a server-side product, so the trade-off is **performance first, size
+is not a constraint**.
+
+**Build time probes the SDK, run time probes the GPU** — these happen on
+different machines, so they are done separately: the build box decides which
+backends get compiled in, and on the target box Erlang decides **by itself**
+which one to use. No script, no per-machine configuration.
+
+#### Build time vs run time: ask them separately
+
+These are two different questions, and they routinely happen on **different
+machines**:
+
+| | Asks | Answered by | On which machine |
+|---|---|---|---|
+| **Build time** | Is there a CUDA **SDK**? | `find_package(CUDAToolkit)` | the build box (often has no GPU) |
+| **Run time** | Is there a matching **GPU**? | the devices ggml enumerates | the deployment box (often has no toolkit) |
+
+The build-time answer is **baked into the .so** so the runtime can ask for it:
+
+```erlang
+{ok, B} = bitcask_llama_nifs:build_info().
+%% #{cuda_built => true, cuda_version => <<"12.4">>,
+%%   cuda_archs => <<"50-virtual,61-virtual,...,90-virtual">>}
+
+{ok, R} = bitcask_llama_nifs:backend_info().
+%% #{count => 2, gpu_count => 1, devices => [#{type => gpu, ...}, ...]}
+
+{ok, S} = bitcask_llama_nifs:gpu_status().   %% the two, reconciled
+%% #{status => ok | cpu_only_build | no_gpu_device | backend_not_initialized, ...}
+```
+
+> ⚠️ **Asking only about run time is not enough.** Faced with "0 GPU devices",
+> without knowing whether this package was built with CUDA you cannot tell the
+> two diagnoses apart — and they need completely different fixes:
+
+| `status` | Meaning | Fix |
+|---|---|---|
+| `ok` | CUDA compiled in, GPU enumerated | — |
+| `cpu_only_build` | the package has no CUDA at all | **rebuild** (installing a driver will not help) |
+| `no_gpu_device` | CUDA is in the package, no GPU on this machine | install the driver / pass devices through with `--gpus all` / check `libggml-cuda.so`'s dependencies |
+| `backend_not_initialized` | `ensure_backend/0` not called yet | call it |
+
+The script is split along the same line — the two halves can run on different
+machines:
+
+```sh
+scripts/detect-llama-backends.sh --build     # build box: is there an SDK
+scripts/detect-llama-backends.sh --runtime   # deploy box: is there a GPU, and can this package use it
+scripts/detect-llama-backends.sh             # both
+```
+
+#### Build time: probe the SDK, decide what to compile
+
+One switch per GPU backend, same semantics, both defaulting to `AUTO` (compiled
+in whenever the SDK is detected):
+
+| Switch | SDK required | For |
+|---|---|---|
+| `BITCASK_LLAMA_CUDA=AUTO\|ON\|OFF` | CUDA Toolkit (nvcc + cublas dev package) | NVIDIA |
+| `BITCASK_LLAMA_VULKAN=AUTO\|ON\|OFF` | Vulkan loader + `glslc` + SPIRV-Headers | AMD / Intel / also works on NVIDIA |
+
+Both can be on at once. Use `ON` for release builds — `AUTO` **silently** produces
+a CPU-only package on a machine without the SDK, and the two look identical.
+
+> ⚠️ Vulkan's `AUTO` has to confirm **three** dependencies before enabling
+> anything: ggml-vulkan's CMakeLists declares both
+> `find_package(Vulkan COMPONENTS glslc REQUIRED)` and
+> `find_package(SPIRV-Headers CONFIG REQUIRED)` as `REQUIRED`, so turning
+> `GGML_VULKAN` on having found only one of them **fails the build outright** —
+> and the entire point of AUTO is "quietly don't compile it if it isn't there".
+
+`scripts/detect-llama-backends.sh` is a **build-time tool**: CMake only says "not
+found", while the script says **which package is missing** and prints the build
+command to use.
+
+#### Run time: Erlang picks the backend itself
+
+Once deployed on the target machine there is no script involved, and no
+per-machine configuration:
+
+```erlang
+%% backend => auto is the default
+{ok, M} = bitcask_llama_nifs:model_load(Path, #{pooling => last, n_ctx => 512}).
+```
+
+`auto` walks **CUDA > Vulkan > CPU** and takes the first backend family that
+actually has a GPU. The order is not arbitrary: on the same NVIDIA card the CUDA
+path is faster and more mature, and Vulkan is the fallback for cards without CUDA.
+`n_gpu_layers` also defaults to auto (offload everything if there is a GPU,
+otherwise 0).
+
+You can force it: `backend => cuda | vulkan | cpu`. An unknown value returns
+`{error, {bad_backend, _}}` rather than silently falling back to the default.
+
+> ⚠️ **Picking exactly one family is a correctness requirement, not a policy.**
+> With CUDA and Vulkan both compiled in, each backend **enumerates the same
+> physical card** — one 4090 shows up as both `CUDA0` and `Vulkan0`. With
+> `llama_model_params.devices` left NULL ("use all available devices") llama then
+> splits the model's layers across what it thinks are two cards. That does not
+> error; it double-books VRAM and produces mysterious slowness or OOM.
+
+#### Multiple GPUs: one card by default; what you want is data parallelism
+
+**Multi-GPU load spreading does not happen automatically, on purpose.** llama's
+`split_mode` defaults to `LAYER` — splitting the model's layers across every card
+(model parallelism). For an **embedding model** that is a pessimization:
+
+- 0.6B of weights fits on a single card, so splitting only adds cross-GPU
+  transfers to every forward pass — and a forward pass is only tens of ms to
+  begin with;
+- worse, it spends N cards' worth of parallelism on **one serial** request path
+  (a single `llama_context` serves one forward at a time).
+
+Embedding wants **data parallelism**: one context per card, N concurrent. That
+maps exactly onto this NIF's structure (one handle = one `llama_context` = serial,
+so N handles = N-way parallel):
+
+```erlang
+{ok, #{devices := Devs}} = bitcask_llama_nifs:backend_info(),
+Gpus = [D || #{type := gpu} = D <- Devs],
+[bitcask_embedder_server:start_link(
+   {local, list_to_atom("emb_" ++ integer_to_list(I))},
+   #{provider => {custom, bitcask_embedder_llama},
+     config   => #{model_path => Path, pooling => last,
+                   n_ctx => 512, gpu_index => I}})
+ || I <- lists:seq(0, length(Gpus) - 1)].
+```
+
+Each process holds its own copy of the weights in VRAM (0.6B Q8_0 ≈ 640 MB; most
+cards fit several). Dispatch round-robin or pick-an-idle-one above that.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `gpu_index` | `0` | Which card within the selected family. `all` = every card (only meaningful with `split_mode /= none`) |
+| `split_mode` | `none` | `none` (single card) \| `layer` \| `row`. Use the latter two only when **a large model does not fit on one card** |
+
+> ⚠️ An out-of-range `gpu_index` (you wrote 2 but there are only 2 cards) returns
+> `{error, {bad_gpu_index, _}}` and does **not** silently fall back to CPU — that
+> would pile the whole worker pool onto the CPU with nobody noticing.
+
+#### Two deployment facts
+
+**(1) The CUDA runtime ships with the package.** `GGML_STATIC` conflicts with the
+`BUILD_SHARED_LIBS=ON` we require (it adds a global `-static`), so
+`libggml-cuda.so` links cudart / cublas / cublasLt **dynamically**. By default
+`BITCASK_LLAMA_CUDA_BUNDLE_RUNTIME=ON` flattens those three into `priv/`, next to
+their consumer, resolved via `$ORIGIN`.
+
+> cuBLAS is genuinely large (hundreds of MB under CUDA 12), but what it buys is
+> the elimination of a whole class of "fine on the build box, no GPU on the
+> target" failures — and those failures **do not report anything**: ggml tolerates
+> a failed backend `dlopen`, it just skips it, so you silently degrade to CPU.
+> Size is not a constraint here; the trade is worth it. Turn it off with
+> `-DBITCASK_LLAMA_CUDA_BUNDLE_RUNTIME=OFF` (then the target machine must install
+> a matching CUDA runtime itself).
+
+**(2) The driver does not ship, and cannot.** `libcuda.so.1` comes from the NVIDIA
+driver, must match the GPU, and can only be provided by the target machine. In a
+container you also need the devices passed through (`docker --gpus all`), or the
+driver libraries are present while the GPU is invisible.
+
+#### CUDA architecture coverage
+
+Because `GGML_NATIVE=OFF`, ggml compiles the whole line: `50/61/70/75/80-virtual`
++ `86/89-real` + `90-virtual` (+ Blackwell, depending on toolkit version),
+covering Maxwell through Blackwell. Much larger artifacts, but "move to another
+machine and there is no usable kernel" cannot happen — the right trade for a
+server product. Narrow it yourself with e.g.
+`-DCMAKE_CUDA_ARCHITECTURES=89-real`.
+
+#### Using it
+
+```erlang
+{bitcask, [{embedder, #{name => my_embedder,
+                        provider => {custom, bitcask_embedder_llama},
+                        config => #{model_path => <<"/models/qwen3-emb.gguf">>,
+                                    pooling    => last,
+                                    n_ctx      => 512}}}]}.
+```
+
+`backend` and `n_gpu_layers` both default to auto — GPU if there is one, CPU
+otherwise, **no config change per machine**.
+
+#### ⚠️ Always check for a silent fallback after loading
+
+```erlang
+{ok, I} = bitcask_embedder_llama:info(Ctx),
+maps:with([gpu_layers_requested, gpu_layers_effective,
+           fell_back_to_cpu, gpu_fallback_reason], I).
+```
+
+When VRAM is insufficient the NIF **falls back to CPU rather than erroring**
+(better slow than unusable), but the fallback is observable:
+
+| Case | `gpu_layers_effective` | `fell_back_to_cpu` | Note |
+|---|---|---|---|
+| `backend => cpu` (explicitly CPU) | 0 | `false` | not a downgrade |
+| auto, and this machine has no GPU | 0 | `false` | a **normal automatic decision**, not a fault; `gpu_fallback_reason` still explains why |
+| GPU explicitly requested, package/machine has none | **0** | **`true`** | the reason is specific to **the family you asked for** |
+| Requested, out of VRAM | **0** | **`true`** | carries llama's own words |
+| Succeeded | = requested | `false` | `backend` = `CUDA`/`Vulkan`, `gpu_device` = device name |
+
+> ⚠️ The reason is judged **against the family you asked for**: if the package has
+> Vulkan but not CUDA and you asked for `cuda`, saying "has a GPU backend but no
+> device" would be wrong — the backend you asked for simply is not in the package.
+> The two need different fixes (rebuild vs install a driver).
+
+> ⚠️ **`gpu_layers_effective` is computed from whether a GPU device exists, not
+> from the requested value.** This is not pedantry: on a CPU-only build, asking
+> for `n_gpu_layers=999` produces **no error** — with no GPU available llama
+> quietly offloads nothing. Reporting the requested value would claim "999 layers
+> in VRAM" when the truth is 0, which is worse than not reporting at all.
+> `gpu_offload_reporting_is_truthful_test_` pins this invariant.
+
 ---
 
 ## 4. Options
@@ -210,7 +427,10 @@ ok = bitcask_llama_nifs:model_close(M).   %% whoever opened it closes it
 | `pooling` | `unspecified` | `last` \| `cls` \| `mean` \| `none` \| `rank`. See §5 |
 | `n_ctx` | `2048` | **A performance knob**, see §6 |
 | `n_threads` | `max(1, available cores - 2)` | See §6 |
-| `n_gpu_layers` | `0` | This repo does not build GPU backends by default |
+| `backend` | `auto` | `auto` (CUDA > Vulkan > CPU) \| `cuda` \| `vulkan` \| `cpu`. See §3.4 |
+| `gpu_index` | `0` | Which card to bind; use data parallelism for multi-GPU, see §3.4 |
+| `split_mode` | `none` | `none` \| `layer` \| `row`. Latter two only when a large model does not fit one card |
+| `n_gpu_layers` | `auto` | Offload everything if there is a GPU, else 0. See §3.4 |
 | `dim` | — | If given, checked against the model's actual dimension; mismatch is an error |
 | `vector_dim` | `= dim` | MRL truncation dimension (≤ dim); truncate + renormalize on the Erlang side |
 | `max_input_bytes` | `32768` | Conservative byte-level truncation before embedding (first gate) |
@@ -327,10 +547,16 @@ normal scheduler thread.
 ## 7. Troubleshooting
 
 ```erlang
+%% Build time: what this package was compiled with (machine-independent)
+bitcask_llama_nifs:build_info().
+%% Run time: what this machine actually enumerates
+bitcask_llama_nifs:backend_info().
+%% The two, reconciled into a diagnosis
+bitcask_llama_nifs:gpu_status().
+
 bitcask_llama_nifs:available().       %% false = not built / .so didn't load
 bitcask_llama_nifs:load_status().     %% the raw load_nif reason
 bitcask_llama_nifs:ensure_backend().  %% {ok, N}; N=0 means no variant matched this CPU
-bitcask_llama_nifs:backend_info().    %% which backend it is running on
 bitcask_llama_nifs:last_error().      %% last error logged by llama/ggml
 ```
 
@@ -347,8 +573,19 @@ default they are all swallowed, keeping only the most recent error for
 | `{error, {dim_mismatch, _}}` | Configured `dim` disagrees with the model's actual dimension |
 | `{error, closed}` | The handle was already `close/1`d |
 | Local embedding an order of magnitude slow | `n_threads` oversubscribed, see §6 |
+| GPU configured but still slow | Check `fell_back_to_cpu` / `gpu_fallback_reason` from `info/1`, see §3.4 |
+| `gpu_status()` returns `cpu_only_build` | No CUDA in the package — **rebuild**; installing a driver will not help |
+| `{error, {bad_gpu_index, _}}` | `gpu_index` exceeds this machine's card count — size the pool from `backend_info()`'s device list |
+| `{error, {bad_backend, _}}` / `{error, {bad_split_mode, _}}` | Values are auto\|cuda\|vulkan\|cpu / none\|layer\|row |
+| `gpu_status()` returns `no_gpu_device` | CUDA is in the package but no GPU here — driver / container passthrough / dependency resolution; run `scripts/detect-llama-backends.sh --runtime` |
 
 ## 8. Tests
+
+Build-time SDK probe (run it on the **build box**; run time needs no script):
+
+```sh
+scripts/detect-llama-backends.sh
+```
 
 ```sh
 # (a) Degradation path — always runs, does not require building this backend

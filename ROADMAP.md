@@ -6,6 +6,99 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 5.1.0 落地
+
+### 本地嵌入后端（llama.cpp / ggml）✅
+
+在 BEAM 进程内直接算 embedding，不经 HTTP 端点。产物是**独立的第二个 NIF**
+`priv/bitcask_llama.so`，与核心 `bitcask_cpp.so` 互不依赖；**默认不构建**
+（`BITCASK_WITH_LLAMA=1`），关掉时构建产物与 5.0.0 一字不差。新增 submodule
+`third_party/llama.cpp`（tag `b10257`）。**本次不涉及 libbitcask 升级**，无 ABI
+变更、无盘上格式变更。
+
+定位是**另开一档**而不是替换 HTTP 端点：CPU 上跑得动的是 0.6B / 1024 维这一类，
+换档 = 落库维度变了 = 全量重建索引。实测（8 vCPU、`Qwen3-Embedding-0.6B-Q8_0`、
+`n_ctx=512`）查询 33–35 ms、文档（276 token）≈ 890 ms。
+
+> ⚠️ **ggml 的 `GGML_ASSERT` 是 `abort()`**，在 BEAM 里等于整个 node 连同所有打开
+> 的 cask 一起没。分成两个 `.so` 不能隔离这一点（同进程），只能把可预期的失败挡
+> 在 llama 之前（路径 / 池化 / token 数）。真要进程级隔离只能上 port —— 那正是
+> 现有的 HTTP 端点方案。不能接受这条就继续用 HTTP 档。
+
+### 独立 embedder 进程 ✅
+
+`bitcask_embedder_server`（gen_server）+ `bitcask_embedder_proxy`（provider）。
+`open/2` 的 `{embedder, _}` 现在也接受进程引用。一次解决三件事：**权重只装一份**
+（此前每 `open` 一次建一个 ctx）、**生命周期有主**（`bitcask:close/1` 不关
+embedder，进程的 `terminate/2` 才关）、**串行本来就是要的**（`llama_context` 非
+线程安全，gen_server 单进程语义就是这个约束）。
+
+两档 embedder 就此分清：HTTP 档（`openai` / `anthropic`）无状态、请求该并发，
+**不需要配置任何进程**；内置档有状态、必须串行，走进程。共享逻辑收进
+`bitcask_embedder_util`（此前 openai / anthropic 各有一份逐字重复的拷贝）。
+
+> ⚠️ 配了 embedder 却起不来（GGUF 路径写错、pooling 解析成 NONE …）会让整个
+> bitcask application 起不来，**这是有意的**——静默降级成没有嵌入能力，要等到
+> 检索结果不对才发现，那时候库已经写脏了。为此 `bitcask:open/2` 也不再吞掉
+> `application:start` 的失败（返回 `{error, {bitcask_app_start_failed, _}}`）。
+
+### GPU（NVIDIA CUDA / Vulkan）✅
+
+服务器产品的取舍是**性能优先、体积不是约束**：CUDA 架构覆盖 Maxwell..Blackwell
+不收窄成 native，CUDA 运行时随包平铺进 `priv/`——换掉的是"目标机缺 libcublas →
+ggml 静默跳过 → 降级纯 CPU"这一整类不报错的故障。
+
+**构建期探测 SDK，运行期探测显卡** —— 这两件事在**不同的机器**上发生（构建机常常
+没有卡，部署机常常没有 SDK），所以分开做：
+
+- **构建期**：`BITCASK_LLAMA_CUDA` / `BITCASK_LLAMA_VULKAN` 各自 `AUTO|ON|OFF`
+  （默认 AUTO，探到 SDK 就编入，两个可同时开）。构建期事实烧进 `.so`，由
+  `build_info/0` 自报。⚠️ Vulkan 的 AUTO 必须 loader / `glslc` / SPIRV-Headers
+  **三个**都确认再开——ggml-vulkan 那两个 `find_package` 都是 `REQUIRED`，只探到
+  一个就打开会直接把构建炸掉。
+- **运行期**：由 Erlang **自己**按 `backend => auto`（CUDA > Vulkan > CPU）挑第一个
+  真的有 GPU 的后端族，`n_gpu_layers` 默认也是 auto。**不需要按机器改配置，也不
+  需要脚本**——部署机上既没有这个仓库也没有 cmake。
+- `gpu_status/0` 把两者对到一起：`ok` / `cpu_only_build`（要重新构建）/
+  `no_gpu_device`（要装驱动）。只看运行期分不清这两种，而修法完全不同。
+
+> ⚠️ **只选一族是正确性要求，不是策略。** CUDA 与 Vulkan 同时编进包里时两者各自
+> 枚举同一张物理卡（一张 4090 = `CUDA0` + `Vulkan0`），`devices=NULL` 会让 llama
+> 把它当成两张去切分模型层——不报错，只是显存重复占用 + 莫名其妙的慢或 OOM。
+
+**多卡：默认只用一张，走数据并行。** llama 的 `split_mode` 默认是 `LAYER`（把层切
+到所有卡上）。对嵌入模型那是反优化：0.6B 权重一张卡装得下，切开只多出跨卡传输，
+还把 N 张卡的并行浪费在**一条串行**的请求路径上（一个 `llama_context` 同时只服务
+一次前向）。嵌入要的是数据并行——按 `backend_info/0` 的设备表开 N 个 embedder 进程、
+各绑一张卡（`gpu_index`），正好对上"一句柄 = 一 context = 串行"的结构。真需要模型
+并行（大模型单卡装不下）才配 `split_mode => layer`。
+
+构建期 SDK 探测脚本 `scripts/detect-llama-backends.sh`：CMake 只会说"没找到"，它说
+**缺哪个包**并给出带上探到的开关的构建命令。
+
+> **Vulkan 构建路径已实测**：开发机上有 Vulkan SDK（1.4.309），AUTO 探到并编入，
+> `priv/libggml-vulkan.so` 落地。因为这台机器没有 GPU，`gpu_status/0` 给的是
+> `no_gpu_device` 而不是 `cpu_only_build`——**这正是构建期/运行期分离要区分的那两
+> 种情况，本次是用真实数据验证的**。
+>
+> ⚠️ **CUDA 编译与真实 GPU 运行路径仍未实测**（开发机无驱动无 toolkit，Vulkan 也
+> 只是编出来、没有卡可跑）。已验证：两条 AUTO 探测分支、构建期宏注入与自报、无
+> GPU 时的诚实诊断、`backend`/`gpu_index`/`split_mode` 的校验与错误路径。
+
+### 后续候选 ⚠️
+
+- **批量 embed 入口**（按 gate）：现在一次一条，索引侧吞吐受限于此。llama 的
+  batch 接口能一次喂多条，收益需实测。
+- **`bitcask_embedder` 加可选 `close/1` 回调**（按 gate）：让 `bitcask:close/1`
+  能自动释放 `{Provider, Cfg}` 那条路建的 ctx。当前用进程形态规避，动核心 API
+  的收益不明显。
+- **多卡自动分发**（按 gate）：现在按 `gpu_index` 手工开池。上层加一个轮询/取空闲
+  的调度器是自然的下一步，但需要先有多卡机器上的实测数据。
+- **ROCm / SYCL 后端**（按 gate）：ggml 都有，与 Vulkan 同一个接法。要不要加取决于
+  实际部署里有没有这类卡。
+
+---
+
 ## 5.0.0 落地
 
 ### libbitcask 升级到 v5.0.0 ✅
