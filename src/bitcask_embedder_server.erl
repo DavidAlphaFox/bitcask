@@ -73,6 +73,7 @@
 -export([start_link/1, start_link/2,
          child_spec/2, child_spec/3,
          embed/2, embed/3,
+         embed_batch/2, embed_batch/3,
          spec/1,
          info/1,
          stop/1]).
@@ -130,6 +131,20 @@ embed(Ref, Text) -> embed(Ref, Text, ?DEFAULT_TIMEOUT).
 embed(Ref, Text, Timeout) when is_binary(Text) ->
     call(Ref, {embed, Text}, Timeout).
 
+%% 批量。⚠️ 超时按条数放大：一整批在 worker 里是**一次** call，用单条的超时会
+%% 在批量稍大时必然超时，而超时的表现是整批白算。
+-spec embed_batch(server_ref(), [binary()]) ->
+          {ok, [{ok, binary()} | {error, term()}]} | {error, term()}.
+embed_batch(Ref, Texts) -> embed_batch(Ref, Texts, batch_timeout(Texts, ?DEFAULT_TIMEOUT)).
+
+-spec embed_batch(server_ref(), [binary()], timeout()) ->
+          {ok, [{ok, binary()} | {error, term()}]} | {error, term()}.
+embed_batch(Ref, Texts, Timeout) when is_list(Texts) ->
+    call(Ref, {embed_batch, Texts}, Timeout).
+
+batch_timeout([], T)    -> T;
+batch_timeout(Texts, T) -> T * length(Texts).
+
 %% 给 bitcask_embedder_proxy 在 open 时问一次：维度 + 默认超时。
 -spec spec(server_ref()) -> {ok, map()} | {error, term()}.
 spec(Ref) -> call(Ref, spec, 5000).
@@ -184,6 +199,9 @@ init(Opts) ->
 
 handle_call({embed, Text}, _From, #{ctx := Ctx} = S) ->
     {reply, bitcask_embedder:embed(Ctx, Text), S};
+
+handle_call({embed_batch, Texts}, _From, #{ctx := Ctx} = S) ->
+    {reply, bitcask_embedder:embed_batch(Ctx, Texts), S};
 
 handle_call(spec, _From, #{ctx := Ctx, timeout := T} = S) ->
     %% ⚠️ **故意不把 ctx 交出去。** 交了就等于允许调用方绕过串行在自己的进程里

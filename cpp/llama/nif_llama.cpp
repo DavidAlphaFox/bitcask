@@ -404,8 +404,10 @@ struct ModelRes {
 
     int32_t n_embd_out  = 0;  // (丙)：向量长度用它，不是 n_embd
     int32_t n_embd      = 0;  // 只用于 model_info 展示，排查"两个维度不一样"用
-    int32_t n_ctx       = 0;
+    int32_t n_ctx       = 0;   // **每条序列**可用的上下文（= llama 的 n_ctx_seq）
     int32_t n_ctx_train = 0;
+    int32_t batch_size  = 1;   // 一次 decode 最多几条序列（n_seq_max）
+    int32_t n_batch     = 0;   // 一次 decode 最多几个 token（所有序列之和）
     int32_t pooling     = -1;
     bool    has_encoder = false;
     uint64_t size_bytes = 0;
@@ -622,14 +624,14 @@ ERL_NIF_TERM nif_backend_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM[]) {
 // NThreads / NCtx / NGpuLayers: 0 或负数表示"用默认"。
 // ---------------------------------------------------------------------------
 ERL_NIF_TERM nif_model_load(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
-    if (argc != 8) return enif_make_badarg(env);
+    if (argc != 9) return enif_make_badarg(env);
     {
         std::lock_guard<std::mutex> lk(g_backend_mu);
         if (!g_backend_ready) return mk_err(env, "backend_not_initialized");
     }
 
     std::string path, backend_pref, split_pref;
-    int pooling = -1, n_threads = 0, n_ctx_req = 0, n_gpu_layers = 0;
+    int pooling = -1, n_threads = 0, n_ctx_req = 0, n_gpu_layers = 0, batch_size = 1;
     std::vector<int32_t> gpu_indexes;
     if (!get_bin_str(env, argv[0], path))          return enif_make_badarg(env);
     if (!enif_get_int(env, argv[1], &pooling))     return enif_make_badarg(env);
@@ -649,6 +651,8 @@ ERL_NIF_TERM nif_model_load(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         if (gpu_indexes.empty()) gpu_indexes.push_back(0);
     }
     if (!get_bin_str(env, argv[7], split_pref))    return enif_make_badarg(env);
+    if (!enif_get_int(env, argv[8], &batch_size))  return enif_make_badarg(env);
+    if (batch_size < 1) batch_size = 1;
     if (path.empty()) return mk_err(env, "empty_path");
     if (backend_pref.empty()) backend_pref = "auto";
     if (backend_pref != "auto" && backend_pref != "cuda" &&
@@ -799,11 +803,19 @@ ERL_NIF_TERM nif_model_load(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
         llama_context_params cp = llama_context_default_params();
         cp.embeddings = true;  // 要向量，不要 logits
-        cp.n_ctx      = static_cast<uint32_t>(use_ctx);
-        // ⚠️ 一次只喂一条，n_batch/n_ubatch 必须容得下最长的那条，否则
-        //    llama_encode/decode 会**拒绝整条 batch**（返回负值，不是截断）。
-        cp.n_batch    = static_cast<uint32_t>(use_ctx);
-        cp.n_ubatch   = static_cast<uint32_t>(use_ctx);
+        // ⚠️ **llama 的 n_ctx 是所有序列共享的总预算**：kv_unified=false（默认）
+        //    时 n_ctx_seq = n_ctx / n_seq_max（llama-context.cpp:290）。
+        //    我们的 n_ctx 语义是「每条文本的上下文」，所以这里必须乘上
+        //    batch_size —— 不乘的话，一开批量就把每条文本的可用长度悄悄缩小
+        //    batch_size 倍，原本放得下的文本开始报 too_many_tokens，而配置里
+        //    的 n_ctx 一个字没变。
+        cp.n_seq_max  = static_cast<uint32_t>(batch_size);
+        cp.n_ctx      = static_cast<uint32_t>(use_ctx) * static_cast<uint32_t>(batch_size);
+        // ⚠️ n_batch/n_ubatch 必须容得下**一次 decode 的全部 token**（批量时是
+        //    所有序列之和），否则 llama_encode/decode 会拒绝整条 batch
+        //    （返回负值，不是截断）。
+        cp.n_batch    = cp.n_ctx;
+        cp.n_ubatch   = cp.n_ctx;
         cp.pooling_type = (pooling < 0) ? LLAMA_POOLING_TYPE_UNSPECIFIED
                                         : static_cast<enum llama_pooling_type>(pooling);
         if (n_threads > 0) {
@@ -887,8 +899,12 @@ ERL_NIF_TERM nif_model_load(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     r->ctx         = ctx;
     r->n_embd_out  = n_embd_out;
     r->n_embd      = llama_model_n_embd(model);
-    r->n_ctx       = use_ctx;
+    // ⚠️ 记 llama **实际**给出的每序列上下文，不是我们要的那个：n_ctx_seq 会被
+    //    向下按 256 对齐（llama-context.cpp:291），报出来的必须是真值。
+    r->n_ctx       = static_cast<int32_t>(llama_n_ctx_seq(ctx));
     r->n_ctx_train = n_ctx_train;
+    r->batch_size  = static_cast<int32_t>(llama_n_seq_max(ctx));
+    r->n_batch     = static_cast<int32_t>(llama_n_batch(ctx));
     r->pooling     = static_cast<int32_t>(llama_pooling_type(ctx));
     r->has_encoder = llama_model_has_encoder(model);
     r->size_bytes  = llama_model_size(model);
@@ -961,8 +977,9 @@ ERL_NIF_TERM nif_model_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                         "gpu_layers_requested", "gpu_layers_effective",
                         "fell_back_to_cpu", "gpu_fallback_reason",
                         "backend_requested", "backend",
-                        "gpu_index", "gpu_device"};
-    constexpr int kN = 16;
+                        "gpu_index", "gpu_device",
+                        "batch_size", "n_batch"};
+    constexpr int kN = 18;
     ERL_NIF_TERM keys[kN];
     for (int i = 0; i < kN; i++) keys[i] = enif_make_atom(env, kn[i]);
     ERL_NIF_TERM vals[kN] = {
@@ -983,6 +1000,8 @@ ERL_NIF_TERM nif_model_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         mk_bin(env, r->backend_chosen),
         enif_make_int(env, r->gpu_index_used),
         mk_bin(env, r->gpu_device),
+        enif_make_int(env, r->batch_size),
+        enif_make_int(env, r->n_batch),
     };
     ERL_NIF_TERM m;
     if (!enif_make_map_from_arrays(env, keys, vals, kN, &m)) return enif_make_badarg(env);
@@ -1142,6 +1161,178 @@ ERL_NIF_TERM nif_embed(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
 }
 
 // ---------------------------------------------------------------------------
+// NIF: embed_batch(Ref, [TextBin], Normalize, Truncate)
+//        -> {ok, [{ok, Vec} | {error, Reason}]} | {error, Reason}
+//
+// 一次 decode 喂多条序列，池化后每条各出一个向量。索引侧的吞吐杠杆：单条路径
+// 每次前向只喂一条，GPU/SIMD 的并行度大半闲着。
+//
+// === 返回形状：**逐条**结果，不是一个整体 ===
+//
+// 外层 {ok, _} 表示"这一批跑完了"，内层每条各自 {ok,Vec} / {error,Reason}。
+// ⚠️ 一条坏文档不该让另外 63 条白算 —— 索引场景下整批失败意味着调用方要么
+//    丢掉整批，要么退化成一条一条重试，两个都比逐条结果差。
+//    顺序与输入严格一一对应（调用方靠下标对回自己的 key）。
+//
+// === 分块 ===
+//
+// 调用方可以一次丢进任意多条，这里按两个上限自动切块：
+//   * 序列数 <= batch_size（llama 的 n_seq_max，建 context 时定死）
+//   * token 总数 <= n_batch（超了 llama_decode 会**拒绝整块**，返回负值）
+// ⚠️ 切块是必须的，不是优化：把 1000 条一次塞进去只会拿到一个负返回值，而那
+//    个负值不会告诉你是因为太多。
+// ---------------------------------------------------------------------------
+ERL_NIF_TERM nif_embed_batch(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    if (argc != 4) return enif_make_badarg(env);
+    ModelRes* r = get_model(env, argv[0]);
+    if (!r) return enif_make_badarg(env);
+    bool normalize = true, truncate = false;
+    if (!get_bool(env, argv[2], normalize)) return enif_make_badarg(env);
+    if (!get_bool(env, argv[3], truncate))  return enif_make_badarg(env);
+
+    std::vector<std::string> texts;
+    {
+        ERL_NIF_TERM list = argv[1], head, tail;
+        while (enif_get_list_cell(env, list, &head, &tail)) {
+            std::string t;
+            if (!get_bin_str(env, head, t)) return enif_make_badarg(env);
+            texts.push_back(std::move(t));
+            list = tail;
+        }
+        if (!enif_is_empty_list(env, list)) return enif_make_badarg(env);
+    }
+    if (texts.empty()) return enif_make_tuple2(env, g_ok, enif_make_list(env, 0));
+
+    std::lock_guard<std::mutex> lk(r->mu);
+    if (!r->ctx) return mk_err(env, "closed");
+
+    const size_t n = texts.size();
+    const size_t dim = static_cast<size_t>(r->n_embd_out);
+
+    // 每条的结果先占位，最后按原顺序组表。
+    std::vector<ERL_NIF_TERM> results(n);
+    std::vector<bool>         done(n, false);
+
+    // 先全部分词：哪些条根本进不了批（空、超长）在这里就定下来。
+    std::vector<std::vector<llama_token>> toks(n);
+    for (size_t i = 0; i < n; i++) {
+        if (texts[i].empty()) {
+            results[i] = mk_err(env, "empty_text"); done[i] = true; continue;
+        }
+        std::string terr;
+        if (!tokenize(r->model, texts[i], toks[i], terr)) {
+            results[i] = mk_err_msg(env, "tokenize_failed", terr); done[i] = true; continue;
+        }
+        if (toks[i].empty()) {
+            results[i] = mk_err(env, "empty_token_sequence"); done[i] = true; continue;
+        }
+        const int32_t nt = static_cast<int32_t>(toks[i].size());
+        if (nt > r->n_ctx) {
+            if (!truncate) {
+                results[i] = enif_make_tuple2(
+                    env, g_error,
+                    enif_make_tuple3(env, enif_make_atom(env, "too_many_tokens"),
+                                     enif_make_int(env, nt),
+                                     enif_make_int(env, r->n_ctx)));
+                done[i] = true; continue;
+            }
+            toks[i].resize(static_cast<size_t>(r->n_ctx));
+        }
+    }
+
+    // 贪心切块，逐块 decode。
+    size_t i = 0;
+    while (i < n) {
+        std::vector<size_t> slot_of;   // 本块内 slot -> 原下标
+        int32_t tok_total = 0;
+        while (i < n && static_cast<int32_t>(slot_of.size()) < r->batch_size) {
+            if (done[i]) { i++; continue; }
+            const int32_t nt = static_cast<int32_t>(toks[i].size());
+            // 放不下就先结这一块（但空块时必须放行，否则死循环）。
+            if (!slot_of.empty() && r->n_batch > 0 && tok_total + nt > r->n_batch) break;
+            tok_total += nt;
+            slot_of.push_back(i);
+            i++;
+        }
+        if (slot_of.empty()) continue;
+
+        // 每块都是独立的一批，不能让上一块的状态留下来。
+        llama_memory_clear(llama_get_memory(r->ctx), true);
+
+        llama_batch batch = llama_batch_init(tok_total, 0, 1);
+        if (!batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits) {
+            llama_batch_free(batch);
+            return mk_err(env, "batch_alloc_failed");
+        }
+        int32_t p = 0;
+        for (size_t slot = 0; slot < slot_of.size(); slot++) {
+            const auto& tv = toks[slot_of[slot]];
+            for (size_t k = 0; k < tv.size(); k++) {
+                batch.token[p]     = tv[k];
+                batch.pos[p]       = static_cast<llama_pos>(k);   // 每条序列各自从 0 开始
+                batch.n_seq_id[p]  = 1;
+                batch.seq_id[p][0] = static_cast<llama_seq_id>(slot);
+                batch.logits[p]    = 1;   // 池化要每个位置都参与
+                p++;
+            }
+        }
+        batch.n_tokens = p;
+
+        err_clear();
+        const int32_t rc = r->has_encoder ? llama_encode(r->ctx, batch)
+                                          : llama_decode(r->ctx, batch);
+        llama_batch_free(batch);
+
+        if (rc != 0) {
+            // ⚠️ 整块失败只让**这一块**的条目失败，别的块照跑 —— 与逐条结果
+            //    同一个理由。
+            std::string d = err_get();
+            if (d.empty()) {
+                d = std::string(r->has_encoder ? "llama_encode" : "llama_decode") +
+                    " returned " + std::to_string(rc);
+            }
+            for (size_t slot : slot_of) {
+                results[slot] = mk_err_msg(env, "forward_failed", d);
+                done[slot] = true;
+            }
+            continue;
+        }
+
+        for (size_t slot = 0; slot < slot_of.size(); slot++) {
+            const size_t idx = slot_of[slot];
+            const float* emb = llama_get_embeddings_seq(r->ctx, static_cast<llama_seq_id>(slot));
+            if (!emb) {
+                results[idx] = mk_err_msg(env, "no_embedding",
+                                          "llama_get_embeddings_seq returned NULL for seq " +
+                                          std::to_string(slot));
+                done[idx] = true; continue;
+            }
+            std::vector<float> vec(dim);
+            if (normalize) {
+                double ss = 0.0;
+                for (size_t k = 0; k < dim; k++) ss += static_cast<double>(emb[k]) * emb[k];
+                if (!(ss > 0.0)) {
+                    results[idx] = mk_err(env, "zero_norm"); done[idx] = true; continue;
+                }
+                const float inv = static_cast<float>(1.0 / std::sqrt(ss));
+                for (size_t k = 0; k < dim; k++) vec[k] = emb[k] * inv;
+            } else {
+                std::memcpy(vec.data(), emb, dim * sizeof(float));
+            }
+            ERL_NIF_TERM out;
+            unsigned char* dst = enif_make_new_binary(env, dim * 4, &out);
+            write_f32_le(dst, vec.data(), dim);
+            results[idx] = enif_make_tuple2(env, g_ok, out);
+            done[idx] = true;
+        }
+    }
+
+    return enif_make_tuple2(
+        env, g_ok,
+        enif_make_list_from_array(env, results.data(), static_cast<unsigned>(n)));
+}
+
+// ---------------------------------------------------------------------------
 // NIF: last_error() -> binary()
 // ---------------------------------------------------------------------------
 ERL_NIF_TERM nif_last_error(ErlNifEnv* env, int argc, const ERL_NIF_TERM[]) {
@@ -1161,11 +1352,12 @@ ErlNifFunc kNifFuncs[] = {
     {"backend_init",   1, nif_backend_init,   ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"backend_info",   0, nif_backend_info,   0},
     {"build_info",     0, nif_build_info,     0},
-    {"model_load",     8, nif_model_load,     ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"model_load",     9, nif_model_load,     ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"model_info",     1, nif_model_info,     0},
     {"model_close",    1, nif_model_close,    ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"tokenize_count", 2, nif_tokenize_count, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"embed",          4, nif_embed,          ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"embed_batch",    4, nif_embed_batch,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"last_error",     0, nif_last_error,     0},
 };
 

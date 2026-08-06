@@ -42,7 +42,7 @@
 
 -behaviour(bitcask_embedder).
 
--export([init/1, embed/2]).
+-export([init/1, embed/2, embed_batch/2]).
 -export([info/1, workers/1]).
 
 %% ===================================================================
@@ -91,6 +91,64 @@ embed(#{server := Ref, timeout := T}, Text) ->
     %% server 挂了返回 {error, {embedder_not_running, _}}，不会把调用方带走
     %% ——见 bitcask_embedder_server:call/3。
     bitcask_embedder_server:embed(Ref, Text, T).
+
+%% ===================================================================
+%% embed_batch/2 —— 池化时**把批拆开、并行打到各个 worker**。
+%%
+%% 这是池 + 批量叠加起来的收益：K 个 worker × 每个一次批量 decode。
+%% ⚠️ 拆分后各段并行发出（每段一个进程），否则就退化成串行地逐个 worker 喂，
+%%    K 张卡里同时只有一张在算。
+%% ⚠️ 结果必须按**原顺序**拼回去——调用方靠下标对回自己的 key。
+%% ===================================================================
+-spec embed_batch(map(), [binary()]) ->
+          {ok, [{ok, binary()} | {error, term()}]} | {error, term()}.
+embed_batch(#{workers := Ws, timeout := T}, Texts) when is_list(Texts) ->
+    case chunk(Texts, length(Ws)) of
+        []      -> {ok, []};
+        [Only]  -> bitcask_embedder_server:embed_batch(pick(Ws), Only, T * length(Only));
+        Chunks  -> scatter(lists:zip(lists:sublist(Ws, length(Chunks)), Chunks), T)
+    end;
+embed_batch(#{server := Ref, timeout := T}, Texts) when is_list(Texts) ->
+    bitcask_embedder_server:embed_batch(Ref, Texts, T * max(1, length(Texts))).
+
+%% 均分成 K 段（最后几段可能少一条）。空输入 → []。
+chunk([], _K) -> [];
+chunk(Texts, K) when K =< 1 -> [Texts];
+chunk(Texts, K) ->
+    N = length(Texts),
+    Per = (N + K - 1) div K,
+    split(Texts, Per).
+
+split([], _)  -> [];
+split(L, Per) ->
+    case length(L) =< Per of
+        true  -> [L];
+        false ->
+            {H, Tl} = lists:split(Per, L),
+            [H | split(Tl, Per)]
+    end.
+
+scatter(Pairs, T) ->
+    Parent = self(),
+    Tag = make_ref(),
+    Pids = [spawn(fun() ->
+                Parent ! {Tag, self(), bitcask_embedder_server:embed_batch(W, C, T * length(C))}
+            end) || {W, C} <- Pairs],
+    Collect = fun(Pid) ->
+        receive {Tag, Pid, R} -> R
+        %% ⚠️ 兜底超时要比 worker 自己的超时更长，否则我们会先放弃、把一段
+        %%    本来会回来的结果丢掉。
+        after T * 4 + 60000 -> {error, {embedder_timeout, T}}
+        end
+    end,
+    Results = [Collect(P) || P <- Pids],
+    %% 任一段整体失败 → 该段的每一条都记成那个错，其余段照常返回。
+    Merged = lists:append(
+        [case R of
+             {ok, Rs}       -> Rs;
+             {error, _} = E -> lists:duplicate(length(C), E)
+         end || {R, {_W, C}} <- lists:zip(Results, Pairs)]),
+    {ok, Merged}.
 
 %% 取消息队列最短的 worker。
 %%

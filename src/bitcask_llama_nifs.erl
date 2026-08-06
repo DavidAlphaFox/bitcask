@@ -42,6 +42,7 @@
          model_close/1,
          tokenize_count/2,
          embed/4,
+         embed_batch/4,
          last_error/0,
          available/0,
          load_status/0]).
@@ -220,6 +221,13 @@ gpu_status() ->
 %%                       卡（`gpu_index => 0|1|2…`），N 路并发。
 %%                    ⚠️ 越界（写了 2 但只有 2 张卡）报 {error,{bad_gpu_index,_}}，
 %%                       不静默退回 CPU——那会让整池 worker 都挤在 CPU 上没人发现。
+%%     batch_size   — 默认 1（不批量）。> 1 时一次 decode 可喂多条序列，
+%%                    embed_batch/4 用得上。
+%%                    ⚠️ **显存/内存按 batch_size 线性增长**：llama 的 n_ctx 是
+%%                       所有序列共享的总预算（n_ctx_seq = n_ctx / n_seq_max），
+%%                       所以这里会用 n_ctx × batch_size 去建 context —— 不这么做
+%%                       就会把每条文本的可用长度悄悄缩小 batch_size 倍。
+%%                       实际生效值看 model_info 的 batch_size / n_ctx / n_batch。
 %%     split_mode   — none（单卡，缺省当卡组只有一张时）| layer | row。
 %%                    只有**大模型单卡装不下**时才用后两个（模型并行）——那时
 %%                    这一组卡同时只服务一个请求，是拿并发换容量。
@@ -251,11 +259,12 @@ model_load(Path, Opts) when is_binary(Path), is_map(Opts) ->
               end,
     %% split_mode 缺省按卡组大小推：一张卡 = none（单卡跑全部层），多张卡 =
     %% layer（模型并行）。显式给了就以显式为准。
+    Batch   = maps:get(batch_size, Opts, 1),
     Split   = atom_to_binary(
                 maps:get(split_mode, Opts,
                          case length(Gpus) > 1 of true -> layer; false -> none end),
                 utf8),
-    model_load(Path, Pooling, Threads, NCtx, Ngl, Backend, Gpus, Split).
+    model_load(Path, Pooling, Threads, NCtx, Ngl, Backend, Gpus, Split, Batch).
 
 %% 留 2 核：见 model_load/2 的注释。核数拿不到时退到 1（宁可慢，也不要因为
 %% 超订而慢一个数量级——下面那张表说明代价是不对称的）。
@@ -307,15 +316,34 @@ first_int([])                                -> 1.
 -spec embed(model(), binary(), boolean(), boolean()) ->
           {ok, binary()} | {ok, binary(), {truncated, integer(), integer()}} | {error, term()}.
 
+%% -------------------------------------------------------------------
+%% embed_batch/4 — 一次喂多条，池化后各出一个向量。索引侧的吞吐杠杆。
+%%
+%%   {ok, [{ok, Vec} | {error, Reason}]}   %% **逐条**结果，顺序与输入一一对应
+%%   {error, Reason}                       %% 整批都没跑起来（句柄已关等）
+%%
+%% ⚠️ 逐条结果不是啰嗦：一条坏文档不该让另外 63 条白算。整批失败会逼调用方
+%%    要么丢掉整批、要么退化成一条一条重试，两个都更差。
+%%
+%% ⚠️ 需要 model_load 时配了 batch_size > 1 才真的批量；batch_size=1 时本函数
+%%    仍可用，只是退化成一条一条 decode（结果一致，没有加速）。
+%%
+%% 传多少条都行 —— C++ 侧按 batch_size（序列数）与 n_batch（token 总数）两个
+%% 上限自动切块。
+%% -------------------------------------------------------------------
+-spec embed_batch(model(), [binary()], boolean(), boolean()) ->
+          {ok, [{ok, binary()} | {error, term()}]} | {error, term()}.
+
 %% =============================================================================
 %% NIF 占位实现。加载成功后全部被 C++ 替换。
 %% =============================================================================
 backend_init(_PrivDir)            -> ?NOT_LOADED.
 backend_info()                    -> ?NOT_LOADED.
 build_info()                      -> ?NOT_LOADED.
-model_load(_P, _Pool, _T, _C, _G, _B, _I, _S) -> ?NOT_LOADED.
+model_load(_P, _Pool, _T, _C, _G, _B, _I, _S, _N) -> ?NOT_LOADED.
 model_info(_M)                    -> ?NOT_LOADED.
 model_close(_M)                   -> ?NOT_LOADED.
 tokenize_count(_M, _Text)         -> ?NOT_LOADED.
 embed(_M, _Text, _Norm, _Trunc)   -> ?NOT_LOADED.
+embed_batch(_M, _Ts, _N, _T)      -> ?NOT_LOADED.
 last_error()                      -> ?NOT_LOADED.

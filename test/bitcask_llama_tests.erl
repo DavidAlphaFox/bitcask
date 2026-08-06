@@ -525,3 +525,102 @@ dot(A, B) ->
     lists:sum([X * Y || {X, Y} <- lists:zip(floats(A), floats(B))]).
 
 floats(Bin) -> [F || <<F:32/float-little>> <= Bin].
+
+%% ===================================================================
+%% 批量 embed（llama 原生：一次 decode 喂多条）
+%% ===================================================================
+
+%% ⚠️ 本组最重要的一条：**批量结果必须与逐条逐字节一致**。
+%%    不一致意味着 seq_id / pos 的填法错了，而那种错**不报错**——向量看起来
+%%    正常、维度也对，只是语义悄悄不对。这是唯一测得出来的方式。
+batch_matches_single_test_() ->
+    {timeout, 600, fun() ->
+        case {bitcask_llama_nifs:available(), model_path()} of
+            {true, Path} when is_list(Path) ->
+                case filelib:is_regular(Path) of
+                    false -> ok;
+                    true  -> run_batch_match(list_to_binary(Path))
+                end;
+            _ -> ok
+        end
+    end}.
+
+run_batch_match(Path) ->
+    Texts = [<<"猫在垫子上睡觉"/utf8>>,
+             <<"一只狗在院子里奔跑"/utf8>>,
+             <<"量子色动力学的渐近自由"/utf8>>,
+             <<"hello world">>],
+    Base = #{model_path => Path, pooling => last, n_ctx => 512},
+    {ok, C1} = bitcask_embedder:new({custom, bitcask_embedder_llama}, Base),
+    Singles = [begin {ok, V} = bitcask_embedder:embed(C1, T), V end || T <- Texts],
+    bitcask_embedder_llama:close(C1),
+
+    {ok, CB} = bitcask_embedder:new({custom, bitcask_embedder_llama},
+                                    Base#{batch_size => 4}),
+    {ok, IB} = bitcask_embedder_llama:info(CB),
+    %% ⚠️ 每条序列的 n_ctx 不能因为开了批量就缩水——llama 的 n_ctx 是所有序列
+    %%    共享的总预算，实现里必须乘上 batch_size 才能维持每条 512。
+    ?assert(maps:get(n_ctx, IB) >= 512),
+    ?assertEqual(4, maps:get(batch_size, IB)),
+
+    {ok, Rs} = bitcask_embedder:embed_batch(CB, Texts),
+    ?assertEqual(length(Texts), length(Rs)),
+    Batched = [begin {ok, V} = R, V end || R <- Rs],
+    ?assertEqual(Singles, Batched),
+    bitcask_embedder_llama:close(CB).
+
+%% 逐条错误：一条坏文档不该让其它条白算，且顺序保持。
+batch_per_item_errors_test_() ->
+    {timeout, 600, fun() ->
+        case {bitcask_llama_nifs:available(), model_path()} of
+            {true, Path} when is_list(Path) ->
+                case filelib:is_regular(Path) of
+                    false -> ok;
+                    true ->
+                        {ok, C} = bitcask_embedder:new(
+                                    {custom, bitcask_embedder_llama},
+                                    #{model_path => list_to_binary(Path),
+                                      pooling => last, n_ctx => 512, batch_size => 4}),
+                        Long = binary:copy(<<"重复的文本片段。"/utf8>>, 400),
+                        {ok, Rs} = bitcask_embedder:embed_batch(
+                                     C, [<<"ok one">>, <<>>, Long, <<"ok two">>]),
+                        ?assertMatch([{ok, _},
+                                      {error, empty_text},
+                                      {error, {too_many_tokens, _, _}},
+                                      {ok, _}], Rs),
+                        bitcask_embedder_llama:close(C)
+                end;
+            _ -> ok
+        end
+    end}.
+
+%% 传的条数远多于 batch_size：C++ 侧必须自动切块，一条不丢、顺序不乱。
+%% ⚠️ 不切块的话 llama_decode 会拒绝整块并返回一个负值，而那个负值不会告诉你
+%%    是因为条数太多。
+batch_chunks_beyond_batch_size_test_() ->
+    {timeout, 600, fun() ->
+        case {bitcask_llama_nifs:available(), model_path()} of
+            {true, Path} when is_list(Path) ->
+                case filelib:is_regular(Path) of
+                    false -> ok;
+                    true ->
+                        {ok, C} = bitcask_embedder:new(
+                                    {custom, bitcask_embedder_llama},
+                                    #{model_path => list_to_binary(Path),
+                                      pooling => last, n_ctx => 512, batch_size => 4}),
+                        N = 13,   %% 故意不是 batch_size 的整数倍
+                        Texts = [integer_to_binary(I) || I <- lists:seq(1, N)],
+                        {ok, Rs} = bitcask_embedder:embed_batch(C, Texts),
+                        ?assertEqual(N, length(Rs)),
+                        [?assertMatch({ok, _}, R) || R <- Rs],
+                        %% 逐条重算，验证切块没有把向量配错到别的位置上
+                        [begin
+                             {ok, V} = bitcask_embedder:embed(C, T),
+                             {ok, VB} = lists:nth(I, Rs),
+                             ?assertEqual(V, VB)
+                         end || {I, T} <- lists:zip(lists:seq(1, N), Texts)],
+                        bitcask_embedder_llama:close(C)
+                end;
+            _ -> ok
+        end
+    end}.

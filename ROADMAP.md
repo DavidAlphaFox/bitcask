@@ -97,6 +97,13 @@ llama 的 `split_mode` 默认 `LAYER`（把层切到所有卡上）对嵌入模�
 `n_gpu_layers`（算错就是静默少卸载几层）。不做这一步的话，装不下的表现是 llama
 OOM → 回落 → **整体退回纯 CPU**。
 
+**批量 embed** `embed_batch/2` ✅：llama 后端一次 decode 喂多条序列，逐条返回结果。
+`bitcask_embedder` 的可选回调，provider 没实现就退化成逐条，调用方无感。池化时一批
+会拆开并行打到各 worker。⚠️ `n_ctx` 必须乘上 `batch_size`（llama 的 n_ctx 是所有
+序列共享的总预算），否则一开批量就把每条文本的可用长度悄悄缩小 N 倍。
+**默认不开**：实测短文本 7.0x / 中文本 2.9x，但测量时机器有外部满载进程，安静机器
+上倍数会小得多，长文本档无可信数据——开之前在自己的硬件上量。
+
 构建期 SDK 探测脚本 `scripts/detect-llama-backends.sh`：CMake 只会说"没找到"，它说
 **缺哪个包**并给出带上探到的开关的构建命令。
 
@@ -111,14 +118,16 @@ OOM → 回落 → **整体退回纯 CPU**。
 
 ### 后续候选 ⚠️
 
-- **批量 embed 入口**（按 gate）：现在一次一条，索引侧吞吐受限于此。llama 的
-  batch 接口能一次喂多条，收益需实测。
 - **`bitcask_embedder` 加可选 `close/1` 回调**（按 gate）：让 `bitcask:close/1`
   能自动释放 `{Provider, Cfg}` 那条路建的 ctx。当前用进程形态规避，动核心 API
   的收益不明显。
 - **`instances => auto`**（按 gate）：现在必须写明用哪几张卡。按机器上的卡数自动
   开池需要先决定"一个库该不该默认占满整机的 GPU"，以及池内某个 worker 起不来时
   是否放宽"整个 application 死"那条策略。两个都是策略问题，不是实现问题。
+- **批量的可信定标**（按 gate）：现有数字是在有外部负载的机器上测的，比值被放大，
+  长文本档没有可信结论。安静机器上重测一遍才能给出该不该默认开的建议。
+- **HTTP 档的原生批量**（按 gate）：openai 的 `/v1/embeddings` 接受数组，接上就是
+  一次请求多条。现在退化成逐条 HTTP。
 - **多卡实测**（按 gate）：池的机制已用 mock provider 测透，但**多卡上的真实 GPU
   行为没跑过**（开发机无卡）。`gpu_index` 越界检查、卡组的 `mp.devices` 传递、
   `split_mode` 的实际效果都只验证了参数路径。

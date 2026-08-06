@@ -93,7 +93,7 @@
 
 -behaviour(bitcask_embedder).
 
--export([init/1, embed/2]).
+-export([init/1, embed/2, embed_batch/2]).
 -export([close/1, info/1, token_count/2]).
 
 -define(DEFAULT_MAX_INPUT_BYTES, 32768).
@@ -168,7 +168,7 @@ load_model(Path, Opts) ->
                        "variants are missing or none matched this CPU">>}};
         {ok, _N} ->
             LoadOpts = maps:with([pooling, n_threads, n_gpu_layers, backend,
-                                  gpu_index, split_mode], Opts),
+                                  gpu_index, split_mode, batch_size], Opts),
             NCtx = maps:get(n_ctx, Opts, ?DEFAULT_N_CTX),
             case bitcask_llama_nifs:model_load(Path, LoadOpts#{n_ctx => NCtx}) of
                 {ok, M}        -> {ok, M, true};
@@ -243,6 +243,27 @@ embed(#{handle := M} = Cfg, Text) when is_binary(Text) ->
         {error, _} = E ->
             E
     end.
+
+%% ===================================================================
+%% embed_batch/2（bitcask_embedder 的可选回调）—— 一次 decode 喂多条。
+%%
+%% 逐条结果，顺序与输入一一对应。⚠️ 一条坏文档不该让另外 63 条白算。
+%% 需要 init 时配了 batch_size > 1 才真的批量（否则退化成逐条 decode）。
+%% ===================================================================
+-spec embed_batch(map(), [binary()]) ->
+          {ok, [{ok, binary()} | {error, term()}]} | {error, term()}.
+embed_batch(#{handle := M} = Cfg, Texts) when is_list(Texts) ->
+    MaxIn = maps:get(max_input_bytes, Cfg, ?DEFAULT_MAX_INPUT_BYTES),
+    Norm  = maps:get(normalize, Cfg, true),
+    Trunc = maps:get(truncate, Cfg, false),
+    Inputs = [bitcask_embedder_util:truncate_utf8(T, MaxIn) || T <- Texts],
+    case bitcask_llama_nifs:embed_batch(M, Inputs, Norm, Trunc) of
+        {ok, Rs}       -> {ok, [apply_mrl_result(R, Cfg) || R <- Rs]};
+        {error, _} = E -> E
+    end.
+
+apply_mrl_result({ok, Vec}, Cfg) -> {ok, apply_mrl(Vec, Cfg)};
+apply_mrl_result({error, _} = E, _) -> E.
 
 %% MRL 截断 + 重归一。实现在 bitcask_embedder_util——HTTP 档那条路是服务端
 %% 替我们做的（请求里带 dimensions），**本地档没人代劳**，只能在 Erlang 侧做。

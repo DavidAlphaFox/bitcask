@@ -416,6 +416,84 @@ maps:with([gpu_layers_requested, gpu_layers_effective,
 > 没有 GPU 可用就默默一层都不卸载。按请求值上报会说"999 层在显存里"而实际是 0，
 > 比不上报更糟。`gpu_offload_reporting_is_truthful_test_` 钉着这条不变式。
 
+### 3.5 批量 embed（索引侧的吞吐杠杆）
+
+单条路径每次前向只喂一条序列，固定开销（建图、清 KV、唤醒线程池）全摊在这一条
+上。批量把 N 条塞进**一次** decode，池化后各出一个向量。
+
+```erlang
+{ok, Ctx} = bitcask_embedder:new({custom, bitcask_embedder_llama},
+              #{model_path => ..., pooling => last, n_ctx => 512,
+                batch_size => 16}),                    %% ← 开批量
+{ok, Rs} = bitcask_embedder:embed_batch(Ctx, Texts).
+%% Rs = [{ok, Vec} | {error, Reason}]，顺序与输入一一对应
+```
+
+#### 返回的是**逐条**结果
+
+外层 `{ok, _}` 只表示"这一批跑完了"，内层每条各自成败：
+
+```erlang
+{ok, [{ok, <<...>>},
+      {error, empty_text},
+      {error, {too_many_tokens, 2001, 512}},
+      {ok, <<...>>}]}
+```
+
+> ⚠️ 一条坏文档不该让另外 63 条白算。整批失败会逼调用方要么丢掉整批、要么退化成
+> 一条一条重试，两个都更差。顺序严格对应输入——调用方靠下标对回自己的 key。
+
+#### `batch_size` 会放大显存/内存
+
+⚠️ **llama 的 `n_ctx` 是所有序列共享的总预算**（`n_ctx_seq = n_ctx / n_seq_max`，
+`llama-context.cpp:290`）。所以实现里用 `n_ctx × batch_size` 去建 context——
+不这么做的话，一开批量就把**每条文本的可用长度悄悄缩小 batch_size 倍**，原本放得下
+的文本开始报 `too_many_tokens`，而配置里的 `n_ctx` 一个字没变。
+
+代价是 KV cache 与计算缓冲按 `batch_size` 线性增长。实际生效值看 `info/1` 的
+`n_ctx`（每序列）/ `batch_size` / `n_batch`。
+
+#### 传多少条都行
+
+C++ 侧按两个上限自动切块：序列数 ≤ `batch_size`，token 总数 ≤ `n_batch`。
+⚠️ 切块是**必须**的不是优化——把 1000 条一次塞进去只会拿到一个负返回值，而那个
+负值不会告诉你是因为条数太多。
+
+#### 池 + 批量
+
+配了 `instances` 时，一批会被**拆开并行打到各个 worker**（K 张卡各跑一次批量
+decode），结果按原顺序拼回。⚠️ 拆分后各段是并行发出的，否则就退化成串行地逐个
+worker 喂，K 张卡里同时只有一张在算。某个 worker 那一段失败只影响那一段。
+
+#### 实测
+
+> ⚠️ **测量条件不干净**：测的时候机器上有**别的**满载进程（load 9.8 / 8 核）。
+> 两个 arm 交错跑、取 3 次中位数，所以比值相对可信；但超订会放大"每次调用的
+> 固定开销"，而那正是批量在摊薄的东西——**安静机器上倍数会明显小于下表**。
+> 绝对耗时完全不可信（同一条 276 token 的文档在 §6 安静时是 890 ms）。
+
+| 文本 | 条数 | 逐条 | 批量 | 加速 |
+|---|---|---|---|---|
+| 短（5 token，查询档） | 64 | 7778 ms | 1108 ms | **7.0x** |
+| 中（30 token） | 32 | 27196 ms | 9517 ms | **2.9x** |
+
+单次非交错的测量给出过 2.4x / 1.04x / 0.79x（长文本更慢），与上表矛盾——那组是
+被不均匀的干扰扭曲的。**长文本档没有可信数据**。
+
+**结论：`batch_size` 默认 1（不开），这是有意的。** 收益随文本变短而增大，而
+长文本档在本机测不出可信结论。开之前在**你自己的硬件和文本长度分布上**量一遍。
+
+`batch_size = 1` 时 `embed_batch/2` 仍然可用，只是退化成逐条 decode，结果一致、
+没有加速。
+
+#### 其它 provider
+
+`embed_batch/2` 是 `bitcask_embedder` 的**可选**回调。provider 没实现时框架自动
+退化成逐条 `embed/2`，结果形状完全一致——调用方不必知道 provider 支不支持。
+目前只有 llama 后端实现了原生批量；HTTP 档（openai 的 `/v1/embeddings` 接受数组）
+是个自然的候选，还没做。
+
+
 ---
 
 ## 4. 选项
@@ -430,6 +508,7 @@ maps:with([gpu_layers_requested, gpu_layers_effective,
 | `backend` | `auto` | `auto`（CUDA > Vulkan > CPU）\| `cuda` \| `vulkan` \| `cpu`。见 §3.4 |
 | `gpu_index` | `0` | 绑第几张卡；也可给卡组 `[0,1]` 或 `all`。多卡见 §3.4 |
 | `split_mode` | `none` | `none` \| `layer` \| `row`。大模型单卡装不下才用后两个 |
+| `batch_size` | `1` | 一次 decode 喂几条序列。见 §3.5；⚠️ 显存按它线性增长 |
 | `n_gpu_layers` | `auto` | 有 GPU 就全卸载，没有就 0。见 §3.4 |
 | `dim` | — | 给了就与模型实际维度核对，不符直接报错 |
 | `vector_dim` | `= dim` | MRL 截断维度（≤ dim），Erlang 侧截断 + 重归一 |

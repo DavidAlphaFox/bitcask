@@ -51,6 +51,23 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
   **一条串行**的请求路径上。嵌入要的是数据并行——按 `backend_info/0` 的设备表开
   N 个 embedder 进程、各绑一张卡。`gpu_index` 越界报 `{error,{bad_gpu_index,_}}`，
   不静默退回 CPU（那会让整池 worker 挤在 CPU 上没人发现）。
+- **批量 embed 入口** `bitcask_embedder:embed_batch/2`（`bitcask_embedder` 的
+  **可选**回调 `embed_batch/2`；provider 没实现时框架自动退化成逐条 `embed/2`，
+  结果形状一致，调用方不必知道 provider 支不支持）。llama 后端原生实现：一次
+  decode 喂多条序列，池化后各出一个向量；`model_load` 加 `batch_size`（默认 1）。
+  ⚠️ 返回**逐条**结果 `[{ok,Vec} | {error,Reason}]`，顺序与输入一一对应——一条
+  坏文档不该让另外 63 条白算，整批失败会逼调用方丢掉整批或退化成逐条重试。
+  ⚠️ **`n_ctx` 必须乘上 `batch_size`**：llama 的 `n_ctx` 是所有序列共享的总预算
+  （`n_ctx_seq = n_ctx / n_seq_max`），不乘的话一开批量就把每条文本的可用长度
+  **悄悄缩小 batch_size 倍**，原本放得下的文本开始报 `too_many_tokens`，而配置里
+  的 `n_ctx` 一个字没变。代价是显存/内存按 batch_size 线性增长。
+  ⚠️ 传多少条都行，C++ 侧按序列数与 token 总数两个上限**自动切块**——不切的话
+  llama_decode 会拒绝整块并返回一个负值，而那个负值不会说是因为条数太多。
+  池化时一批会被**拆开并行**打到各 worker（K 张卡各跑一次批量 decode），结果按
+  原顺序拼回。
+  **默认 `batch_size = 1`（不开）**：实测收益随文本变短而增大（短文本 7.0x、
+  中文本 2.9x），但测量时机器上有别的满载进程，超订会放大批量摊薄的那部分开销，
+  安静机器上倍数会小得多；长文本档没有可信数据。开之前在自己的硬件上量一遍。
 - **多卡数据并行池** `bitcask_embedder_pool`：N 个 embedder 进程，**一卡跑全部
   layer、一个 instance 占一卡**，N 个请求真并发。application env 加
   `instances => [0,1,2,3]`（或 `[[0,1],[2,3]]` 卡组，用于单卡装不下时）。

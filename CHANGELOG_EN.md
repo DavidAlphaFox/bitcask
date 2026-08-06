@@ -63,6 +63,32 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   list, one bound per card. An out-of-range `gpu_index` returns
   `{error, {bad_gpu_index, _}}` instead of silently falling back to CPU (which
   would pile the whole pool onto the CPU with nobody noticing).
+- **Batch embedding entry point** `bitcask_embedder:embed_batch/2` (an
+  **optional** `bitcask_embedder` callback `embed_batch/2`; when a provider does
+  not implement it the framework falls back to sequential `embed/2` with an
+  identical result shape, so callers never need to know). The llama backend
+  implements it natively: one decode feeds several sequences and pooling produces
+  one vector each; `model_load` gains `batch_size` (default 1).
+  ⚠️ Results are **per item**, `[{ok,Vec} | {error,Reason}]`, in input order — one
+  bad document should not waste the other 63, and failing the whole batch forces
+  the caller to drop it or fall back to one-at-a-time retries.
+  ⚠️ **`n_ctx` must be multiplied by `batch_size`**: llama's `n_ctx` is a budget
+  shared across sequences (`n_ctx_seq = n_ctx / n_seq_max`), so without that,
+  enabling batching would **silently shrink each text's usable length by a factor
+  of batch_size** and texts that used to fit would start returning
+  `too_many_tokens` while the configured `n_ctx` never changed. The cost is that
+  memory/VRAM grows linearly with `batch_size`.
+  ⚠️ Any number of texts may be passed; the C++ side **chunks automatically**
+  against the sequence-count and total-token limits — without chunking
+  `llama_decode` rejects the whole block with a negative value that does not say
+  the count was the problem.
+  With a pool, a batch is **split and dispatched concurrently** across the workers
+  (K cards each running one batched decode) and reassembled in the original order.
+  **`batch_size` defaults to 1 (off)**: the measured gain grows as texts get
+  shorter (7.0x short, 2.9x medium), but other fully-loaded processes were running
+  on the measurement box, and oversubscription inflates exactly the overhead
+  batching amortizes — expect noticeably less on a quiet machine, and there is no
+  trustworthy data for the long-text case. Measure on your own hardware first.
 - **Multi-GPU data-parallel pool** `bitcask_embedder_pool`: N embedder processes,
   **all layers on one card, one instance per card**, N requests genuinely
   concurrent. The application env gains `instances => [0,1,2,3]` (or card groups

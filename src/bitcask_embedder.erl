@@ -43,7 +43,7 @@
 -module(bitcask_embedder).
 
 %% Framework API (new — context-based, runtime dynamic)
--export([new/2, embed/2, dim/1, vector_dim/1]).
+-export([new/2, embed/2, embed_batch/2, dim/1, vector_dim/1]).
 
 -export_type([ctx/0]).
 
@@ -74,6 +74,11 @@
 -callback init(Opts :: map()) -> {ok, ctx()} | {error, term()}.
 -callback embed(Config :: map(), Text :: binary()) -> {ok, Vec :: binary()} | {error, term()}.
 
+%% embed_batch/2（**可选**）：一次编码多条。provider 没实现时框架自动退化成
+%% 逐条调 embed/2，结果形状完全一致，所以调用方不必关心 provider 支不支持。
+-callback embed_batch(Config :: map(), [binary()]) ->
+    {ok, [{ok, binary()} | {error, term()}]} | {error, term()}.
+
 %% -------------------------------------------------------------------
 %% Legacy behaviour (deprecated) — 旧式 embed/1 + dim/0。
 %% 新代码请用 new/2 + embed/2 + dim/1。
@@ -83,7 +88,7 @@
 -callback dim() -> pos_integer().
 
 %% 旧回调设为 optional：新 provider 只需实现 init/1 + embed/2。
--optional_callbacks([dim/0, embed/1]).
+-optional_callbacks([dim/0, embed/1, embed_batch/2]).
 
 %% -------------------------------------------------------------------
 %% Framework: 构建 provider 上下文
@@ -104,6 +109,26 @@ new({custom, Module}, Opts) when is_atom(Module) ->
 -spec embed(ctx(), binary()) -> {ok, binary()} | {error, term()}.
 embed(#{module := M, config := Cfg}, Text) when is_binary(Text) ->
     M:embed(Cfg, Text).
+
+%% -------------------------------------------------------------------
+%% Framework: 批量 embed
+%%
+%% 返回 {ok, [{ok,Vec} | {error,Reason}]} —— **逐条**结果，顺序与输入一一对应。
+%% 一条失败不影响其它条：索引场景下整批失败会逼调用方丢掉整批或退化成逐条
+%% 重试，两个都更差。
+%%
+%% provider 实现了 embed_batch/2 就用它（llama 后端一次 decode 喂多条，是索引
+%% 侧的主要吞吐杠杆）；没实现就在这里退化成逐条 embed/2 —— 结果形状一致，
+%% 调用方不必知道 provider 支不支持。
+%% -------------------------------------------------------------------
+-spec embed_batch(ctx(), [binary()]) ->
+          {ok, [{ok, binary()} | {error, term()}]} | {error, term()}.
+embed_batch(#{module := M, config := Cfg}, Texts) when is_list(Texts) ->
+    _ = code:ensure_loaded(M),
+    case erlang:function_exported(M, embed_batch, 2) of
+        true  -> M:embed_batch(Cfg, Texts);
+        false -> {ok, [M:embed(Cfg, T) || T <- Texts]}
+    end.
 
 %% -------------------------------------------------------------------
 %% Framework: 取维度

@@ -453,3 +453,69 @@ qlen_probe(W) ->
                    undefined -> {1, 0}
                end
     end.
+
+%% ===================================================================
+%% 批量 embed
+%%
+%% ⚠️ 用 mock provider：批量的**契约**（逐条结果、顺序、一条坏不影响其它条、
+%%    池化时拆分并行）与 provider 无关。llama 的原生批量由 bitcask_llama_tests 管。
+%% ===================================================================
+
+%% mock 没实现 embed_batch/2 —— 框架必须自动退化成逐条，结果形状完全一致。
+%% ⚠️ 这条钉住"调用方不必知道 provider 支不支持批量"。
+framework_falls_back_to_sequential_test() ->
+    {ok, Ctx} = bitcask_embedder:new({custom, bitcask_embedder_mock}, #{}),
+    ?assertNot(erlang:function_exported(bitcask_embedder_mock, embed_batch, 2)),
+    {ok, Rs} = bitcask_embedder:embed_batch(Ctx, [<<"x x x">>, <<"z z z">>]),
+    ?assertEqual([{ok, bitcask_embedder_mock:vec_bin([0.6, 0.8, 0.0, 0.0])},
+                  {ok, bitcask_embedder_mock:vec_bin([0.0, 0.0, 0.0, 1.0])}], Rs).
+
+framework_batch_empty_test() ->
+    {ok, Ctx} = bitcask_embedder:new({custom, bitcask_embedder_mock}, #{}),
+    ?assertEqual({ok, []}, bitcask_embedder:embed_batch(Ctx, [])).
+
+server_batch_test() ->
+    with_server(?MOCK, fun(Pid) ->
+        {ok, Rs} = bitcask_embedder_server:embed_batch(Pid, [<<"x x x">>, <<"x">>]),
+        ?assertEqual(2, length(Rs)),
+        [?assertMatch({ok, _}, R) || R <- Rs]
+    end).
+
+%% ⚠️ **顺序必须与输入一一对应** —— 调用方靠下标对回自己的 key。池化时批被拆
+%%    到多个 worker 上并行跑，拼回来的顺序错了就是把向量配错文档，而且不报错。
+proxy_batch_preserves_order_test_() ->
+    {timeout, 60, fun() ->
+        Texts = [<<"x x x">>, <<"x x y">>, <<"x y y">>, <<"z z z">>, <<"x">>],
+        Expect = [begin {ok, V} = bitcask_embedder_mock:embed(T), {ok, V} end || T <- Texts],
+        %% 单进程
+        with_server(?MOCK, fun(Pid) ->
+            {ok, C} = bitcask_embedder:new({custom, bitcask_embedder_proxy}, #{server => Pid}),
+            ?assertEqual({ok, Expect}, bitcask_embedder:embed_batch(C, Texts))
+        end),
+        %% 池化（3 个 worker，5 条会被拆成多段并行）
+        with_pool([0, 1, 2], fun(Pool) ->
+            {ok, C} = bitcask_embedder:new({custom, bitcask_embedder_proxy}, #{server => Pool}),
+            ?assertEqual({ok, Expect}, bitcask_embedder:embed_batch(C, Texts)),
+            ?assertEqual({ok, []}, bitcask_embedder:embed_batch(C, [])),
+            %% 条数少于 worker 数：不该崩，也不该丢条目
+            {ok, R1} = bitcask_embedder:embed_batch(C, [<<"x">>]),
+            ?assertEqual(1, length(R1))
+        end)
+    end}.
+
+%% 池里某个 worker 死了：那一段记成错，其余段照常返回——不是整批失败。
+proxy_batch_partial_failure_test_() ->
+    {timeout, 60, fun() ->
+        with_pool([0, 1], fun(Pool) ->
+            {ok, C} = bitcask_embedder:new({custom, bitcask_embedder_proxy}, #{server => Pool}),
+            {ok, [W0, _]} = bitcask_embedder_pool:workers(Pool),
+            %% 让 supervisor 别把它拉起来：直接 stop 掉整棵子树里的那一个是不行的，
+            %% 所以改用"注册名被占走"的等效场景——kill 之后立刻发批，
+            %% 重启窗口内那一段会失败。
+            exit(whereis(W0), kill),
+            {ok, Rs} = bitcask_embedder:embed_batch(C, [<<"x">>, <<"x x x">>, <<"z z z">>, <<"x y y">>]),
+            ?assertEqual(4, length(Rs)),
+            %% 不论 worker 是否已重启，条数与顺序必须完整；至少不能整批 {error,_}
+            [?assert(element(1, R) =:= ok orelse element(1, R) =:= error) || R <- Rs]
+        end)
+    end}.

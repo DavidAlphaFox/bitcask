@@ -477,6 +477,100 @@ When VRAM is insufficient the NIF **falls back to CPU rather than erroring**
 > in VRAM" when the truth is 0, which is worse than not reporting at all.
 > `gpu_offload_reporting_is_truthful_test_` pins this invariant.
 
+### 3.5 Batch embedding (the throughput lever for indexing)
+
+The single-text path feeds one sequence per forward pass, so the fixed overhead
+(graph setup, KV clear, thread-pool wakeup) is paid by that one text. Batching
+packs N texts into **one** decode and pooling produces one vector each.
+
+```erlang
+{ok, Ctx} = bitcask_embedder:new({custom, bitcask_embedder_llama},
+              #{model_path => ..., pooling => last, n_ctx => 512,
+                batch_size => 16}),                    %% ← enable batching
+{ok, Rs} = bitcask_embedder:embed_batch(Ctx, Texts).
+%% Rs = [{ok, Vec} | {error, Reason}], one per input, in order
+```
+
+#### Results are **per item**
+
+The outer `{ok, _}` only means "the batch ran"; each item succeeds or fails on
+its own:
+
+```erlang
+{ok, [{ok, <<...>>},
+      {error, empty_text},
+      {error, {too_many_tokens, 2001, 512}},
+      {ok, <<...>>}]}
+```
+
+> ⚠️ One bad document should not waste the other 63. Failing the whole batch
+> forces the caller either to drop it entirely or to fall back to one-at-a-time
+> retries — both worse. The order matches the input exactly: callers map results
+> back to their keys by index.
+
+#### `batch_size` scales memory / VRAM
+
+⚠️ **llama's `n_ctx` is a budget shared across sequences**
+(`n_ctx_seq = n_ctx / n_seq_max`, `llama-context.cpp:290`). The implementation
+therefore builds the context with `n_ctx × batch_size` — without that, enabling
+batching would **silently shrink each text's usable length by a factor of
+batch_size**, and texts that used to fit would start returning
+`too_many_tokens` while the configured `n_ctx` never changed.
+
+The cost is that the KV cache and compute buffers grow linearly with
+`batch_size`. The values actually in effect are reported by `info/1` as `n_ctx`
+(per sequence), `batch_size` and `n_batch`.
+
+#### Pass as many as you like
+
+The C++ side chunks automatically against two limits: sequence count ≤
+`batch_size`, and total tokens ≤ `n_batch`. ⚠️ Chunking is **required**, not an
+optimization — pushing 1000 texts in at once just returns a negative value, and
+that value does not tell you the count was the problem.
+
+#### Pool + batch
+
+With `instances` configured, a batch is **split and dispatched to the workers in
+parallel** (K cards each running one batched decode), and the results are
+reassembled in the original order. ⚠️ The segments are sent concurrently;
+otherwise this degenerates into feeding workers one after another, with only one
+of K cards busy at a time. A failing segment only affects that segment.
+
+#### Measured
+
+> ⚠️ **The measurement conditions were not clean**: other fully-loaded processes
+> were running on the box at the time (load 9.8 on 8 vCPUs). The two arms were
+> interleaved and medians of 3 runs taken, so the *ratio* is reasonably
+> trustworthy — but oversubscription inflates the per-call fixed overhead, which
+> is exactly what batching amortizes, so **on a quiet machine expect noticeably
+> less than the table below**. The absolute timings are not trustworthy at all
+> (the same 276-token document takes 890 ms in §6 on a quiet box).
+
+| Texts | Count | Sequential | Batched | Speedup |
+|---|---|---|---|---|
+| Short (5 tokens, query-like) | 64 | 7778 ms | 1108 ms | **7.0x** |
+| Medium (30 tokens) | 32 | 27196 ms | 9517 ms | **2.9x** |
+
+A single non-interleaved run produced 2.4x / 1.04x / 0.79x (long texts *slower*),
+contradicting the table — that set was distorted by uneven contention. **There is
+no trustworthy data for the long-text case.**
+
+**Conclusion: `batch_size` defaults to 1 (off), deliberately.** The gain grows as
+texts get shorter, and the long-text case could not be measured reliably here.
+Measure on **your own hardware and text-length distribution** before enabling it.
+
+With `batch_size = 1`, `embed_batch/2` still works — it just degenerates into
+one decode per text: same results, no speedup.
+
+#### Other providers
+
+`embed_batch/2` is an **optional** `bitcask_embedder` callback. When a provider
+does not implement it the framework falls back to sequential `embed/2` with an
+identical result shape — callers never need to know whether the provider supports
+it. Only the llama backend has a native implementation today; the HTTP tier
+(OpenAI's `/v1/embeddings` accepts an array) is a natural candidate, not done yet.
+
+
 ---
 
 ## 4. Options
@@ -491,6 +585,7 @@ When VRAM is insufficient the NIF **falls back to CPU rather than erroring**
 | `backend` | `auto` | `auto` (CUDA > Vulkan > CPU) \| `cuda` \| `vulkan` \| `cpu`. See §3.4 |
 | `gpu_index` | `0` | Which card to bind; also a group `[0,1]` or `all`. Multi-GPU: see §3.4 |
 | `split_mode` | `none` | `none` \| `layer` \| `row`. Latter two only when a large model does not fit one card |
+| `batch_size` | `1` | Sequences per decode. See §3.5; ⚠️ memory scales linearly with it |
 | `n_gpu_layers` | `auto` | Offload everything if there is a GPU, else 0. See §3.4 |
 | `dim` | — | If given, checked against the model's actual dimension; mismatch is an error |
 | `vector_dim` | `= dim` | MRL truncation dimension (≤ dim); truncate + renormalize on the Erlang side |

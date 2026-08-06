@@ -129,6 +129,16 @@ options when it clearly will not fit — but it is never used to pick
 layers). Without it, "does not fit" shows up as llama OOM → fallback → **the
 whole model back on CPU**.
 
+**Batch embedding** `embed_batch/2` ✅: the llama backend feeds several sequences
+per decode and returns per-item results. It is an optional `bitcask_embedder`
+callback, so providers without it fall back to sequential encoding transparently.
+With a pool, a batch is split and dispatched concurrently across workers.
+⚠️ `n_ctx` must be multiplied by `batch_size` (llama's `n_ctx` is shared across
+sequences), or enabling batching silently shrinks each text's usable length N-fold.
+**Off by default**: measured 7.0x on short texts and 2.9x on medium ones, but the
+measurement box had external load which inflates the ratio, and the long-text case
+has no trustworthy data — measure on your own hardware before enabling.
+
 The build-time SDK probe `scripts/detect-llama-backends.sh`: CMake only says "not
 found"; the script says **which package is missing** and prints the build command
 pre-filled with whichever switches it detected.
@@ -149,9 +159,6 @@ pre-filled with whichever switches it detected.
 
 ### Candidates ⚠️
 
-- **Batch embed entry point** (gated): one text at a time today, which caps
-  indexing throughput. llama's batch interface can take several at once; the gain
-  needs measuring.
 - **Optional `close/1` callback on `bitcask_embedder`** (gated): would let
   `bitcask:close/1` release a ctx built via the `{Provider, Cfg}` path. Currently
   side-stepped by the process form, and touching the core API has no obvious
@@ -161,6 +168,13 @@ pre-filled with whichever switches it detected.
   library should claim every GPU by default, and whether the "a failing embedder
   kills the application" policy should be relaxed when one worker in a pool fails
   to start. Both are policy questions, not implementation ones.
+- **Trustworthy batch calibration** (gated): the current numbers were taken on a
+  box with external load, which inflates the ratio, and the long-text case has no
+  conclusion. A re-measure on a quiet machine is needed before recommending a
+  default.
+- **Native batching for the HTTP tier** (gated): OpenAI's `/v1/embeddings` accepts
+  an array; wiring it up would make one request cover many texts. Today it falls
+  back to one HTTP request per text.
 - **Real multi-GPU measurement** (gated): the pool mechanism is thoroughly tested
   with the mock provider, but **real GPU behaviour on a multi-card box has never
   been exercised** (no card on the development machine). The `gpu_index` range
