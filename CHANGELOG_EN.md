@@ -3,6 +3,158 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [6.0.0] — 2026-08-06
+
+**Upgrade libbitcask v5.0.0 → 6.0.0** (spanning two upstream releases: 5.1.0 and
+6.0.0), and expose all three capabilities they added to the Erlang side:
+**ordered range queries**, **crash-atomic batches**, and **multi-key
+transactions**. The `third_party/libbitcask` submodule advances from `aaac44c`
+to `3480d0f` (tag `6.0.0`). This repo's version is aligned to **6.0.0**.
+
+> ### ⚠️ Read this first: existing directories need one offline migration
+>
+> Upstream 5.1.0 introduced the **hint-embedded-ord flag day**: `bitcask.meta`
+> v4 → **v5**. **Every directory written by this repo's 5.x line is cleanly
+> refused when opened with 6.0.0** — old bytes are never silently reinterpreted
+> under the new semantics. The migration is **non-destructive**: data files are
+> hard-linked (zero byte changes), only hints + meta are regenerated, and it is
+> idempotent and re-runnable:
+>
+> ```sh
+> _build/cmake/libbitcask-build/bitcask_migrate hintord <old-dir> <new-dir>
+> _build/cmake/libbitcask-build/bitcask_migrate detect  <dir>   # confirm the era first
+> ```
+>
+> On refusal `bitcask:open/2` now **hands the migration command straight back**
+> (see the error-detail passthrough under Changed) — you no longer need to read
+> the docs first to get unstuck.
+>
+> The reverse does not hold: **directories written by 6.0.0 cannot be opened by
+> older versions**. Upgrade in one direction only.
+
+> ### Version semantics
+>
+> Upstream 6.0.0 is an **ABI break** (`CaskOptions` / `bitcask_options_t` gain a
+> `keydir_cache_entries` field → struct layout change, `SOVERSION` 5 → **6**).
+> This repo depends on it at the **source level** (submodule +
+> `add_subdirectory`), so a rebuild is all it takes — there is no stale `.so.5`
+> to link against. On-disk: the meta epoch does not move (v5; directories that
+> use atomic batches lazily upgrade to v6), and the new BCOK v2 / BCOM v2-v3 /
+> BCKS v4 formats are all **derived-cache evolutions** — older versions discard
+> and rebuild them, so no migration is involved.
+
+### Added
+
+- **Ordered range queries** (upstream S33-5, the OKI ordered-key index):
+  - `bitcask:range/2,3` — returns the `{Key, Value}` pairs in `[Lo, Hi)` in key
+    lexicographic order. `Lo` is inclusive, `Hi` exclusive; either bound may be
+    `undefined` for unbounded.
+  - `bitcask:range_fold/5` — streaming variant; the callback is
+    `fun(Key, Value, Tstamp, Ord, Acc) -> Acc'`.
+  - Costs **O(range)** rather than filtering over the whole table (upstream
+    measured 100k keys at 1/256 selectivity: 8.0 ms → **0.53 ms**).
+  - Options `{prefetch, N}` (N>1 fetches values concurrently in batches; this
+    changes *when* values are read, **never the output order or contents**) and
+    `{prefetch_threads, N}` (0 = `min(online cores, 4)`). It pays off for large
+    windows over cold values and loses to thread-creation cost on small ones,
+    hence off by default.
+  - ⚠️ Consistency is **per-key weak** (same tier as `parallel_scan`) — writes
+    concurrent with the iteration may be partially visible. This is **not**
+    `fold/3`'s snapshot semantics; keep using `fold` when you need a snapshot.
+  - No OKI for the directory (read-only open of a never-written database, or a
+    failed rebuild) → `{error, no_index}`; callers should fall back to `fold`
+    plus prefix filtering.
+- **Crash-atomic batches**, `bitcask:put_batch_atomic/2` (upstream S35):
+  `Ops :: [{put, Key, Value} | {remove, Key}]`. After a crash or power loss the
+  batch is **either entirely visible or entirely invisible** (the on-disk batch
+  header declares the extent; an incomplete extent truncates the whole batch at
+  recovery). The same key may appear multiple times (applied in order =
+  intra-batch LWW); an empty batch is a no-op.
+  ⚠️ Atomicity and durability are **orthogonal**: without an fsync, power loss
+  can still lose the entire batch — but never half of one.
+- **Multi-key transactions**, `bitcask:txn_commit/2,3` (upstream S34): a
+  validation layer over the atomic batch — non-empty batch, non-empty keys, no
+  duplicate keys, and no use of the reserved `"_txn:"` prefix. Violating any of
+  these returns `{error, {invalid_option, Msg}}` with **zero side effects**.
+  The third argument is the commit-point fsync policy: `sync_on_commit`
+  (default) or `no_sync`.
+  ⚠️ **No isolation (I) and no CAS**: intermediate transaction state is visible
+  to concurrent readers, and concurrent commits with overlapping key sets have
+  no ordering guarantee — serialize those in your application. Disjoint key sets
+  are safe to commit concurrently.
+  ⚠️ The first call to either entry point **lazily upgrades the directory's
+  `bitcask.meta` to v6**, after which readers older than upstream 5.1.0 cannot
+  open it. Directories that never call them stay at v5.
+- **`{keydir_cache_entries, N}` open option** (upstream S36-4, disk-resident
+  keydir Level B): `0` (default) = unlimited = today's fully in-memory
+  behaviour; `>0` opts in to a hot-cache entry budget. The keydir degrades to a
+  cache, and point lookups resolve through cache → memdelta → BCOK v2 run
+  (embedded bloom + block LRU, cold get ≤2 preads). Upstream measured 100M
+  `doc:` keys: 11 GB resident → **1.14 GB peak while loading / 0.80 GB on
+  reopen (-90%)**, with no regression on hot get/put/merge.
+  ⚠️ Enabling it for the first time on a directory without the Level B stamp
+  triggers a **full OKI rebuild** (one slow open); `merge_only` sidecars and
+  Level B directories are **mutually exclusive** (open is refused outright).
+- `test/bitcask_range_txn_tests.erl` (19 cases) covering the boundary semantics,
+  error translation, and resource lifetimes of all three.
+
+### Changed
+
+- **`bitcask:open/2` errors now carry their reason.** libbitcask has two classes
+  of failure that are message-only, with no errno and no dedicated enum —
+  `kIo(errnum == 0)` and `kInvalidOption`. They used to collapse to
+  `{error, unknown}` and `{error, error}`, losing everything. They are now
+  `{error, {io_error | invalid_option, DetailBinary}}`.
+  This is what makes the migration path above self-serving: opening a v4-era
+  directory now yields ``{error, {io_error, <<"read meta failed: ord-less-hint
+  era format (meta v4); run `bitcask_migrate hintord <src> <dst>` to migrate
+  ...">>}}``.
+  **Every other failure shape is unchanged** — in particular
+  `{error, write_locked}` stays a bare atom, which `merge/3`'s `merge_locked`
+  mapping matches exactly.
+- Inherited from upstream B4: **merge input files are now retired and deleted
+  lazily** instead of being unlinked on the spot. The visible change is that
+  **disk space freed by a merge is released one beat later** (at the next merge
+  start / `checkpoint()` entry / `close()`). In exchange, in-flight readers
+  holding an older keydir snapshot no longer hit a spurious-ENOENT window.
+  Retired files left behind by a crash are ordinary data files; recovery and
+  subsequent merges absorb them.
+- Inherited upstream fix: once group commit became the primary put path, the
+  **memdelta threshold flush lost its trigger** — a pure-KV write-heavy workload
+  (no checkpoint to piggyback on) grew memdelta without bound (upstream measured
+  790 MB at 10M puts). Also fixes the pre-existing exposure where `close()`
+  performed no fsync at all under `sync_every_n=0`.
+- Inherited upstream B1 closure: **checkpoints could outrun un-fsynced data** —
+  keydir snapshots, ckpt-chain watermarks, and OKI runs are now all filtered by
+  "reference ≤ durable". The dangling entries that survived a power loss while
+  their data evaporated (get reporting IO/CRC) are gone.
+- Inherited upstream S33-6: the automatic tier of `{max_read_handles, 0}` is now
+  **clamped to [64, 1024]**. It previously took half of `RLIMIT_NOFILE`, and
+  under containers/systemd that limit is routinely 5×10^5+, where "half" is no
+  limit at all.
+
+### Removed
+
+- Nothing. Upstream removed TxnCask's plan-B intent replay
+  (`recover` / `pending_txns`), which this repo never exposed — the Erlang side
+  is unaffected.
+
+### Verified
+
+- `rebar3 compile` (linked against 6.0.0) + `rebar3 eunit` **157/157**
+  (19 new cases).
+- **The migration path was exercised end to end** (against a synthetic but valid
+  meta v4 directory — version byte changed *and* the meta CRC recomputed):
+  `open/2` refuses cleanly and hands back the verbatim `bitcask_migrate hintord`
+  command → `bitcask_migrate detect` identifies the era and names the next step →
+  `hintord` migrates successfully (112 records) → the migrated directory opens
+  normally with `get` / `range` data intact.
+- Lifetime smoke test: using a range iterator after `cask_close` yields
+  `{error, closed}` (the NIF keeps the parent resource alive and checks it on
+  every call) rather than a segfault.
+
+---
+
 ## [5.1.0] — 2026-08-06
 
 **Local embedding backend (llama.cpp / ggml) + a standalone embedder process.**

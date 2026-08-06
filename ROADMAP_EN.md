@@ -6,6 +6,90 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 6.0.0 shipped
+
+### libbitcask v5.0.0 → 6.0.0 upgrade ✅
+
+One step across two upstream releases, **5.1.0 and 6.0.0**. It is an ABI break
+(`CaskOptions` gains `keydir_cache_entries` → struct layout change, `SOVERSION`
+5 → 6), but this repo depends on libbitcask at the source level (submodule +
+`add_subdirectory`), so a rebuild is all it takes — there is no stale `.so.5` to
+link against. Upstream's public API is **purely additive** with respect to
+everything this repo already touched: the NIF compiled unchanged.
+
+> ⚠️ **Existing directories must be migrated offline first.** Upstream 5.1.0's
+> hint-embedded-ord flag day moves `bitcask.meta` v4 → **v5**, so directories
+> written by this repo's 5.x line are **cleanly refused** by 6.0.0 (old bytes are
+> never reinterpreted under the new semantics). The migration is
+> non-destructive — data files are hard-linked with zero byte changes, only
+> hints + meta are regenerated — and it is idempotent and re-runnable:
+>
+> ```sh
+> _build/cmake/libbitcask-build/bitcask_migrate hintord <old-dir> <new-dir>
+> ```
+>
+> The reverse does not hold: directories written by 6.0.0 cannot be opened by
+> older versions. Upgrade in one direction only.
+
+### Ordered range queries: `range/2,3` + `range_fold/5` ✅
+
+Walks `[Lo, Hi)` in key lexicographic order at **O(range)** cost instead of
+filtering the whole table (upstream measured 100k keys at 1/256 selectivity:
+8.0 ms → **0.53 ms**). The foundation is upstream S33's OKI ordered-key index (a
+derived cache — if it fails validation it is discarded and rebuilt wholesale).
+`{prefetch, N}` fetches values concurrently in batches, changing *when* values
+are read and **never the output order or contents**.
+
+> ⚠️ Consistency is **per-key weak** (the same tier as `parallel_scan`), not
+> `fold/3`'s snapshot semantics — writes concurrent with the iteration may be
+> partially visible. That is the deliberate trade: you cannot have O(range) and a
+> frozen keydir at once. Call sites that need a snapshot keep using `fold`.
+
+### Crash-atomic batches and multi-key transactions: `put_batch_atomic/2` + `txn_commit/2,3` ✅
+
+After a crash or power loss the batch **either fully applies or does not apply at
+all** (the on-disk batch header declares the extent; an incomplete extent
+truncates the whole batch at recovery), with no intent-log write amplification.
+`txn_commit` layers validation on top (non-empty, non-empty keys, no duplicates,
+no `_txn:` prefix); a violation returns `{error, {invalid_option, Msg}}` with
+**zero side effects**.
+
+> ⚠️ **You get A and D — not I, and no CAS.** Intermediate transaction state is
+> visible to concurrent readers, and concurrent commits with overlapping key sets
+> have no ordering guarantee; serialize those in your application. Do not treat
+> this as a database transaction.
+> ⚠️ **The first call lazily upgrades the directory's meta to v6**, after which
+> readers older than upstream 5.1.0 cannot open it. Directories that never call
+> it stay at v5 and remain mutually openable with older readers — this
+> "upgrade only when used" design leaves deployments that don't need atomic
+> batches completely unaffected.
+
+### Disk-resident keydir: `{keydir_cache_entries, N}` ⚠️ (opt-in, off by default)
+
+The keydir degrades to a hot cache; point lookups resolve through cache →
+memdelta → BCOK v2 run (embedded bloom + block LRU, cold get ≤2 preads).
+Upstream measured 100M `doc:` keys: 11 GB resident → **1.14 GB peak while
+loading / 0.80 GB on reopen (-90%)**, with no regression on hot get/put/merge.
+
+> Defaults to `0` (unlimited = today's fully in-memory behaviour). ⚠️ Enabling it
+> for the first time on a directory without the Level B stamp triggers a **full
+> OKI rebuild** (one slow open); `merge_only` sidecars and Level B directories
+> are **mutually exclusive**.
+> This repo only wired the option through and smoke-tested it — **the large-scale
+> numbers above are upstream's**. Measure on your own data shape before turning
+> it on in production.
+
+### Error detail passthrough ✅
+
+`bitcask:open/2` failures now carry their reason:
+`{error, {io_error | invalid_option, DetailBinary}}`. Upstream's two
+message-only failure classes (no errno, no dedicated enum) previously collapsed
+to `{error, unknown}` and `{error, error}`, losing everything — and the epoch
+gate's migration hint travels exactly that path. **Every other failure shape is
+unchanged** (notably `{error, write_locked}`, still a bare atom).
+
+---
+
 ## 5.1.0 shipped
 
 ### Local embedding backend (llama.cpp / ggml) ✅

@@ -323,6 +323,33 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## M8 — libbitcask 升级 v5.0.0 → 6.0.0（跨上游 5.1.0 + 6.0.0 两版）
+
+> submodule 由 `aaac44c`（v5.0.0）升至 `3480d0f`（6.0.0）。上游 6.0.0 是 ABI
+> 破坏（`CaskOptions` 新增 `keydir_cache_entries` → 布局变更，`SOVERSION` 5→6），
+> 但本仓库是源码级依赖（`add_subdirectory`），重编即可。本仓库 `vsn` → 6.0.0。
+>
+> ⚠️ **盘上格式**：上游 5.1.0 的 hint 内嵌 ord flag-day 把 `bitcask.meta`
+> v4 → v5，**本仓库 5.x 写出的目录必须先离线迁移**
+>（`bitcask_migrate hintord`，非破坏性、data 字节零改动、幂等）。
+>
+> 本次不只做「能编过」的适配，而是把上游两版新增的三块能力全部开到 Erlang：
+> range 查询、原子批、多键事务。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M8-1** | submodule pin v5.0.0（`aaac44c`）→ 6.0.0（`3480d0f`）+ 嵌套子模块同步。⚠️ M5-1 记过的坑**又踩了一次**：`rebar.config` 的 pre-hook `git submodule update` 按父仓库 **index** 里的 gitlink 复位子模块——直接 `cmake --build` 能过，一跑 `rebar3 compile` 就被悄悄退回 v5.0.0，报的是一堆「`CaskRangeIter` 未声明」这种看着像代码写错的错。checkout 后必须先 `git add third_party/libbitcask`。 | ✅ |
+| **M8-2** | 编译适配：**零破坏**。上游公开 API 对本仓库既有触点纯增量，NIF 一行不用改就编过（先验证了这一点再动新功能）。 | ✅ |
+| **M8-3** | `{keydir_cache_entries, N}` 选项透传（`atoms` + `nif_options.cpp` + `?CASK_PASSTHROUGH_OPTS`）。0 = 不限 = 现状全内存。 | ✅ |
+| **M8-4** | **错误 detail 透传**：`kIo(errnum==0)` 与 `kInvalidOption` 是上游仅有的两类「只有消息」的故障，此前分别塌成 `{error, unknown}` / `{error, error}`。新增 `fault_to_term_detailed` → `{error, {io_error\|invalid_option, DetailBin}}`，只在 open 与新 API 上启用。⚠️ **刻意不改其余形态**：`{error, write_locked}` 必须保持裸 atom，`cask_merge_dir` 的 `merge_locked` 映射精确匹配它。这条正好把 M5-3 里记下的「上游门禁错误映射成 `{error, unknown}`，可提 issue」在本地解决了——不用等上游加错误码。 | ✅ |
+| **M8-5** | range 迭代器 NIF（`nif_cask_range.cpp`）：4 个入口 + 新资源类型。⚠️ **生命周期比 fold 迭代器更紧**——`CaskRangeIter` 取值要回调父 `Cask` 的读路径，不是 fold 那样快照自足。资源里 `enif_keep_resource` 住父 `CaskHandle` + 每次 next 前检查 `owner->cask` 是否被 `cask_close` 置空，把「先 close 再 next」从段错误降级成 `{error, closed}`。⚠️ `RangeOptions.lo/hi` 是 span，借用调用期的 `ErlNifBinary` 是安全的（读过上游实现确认：`lo` 只在建游标时用，`hi` 被拷进迭代器自己的 string）。 | ✅ |
+| **M8-6** | 原子批 / 事务 NIF（`nif_cask_batch.cpp`）：`cask_put_batch_atomic/2` + `cask_txn_commit/3`。⚠️ ops 解析**刻意与 open 选项的宽松语义相反**——形态不认一律 badarg，不静默跳过：批里悄悄丢一条会让「原子」这个词失去意义。上游的 `recover`/`pending_txns` 在 6.0.0 已恒返空（方案 B 意图重放删除），不暴露。 | ✅ |
+| **M8-7** | Erlang 门面：`range/2,3`、`range_fold/5`、`put_batch_atomic/2`、`txn_commit/2,3`。range 内部走 `next_batch(256)` 而不是逐条 next——长范围下少两个数量级的 BEAM↔NIF 往返。 | ✅ |
+| **M8-8** | 回归：`rebar3 eunit` **157/157**（新增 `bitcask_range_txn_tests` 19 例）。**迁移路径端到端实测**：拒开（带回 `bitcask_migrate hintord` 命令原文，此前是 `{error, unknown}`）→ `detect` → `hintord`（112 条记录）→ 迁移后目录正常打开、`get`/`range` 数据完好。⚠️ 第一次构造 v4 fixture 时只改了版本字节没重算 meta CRC，`hintord` 报 `CRC mismatch`——**不是迁移工具的问题，是 fixture 的问题**（`detect` 不校 CRC 所以先前看着正常）；重算 `crc32(header[0:14])` 写回 offset 14 之后才是有效样本。生命周期冒烟：close 后用迭代器 → `{error, closed}`。README / USAGE 里每段示例的输出都是真跑出来贴的。 | ✅ |
+| **M8-9** | 文档：CHANGELOG（中/英）[6.0.0] + ROADMAP（中/英）6.0.0 落地 + README（中/英）发布条目 + API 表 + 快速上手示例 + `CMakeLists.txt` 版本注释 + `bitcask.app.src` 版本对齐。迁移警告在 CHANGELOG / README / CMakeLists 三处都写了——存量目录打不开是升级后第一件会撞上的事。 | ✅ |
+
+---
+
 ## 明确排除（V7+ 或永久取消）
 
 | 条目 | 决策 | 理由 |

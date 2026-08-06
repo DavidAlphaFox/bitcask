@@ -6,6 +6,70 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 6.0.0 落地
+
+### 升级 libbitcask v5.0.0 → 6.0.0 ✅
+
+一次跨上游 **5.1.0 + 6.0.0** 两版。ABI 破坏（`CaskOptions` 新增
+`keydir_cache_entries` → 结构体布局变更，`SOVERSION` 5 → 6），但本仓库是源码级
+依赖（submodule + `add_subdirectory`），重编即可，不存在链接旧 `.so.5` 的问题。
+上游公开 API 对本仓库既有触点是**纯增量**——NIF 一行不改就编过。
+
+> ⚠️ **存量目录必须先离线迁移**。上游 5.1.0 的 hint 内嵌 ord flag-day 把
+> `bitcask.meta` v4 → **v5**，本仓库 5.x 写出的目录用 6.0.0 打开会被**干净拒绝**
+>（绝不按新语义把旧字节读坏）。迁移是非破坏性的，data 文件硬链接、字节零改动，
+> 只重生成 hint + meta，幂等可重跑：
+>
+> ```sh
+> _build/cmake/libbitcask-build/bitcask_migrate hintord <旧目录> <新目录>
+> ```
+>
+> 反过来不成立：6.0.0 写出的目录不能被旧版打开。升级请单向进行。
+
+### 有序范围查询：`range/2,3` + `range_fold/5` ✅
+
+按 key 字典序遍历 `[Lo, Hi)`，代价 **O(range)** 而不是 O(全表) 过滤（上游实测
+10 万 key、选择性 1/256：8.0 ms → **0.53 ms**）。底座是上游 S33 的 OKI 有序 key
+索引（派生缓存，校验不过即整体弃用重建）。`{prefetch, N}` 批量并发取值，只改
+取值时机、**输出序与内容不变**。
+
+> ⚠️ 一致性是 **per-key 弱一致**（与 `parallel_scan` 同档），不是 `fold/3` 的
+> 快照语义——迭代期间的并发写可能部分可见。这是刻意的取舍：要 O(range) 就不能
+> 冻结 keydir。需要快照的调用点继续用 `fold`。
+
+### 跨崩溃原子批与多键事务：`put_batch_atomic/2` + `txn_commit/2,3` ✅
+
+崩溃/掉电后**整批要么全生效要么全不生效**（盘上批头声明区间，恢复时区间不完整
+即整批截断），无意图日志写放大。`txn_commit` 在其上加一层校验（非空 / key 非空 /
+key 不重复 / 不占用 `_txn:` 前缀），违反即 `{error, {invalid_option, Msg}}` 且
+**零副作用**。
+
+> ⚠️ **只有 A 和 D，没有 I，也没有 CAS**。事务中间态对并发读者可见；键集重叠的
+> 并发提交无定序保证，需应用层串行化。别把它当数据库事务用。
+> ⚠️ **首次调用把目录 meta 懒升级为 v6**，此后不能被早于上游 5.1.0 的读端打开。
+> 从不调用的目录停留在 v5，与旧读端双向互开——这个「用了才升」的设计让不需要
+> 原子批的部署完全不受影响。
+
+### keydir 磁盘驻留：`{keydir_cache_entries, N}` ⚠️（opt-in，默认关）
+
+keydir 降级为热点缓存，点查权威走 缓存 → memdelta → BCOK v2 run（内嵌 bloom +
+块 LRU，冷 get ≤2 次 pread）。上游 1 亿 `doc:` key 实测：常驻 11 GB →
+**加载峰值 1.14 GB / 重开 0.80 GB（-90%）**，热 get/put/merge 零回归。
+
+> 默认 `0`（不限 = 现状全内存）。⚠️ 首次在未带 Level B 戳的目录上开启会**全量
+> 重建 OKI**（open 慢一次）；`merge_only` 旁车与 Level B 目录**互斥**。
+> 本仓库只做了选项透传与冒烟，**大库上的实测归属上游数据**——真要在生产上开，
+> 先在自己的数据形态上量一遍。
+
+### 错误 detail 透传 ✅
+
+`bitcask:open/2` 的失败现在带得上原因：`{error, {io_error | invalid_option,
+DetailBinary}}`。此前上游那两类「只有消息、没有 errno」的故障分别塌成
+`{error, unknown}` 与 `{error, error}`，信息全丢——而纪元门禁的迁移提示正好走
+这条路。**其余故障形态一律不变**（尤其 `{error, write_locked}` 仍是裸 atom）。
+
+---
+
 ## 5.1.0 落地
 
 ### 本地嵌入后端（llama.cpp / ggml）✅

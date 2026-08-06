@@ -3,6 +3,121 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [6.0.0] — 2026-08-06
+
+**升级 libbitcask v5.0.0 → 6.0.0**（跨两个上游版本：5.1.0 + 6.0.0），并把这两版
+新增的三块能力全部开到 Erlang 侧：**有序 range 查询**、**跨崩溃原子批**、
+**多键事务**。submodule `third_party/libbitcask` 由 `aaac44c` 推进至
+`3480d0f`（tag `6.0.0`）。本仓库版本同步对齐为 **6.0.0**。
+
+> ### ⚠️ 升级前必读：存量目录需要一次离线迁移
+>
+> 上游 5.1.0 引入了 **hint 内嵌 ord 的 flag-day**：`bitcask.meta` v4 → **v5**。
+> **本仓库 5.x 写出的所有目录，用 6.0.0 打开会被干净拒绝**（不会按新语义把旧
+> 字节读坏）。迁移是**非破坏性**的，data 文件字节零改动（硬链接），只重生成
+> hint + meta，幂等可重跑：
+>
+> ```sh
+> _build/cmake/libbitcask-build/bitcask_migrate hintord <旧目录> <新目录>
+> _build/cmake/libbitcask-build/bitcask_migrate detect  <目录>   # 先确认纪元
+> ```
+>
+> 拒开时 `bitcask:open/2` 现在会**把迁移命令原样带回来**（见下面「变更」里的
+> 错误 detail 透传）——升级前不必先读文档也能自救。
+>
+> 反过来不成立：**6.0.0 写出的目录不能被旧版打开**。升级请单向进行。
+
+> ### 版本号语义
+>
+> 上游 6.0.0 是 **ABI 破坏**（`CaskOptions` / `bitcask_options_t` 新增
+> `keydir_cache_entries` 字段 → 结构体布局变更，`SOVERSION` 5 → **6**）。
+> 本仓库是**源码级**依赖（submodule + `add_subdirectory`），重编即可，
+> 没有链接旧 `.so.5` 的问题。盘上格式：meta 纪元不动（v5，用原子批的目录
+> 懒升 v6），新增的 BCOK v2 / BCOM v2-v3 / BCKS v4 全是**派生缓存演进**，
+> 旧版遇到即弃用重建，不需要迁移。
+
+### 新增
+
+- **有序 range 查询**（上游 S33-5，OKI 有序 key 索引）：
+  - `bitcask:range/2,3` — 按 key 字典序取回 `[Lo, Hi)` 的 `{Key, Value}` 列表。
+    `Lo` 含、`Hi` 不含，两端都可以传 `undefined` 表示无界。
+  - `bitcask:range_fold/5` — 流式版本，回调是
+    `fun(Key, Value, Tstamp, Ord, Acc) -> Acc'`。
+  - 代价 **O(range)** 而不是 O(全表) 过滤（上游实测 10 万 key、选择性 1/256：
+    8.0 ms → **0.53 ms**）。
+  - 选项 `{prefetch, N}`（N>1 时批量并发取值，只改取值时机，**输出序与内容
+    不变**）与 `{prefetch_threads, N}`（0 = `min(在线核数, 4)`）。大窗口 + 冷值
+    时收益明显，小窗口反被线程创建成本吃掉，故默认关。
+  - ⚠️ 一致性是 **per-key 弱一致**（与 `parallel_scan` 同档）——迭代期间的并发
+    写可能部分可见，**不是 `fold/3` 的快照语义**。要快照请继续用 `fold`。
+  - 目录没有 OKI（只读打开一个从未写过的库 / 重建失败）→ `{error, no_index}`，
+    调用方按需回落到 `fold` + 前缀过滤。
+- **跨崩溃原子批** `bitcask:put_batch_atomic/2`（上游 S35）：
+  `Ops :: [{put, Key, Value} | {remove, Key}]`。崩溃/掉电后**整批要么全可见
+  要么全不可见**（盘上批头声明区间，恢复时区间不完整即整批截断）。允许批内
+  同 key 多次（依序 apply = 批内 LWW），空批是 no-op。
+  ⚠️ 原子性与持久性**正交**：没 fsync 就掉电仍可能整批丢失，但绝不半批。
+- **多键事务** `bitcask:txn_commit/2,3`（上游 S34）：在原子批之上多一层校验
+  ——批非空、key 非空、key 互不重复、不占用 `"_txn:"` 保留前缀；违反任一条
+  返回 `{error, {invalid_option, Msg}}` 且**零副作用**。第三参是提交点 fsync
+  策略：`sync_on_commit`（默认）| `no_sync`。
+  ⚠️ **不提供隔离性（I）与 CAS**：事务中间态对并发读者可见；键集重叠的并发
+  提交无定序保证，需应用层自行串行化。键集不相交则并发安全。
+  ⚠️ 原子批与事务**首次调用会把目录 `bitcask.meta` 懒升级为 v6**，此后不能被
+  早于上游 5.1.0 的读端打开。从不调这两个入口的目录停留在 v5。
+- **`{keydir_cache_entries, N}` 打开选项**（上游 S36-4，keydir 磁盘驻留
+  Level B）：`0`（默认）= 不限 = 现状全内存；`>0` = opt-in 热点缓存条目预算，
+  keydir 降级为缓存，点查权威走 缓存 → memdelta → BCOK v2 run（内嵌 bloom +
+  块 LRU，冷 get ≤2 次 pread）。上游 1 亿 `doc:` key 实测：常驻 11 GB →
+  **加载峰值 1.14 GB / 重开 0.80 GB（-90%）**，热 get/put/merge 零回归。
+  ⚠️ 首次在未带 Level B 戳的目录上开启会**全量重建 OKI**（open 慢一次）；
+  `merge_only` 旁车与 Level B 目录**互斥**（open 直接拒）。
+- 测试 `test/bitcask_range_txn_tests.erl`（19 例）覆盖上述三块的边界语义、
+  错误翻译与资源生命周期。
+
+### 变更
+
+- **`bitcask:open/2` 的错误现在带得上原因**。libbitcask 有两类「只有消息、
+  没有 errno/专用枚举」的故障——`kIo(errnum == 0)` 与 `kInvalidOption`，此前
+  分别塌成 `{error, unknown}` 与 `{error, error}`，信息全丢。现在形态是
+  `{error, {io_error | invalid_option, DetailBinary}}`。
+  这正是上面那条迁移路径的关键：打开一个 v4 纪元目录，现在拿到的是
+  ``{error, {io_error, <<"read meta failed: ord-less-hint era format (meta v4);
+  run `bitcask_migrate hintord <src> <dst>` to migrate ...">>}}``。
+  **其余故障形态一律不变**——尤其 `{error, write_locked}` 仍是裸 atom
+  （`merge/3` 的 `merge_locked` 映射精确匹配它）。
+- 继承上游 B4：**merge 的输入文件改「退休 + 延迟删除」**，不再当场 unlink。
+  可见变化是 **merge 释放的磁盘空间延后一拍**（到下次 merge 开始 /
+  `checkpoint()` 入口 / `close()`）。换来的是持旧 keydir 快照的在途读者不再有
+  ENOENT 假失败窗口。崩溃残留的退休文件是普通 data 文件，恢复与后续 merge
+  自愈收编。
+- 继承上游修复：组提交成为 put 主路径后 **memdelta 阈值 flush 失联**——纯 KV
+  长写负载（无 checkpoint 搭车点）memdelta 无界增长（上游实测 1000 万 put 时
+  790 MB）。同时修 `close()` 在 `sync_every_n=0` 下全程零 fsync 的既有暴露。
+- 继承上游 B1 收口：**checkpoint 跑赢未 fsync 数据**——keydir 快照 / ckpt 链
+  水位 / OKI run 一律「引用 ≤ 持久」过滤，掉电后快照存活而数据蒸发的悬空条目
+  （get 报 IO/CRC）就此消除。
+- 继承上游 S33-6：`{max_read_handles, 0}`（自动档）的推导结果现在**夹在
+  [64, 1024]**。此前只取 `RLIMIT_NOFILE` 的一半，容器/systemd 下 rlimit 常见
+  5×10^5+，"取一半"等于没有上限。
+
+### 移除
+
+- 无。上游删除的 TxnCask 方案 B 意图重放（`recover` / `pending_txns`）本仓库
+  从未暴露过，Erlang 侧无感。
+
+### 验证
+
+- `rebar3 compile`（链接 6.0.0）+ `rebar3 eunit` **157/157**（新增 19 例）。
+- **迁移路径端到端实测**（构造一个合法的 meta v4 目录——改版本字节 + 重算
+  meta CRC）：`open/2` 干净拒开并带回 `bitcask_migrate hintord` 命令原文 →
+  `bitcask_migrate detect` 认出纪元并给出下一步 → `hintord` 迁移成功
+  （112 条记录）→ 迁移后的目录正常打开，`get` / `range` 数据完好。
+- 生命周期冒烟：`cask_close` 之后再用 range 迭代器 → `{error, closed}`
+  （NIF 侧 keep 住父资源 + 逐次检查，不是段错误）。
+
+---
+
 ## [5.1.0] — 2026-08-06
 
 **本地嵌入后端（llama.cpp / ggml）+ 独立 embedder 进程。**

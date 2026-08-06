@@ -84,6 +84,50 @@ ok
 ok
 ```
 
+**Ordered range queries** (6.0.0) — walk `[Lo, Hi)` in key lexicographic order at
+O(range) cost instead of filtering the whole table. Either bound may be
+`undefined` for unbounded:
+
+```erlang
+1> R = bitcask:open("/tmp/db", [read_write]).
+2> [bitcask:put(R, <<"user:", (integer_to_binary(N))/binary>>, <<"v">>)
+    || N <- lists:seq(1, 3)].
+3> bitcask:range(R, {<<"user:">>, <<"user;">>}).     % prefix scan: `;` is the byte after `:`
+[{<<"user:1">>,<<"v">>},{<<"user:2">>,<<"v">>},{<<"user:3">>,<<"v">>}]
+4> bitcask:range_fold(R, {<<"user:">>, undefined}, [{prefetch, 64}],
+                      fun(K, _V, _T, _O, Acc) -> [K | Acc] end, []).
+[<<"user:3">>,<<"user:2">>,<<"user:1">>]
+```
+
+> ⚠️ Ranges are **per-key weakly consistent** (writes concurrent with the
+> iteration may be partially visible) — this is not `fold/3`'s snapshot
+> semantics. Keep using `fold` when you need a snapshot.
+> A read-only open of a never-written directory has no OKI index and returns
+> `{error, no_index}`.
+
+**Atomic batches and multi-key transactions** (6.0.0) — after a crash or power
+loss, the batch either fully applies or does not apply at all:
+
+```erlang
+1> bitcask:put_batch_atomic(R, [{put, <<"a">>, <<"1">>},
+                                {put, <<"b">>, <<"2">>},
+                                {remove, <<"old">>}]).
+ok
+2> bitcask:txn_commit(R, [{put, <<"x">>, <<"1">>}, {put, <<"y">>, <<"2">>}]).
+ok
+3> bitcask:txn_commit(R, [{put, <<"d">>, <<"1">>}, {put, <<"d">>, <<"2">>}]).
+{error,{invalid_option,<<"txn: duplicate key in ops">>}}      % zero side effects
+```
+
+> `txn_commit` adds validation on top of `put_batch_atomic` (non-empty, non-empty
+> keys, no duplicates, no `_txn:` prefix); its optional third argument is
+> `sync_on_commit` (default) or `no_sync`.
+> ⚠️ Neither provides **isolation or CAS** — intermediate state is visible to
+> concurrent readers, and concurrent commits with overlapping key sets must be
+> serialized by the application. ⚠️ **The first call lazily upgrades the
+> directory's meta to v6**, after which readers older than upstream 5.1.0 cannot
+> open it.
+
 **BM25 full-text search** — open with `{analyzer, ...}` to enable. Each `put`
 indexes the value; results are `{ok, [{Key, Ord, Score}, ...]}` sorted by score:
 
@@ -230,7 +274,9 @@ ok
 |----------|-------------|
 | `open/1,2` | Open a cask (KV mode or search mode via `{analyzer, ...}`) |
 | `get/2`, `put/3`, `delete/2`, `sync/1` | Core KV operations |
-| `fold/3,6`, `fold_keys/3,6`, `list_keys/1` | Iteration |
+| `fold/3,6`, `fold_keys/3,6`, `list_keys/1` | Iteration (**snapshot-consistent**, costs O(whole table)) |
+| `range/2,3`, `range_fold/5` | Ordered range query over `[Lo, Hi)`, costs **O(range)**; per-key weak consistency (not a snapshot); `{prefetch, N}` fetches values concurrently |
+| `put_batch_atomic/2`, `txn_commit/2,3` | Crash-atomic batch / multi-key transaction; `Ops :: [{put,K,V} \| {remove,K}]`; ⚠️ the first call lazily upgrades the directory's meta to v6 |
 | `stream/1`, `next/1`, `stop/1`, `with_stream/2` | Streaming iteration |
 | `merge/1,2,3`, `needs_merge/1,2`, `status/1` | Merge management |
 | `search_text/2,3`, `search_phrase/2,3`, `search_fields/2,3` | BM25 search (full-text / phrase / `field:term^boost`) |
@@ -258,7 +304,7 @@ ok
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
 | `doc/unified-architecture-plan-zh.md` | 统一架构计划（已实施） |
 | `doc/libcask-extraction-zh.md` | **libcask standalone extraction feasibility** (2.2.0 plan) |
-| `ROADMAP_EN.md` / `ROADMAP.md` | **Roadmap**: 5.1.0 / 5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 shipped + 2.1.1 shipped (P5–P15) + 2.2.0 plan (libcask extraction / V7+ vector optimization) (EN/中) |
+| `ROADMAP_EN.md` / `ROADMAP.md` | **Roadmap**: 6.0.0 / 5.1.0 / 5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 shipped + 2.1.1 shipped (P5–P15) + 2.2.0 plan (libcask extraction / V7+ vector optimization) (EN/中) |
 | `TASK.md` | Detailed task breakdown & history |
 
 ## Project status
@@ -277,7 +323,8 @@ ok
 - **3.1.0** (2026-07-01) — libbitcask v3.1.0 upgrade (ABI unbroken): `{max_read_handles, unlimited}` / `{auto_compact_dead_ratio, R}` options, `closed` error atom; ships with default read-handle cap (auto-derived from `RLIMIT_NOFILE`), `bitcask.meta` v3 with CRC32, field.schema FSCH v1 header + CRC
 - **4.0.0** (2026-07-13) — libbitcask v4.0.0 upgrade (ABI break, `SOVERSION` 3→4, source-compatible): `{vector_engine, hnsw|ivfrq|diskann}` vector dual-engine + tuning options, `{auto_checkpoint_min_docs, N}` bounded crash-recovery replay; ships with IVF-RaBitQ-lite engine, DiskANN engine (experimental), AVX2 int8 kernels, HNSW `.qc8` codeword mmap; `examples/` Wikipedia search-database example
 - **4.1.0** (2026-07-15) — libbitcask v4.1.0 upgrade (ABI unbroken, `SOVERSION` stays 4, on-disk format unchanged): **no API change** for Erlang callers — just rebuild; ships with the Phase 5/6 deep audit — fixes a process-wide permanent hang on the `close/1` teardown path (`IndexPool` count leak + unbounded `flush` in `unregister_lib`), adds `fdatasync` before `rename` to hnsw's three atomic writes (previously a crash left a truncated file), closes `RowChunks`/`MmapSegment` resource leaks; `file_util` consolidation converges fsync discipline from 4 variants to 1
-- **5.1.0** (2026-08-06, current) — Local embedding backend (llama.cpp / ggml, **not built by default**) plus a standalone embedder process. **No libbitcask upgrade**, no ABI or on-disk format change, and with the backend off the output is byte-for-byte 5.0.0's: a second independent NIF `priv/bitcask_llama.so` (enable with `BITCASK_WITH_LLAMA=1`), `bitcask_embedder_server` so all casks share one copy of the weights with the lifecycle tied to the process, CUDA support (`BITCASK_LLAMA_CUDA=AUTO|ON|OFF`) with build-time/run-time split diagnostics (`build_info/0` / `backend_info/0` / `gpu_status/0`) and the `scripts/detect-llama-backends.sh` probe; ⚠️ `bitcask:open/2` no longer swallows an `application:start` failure (returns `{error, {bitcask_app_start_failed, _}}` — a deliberate behaviour change)
+- **6.0.0** (2026-08-06, current) — libbitcask v5.0.0 → **6.0.0** upgrade (spanning upstream 5.1.0 and 6.0.0; ABI break, `SOVERSION` 5→6, but this repo depends on it at source level so a rebuild suffices): three new API surfaces — `range/2,3` + `range_fold/5` ordered range queries (O(range); upstream measured 15×), `put_batch_atomic/2` crash-atomic batches, `txn_commit/2,3` multi-key transactions; new `{keydir_cache_entries, N}` option (disk-resident keydir Level B; upstream measured -90% resident memory at 100M keys); `open/2` errors now carry detail (`{error, {io_error \| invalid_option, Msg}}`). ⚠️ **Existing directories must be migrated offline first**: upstream 5.1.0's hint-ord flag day moves `bitcask.meta` v4 → v5, so directories written by the 5.x line are cleanly refused — migrate non-destructively with `bitcask_migrate hintord <src> <dst>` (zero changes to data bytes)
+- **5.1.0** (2026-08-06) — Local embedding backend (llama.cpp / ggml, **not built by default**) plus a standalone embedder process. **No libbitcask upgrade**, no ABI or on-disk format change, and with the backend off the output is byte-for-byte 5.0.0's: a second independent NIF `priv/bitcask_llama.so` (enable with `BITCASK_WITH_LLAMA=1`), `bitcask_embedder_server` so all casks share one copy of the weights with the lifecycle tied to the process, CUDA support (`BITCASK_LLAMA_CUDA=AUTO|ON|OFF`) with build-time/run-time split diagnostics (`build_info/0` / `backend_info/0` / `gpu_status/0`) and the `scripts/detect-llama-backends.sh` probe; ⚠️ `bitcask:open/2` no longer swallows an `application:start` failure (returns `{error, {bitcask_app_start_failed, _}}` — a deliberate behaviour change)
 - **5.0.0** (2026-07-17) — libbitcask v5.0.0 upgrade (64-bit timestamp flag-day, breaking both ABI and **on-disk format**, `SOVERSION` 4→5): `tstamp`/`expiry_at` widen u32→u64 end to end (Y2038 readiness), fixing a u32 wraparound with huge `expiry_secs` that misjudged every key as expired; **no API change** for Erlang callers (`tstamp` was always an arbitrary-precision integer); the `bitcask.meta` v4 gate cleanly refuses old u32-era databases — migrate existing ones offline and non-destructively with upstream's `bitcask_migrate tstamp64`, no re-ingest needed
 
 ## License
