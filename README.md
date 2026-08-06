@@ -26,6 +26,15 @@ rebar3 do xref, dialyzer
 
 要求 Erlang ≥ 22.0。
 
+可选的本地嵌入后端（llama.cpp），**默认不构建**：
+
+```sh
+BITCASK_WITH_LLAMA=1 rebar3 compile   # 额外产出 priv/bitcask_llama.so 与一组 vendored ggml/llama 库
+```
+
+关掉时构建产物与这个后端存在之前一字不差：不拉子模块、不加 CMake 开关、不多
+任何 target。见 [doc/local-embedding-zh.md](doc/local-embedding-zh.md)。
+
 ### CMake（C++ 测试 + 基准）
 
 ```sh
@@ -148,12 +157,13 @@ ok
 > 例如 `vector_dim=4`、库里 `[1,0,0,0]`、查 `[0.9,0.1,0,0]` →
 > `search_vector(H, V)` 返回 `{ok,[{<<"d1">>,0,0.99388}]}`（cosine = 0.9/√0.82）。
 
-> **独立 embedder 进程**：`{embedder, ServerRef}` 接受一个
-> `bitcask_embedder_server` 进程（pid / 注册名 / `{global,_}` / `{via,_,_}`）。
-> provider 状态归那个进程：**多个 cask 共用一份**，生命周期跟着进程走
-> （`terminate/2` 释放）。有状态 provider（尤其是下面的本地模型）应当走这条——
-> `{Provider, Cfg}` 是每 open 一次建一份 ctx，而 `bitcask:close/1` **不释放**
-> embedder。不配置就不启动，也**不挂在 `bitcask_sup` 下**。
+> **两档 embedder**：HTTP 档（`openai` / `anthropic`）无状态、请求本来就该并发，
+> 直接写 `{embedder, {openai, Cfg}}`，**不需要配置任何进程**；内置档（下面的
+> 本地模型）有状态、必须串行，走 `bitcask_embedder_server` 进程 ——
+> application env 配 `{embedder, #{name, provider, config}}`，由 `bitcask_sup`
+> 起，`{embedder, my_embedder}` 引用。**多个 cask 共用一份权重**，生命周期跟着
+> 进程走。⚠️ 配了却起不来会让整个 bitcask application 起不来（有意如此：静静地
+> 降级成没有嵌入能力比当场死掉危险得多）。共享逻辑在 `bitcask_embedder_util`。
 
 > **本地嵌入（可选，默认不构建）**：`{custom, bitcask_embedder_llama}` 在 BEAM
 > 进程内用 llama.cpp 直接算 embedding，不经 HTTP 端点。`BITCASK_WITH_LLAMA=1
@@ -194,6 +204,7 @@ ok
 |------|------|
 | `doc/api-zh.md` / `doc/api-en.md` | **API 参考**：能力、参数含义与限制、返回值（中/英） |
 | `doc/USAGE.md` | 教程：打开、合并、配置、搜索 |
+| `doc/local-embedding-zh.md` / `doc/local-embedding-en.md` | **本地嵌入后端**（llama.cpp NIF）：构建、embedder 进程、静默失败的三个来源、实测数字（中/EN） |
 | `doc/format-zh.md` | 磁盘格式字节级规范（带类型记录、DocValue、提示文件、锁；字节序统一小端） |
 | `doc/migrate-le.md` / `doc/migrate-le-en.md` | **迁移工具** `migrate_le`：把旧大端（v1）目录离线迁移成小端（v2）（中/EN） |
 | `doc/cpp-arch.md` | C++ 模块布局、锁策略、构建入口 |

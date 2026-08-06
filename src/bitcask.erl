@@ -179,7 +179,29 @@ open(Dirname) -> open(Dirname, []).
 -spec open(Dirname::string(), Opts::[_]) -> {reference(), term()} | {error, term()}.
 open(Dirname, Opts) ->
     catch application:load(bitcask),
-    catch application:start(bitcask),
+    case ensure_app_started() of
+        {error, _} = E -> E;
+        ok             -> open_1(Dirname, Opts)
+    end.
+
+%% ⚠️ **不再吞掉 application:start 的失败。**
+%%
+%% 从前这里是一句 `catch application:start(bitcask)`，返回值直接丢掉。加了
+%% 可选的 embedder child 之后那样做是危险的：application env 里配了嵌入模型
+%% 但路径写错时，bitcask_sup 起不来 → application 起不来 → 而 open 照常返回
+%% 一个句柄。之后所有 put #{text=>...} 都不会有向量，症状要等到检索结果不对
+%% 才浮现，那时候库已经写脏了。
+%%
+%% 顺带也让"sup 因为别的原因没起来"变得可见——那种情况下 merge 调度器同样
+%% 是缺的，从前一样被吞掉。
+ensure_app_started() ->
+    case application:start(bitcask) of
+        ok                              -> ok;
+        {error, {already_started, _}}   -> ok;
+        {error, Reason}                 -> {error, {bitcask_app_start_failed, Reason}}
+    end.
+
+open_1(Dirname, Opts) ->
     case resolve_embedder(Opts) of
         {error, _} = E -> E;
         {ok, EmbedderCtx, EmbVecDim} ->

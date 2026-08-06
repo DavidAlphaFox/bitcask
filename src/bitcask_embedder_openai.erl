@@ -58,7 +58,7 @@ init(Opts) ->
         {undefined, _} -> {error, {missing_opt, url}};
         {_, undefined} -> {error, {missing_opt, model}};
         {Url, Model} ->
-            case validate_dims(Opts, ?DEFAULT_DIM) of
+            case bitcask_embedder_util:validate_dims(Opts, ?DEFAULT_DIM) of
                 {ok, Dim, VDim} ->
                     case validate_limits(Opts) of
                         {ok, Limits} ->
@@ -83,32 +83,13 @@ init(Opts) ->
             end
     end.
 
-%% 校验 dim（模型原生维度）与 vector_dim（MRL 落库维度）。vector_dim 缺省 = dim，
-%% 必须为正整数且 ≤ dim（MRL 只能截短，不能扩展）。
-validate_dims(Opts, DefaultDim) ->
-    Dim  = maps:get(dim, Opts, DefaultDim),
-    VDim = maps:get(vector_dim, Opts, Dim),
-    if
-        not (is_integer(Dim) andalso Dim > 0)   -> {error, {bad_opt, dim}};
-        not (is_integer(VDim) andalso VDim > 0) -> {error, {bad_opt, vector_dim}};
-        VDim > Dim -> {error, {vector_dim_exceeds_dim, VDim, Dim}};
-        true -> {ok, Dim, VDim}
-    end.
-
 %% 校验三个正整数可选项，返回 {ok, #{Key => Val}}（缺省填默认值）或
 %% {error, {bad_opt, Key}}。供 init 把校验过的上限并入 config。
 validate_limits(Opts) ->
-    Specs = [{max_input_bytes,    ?DEFAULT_MAX_INPUT_BYTES},
+    bitcask_embedder_util:validate_limits(
+      Opts, [{max_input_bytes,    ?DEFAULT_MAX_INPUT_BYTES},
              {timeout_ms,         ?DEFAULT_TIMEOUT_MS},
-             {connect_timeout_ms, ?DEFAULT_CONNECT_TIMEOUT_MS}],
-    lists:foldl(
-        fun({Key, Def}, {ok, Acc}) ->
-                case maps:get(Key, Opts, Def) of
-                    V when is_integer(V), V > 0 -> {ok, Acc#{Key => V}};
-                    _ -> {error, {bad_opt, Key}}
-                end;
-           (_, {error, _} = E) -> E
-        end, {ok, #{}}, Specs).
+             {connect_timeout_ms, ?DEFAULT_CONNECT_TIMEOUT_MS}]).
 
 %% ===================================================================
 %% Provider behaviour: embed/2
@@ -118,7 +99,7 @@ validate_limits(Opts) ->
 embed(#{url := Url, model := Model} = Cfg, Text) when is_binary(Text) ->
     {ok, _} = application:ensure_all_started(inets),
     MaxIn = maps:get(max_input_bytes, Cfg, ?DEFAULT_MAX_INPUT_BYTES),
-    Input = truncate_utf8(Text, MaxIn),
+    Input = bitcask_embedder_util:truncate_utf8(Text, MaxIn),
     Dim  = maps:get(dim, Cfg, undefined),
     VDim = maps:get(vector_dim, Cfg, Dim),
     %% MRL：vector_dim ≠ dim 时发 dimensions，让服务端按 MRL 截断+重归一。
@@ -201,20 +182,3 @@ json_decode(Bin)  -> json:decode(Bin).
 to_bin(B) when is_binary(B) -> B;
 to_bin(L) when is_list(L)   -> list_to_binary(L).
 
-%% 字节级保守截断 + 回退 UTF-8 续延字节，保证截断结果仍是合法 UTF-8 前缀。
-truncate_utf8(Bin, Max) when byte_size(Bin) =< Max -> Bin;
-truncate_utf8(Bin, Max) ->
-    strip_partial(binary:part(Bin, 0, Max), 3).
-
-%% 从尾部剥掉未截全的码点:至多 3 个续延字节(10xxxxxx)+ 1 个落单
-%% 首字节(11xxxxxx)。
-strip_partial(<<>>, _) -> <<>>;
-strip_partial(Bin, N) ->
-    Sz = byte_size(Bin),
-    case binary:at(Bin, Sz - 1) of
-        B when B band 16#C0 =:= 16#80, N > 0 ->
-            strip_partial(binary:part(Bin, 0, Sz - 1), N - 1);
-        B when B >= 16#C0 ->
-            binary:part(Bin, 0, Sz - 1);
-        _ -> Bin
-    end.

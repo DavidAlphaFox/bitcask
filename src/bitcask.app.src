@@ -10,6 +10,31 @@
                  ]},
   {mod, {bitcask_app, []}},
   {env, [
+         %% Optional embedder process, started by bitcask_sup.
+         %%
+         %%   {embedder, #{name     => my_embedder,   % optional registered name
+         %%                provider => {custom, bitcask_embedder_llama},
+         %%                config   => #{model_path => <<"/models/x.gguf">>,
+         %%                              pooling => last, n_ctx => 512}}}
+         %%
+         %% Leave it undefined (the default) and no such child is started --
+         %% bitcask does not depend on an embedder.
+         %%
+         %% ⚠️ If it IS configured and fails to start (bad GGUF path, pooling
+         %% resolving to NONE, ...) the whole bitcask application fails to
+         %% start, on purpose: configuring an embedding model means the
+         %% workload needs it, and silently degrading to "no embeddings" is
+         %% far more dangerous than dying -- you would only notice once the
+         %% search results are wrong, by which point the store is dirty.
+         %% bitcask:open/2 surfaces this as
+         %% {error, {bitcask_app_start_failed, _}} rather than handing back a
+         %% handle that looks fine.
+         %%
+         %% ⚠️ Only put *stateful* providers here (the local llama backend).
+         %% HTTP providers are stateless and want concurrency -- use
+         %% {embedder, {openai, Cfg}} at open/2 instead; no process needed.
+         {embedder, undefined},
+
          %% Default max file size (in bytes)
          {max_file_size, 16#80000000}, % 2GB default
 

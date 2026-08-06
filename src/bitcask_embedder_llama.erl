@@ -146,10 +146,11 @@ build_ctx(Opts, Model, Owned, #{dim := Dim} = Info) ->
         {error, _} = E ->
             E;
         {ok, VDim} ->
-            case validate_pos(max_input_bytes, Opts, ?DEFAULT_MAX_INPUT_BYTES) of
+            case bitcask_embedder_util:validate_limits(
+                   Opts, [{max_input_bytes, ?DEFAULT_MAX_INPUT_BYTES}]) of
                 {error, _} = E ->
                     E;
-                {ok, MaxIn} ->
+                {ok, #{max_input_bytes := MaxIn}} ->
                     Cfg = #{handle          => Model,
                             owned           => Owned,
                             dim             => Dim,
@@ -185,12 +186,6 @@ vdim(Opts, Dim) ->
         _                                     -> {error, {bad_opt, vector_dim}}
     end.
 
-validate_pos(Key, Opts, Default) ->
-    case maps:get(Key, Opts, Default) of
-        V when is_integer(V), V > 0 -> {ok, V};
-        _                           -> {error, {bad_opt, Key}}
-    end.
-
 %% ===================================================================
 %% Provider behaviour: embed/2
 %%
@@ -200,7 +195,7 @@ validate_pos(Key, Opts, Default) ->
 -spec embed(map(), binary()) -> {ok, binary()} | {error, term()}.
 embed(#{handle := M} = Cfg, Text) when is_binary(Text) ->
     MaxIn = maps:get(max_input_bytes, Cfg, ?DEFAULT_MAX_INPUT_BYTES),
-    Input = truncate_utf8(Text, MaxIn),
+    Input = bitcask_embedder_util:truncate_utf8(Text, MaxIn),
     Norm  = maps:get(normalize, Cfg, true),
     Trunc = maps:get(truncate, Cfg, false),
     case bitcask_llama_nifs:embed(M, Input, Norm, Trunc) of
@@ -214,37 +209,15 @@ embed(#{handle := M} = Cfg, Text) when is_binary(Text) ->
             E
     end.
 
-%% MRL 截断：取前 VDim 个 f32，然后重新 L2 归一化。
-%%
-%% ⚠️ 截断之后必须重新归一化。截断前的向量是在 Dim 维上单位长度的，砍掉尾部
-%%    之后模长 < 1 且**每条不一样**——直接拿去点积当余弦用，比较的就不再是
-%%    夹角，长文本会系统性地排在后面。openai provider 那条路是服务端替我们做的
-%%    （dimensions 参数），本地档没人代劳。
+%% MRL 截断 + 重归一。实现在 bitcask_embedder_util——HTTP 档那条路是服务端
+%% 替我们做的（请求里带 dimensions），**本地档没人代劳**，只能在 Erlang 侧做。
 apply_mrl(Vec, Cfg) ->
     Dim  = maps:get(dim, Cfg),
     VDim = maps:get(vector_dim, Cfg, Dim),
     case VDim =:= Dim of
-        true ->
-            Vec;
-        false ->
-            Head = binary:part(Vec, 0, VDim * 4),
-            case maps:get(normalize, Cfg, true) of
-                false -> Head;
-                true  -> l2_normalize(Head)
-            end
-    end.
-
-l2_normalize(Bin) ->
-    Fs = [F || <<F:32/float-little>> <= Bin],
-    Sum = lists:foldl(fun(F, Acc) -> Acc + F * F end, 0.0, Fs),
-    case Sum > 0.0 of
-        false ->
-            %% 零向量归一化会得到 NaN，而 NaN 在余弦里不报错、只是让这一条
-            %% 永远排不上来。原样返回，让上层看到的是一个可辨认的零向量。
-            Bin;
-        true ->
-            Inv = 1.0 / math:sqrt(Sum),
-            << <<(F * Inv):32/float-little>> || F <- Fs >>
+        true  -> Vec;
+        false -> bitcask_embedder_util:mrl_truncate(
+                   Vec, VDim, maps:get(normalize, Cfg, true))
     end.
 
 %% ===================================================================
@@ -279,16 +252,3 @@ maybe_close(_, false) -> ok.
 
 to_bin(B) when is_binary(B) -> B;
 to_bin(L) when is_list(L)   -> list_to_binary(L).
-
-%% 字节级保守截断，并回退尾部 UTF-8 续延字节避免截出非法编码。
-truncate_utf8(Bin, Max) when byte_size(Bin) =< Max -> Bin;
-truncate_utf8(Bin, Max) -> strip_partial(binary:part(Bin, 0, Max), 3).
-
-%% 最多回退 3 个字节（UTF-8 一个码点最长 4 字节）。
-strip_partial(<<>>, _) -> <<>>;
-strip_partial(Bin, 0)  -> Bin;
-strip_partial(Bin, N) ->
-    case unicode:characters_to_binary(Bin, utf8, utf8) of
-        Bin -> Bin;
-        _   -> strip_partial(binary:part(Bin, 0, byte_size(Bin) - 1), N - 1)
-    end.

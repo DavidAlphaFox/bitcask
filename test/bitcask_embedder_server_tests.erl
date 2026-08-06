@@ -40,17 +40,10 @@ start_and_embed_test() ->
 spec_reports_dims_test() ->
     with_server(?MOCK, fun(Pid) ->
         {ok, Spec} = bitcask_embedder_server:spec(Pid),
-        ?assertMatch(#{dim := 4, vector_dim := 4, mode := serial}, Spec),
-        %% serial 模式**故意不**把真正的 ctx 交出去——交了就等于允许调用方
-        %% 绕过串行，而串行正是这个进程存在的理由之一。
+        ?assertMatch(#{dim := 4, vector_dim := 4}, Spec),
+        %% ⚠️ **故意不**把真正的 ctx 交出去——交了就等于允许调用方绕过串行在
+        %%    自己的进程里算，而串行正是这个进程存在的理由之一。
         ?assertNot(maps:is_key(ctx, Spec))
-    end).
-
-direct_mode_hands_out_ctx_test() ->
-    with_server(?MOCK#{mode => direct}, fun(Pid) ->
-        {ok, Spec} = bitcask_embedder_server:spec(Pid),
-        ?assertMatch(#{mode := direct}, Spec),
-        ?assert(maps:is_key(ctx, Spec))
     end).
 
 bad_opts_test() ->
@@ -60,8 +53,6 @@ bad_opts_test() ->
     ?assertMatch({error, {missing_opt, config}},
                  bitcask_embedder_server:start_link(
                    #{provider => {custom, bitcask_embedder_mock}})),
-    ?assertMatch({error, {bad_opt, mode}},
-                 bitcask_embedder_server:start_link(?MOCK#{mode => sideways})),
     process_flag(trap_exit, false),
     ok.
 
@@ -106,14 +97,6 @@ proxy_embeds_through_server_test() ->
                      bitcask_embedder:embed(Ctx, <<"x x x">>))
     end).
 
-%% direct 模式下 embed 在**调用方**进程里算，结果必须与 serial 完全一致。
-proxy_direct_mode_test() ->
-    with_server(?MOCK#{mode => direct}, fun(Pid) ->
-        {ok, Ctx} = bitcask_embedder:new({custom, bitcask_embedder_proxy},
-                                         #{server => Pid}),
-        ?assertEqual({ok, bitcask_embedder_mock:vec_bin([0.6, 0.8, 0.0, 0.0])},
-                     bitcask_embedder:embed(Ctx, <<"x x x">>))
-    end).
 
 %% ===================================================================
 %% bitcask:open 收进程引用
@@ -192,5 +175,94 @@ open_rejects_prebuilt_ctx_test_() ->
             {ok, Ctx} = bitcask_embedder:new({custom, bitcask_embedder_mock}, #{}),
             ?assertMatch({error, {bad_embedder, _}},
                          bitcask:open(Dir, ?VOPTS ++ [{embedder, Ctx}]))
+        end)
+    end}.
+
+%% ===================================================================
+%% application env → bitcask_sup child
+%%
+%% ⚠️ 这几条要自己 stop/start bitcask application，跑完必须把 env 清掉并把
+%%    application 恢复原状，否则会污染同一个 VM 里后面所有用例。
+%% ===================================================================
+
+with_env(Spec, Fun) ->
+    _ = application:stop(bitcask),
+    %% 之前的用例多半已经 load 过（bitcask:open/2 自己会 load），
+    %% {already_loaded,_} 不是错。
+    case application:load(bitcask) of
+        ok                              -> ok;
+        {error, {already_loaded, _}}    -> ok
+    end,
+    Old = application:get_env(bitcask, embedder),
+    case Spec of
+        undefined -> application:unset_env(bitcask, embedder);
+        _         -> application:set_env(bitcask, embedder, Spec)
+    end,
+    try Fun()
+    after
+        _ = application:stop(bitcask),
+        case Old of
+            undefined -> application:unset_env(bitcask, embedder);
+            {ok, V}   -> application:set_env(bitcask, embedder, V)
+        end,
+        _ = application:start(bitcask)
+    end.
+
+%% 没配 → 没有这个 child，bitcask 照常起（绝大多数部署走这条）。
+sup_without_env_has_no_embedder_test_() ->
+    {timeout, 60, fun() ->
+        with_env(undefined, fun() ->
+            ?assertEqual(ok, application:start(bitcask)),
+            Ids = [Id || {Id, _, _, _} <- supervisor:which_children(bitcask_sup)],
+            ?assertNot(lists:member(bitcask_embedder, Ids)),
+            ?assert(lists:member(bitcask_merge_worker, Ids))
+        end)
+    end}.
+
+%% 配了 → child 起来，注册名可直接用在 {embedder, Name} 上。
+sup_starts_configured_embedder_test_() ->
+    {timeout, 60, fun() ->
+        with_env(#{name => bc_env_embedder,
+                   provider => {custom, bitcask_embedder_mock},
+                   config => #{}},
+                 fun() ->
+            ?assertEqual(ok, application:start(bitcask)),
+            Ids = [Id || {Id, _, _, _} <- supervisor:which_children(bitcask_sup)],
+            ?assert(lists:member(bitcask_embedder, Ids)),
+            ?assertMatch({ok, #{dim := 4}},
+                         bitcask_embedder_server:spec(bc_env_embedder)),
+            with_dir(fun(Dir) ->
+                H = bitcask:open(Dir, ?VOPTS ++ [{embedder, bc_env_embedder}]),
+                ok = bitcask:put(H, <<"d1">>, #{text => <<"x x x">>}),
+                ?assertMatch({ok, [{<<"d1">>, _, _}]},
+                             bitcask:search_vector(H, {text, <<"x">>}, 1)),
+                ok = bitcask:close(H)
+            end)
+        end)
+    end}.
+
+%% ⚠️ **本文件里最重要的一条。** 配了 embedder 但起不来（这里用缺 url 的
+%%    openai 模拟"GGUF 路径写错"那一类）时：
+%%      1. application 必须**起不来**——不能静静地降级成没有嵌入能力；
+%%      2. bitcask:open/2 必须把这件事**说出来**，而不是照常返回一个句柄。
+%%    第 2 条是有代价才换来的：从前那句 `catch application:start(bitcask)`
+%%    会把失败吃干净，症状要等到检索结果不对才浮现，而那时候库已经写脏了。
+sup_fails_loudly_on_bad_embedder_test_() ->
+    {timeout, 60, fun() ->
+        with_env(#{provider => openai, config => #{model => <<"m">>}},  %% 缺 url
+                 fun() ->
+            ?assertMatch({error, _}, application:start(bitcask)),
+            with_dir(fun(Dir) ->
+                ?assertMatch({error, {bitcask_app_start_failed, _}},
+                             bitcask:open(Dir, [read_write]))
+            end)
+        end)
+    end}.
+
+%% env 本身配错（不是 map）同样在启动期就死。
+sup_rejects_bad_env_test_() ->
+    {timeout, 60, fun() ->
+        with_env(not_a_map, fun() ->
+            ?assertMatch({error, _}, application:start(bitcask))
         end)
     end}.

@@ -1,5 +1,7 @@
 # 本地嵌入后端（llama.cpp / ggml）
 
+English version: [`local-embedding-en.md`](local-embedding-en.md)。
+
 在 BEAM 进程内直接算 embedding，不经 HTTP 端点。产物是**第二个 NIF**
 `priv/bitcask_llama.so`，与核心的 `priv/bitcask_cpp.so` 互不依赖。
 
@@ -69,24 +71,34 @@ priv/libggml.so* priv/libllama.so*
 
 ## 3. 用
 
-### 3.1 推荐形态：独立的 embedder 进程
+### 3.0 两档 embedder，只有一档需要进程
 
-把模型装进一个 `bitcask_embedder_server` 进程，`bitcask:open` 直接收这个进程：
+| | HTTP 档（`openai` / `anthropic`） | 内置档（`llama`） |
+|---|---|---|
+| 状态 | 无状态，配置就是几个字段 | 几百 MB 权重 + 非线程安全的 context |
+| 并发 | 本来就该并发 | 本来就必须串行 |
+| 怎么用 | `{embedder, {openai, Cfg}}`，**不需要配置任何进程** | 走 `bitcask_embedder_server` 进程 |
+
+共享的逻辑（输入裁剪、维度校验、MRL 截断+重归一）在
+`bitcask_embedder_util`，两档共用一份。
+
+### 3.1 内置档的形态：application env + `bitcask_sup`
 
 ```erlang
-%% 挂进你自己的 supervision tree（推荐）
-ChildSpec = bitcask_embedder_server:child_spec(
-    my_embedder, {local, my_embedder},
-    #{provider => {custom, bitcask_embedder_llama},
-      config   => #{model_path => <<"/models/Qwen3-Embedding-0.6B-Q8_0.gguf">>,
-                    pooling    => last,
-                    n_ctx      => 512}}),
+%% sys.config / app env
+{bitcask, [
+  {embedder, #{name     => my_embedder,
+               provider => {custom, bitcask_embedder_llama},
+               config   => #{model_path => <<"/models/Qwen3-Embedding-0.6B-Q8_0.gguf">>,
+                             pooling    => last,
+                             n_ctx      => 512}}}
+]}.
+```
 
+```erlang
 %% 之后所有 cask 都只写一个名字
-H1 = bitcask:open(Dir1, [read_write, {analyzer, whitespace},
-                         {embedder, my_embedder}]),
-H2 = bitcask:open(Dir2, [read_write, {analyzer, whitespace},
-                         {embedder, my_embedder}]),   %% 共用同一份权重
+H1 = bitcask:open(Dir1, [read_write, {analyzer, whitespace}, {embedder, my_embedder}]),
+H2 = bitcask:open(Dir2, [read_write, {analyzer, whitespace}, {embedder, my_embedder}]),
 
 ok = bitcask:put(H1, <<"d1">>, #{text => <<"猫在垫子上睡觉"/utf8>>}),
 {ok, R} = bitcask:search_vector(H1, {text, <<"猫咪在睡觉"/utf8>>}, 3).
@@ -94,27 +106,37 @@ ok = bitcask:put(H1, <<"d1">>, #{text => <<"猫在垫子上睡觉"/utf8>>}),
 
 集合维度仍然由 embedder 的 `vector_dim` 推出，不用也不该再写 `{vector_dim, N}`。
 
-**为什么本地模型应该走这条**——三件事一次解决：
+**没配就没有这个 child**，bitcask 不依赖 embedder。也可以不用 app env，自己
+`start_link/2` 或用 `child_spec/3` 挂进你自己的 supervision tree。
+
+> ⚠️ **配了却起不来（GGUF 路径写错、pooling 解析成 NONE …）会让整个 bitcask
+> application 起不来，这是有意的。** 配置了嵌入模型就说明业务要用它，此时
+> "静静地降级成没有嵌入能力"比当场死掉危险得多：前者要等到检索结果不对才发现，
+> 而那时候库已经写脏了（维度和语义都不对）。
+>
+> 为此 `bitcask:open/2` 也**不再吞掉** `application:start` 的失败——从前那句
+> `catch application:start(bitcask)` 会把它吃干净，然后照常返回一个看起来正常
+> 的句柄。现在返回 `{error, {bitcask_app_start_failed, Reason}}`。
+
+**为什么本地模型必须走进程**——三件事一次解决：
 
 1. **权重只装一份。** `{Provider, Cfg}` 那条是每 `open` 一次建一个 ctx，也就是
    每个 cask 一份几百 MB 的权重。
 2. **生命周期有主。** `bitcask:close/1` **只关 cask ref，不关 embedder**。走
    `{Provider, Cfg}` 的话模型会一直占着内存直到那个 ctx term 被 GC，而释放又会
-   占住 BEAM 的资源回收线程几十到几百毫秒。进程形态下 `terminate/2` 里显式释放，
-   supervisor 关停就收干净了（`child_spec` 的 shutdown 给了 30 秒，几 GB 权重的
-   munmap 不是瞬间完成的）。
+   占住 BEAM 的资源回收线程几十到几百毫秒。进程形态下 `terminate/2` 里显式释放
+   （`child_spec` 的 shutdown 给了 30 秒——几 GB 权重的 munmap 不是瞬间完成的）。
 3. **串行是本来就要的。** `llama_context` 不是线程安全的。gen_server 的单进程
    语义就是这个约束本身，而且排队发生在 Erlang 消息队列里，不是让多个 dirty
    调度线程堵在一把 C 互斥量上。
 
-**不配置就不启动。** 这个进程**刻意不挂在 `bitcask_sup` 下**：挂上去的话 GGUF
-路径写错会让 bitcask 这个 application 整个起不来，而 `bitcask:open/2` 里那句
-`catch application:start(bitcask)` 会把失败吞掉——症状变成"所有 cask 操作都不对
-劲"，指不到路径写错这件事。谁配置谁负责挂树。
-
 `{embedder, _}` 接受 `pid()` / 注册名 / `{global, _}` / `{via, M, N}`。进程没起来
 时 `open` 返回 `{error, {embedder_not_running, Ref}}`；运行中挂掉时 `put` 拿到的
 是 `{error, {embedder_not_running, _}}` 而**不会把调用方一起带走**。
+
+> ⚠️ **不要把 HTTP provider 塞进这个进程。** 它无状态、请求本来就该并发，进了
+> 进程之后所有 embed 排成一条链，吞吐被锁死在单进程上。HTTP 档直接写
+> `{embedder, {openai, Cfg}}`，不需要配置任何进程。
 
 ### 3.2 直接配进 `bitcask:open`（单 cask、生命周期不重要时）
 
@@ -126,23 +148,10 @@ H = bitcask:open(Dir, [read_write, {analyzer, whitespace},
                     n_ctx      => 512}}}]).
 ```
 
-形态与 `openai` provider 完全一致。⚠️ 但上面那三条限制都在：一个 cask 一份权重、
-`close/1` 不释放。多 cask 或长跑服务用 §3.1。
+⚠️ 上面那三条限制都在：一个 cask 一份权重、`close/1` 不释放。多 cask 或长跑
+服务用 §3.1。
 
-### 3.3 `mode`：serial 还是 direct
-
-`bitcask_embedder_server` 的 `mode` 决定 embed 在哪跑：
-
-- **`serial`（默认）** — 走 `gen_server:call`，全局串行。**本地模型必须用这个。**
-- **`direct`** — 进程只负责"装一次、持有生命周期"，embed 时把 ctx 交给调用方，
-  在调用方进程里算。**无状态 provider（openai / anthropic）应该用这个**：HTTP
-  请求本来就该并发，串行会把吞吐锁死在一条链上。
-
-> ⚠️ 默认是 `serial` 而不是"自动挑"：挑错的两个方向代价不对称。`serial` 用在
-> HTTP 上只是慢，`direct` 用在本地模型上是让多个 dirty 调度线程堵在一把 C
-> 互斥量上——前者能从监控看出来，后者看起来像"BEAM 莫名其妙卡住"。
-
-### 3.4 单独用（不接 cask）
+### 3.3 单独用（不接 cask）
 
 ```erlang
 {ok, Ctx} = bitcask_embedder:new({custom, bitcask_embedder_llama},

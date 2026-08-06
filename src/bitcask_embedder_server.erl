@@ -18,50 +18,52 @@
 %%       保证正确性。gen_server 的单进程语义就是这个约束本身，而且排队发生在
 %%       Erlang 侧（消息队列），不是让多个 dirty 调度线程堵在一把 C 互斥量上。
 %%
-%%   **不配置就不启动**——本模块不挂在 bitcask_sup 下，bitcask 不依赖它。
+%%   === 怎么起 ===
 %%
-%%   === 用 ===
+%%   **推荐：配 application env，由 bitcask_sup 起。** 不配就不起，bitcask
+%%   不依赖它：
 %%
-%%       {ok, Pid} = bitcask_embedder_server:start_link(
-%%           {local, my_embedder},
-%%           #{provider => {custom, bitcask_embedder_llama},
+%%       {bitcask, [{embedder,
+%%           #{name     => my_embedder,          %% 可选，注册名
+%%             provider => {custom, bitcask_embedder_llama},
 %%             config   => #{model_path => <<"/models/qwen3-emb.gguf">>,
-%%                           pooling => last, n_ctx => 512}}),
+%%                           pooling => last, n_ctx => 512}}}]}
 %%
 %%       H1 = bitcask:open(Dir1, [read_write, {analyzer, whitespace},
 %%                                {embedder, my_embedder}]),
 %%       H2 = bitcask:open(Dir2, [read_write, {analyzer, whitespace},
 %%                                {embedder, my_embedder}]),   %% 共用同一份权重
 %%
-%%   放进自己的 supervision tree（推荐）：
+%%   ⚠️ **配了却起不来（GGUF 路径写错、pooling 解析成 NONE …）会让整个 bitcask
+%%      application 起不来，这是有意的**：配置了嵌入模型就说明业务要用它，此时
+%%      "静静地降级成没有嵌入能力"比当场死掉危险得多——前者要到检索结果不对
+%%      才发现，那时候库已经写脏了。
+%%      为此 bitcask:open/2 也不再吞掉 application:start 的失败（从前那句
+%%      `catch application:start(bitcask)` 会把它吃干净）。
+%%
+%%   也可以自己 start_link / 放进自己的 supervision tree：
 %%
 %%       ChildSpec = bitcask_embedder_server:child_spec(
-%%                     my_embedder, {local, my_embedder}, #{...}),
-%%
-%%   ⚠️ **刻意不挂在 bitcask_sup 下。** 挂上去的话，GGUF 路径写错会让
-%%      bitcask 这个 application 整个起不来，而 bitcask:open/2 里那句
-%%      `catch application:start(bitcask)` 会把失败吞掉——症状变成"所有
-%%      cask 操作都不对劲"，指不到路径写错这件事。谁配置谁负责挂树。
+%%                     my_embedder, {local, my_embedder}, #{provider => ..., config => ...}),
 %%
 %%   === Opts ===
-%%     provider  — 必填。openai | anthropic | {custom, Mod}，同 bitcask_embedder:new/2
+%%     provider  — 必填。{custom, Mod} | openai | anthropic，同 bitcask_embedder:new/2
 %%     config    — 必填。provider 的配置 map
-%%     mode      — serial（默认）| direct，见下
 %%     timeout   — embed 调用超时（毫秒），默认 60000
 %%
-%%   === mode ===
+%%   === ⚠️ 只把**有状态** provider 放进来 ===
 %%
-%%     serial（默认）— embed 走 gen_server:call，全局串行。**有状态 / 本地
-%%       provider 必须用这个**（llama）。
+%%   两类 provider 的差别只在"向量从哪来"，而那个差别决定了要不要进程：
 %%
-%%     direct — 进程只做"装一次、持有生命周期"，embed 时把真正的 ctx 交给
-%%       调用方，在调用方进程里直接算。**无状态 provider（openai /
-%%       anthropic）应该用这个**：HTTP 请求本来就该并发，串行会把吞吐锁死在
-%%       一条链上。
+%%     * **HTTP 档**（openai / anthropic）——无状态，配置就是几个字段，HTTP
+%%       请求本来就该并发。**不要**放进这个进程：所有 embed 会排成一条链，
+%%       吞吐被锁死在单进程上。直接写 {embedder, {openai, Cfg}}，不需要配置
+%%       任何进程。
+%%     * **内置档**（bitcask_embedder_llama）——有状态（几百 MB 权重 + 非线程
+%%       安全的 context），装一次要复用，本来就必须串行。**这个进程就是为它
+%%       存在的。**
 %%
-%%     ⚠️ 默认是 serial 而不是"自动挑"：挑错的两个方向代价不对称。serial 用在
-%%        HTTP 上只是慢，direct 用在本地模型上是让多个 dirty 调度线程堵在一把
-%%        C 互斥量上——前者能从监控看出来，后者看起来像"BEAM 莫名其妙卡住"。
+%%   两边共享的逻辑（输入裁剪、维度校验、MRL）在 bitcask_embedder_util。
 %% -------------------------------------------------------------------
 -module(bitcask_embedder_server).
 
@@ -128,8 +130,7 @@ embed(Ref, Text) -> embed(Ref, Text, ?DEFAULT_TIMEOUT).
 embed(Ref, Text, Timeout) when is_binary(Text) ->
     call(Ref, {embed, Text}, Timeout).
 
-%% 给 bitcask_embedder_proxy 在 open 时问一次：维度、模式、以及 direct 模式
-%% 下真正的 provider ctx。
+%% 给 bitcask_embedder_proxy 在 open 时问一次：维度 + 默认超时。
 -spec spec(server_ref()) -> {ok, map()} | {error, term()}.
 spec(Ref) -> call(Ref, spec, 5000).
 
@@ -167,39 +168,29 @@ init(Opts) ->
         {undefined, _} -> {stop, {missing_opt, provider}};
         {_, undefined} -> {stop, {missing_opt, config}};
         {Provider, Cfg} ->
-            Mode = maps:get(mode, Opts, serial),
-            case lists:member(Mode, [serial, direct]) of
-                false -> {stop, {bad_opt, mode}};
-                true ->
-                    case bitcask_embedder:new(Provider, Cfg) of
-                        {error, Reason} ->
-                            %% 起不来就明确 stop，别装作起来了——半死的 embedder
-                            %% 会让每一次 put 都在运行期才发现问题。
-                            {stop, Reason};
-                        {ok, Ctx} ->
-                            {ok, #{provider => Provider,
-                                   ctx      => Ctx,
-                                   mode     => Mode,
-                                   timeout  => maps:get(timeout, Opts, ?DEFAULT_TIMEOUT)}}
-                    end
+            case bitcask_embedder:new(Provider, Cfg) of
+                {error, Reason} ->
+                    %% 起不来就明确 stop，别装作起来了——半死的 embedder 会让
+                    %% 每一次 put 都在运行期才发现问题。挂在 bitcask_sup 下时
+                    %% 这一步的失败会一路冒到 application:start，那正是我们要的
+                    %% ——配了模型却路径写错，就该当场死给用户看。
+                    {stop, Reason};
+                {ok, Ctx} ->
+                    {ok, #{provider => Provider,
+                           ctx      => Ctx,
+                           timeout  => maps:get(timeout, Opts, ?DEFAULT_TIMEOUT)}}
             end
     end.
 
 handle_call({embed, Text}, _From, #{ctx := Ctx} = S) ->
     {reply, bitcask_embedder:embed(Ctx, Text), S};
 
-handle_call(spec, _From, #{ctx := Ctx, mode := Mode, timeout := T} = S) ->
-    Base = #{dim        => bitcask_embedder:dim(Ctx),
-             vector_dim => bitcask_embedder:vector_dim(Ctx),
-             mode       => Mode,
-             timeout    => T},
-    %% direct 模式才把真正的 ctx 交出去。serial 模式下故意不给——给了就等于
-    %% 允许调用方绕过串行，而那正是这个进程存在的理由之一。
-    Reply = case Mode of
-                direct -> Base#{ctx => Ctx};
-                serial -> Base
-            end,
-    {reply, {ok, Reply}, S};
+handle_call(spec, _From, #{ctx := Ctx, timeout := T} = S) ->
+    %% ⚠️ **故意不把 ctx 交出去。** 交了就等于允许调用方绕过串行在自己的进程里
+    %%    算，而串行正是这个进程存在的理由之一（llama_context 非线程安全）。
+    {reply, {ok, #{dim        => bitcask_embedder:dim(Ctx),
+                   vector_dim => bitcask_embedder:vector_dim(Ctx),
+                   timeout    => T}}, S};
 
 handle_call(info, _From, #{provider := Provider, ctx := Ctx} = S) ->
     {reply, provider_info(Provider, Ctx), S};

@@ -120,23 +120,26 @@ list，churn 下内存有界，不再依赖 merge 才回收。
 - `K` 默认 10；`Ef` 默认 `max(K,64)`（越大越准越慢）；`Filter` 为结构化 meta 过滤。
 - 详尽参数/arity 展开表见 [`doc/api-zh.md`](api-zh.md) 向量/混合检索节。
 
-**独立 embedder 进程** — `{embedder, _}` 也接受一个 `bitcask_embedder_server`
-进程。provider 状态归那个进程：多个 cask 共用一份，生命周期跟着进程走。
-有状态 provider（尤其是下面的本地模型）应当走这条：
+**独立 embedder 进程**（有状态 provider 用；HTTP 档不需要）— application env
+里配上，由 `bitcask_sup` 起，`bitcask:open` 按名字引用：
 
 ```erlang
-%% 挂进自己的 supervision tree
-1> Spec = bitcask_embedder_server:child_spec(my_emb, {local, my_emb},
-1>     #{provider => {custom, bitcask_embedder_llama},
-1>       config   => #{model_path => <<"/models/Qwen3-Embedding-0.6B-Q8_0.gguf">>,
-1>                     pooling => last,   % Qwen3-Embedding 要 last；BERT/BGE 要 cls
-1>                     n_ctx   => 512}}). % 性能旋钮，不只是长度上限
-2> H1 = bitcask:open("/tmp/v1", [read_write, {analyzer, whitespace}, {embedder, my_emb}]).
-3> H2 = bitcask:open("/tmp/v2", [read_write, {analyzer, whitespace}, {embedder, my_emb}]).
+%% sys.config
+{bitcask, [{embedder, #{name     => my_emb,
+                        provider => {custom, bitcask_embedder_llama},
+                        config   => #{model_path => <<"/models/Qwen3-Embedding-0.6B-Q8_0.gguf">>,
+                                      pooling => last,   % Qwen3-Embedding 要 last；BERT/BGE 要 cls
+                                      n_ctx   => 512}}}]}.  % 性能旋钮，不只是长度上限
+```
+```erlang
+1> H1 = bitcask:open("/tmp/v1", [read_write, {analyzer, whitespace}, {embedder, my_emb}]).
+2> H2 = bitcask:open("/tmp/v2", [read_write, {analyzer, whitespace}, {embedder, my_emb}]).
 ```
 
+多个 cask 共用一份权重，生命周期跟着进程走。⚠️ 配了却起不来会让整个 bitcask
+application 起不来（有意如此），`open` 返回 `{error, {bitcask_app_start_failed, _}}`。
 ⚠️ `bitcask:close/1` **不会**释放 embedder；`{embedder, {Provider, Cfg}}` 那条是
-每 open 一次建一份 ctx（本地模型 = 每次装一份权重）。长跑服务用进程形态。
+每 open 一次建一份 ctx（本地模型 = 每次装一份权重）。
 
 **本地嵌入（不经 HTTP 端点，可选）** — 需 `BITCASK_WITH_LLAMA=1 rebar3 compile`
 构建。这是另开一档不是替换 HTTP：换档 = 落库维度变了 = 全量重建索引，且 ggml 的

@@ -27,6 +27,16 @@ rebar3 do xref, dialyzer
 
 Erlang ≥ 22.0 required.
 
+Optional local embedding backend (llama.cpp), **off by default**:
+
+```sh
+BITCASK_WITH_LLAMA=1 rebar3 compile   # + priv/bitcask_llama.so and the vendored ggml/llama libs
+```
+
+Leaving it off keeps the build byte-for-byte as it was before that backend
+existed: no submodule fetch, no CMake flag, no extra target. See
+[doc/local-embedding-en.md](doc/local-embedding-en.md).
+
 ### CMake (C++ tests + benchmarks)
 
 ```sh
@@ -154,6 +164,34 @@ ok
 > query. E.g. `vector_dim=4`, doc `[1,0,0,0]`, query `[0.9,0.1,0,0]` →
 > `search_vector(H, V)` returns `{ok,[{<<"d1">>,0,0.99388}]}` (cosine = 0.9/√0.82).
 
+> **Two tiers of embedder**: the HTTP tier (`openai` / `anthropic`) is stateless and
+> wants concurrency — just write `{embedder, {openai, Cfg}}`, **no process to
+> configure**. The built-in tier (the local model below) is stateful and must be
+> serialized, so it runs in a `bitcask_embedder_server` process: configure
+> `{embedder, #{name, provider, config}}` in the application env, `bitcask_sup`
+> starts it, and casks refer to it as `{embedder, my_embedder}`. **All casks share
+> one copy of the weights** and the lifecycle follows the process (`terminate/2`
+> releases it — `bitcask:close/1` does **not**).
+> ⚠️ If it is configured but fails to start (bad GGUF path, pooling resolving to
+> NONE, …) the **whole bitcask application fails to start**, on purpose: silently
+> degrading to "no embeddings" is far more dangerous than dying, since you would
+> only notice once the search results are wrong and the store is already dirty.
+> `bitcask:open/2` surfaces this as `{error, {bitcask_app_start_failed, _}}`.
+> Logic shared by both tiers (input truncation, dimension validation, MRL) lives in
+> `bitcask_embedder_util`.
+
+> **Local embedding (optional, not built by default)**: `{custom,
+> bitcask_embedder_llama}` computes embeddings in-process via llama.cpp, with no
+> HTTP endpoint. Enable with `BITCASK_WITH_LLAMA=1 rebar3 compile`; it produces a
+> **second, independent NIF** (`priv/bitcask_llama.so` plus a set of vendored
+> ggml/llama shared libraries) and leaves the core `bitcask_cpp.so` untouched.
+> ⚠️ This is **a different tier, not a replacement** for the HTTP endpoint: what
+> runs on CPU is the 0.6B/1024-dim class, so switching tiers changes the stored
+> dimension and means a full index rebuild — and ggml's `abort()` takes the whole
+> node down with it. Trade-offs, measured numbers (35 ms per query; oversubscribing
+> `n_threads` costs 20×) and troubleshooting are in
+> [doc/local-embedding-en.md](doc/local-embedding-en.md).
+
 > **Vector dual-engine** (v4.0.0): pass `{vector_engine, hnsw | ivfrq | diskann}` at
 > open to select the engine (default `hnsw`, in-memory graph, up to a few M vectors;
 > `ivfrq` IVF disk tier, recommended for 10M-100M; `diskann` Vamana graph,
@@ -186,6 +224,7 @@ ok
 |------|----------------|
 | `doc/api-en.md` / `doc/api-zh.md` | **API reference**: capabilities, parameter meaning & constraints, return values (EN/中) |
 | `doc/USAGE.md` | Tutorial: opening, merging, configuring, searching |
+| `doc/local-embedding-en.md` / `doc/local-embedding-zh.md` | **Local embedding backend** (llama.cpp NIF): build, embedder process, the three silent-failure sources, measured numbers (EN/中) |
 | `doc/format-zh.md` | 磁盘格式字节级规范（带类型记录、DocValue、提示文件、锁；字节序统一小端） |
 | `doc/migrate-le.md` / `doc/migrate-le-en.md` | **Migration tool** `migrate_le`: offline-migrate an old big-endian (v1) dir to little-endian (v2) (中/EN) |
 | `doc/cpp-arch.md` | C++ 模块布局、锁策略、构建入口 |
