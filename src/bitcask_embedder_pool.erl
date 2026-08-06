@@ -43,18 +43,37 @@
 %%       H = bitcask:open(Dir, [read_write, {analyzer, whitespace},
 %%                              {embedder, my_embedder}]).
 %%
-%%   `instances` 的取值 —— **只接受显式的卡（组）列表，不做 auto**：
+%%   `instances` 的取值：
 %%
 %%     [0, 1, 2, 3]      4 个 instance，各占 1 张卡（模型单卡装得下，首选）
 %%     [[0,1], [2,3]]    2 个 instance，各横跨 2 张卡（单卡装不下时）
 %%     [[0,1,2,3]]       1 个 instance 跨 4 张卡（极大模型，退化成无并发）
+%%     auto              由 provider 探测：**枚举到的、且装得下模型的**卡，
+%%                       一卡一个
 %%
 %%   扁平写法是"每组一张卡"的简写。组内多于一张时 `split_mode` 缺省自动变成
 %%   `layer`（模型并行）；可在 `config` 里显式覆盖。
 %%
-%%   ⚠️ **不提供 `auto`（按机器上的卡数自动开）是有意的**：共享机器上别的租户
-%%      也在用 GPU，一个被嵌入的库默认把整机的卡全占了不合适。要用哪几张由
-%%      部署方写明。
+%%   `per_gpu => K`（默认 1）在上面的基础上把每个 instance 复制 K 份 —— 同一张卡
+%%   开 K 个 context。⚠️ 一个 context 同时只服务一次前向，所以同卡多开确实能多几路
+%%   并发；但它们抢同一批 SM，收益**不一定线性**，而显存按份数实打实地涨。这条
+%%   没有实测数据，所以是显式选项、不进默认路径。
+%%
+%%   === ⚠️ 失败策略按写法不同，这条不对称是有意的 ===
+%%
+%%     显式列表 → **全都必须起来**，任一起不来则整个 application 起不来。
+%%                写下卡号是一种意图声明：你说了要 2 号卡，它起不来就是配置与
+%%                现实不符。
+%%     auto     → **尽力而为**：起不来的那个跳过（日志里记原因），其余照起；
+%%                一个都没起来才算失败。auto 本来就是"有什么用什么"，一张卡忙着
+%%                不该拖垮整个 application。
+%%
+%%   ⚠️ "尽力而为"必须配"说得出来"：8 张卡只起来 1 个时业务拿到的是 1/8 的吞吐，
+%%      而一切看起来正常。`status/1` 报 requested / started / missing。
+%%
+%%   ⚠️ **`auto` 不去猜"该用哪几张卡"**：这个进程能看见哪几张本来就是运维侧的
+%%      标准手段（`GGML_CUDA_DEVICES` / `CUDA_VISIBLE_DEVICES` /
+%%      `GGML_VK_VISIBLE_DEVICES` / 容器设备透传），我们不该另造一套。
 %%
 %%   === ⚠️ 启动是串行的 ===
 %%
@@ -69,7 +88,9 @@
 
 -behaviour(supervisor).
 
--export([start_link/2, child_spec/3, workers/1, worker_name/2, is_pool/1]).
+-export([start_link/2, child_spec/3, workers/1, worker_name/2, is_pool/1,
+         status/1]).
+-export([start_worker_lenient/3]).
 -export([init/1]).
 
 %% supervisor 的启动超时：N 次模型加载都在这里面。给足。
@@ -85,16 +106,109 @@
 %%    校验本来就是纯函数，提前做，错误就是裸的 {error, {bad_opt, _}}。
 -spec start_link({local, atom()}, map()) -> {ok, pid()} | {error, term()}.
 start_link({local, Name} = Reg, Opts) when is_atom(Name), is_map(Opts) ->
+    case resolve_instances(Opts) of
+        {error, _} = E ->
+            E;
+        {ok, Groups0, Mode} ->
+            Groups = expand_per_gpu(Groups0, maps:get(per_gpu, Opts, 1)),
+            case supervisor:start_link(Reg, ?MODULE, {Name, Groups, Mode, Opts}) of
+                {error, _} = E ->
+                    E;
+                {ok, Pid} ->
+                    %% ⚠️ auto 模式下起不来的 worker 被记成 undefined（child 的
+                    %%    start 返回 ignore），supervisor 照常起来。这里收口两件事：
+                    %%    ① 一个都没起来就不算成功——8 张卡只起来 0 个还说 ok，
+                    %%       业务拿到的是"配了 embedder 但每次 embed 都失败"；
+                    %%    ② 把**实际**起来的名字写进 persistent_term，别让调用方
+                    %%       缓存一堆从没起来的名字。
+                    Live = live_workers(Name, length(Groups)),
+                    case Live of
+                        [] ->
+                            unlink(Pid),
+                            exit(Pid, shutdown),
+                            {error, {no_worker_started, Mode}};
+                        _ ->
+                            persistent_term:put(pt_key(Name), Live),
+                            {ok, Pid}
+                    end
+            end
+    end.
+
+%% instances 的三种写法：
+%%   [0,1,2] / [[0,1],[2,3]]  显式 —— **全都必须起来**（见下）
+%%   auto                     由 provider 探测 —— 尽力而为
+resolve_instances(Opts) ->
     case maps:get(instances, Opts, undefined) of
         undefined ->
             {error, {missing_opt, instances}};
+        auto ->
+            case provider_auto_instances(Opts) of
+                {error, _} = E -> E;
+                %% 一张可用的卡都没有 → 一个不绑卡的 instance（纯 CPU）。
+                %% auto 的语义是"有什么用什么"，没卡时仍然该可用。
+                {ok, []}       -> {ok, [none], auto};
+                {ok, Groups}   -> {ok, Groups, auto}
+            end;
         Instances when is_list(Instances), Instances =/= [] ->
             case validate_instances(Instances) of
                 {error, _} = E -> E;
-                {ok, Groups}   -> supervisor:start_link(Reg, ?MODULE, {Name, Groups, Opts})
+                {ok, Groups}   -> {ok, Groups, explicit}
             end;
         _ ->
             {error, {bad_opt, instances}}
+    end.
+
+%% auto 需要 provider 告诉我们这台机器上有哪些可用的卡 —— 这件事只有 provider
+%% 知道（HTTP 档根本没有卡的概念）。没实现这个可选回调的 provider 不支持 auto。
+provider_auto_instances(Opts) ->
+    Mod = case maps:get(provider, Opts, undefined) of
+              {custom, M} -> M;
+              _           -> undefined
+          end,
+    Cfg = maps:get(config, Opts, #{}),
+    case Mod =/= undefined andalso
+         (code:ensure_loaded(Mod) =/= {error, nofile}) andalso
+         erlang:function_exported(Mod, auto_instances, 1) of
+        true  -> Mod:auto_instances(Cfg);
+        false -> {error, {instances_auto_unsupported, Mod}}
+    end.
+
+%% per_gpu：同一张卡上开 K 个 instance。
+%%
+%% ⚠️ **默认 1，不要随手调大。** 一个 llama_context 同时只服务一次前向，所以同卡
+%%    多开确实能多几路并发；但它们抢的是同一批 SM，收益**不一定线性**，而显存是
+%%    实打实按份数涨的。这条没有实测数据，所以是显式选项、不进默认路径。
+expand_per_gpu(Groups, K) when is_integer(K), K > 1 ->
+    lists:append([lists:duplicate(K, G) || G <- Groups]);
+expand_per_gpu(Groups, _) ->
+    Groups.
+
+%% 实际起来了的 worker 名（按 index 顺序）。
+live_workers(Name, N) ->
+    [W || I <- lists:seq(0, N - 1),
+          W <- [worker_name(Name, I)],
+          whereis(W) =/= undefined].
+
+%% -------------------------------------------------------------------
+%% status/1 —— 要了几个、实际起了几个。
+%%
+%% ⚠️ 这个函数是 auto 模式"尽力而为"的**必要配套**：8 张卡只起来 1 个时业务拿到
+%%    的是 1/8 的吞吐，而一切看起来正常。少了就必须问得出来。
+%% -------------------------------------------------------------------
+-spec status(atom()) -> {ok, map()} | {error, term()}.
+status(Pool) when is_atom(Pool) ->
+    case whereis(Pool) of
+        undefined -> {error, not_a_pool};
+        _ ->
+            All  = persistent_term:get(pt_key({all, Pool}), []),
+            Live = case persistent_term:get(pt_key(Pool), undefined) of
+                       undefined -> [];
+                       L -> [W || W <- L, whereis(W) =/= undefined]
+                   end,
+            {ok, #{requested => length(All),
+                   started   => length(Live),
+                   workers   => Live,
+                   missing   => All -- Live}}
     end.
 
 -spec child_spec(term(), {local, atom()}, map()) -> supervisor:child_spec().
@@ -156,27 +270,61 @@ is_pool(Ref) ->
 %% ===================================================================
 
 %% Groups 已由 start_link 校验并归一（每项是非空的卡下标列表）。
-init({Name, Groups, Opts}) ->
-    Base = maps:without([instances, name], Opts),
+init({Name, Groups, Mode, Opts}) ->
+    Base = maps:without([instances, name, per_gpu], Opts),
     Idxs = lists:seq(0, length(Groups) - 1),
+    Names = [worker_name(Name, I) || I <- Idxs],
     %% worker 名字表写一次就不再变（名字稳定，worker 重启也不换），
     %% 所以 persistent_term 的写入代价只付一次。见 workers/1 的注释。
-    persistent_term:put(pt_key(Name), [worker_name(Name, I) || I <- Idxs]),
-    Children = [worker_spec(Name, I, G, Base)
+    %% start_link 之后会把它收窄成**实际起来**的那些。
+    persistent_term:put(pt_key(Name), Names),
+    persistent_term:put(pt_key({all, Name}), Names),
+    Children = [worker_spec(Name, I, G, Base, Mode)
                 || {I, G} <- lists:zip(Idxs, Groups)],
     %% one_for_one：一个 worker 挂了只重启它自己。其余卡上那些 context 没理由
     %% 跟着重建——每次重建都是一次模型加载。
     {ok, {{one_for_one, 5, 10}, Children}}.
 
-worker_spec(Pool, Idx, Group, Base) ->
+worker_spec(Pool, Idx, Group, Base, Mode) ->
     WName = worker_name(Pool, Idx),
-    Cfg = maps:get(config, Base, #{}),
-    Opts = Base#{config => Cfg#{gpu_index => Group}},
+    Cfg0 = maps:get(config, Base, #{}),
+    %% Group = none 表示"不绑卡"（auto 在没有可用 GPU 时的退化）。
+    Cfg = case Group of
+              none -> Cfg0;
+              _    -> Cfg0#{gpu_index => Group}
+          end,
+    Opts = Base#{config => Cfg},
+    %% ⚠️ **失败策略按写法不同而不同，这条不对称是有意的：**
+    %%
+    %%   显式列表 → 起不来就让 supervisor 失败（一路冒到 application 起不来）。
+    %%     写下卡号是一种**意图声明**：你说了要用 2 号卡，它起不来就是配置与
+    %%     现实不符，该死给你看。
+    %%   auto     → 起不来就 ignore 掉那一个，别的照起。
+    %%     auto 本来就是"有什么用什么"，一张卡忙着不该拖垮整个 application。
+    %%     少了几个由 status/1 问得出来——"尽力而为"必须配"说得出来"。
+    Start = case Mode of
+                explicit -> {bitcask_embedder_server, start_link, [{local, WName}, Opts]};
+                auto     -> {?MODULE, start_worker_lenient, [{local, WName}, Opts, Idx]}
+            end,
     %% child id 里带上 index 和名字，workers/1 靠它认出"这是我们的 worker"
     %% 并还原顺序。
-    {{bc_emb_worker, Idx, WName},
-     {bitcask_embedder_server, start_link, [{local, WName}, Opts]},
+    {{bc_emb_worker, Idx, WName}, Start,
      permanent, ?WORKER_SHUTDOWN, worker, [bitcask_embedder_server]}.
+
+%% auto 模式的 child start：起不来返回 ignore（supervisor 把它记成 undefined
+%% 并继续），而不是 {error,_}（那会让整个 supervisor 起不来）。
+%%
+%% ⚠️ 失败必须**留下痕迹**。静默跳过一张卡的后果是吞吐悄悄少一份，而这正是
+%%    整套设计一直在防的那类事。
+start_worker_lenient(Reg, Opts, Idx) ->
+    case bitcask_embedder_server:start_link(Reg, Opts) of
+        {ok, _} = Ok ->
+            Ok;
+        {error, Reason} ->
+            logger:warning("bitcask_embedder_pool: instance ~p failed to start, "
+                           "skipping it (instances => auto). reason=~p", [Idx, Reason]),
+            ignore
+    end.
 
 %% instances 每一项：整数 = 单卡；非空整数列表 = 卡组。
 %%

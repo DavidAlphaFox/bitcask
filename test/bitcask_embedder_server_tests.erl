@@ -519,3 +519,64 @@ proxy_batch_partial_failure_test_() ->
             [?assert(element(1, R) =:= ok orelse element(1, R) =:= error) || R <- Rs]
         end)
     end}.
+
+%% ===================================================================
+%% instances => auto / per_gpu / 不对称失败策略
+%% ===================================================================
+
+%% mock provider 没实现 auto_instances/1 —— auto 必须被明确拒绝，
+%% ⚠️ 不能悄悄退化成"起一个"，那会让 `instances => auto` 在不支持的 provider 上
+%%    看起来生效了。
+auto_unsupported_provider_test() ->
+    process_flag(trap_exit, true),
+    N = list_to_atom("bc_auto_" ++ integer_to_list(erlang:unique_integer([positive]))),
+    ?assertMatch({error, {instances_auto_unsupported, _}},
+                 bitcask_embedder_pool:start_link({local, N}, pool_opts(auto))),
+    process_flag(trap_exit, false),
+    ok.
+
+%% per_gpu：同一张卡开 K 个 instance。
+%% ⚠️ 显式列表里重复写同一张卡会被拒（配置错），但 per_gpu 是**明确要求**的复制，
+%%    两者必须区分开。
+per_gpu_expands_instances_test_() ->
+    {timeout, 60, fun() ->
+        Name = list_to_atom("bc_pg_" ++ integer_to_list(erlang:unique_integer([positive]))),
+        Opts = (pool_opts([0, 1]))#{per_gpu => 3},
+        {ok, Pid} = bitcask_embedder_pool:start_link({local, Name}, Opts),
+        try
+            {ok, Ws} = bitcask_embedder_pool:workers(Name),
+            ?assertEqual(6, length(Ws)),          %% 2 卡 × 3
+            {ok, St} = bitcask_embedder_pool:status(Name),
+            ?assertMatch(#{requested := 6, started := 6, missing := []}, St)
+        after
+            unlink(Pid), exit(Pid, shutdown),
+            (fun W(0) -> ok; W(K) ->
+                case whereis(Name) of undefined -> ok; _ -> timer:sleep(10), W(K-1) end
+             end)(100)
+        end
+    end}.
+
+%% status/1 是"尽力而为"的必要配套 —— 少了几个必须问得出来。
+pool_status_test_() ->
+    {timeout, 60, fun() ->
+        with_pool([0, 1, 2], fun(Pool) ->
+            {ok, St} = bitcask_embedder_pool:status(Pool),
+            ?assertMatch(#{requested := 3, started := 3, missing := []}, St),
+            ?assertEqual({error, not_a_pool},
+                         bitcask_embedder_pool:status(no_such_pool_xyz))
+        end)
+    end}.
+
+%% ⚠️ 显式列表 = 全都必须起来。这里用一个必然起不来的 provider 配置验证：
+%%    supervisor 起不来 → start_link 报错（而不是少一个照跑）。
+explicit_instances_fail_hard_test_() ->
+    {timeout, 60, fun() ->
+        process_flag(trap_exit, true),
+        N = list_to_atom("bc_hard_" ++ integer_to_list(erlang:unique_integer([positive]))),
+        %% 缺 url 的 openai：每个 worker 的 init 都会失败
+        Opts = #{provider => openai, config => #{model => <<"m">>}, instances => [0, 1]},
+        ?assertMatch({error, _}, bitcask_embedder_pool:start_link({local, N}, Opts)),
+        ?assertEqual(undefined, whereis(N)),
+        process_flag(trap_exit, false),
+        ok
+    end}.

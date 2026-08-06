@@ -624,3 +624,76 @@ batch_chunks_beyond_batch_size_test_() ->
             _ -> ok
         end
     end}.
+
+%% ===================================================================
+%% instances => auto（provider 侧的探测）
+%% ===================================================================
+
+%% ⚠️ `auto` 在**没有可用 GPU** 时必须返回 {ok, []}（池据此退化成一个不绑卡的
+%%    CPU instance），而不是报错。auto 的语义是"有什么用什么"——没卡就让整个
+%%    application 起不来，那不是 auto 该有的行为。
+%%    本机没有 GPU，所以这条走的正是那条降级路径；有卡的机器上它会返回卡下标。
+auto_instances_test_() ->
+    {timeout, 300, fun() ->
+        case {bitcask_llama_nifs:available(), model_path()} of
+            {true, Path} when is_list(Path) ->
+                case filelib:is_regular(Path) of
+                    false -> ok;
+                    true ->
+                        Cfg = #{model_path => list_to_binary(Path),
+                                pooling => last, n_ctx => 512},
+                        {ok, Groups} = bitcask_embedder_llama:auto_instances(Cfg),
+                        ?assert(is_list(Groups)),
+                        %% 每项都是"一卡一个 instance"的族内下标
+                        [?assertMatch([I] when is_integer(I) andalso I >= 0, G)
+                         || G <- Groups],
+                        {ok, #{gpu_count := NGpu}} = bitcask_llama_nifs:backend_info(),
+                        %% 探测出来的不可能多于机器上真有的卡
+                        ?assert(length(Groups) =< NGpu),
+                        %% 没卡 → 空表（池会退化成一个 CPU instance）
+                        case NGpu of
+                            0 -> ?assertEqual([], Groups);
+                            _ -> ok
+                        end
+                end;
+            _ -> ok
+        end
+    end}.
+
+%% 池 + auto 端到端：无卡时是一个不绑卡的 instance，仍然能 embed。
+pool_auto_end_to_end_test_() ->
+    {timeout, 600, fun() ->
+        case {bitcask_llama_nifs:available(), model_path()} of
+            {true, Path} when is_list(Path) ->
+                case filelib:is_regular(Path) of
+                    false -> ok;
+                    true ->
+                        Name = list_to_atom("bc_llama_auto_" ++
+                                 integer_to_list(erlang:unique_integer([positive]))),
+                        {ok, Pid} = bitcask_embedder_pool:start_link(
+                                      {local, Name},
+                                      #{provider => {custom, bitcask_embedder_llama},
+                                        instances => auto,
+                                        config => #{model_path => list_to_binary(Path),
+                                                    pooling => last, n_ctx => 512}}),
+                        try
+                            {ok, St} = bitcask_embedder_pool:status(Name),
+                            %% ⚠️ 尽力而为必须配说得出来：起了几个、少了哪些
+                            #{requested := Req, started := Started} = St,
+                            ?assert(Started >= 1),
+                            ?assert(Started =< Req),
+                            {ok, Ctx} = bitcask_embedder:new(
+                                          {custom, bitcask_embedder_proxy}, #{server => Name}),
+                            ?assertMatch({ok, _}, bitcask_embedder:embed(Ctx, <<"hello">>))
+                        after
+                            unlink(Pid), exit(Pid, shutdown),
+                            (fun W(0) -> ok; W(K) ->
+                                case whereis(Name) of
+                                    undefined -> ok; _ -> timer:sleep(10), W(K-1)
+                                end
+                             end)(200)
+                        end
+                end;
+            _ -> ok
+        end
+    end}.

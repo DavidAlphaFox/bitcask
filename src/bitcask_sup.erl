@@ -29,7 +29,7 @@
 %%     {bitcask, [{embedder,
 %%         #{name      => my_embedder,
 %%           provider  => {custom, bitcask_embedder_llama},
-%%           instances => [0, 1, 2, 3],   %% 或 [[0,1],[2,3]]（单卡装不下时）
+%%           instances => [0, 1, 2, 3],   %% 或 [[0,1],[2,3]]（单卡装不下时）/ auto
 %%           config    => #{model_path => ..., pooling => last}}}]}
 %%
 %%   **没配就没有这个 child**——bitcask 不依赖 embedder，绝大多数部署不配。

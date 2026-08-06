@@ -94,7 +94,7 @@
 -behaviour(bitcask_embedder).
 
 -export([init/1, embed/2, embed_batch/2]).
--export([close/1, info/1, token_count/2]).
+-export([close/1, info/1, token_count/2, auto_instances/1]).
 
 -define(DEFAULT_MAX_INPUT_BYTES, 32768).
 %% ⚠️ 不用模型的 n_ctx_train 当默认值：见文件头 (Opts) n_ctx 那条。2048 覆盖
@@ -274,6 +274,70 @@ apply_mrl(Vec, Cfg) ->
         true  -> Vec;
         false -> bitcask_embedder_util:mrl_truncate(
                    Vec, VDim, maps:get(normalize, Cfg, true))
+    end.
+
+%% ===================================================================
+%% auto_instances/1 —— `instances => auto` 的探测（bitcask_embedder_pool 的
+%% 可选 provider 回调）。
+%%
+%% 返回 [[GpuIdx]]，每项一个 instance。**族内下标**（与 gpu_index 的语义一致）。
+%%
+%% 取哪些卡：**ggml 枚举到的、且装得下这个模型的**。两条都不是随便定的：
+%%
+%%   * 「枚举到的」—— 这个进程能看见哪几张卡本来就是运维侧的标准手段：
+%%     `GGML_CUDA_DEVICES` / `CUDA_VISIBLE_DEVICES` / `GGML_VK_VISIBLE_DEVICES`
+%%     / 容器的设备透传。我们不该另造一套，也不该假装比运维更懂该用哪几张。
+%%   * 「装得下的」—— 复用加载前那次粗检（GGUF 大小 vs 该卡可用显存）。这一条
+%%     顺带解决了"别人正占着显存的卡"：它会被自动跳过，而不是起到一半 OOM。
+%%     ⚠️ 仍然只是粗检（不含 compute buffer / KV cache），所以它是**筛选**不是
+%%     保证；真起不来的那张由池按"尽力而为"跳过并报出来。
+%%
+%% 一张可用的都没有 → {ok, []}，池会退化成**一个不绑卡的 instance**（纯 CPU）。
+%% ⚠️ 不报错是有意的：`auto` 的语义是"有什么用什么"，没有卡时它应当仍然可用，
+%%    否则一台机器没卡就让整个 application 起不来，那不是 auto 该有的行为。
+%% ===================================================================
+-spec auto_instances(map()) -> {ok, [[non_neg_integer()]]} | {error, term()}.
+auto_instances(Cfg) when is_map(Cfg) ->
+    case bitcask_llama_nifs:available() of
+        false -> {error, {llama_nif_unavailable, bitcask_llama_nifs:load_status()}};
+        true  -> auto_instances_1(Cfg)
+    end.
+
+auto_instances_1(Cfg) ->
+    case bitcask_llama_nifs:ensure_backend() of
+        {error, _} = E -> E;
+        {ok, _} ->
+            {ok, #{devices := Devs}} = bitcask_llama_nifs:backend_info(),
+            Gpus = [D || #{type := gpu} = D <- Devs],
+            Fam  = pick_family(Gpus, maps:get(backend, Cfg, auto)),
+            InFam = [D || #{backend := B} = D <- Gpus, B =:= Fam],
+            Need = model_bytes(Cfg),
+            Idx  = lists:zip(lists:seq(0, length(InFam) - 1), InFam),
+            Usable = [I || {I, #{memory_free := Free}} <- Idx,
+                           Need =:= undefined orelse Free >= Need],
+            {ok, [[I] || I <- Usable]}
+    end.
+
+%% auto 的顺序与 C++ 侧 select_devices 一致：CUDA > Vulkan。
+pick_family(Gpus, auto) ->
+    Names = [B || #{backend := B} <- Gpus],
+    case lists:member(<<"CUDA">>, Names) of
+        true  -> <<"CUDA">>;
+        false -> case Names of [B | _] -> B; [] -> <<>> end
+    end;
+pick_family(_Gpus, cuda)   -> <<"CUDA">>;
+pick_family(_Gpus, vulkan) -> <<"Vulkan">>;
+pick_family(_Gpus, _)      -> <<>>.
+
+model_bytes(Cfg) ->
+    case maps:get(model_path, Cfg, undefined) of
+        undefined -> undefined;
+        P0 ->
+            P = to_bin(P0),
+            case filelib:file_size(P) of
+                0 -> undefined;
+                N -> N
+            end
     end.
 
 %% ===================================================================
