@@ -38,6 +38,9 @@
          stream_fold/3, stream_fold/4,
          stream/1, next/1, stop/1, with_stream/2,
          merge/1, merge/2, merge/3,
+         range/2, range/3, range_fold/5,
+         put_batch_atomic/2,
+         txn_commit/2, txn_commit/3,
          needs_merge/1,
          needs_merge/2,
          is_frozen/1,
@@ -74,7 +77,8 @@
     vector_engine,
     hnsw_m, hnsw_ef_construction, hnsw_build_nav_int8,
     vector_rebase_min_docs, vector_ivf_nlist, vector_ivf_nprobe,
-    vector_diskann_r, vector_diskann_l_build
+    vector_diskann_r, vector_diskann_l_build,
+    keydir_cache_entries
 ]).
 
 %% =========================================================================
@@ -427,6 +431,117 @@ next(S) -> bitcask_stream:next(S).
 stop(S) -> bitcask_stream:stop(S).
 
 with_stream(Handle, Fun) -> bitcask_stream:with_stream(ref(Handle), Fun).
+
+%% =========================================================================
+%% v5.1.0：有序 range 查询（OKI 索引）
+%%
+%% 按 key 字典序遍历 [Lo, Hi)。代价 O(range)，不是 O(全表) 过滤——上游实测
+%% （10 万 key、选择性 1/256）8.0ms → 0.53ms。
+%%
+%% ⚠️ 一致性只到 **per-key 弱一致**（与 parallel_scan 同档）：迭代期间的并发
+%% 写可能部分可见，**不是 fold 的快照语义**。要快照请继续用 fold/3。
+%%
+%% Lo 含、Hi 不含；两端都可以传 undefined 表示无界。
+%%
+%% Opts:
+%%   {prefetch, N}          N>1 时一次归并 N 个 key 并发取值。只改取值时机，
+%%                          输出序与内容不变。大窗口 + 冷值形态收益明显，
+%%                          小窗口反而可能被线程创建成本吃掉，故默认关。
+%%   {prefetch_threads, N}  0（默认）= min(在线核数, 4)。
+%%
+%% 目录没有 OKI（只读打开一个从未写过的库 / 重建失败）→ {error, no_index}；
+%% 这时候调用方应回落到 fold + 前缀过滤。
+%% =========================================================================
+
+%% 收集 [Lo, Hi) 的全部 {Key, Value}，按 key 字典序。
+range(Handle, {Lo, Hi}) -> range(Handle, {Lo, Hi}, []).
+
+range(Handle, {Lo, Hi}, Opts) ->
+    Fun = fun(K, V, _T, _O, Acc) -> [{K, V} | Acc] end,
+    case range_fold(Handle, {Lo, Hi}, Opts, Fun, []) of
+        {error, _} = E -> E;
+        Acc            -> lists:reverse(Acc)
+    end.
+
+%% 流式版本：Fun 是 fun(Key, Value, Tstamp, Ord, Acc) -> Acc'。
+%% 迭代器一定会被释放（after 兜底），NIF 错误原样返回、不抛异常——与
+%% cask_fold_collect 的契约一致。
+range_fold(Handle, {Lo, Hi}, Opts, Fun, Acc0) ->
+    RangeOpts = range_opts(Lo, Hi, Opts),
+    case bitcask_cpp_nifs:cask_range_start(ref(Handle), RangeOpts) of
+        {ok, IterRef} ->
+            try range_loop(IterRef, Fun, Acc0)
+            after bitcask_cpp_nifs:cask_range_release(IterRef)
+            end;
+        Other -> normalize_error(Other)
+    end.
+
+%% NIF 的错误形态不统一：`fault_to_term` 对若干故障（`no_index`、`closed`、
+%% `mode_mismatch`、`not_found`、`already_exists`）返回**裸 atom**，这是 legacy
+%% 契约，改它会波及现有匹配点。门面这一层统一归一成 `{error, Reason}`——
+%% `open_1` 早就这么做了（那里的注释同源）。
+%%
+%% 踩过：`range` 在「只读打开一个从未写过的目录」上会拿到裸 `no_index`
+%%（那种目录没有 OKI），漏了这层归一就是 case_clause 崩在门面里。
+normalize_error({error, _} = E) -> E;
+normalize_error(Reason)         -> {error, Reason}.
+
+%% undefined 边界不进 proplist —— NIF 侧「键不存在」即无界，和空 binary
+%% 等价，但显式不传更省一次 binary 检查。
+range_opts(Lo, Hi, Opts) ->
+    Bounds = [{lo, Lo} || is_binary(Lo)] ++ [{hi, Hi} || is_binary(Hi)],
+    Tuning = [{K, V} || K <- [prefetch, prefetch_threads],
+                        (V = proplists:get_value(K, Opts)) =/= undefined],
+    Bounds ++ Tuning.
+
+%% 批量拉 —— 每次 NIF 往返最多带回 256 条，长范围下比逐条 next 少两个数量级
+%% 的往返。批未满即到尾（NIF 契约），所以短列表也要继续走到 done。
+range_loop(IterRef, Fun, Acc) ->
+    case bitcask_cpp_nifs:cask_range_next_batch(IterRef, 256) of
+        done -> Acc;
+        {ok, Entries} ->
+            Acc1 = lists:foldl(fun({K, V, T, O}, A) -> Fun(K, V, T, O, A) end,
+                               Acc, Entries),
+            range_loop(IterRef, Fun, Acc1);
+        Other -> normalize_error(Other)
+    end.
+
+%% =========================================================================
+%% v5.1.0：跨崩溃原子批 / 多键事务
+%%
+%% Ops :: [{put, Key, Value} | {remove, Key}]，Key/Value 都是 binary。
+%%
+%% 崩溃/掉电后**整批要么全生效要么全不生效**——盘上批头声明区间，恢复时
+%% 区间不完整即整批截断。原子性与持久性正交：没 fsync 就掉电仍可能整批
+%% 丢失，但绝不半批。
+%%
+%% ⚠️ **首次调用把目录 bitcask.meta 懒升级为 v6**，此后不能被早于 5.1.0 的
+%% 读端打开。从不调这两个入口的目录停留在 v5，与旧读端双向互开。
+%%
+%% 不提供隔离性（I）与 CAS：事务中间态对并发读者可见；键集重叠的并发
+%% 提交无定序保证，需应用层自行串行化。键集不相交则并发安全。
+%% =========================================================================
+
+%% 裸原子批：允许批内同 key 多次（依序 apply = 批内 LWW），空批是 no-op。
+put_batch_atomic(Handle, Ops) ->
+    case bitcask_cpp_nifs:cask_put_batch_atomic(ref(Handle), Ops) of
+        ok    -> ok;
+        Other -> normalize_error(Other)   % 裸 atom 故障归一，同 range_fold
+    end.
+
+%% 事务提交：比 put_batch_atomic 多一层校验——批非空、key 非空、key 互不
+%% 重复、不占用 "_txn:" 保留前缀。违反任一条返回
+%% {error, {invalid_option, Msg}} 且**零副作用**。
+txn_commit(Handle, Ops) -> txn_commit(Handle, Ops, sync_on_commit).
+
+%% Sync :: sync_on_commit（默认，提交点显式 fsync，防掉电）
+%%       | no_sync（依赖 {sync_strategy, ...}，只防进程崩溃）
+txn_commit(Handle, Ops, Sync) when Sync =:= sync_on_commit;
+                                   Sync =:= no_sync ->
+    case bitcask_cpp_nifs:cask_txn_commit(ref(Handle), Ops, Sync) of
+        ok    -> ok;
+        Other -> normalize_error(Other)
+    end.
 
 %% =========================================================================
 %% 目录级 merge
