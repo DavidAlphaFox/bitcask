@@ -110,10 +110,20 @@ genuinely concurrent, and per-card VRAM is still one copy of the weights.
 > hops. Routing through a process that `gen_server:call`s the workers would make
 > that process the new serialization point, rendering the N workers pointless.
 >
-> ⚠️ **Only an explicit list of cards (or groups); no `auto`** — other tenants on
-> a shared box use the GPUs too. `[[0,1],[2,3]]` denotes groups (for a model that
-> does not fit on one card); a group larger than one card implies
-> `split_mode => layer`.
+> `instances` takes either an explicit list of cards (or groups) or `auto` (the
+> provider probes for cards that are **enumerated and can fit the model**).
+> `per_gpu => K` then runs K contexts per card (explicit option; no measured data,
+> so never a default).
+>
+> ⚠️ **The failure policy is deliberately asymmetric**: an explicit list means all
+> must start (naming a card is a statement of intent); `auto` is best effort —
+> failures are skipped and only zero started is a failure. `status/1` reports
+> requested / started / missing, because best effort has to come with saying so.
+>
+> ⚠️ `auto` does **not guess which cards to take**: visibility is controlled by
+> `GGML_CUDA_DEVICES` / `CUDA_VISIBLE_DEVICES` / `GGML_VK_VISIBLE_DEVICES` /
+> container passthrough, which is the operator-side standard. With no usable card
+> it degenerates to one unbound CPU instance rather than erroring.
 >
 > ⚠️ **Startup is sequential** (N model loads). Deliberately not parallel or lazy
 > — that would let a worker's startup failure bypass the supervisor's start-time
@@ -171,11 +181,6 @@ pre-filled with whichever switches it detected.
   `bitcask:close/1` release a ctx built via the `{Provider, Cfg}` path. Currently
   side-stepped by the process form, and touching the core API has no obvious
   payoff.
-- **`instances => auto`** (gated): the cards to use must be spelled out today.
-  Sizing the pool from the machine's card count first requires deciding whether a
-  library should claim every GPU by default, and whether the "a failing embedder
-  kills the application" policy should be relaxed when one worker in a pool fails
-  to start. Both are policy questions, not implementation ones.
 - **Trustworthy batch calibration** (gated): the current numbers were taken on a
   box with external load, which inflates the ratio, and the long-text case has no
   conclusion. A re-measure on a quiet machine is needed before recommending a

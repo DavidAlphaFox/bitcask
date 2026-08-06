@@ -81,6 +81,24 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
   超时、响应解析此前**完全一样**（只有认证 header 不同），现在只剩一份。解析做成
   **纯函数并导出**，新增 `test/bitcask_embedder_util_tests.erl` 14 条不打网络的单测
   ——这段路径此前只有一个默认跳过的手动用例（要真实端点），等于没测过。
+- **`instances => auto`**：由 provider 探测该用哪几张卡——取**ggml 枚举到的、且
+  装得下模型的**（后者复用加载前那次粗检，顺带跳过别人正占着显存的卡）。
+  一张可用的都没有 → 退化成**一个不绑卡的 instance**（纯 CPU），不报错——`auto`
+  的语义是"有什么用什么"，没卡时仍该可用。
+  ⚠️ **不去猜"该用哪几张卡"**：这个进程能看见哪几张本来就是运维侧的标准手段
+  （`GGML_CUDA_DEVICES` / `CUDA_VISIBLE_DEVICES` / `GGML_VK_VISIBLE_DEVICES` /
+  容器设备透传），不另造一套。
+  ⚠️ **失败策略按写法不对称，这是有意的**：显式卡列表 = **全都必须起来**（写下
+  卡号是意图声明，起不来就是配置与现实不符）；`auto` = **尽力而为**，起不来的
+  跳过并记 warning，一个都没起来才算失败。
+  ⚠️ 尽力而为必须配得上说得出来——新增 `bitcask_embedder_pool:status/1` 报
+  `requested` / `started` / `missing`。8 张卡只起来 1 个时业务拿到的是 1/8 的吞吐
+  而一切看起来正常，这个函数是那种情况唯一的线索。
+  provider 没实现 `auto_instances/1`（HTTP 档根本没有卡的概念）时 `auto` 被
+  **明确拒绝**，不悄悄退化成"起一个"。
+- **`per_gpu => K`**（默认 1）：同一张卡开 K 个 context。⚠️ 一个 context 同时只
+  服务一次前向，多开确实多几路并发，但它们抢同一批 SM、收益**不一定线性**，而
+  显存按份数实打实地涨。**没有实测数据，所以是显式选项、不进默认路径。**
 - **多卡数据并行池** `bitcask_embedder_pool`：N 个 embedder 进程，**一卡跑全部
   layer、一个 instance 占一卡**，N 个请求真并发。application env 加
   `instances => [0,1,2,3]`（或 `[[0,1],[2,3]]` 卡组，用于单卡装不下时）。
@@ -91,8 +109,7 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
   用稳定注册名注册，调用方（proxy）拿到名字列表后**直接打 worker**，中间零跳；
   让一个进程去 `gen_server:call` worker 的话，它自己就成了新的串行点。派发取
   消息队列最短的 worker（worker 串行，队列长度就是它欠的活）。
-  ⚠️ **只接受显式卡列表，不提供 `auto`**：共享机器上别的租户也在用 GPU，一个被
-  嵌入的库默认把整机的卡全占了不合适。同一张卡出现在两个 instance 里会被拒绝。
+  ⚠️ 同一张卡出现在两个 instance 里会被拒绝（配置错；`per_gpu` 才是明确要求的复制）。
   ⚠️ **启动是串行的**（N 次模型加载，0.6B 实测 542 ms/次）。故意没做并行/懒加载
   ——那样 worker 的启动失败会绕过 supervisor 的启动期检查，而"配了 embedder 却
   起不来就让 application 死"这条策略正是靠启动期同步失败才成立的。
@@ -162,7 +179,7 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 
 ### 回归
 
-- `rebar3 eunit` **132/132**（23 条本地嵌入 + 31 条 embedder 进程/池/批量 +
+- `rebar3 eunit` **138/138**（25 条本地嵌入 + 39 条 embedder 进程/池/批量 +
   14 条 HTTP 解析单测；NIF 未构建时相关用例优雅跳过），`rebar3 xref` 干净，
   `rebar3 dialyzer` **零警告**。
 - **Vulkan 构建路径已实测**：开发机上有 Vulkan SDK（1.4.309），AUTO 探测到并

@@ -85,8 +85,17 @@ llama 的 `split_mode` 默认 `LAYER`（把层切到所有卡上）对嵌入模�
 > 让一个进程去 `gen_server:call` worker 的话，它自己就成了新的串行点，N 个 worker
 > 等于白开。
 >
-> ⚠️ **只接受显式卡（组）列表，不提供 `auto`**：共享机器上别的租户也在用 GPU。
-> `[[0,1],[2,3]]` 表示卡组（单卡装不下时），组内多于一张自动 `split_mode => layer`。
+> `instances` 可以是显式卡（组）列表，也可以是 `auto`（provider 探测：**枚举到的、
+> 且装得下模型的**卡）。`per_gpu => K` 在此基础上同卡开 K 个 context（显式选项，
+> 无实测数据不默认）。
+>
+> ⚠️ **失败策略不对称，有意如此**：显式列表 = 全都必须起来（写下卡号是意图声明）；
+> `auto` = 尽力而为，起不来的跳过、一个都没起来才失败。配套 `status/1` 报
+> requested / started / missing —— 尽力而为必须配得上说得出来。
+>
+> ⚠️ `auto` **不猜"该用哪几张卡"**：可见性由 `GGML_CUDA_DEVICES` /
+> `CUDA_VISIBLE_DEVICES` / `GGML_VK_VISIBLE_DEVICES` / 容器透传控制，那是运维侧的
+> 标准手段。没有可用卡时退化成一个不绑卡的 CPU instance，不报错。
 >
 > ⚠️ **启动串行**（N 次模型加载）。故意没做并行/懒加载——那样 worker 的启动失败会
 > 绕过 supervisor 的启动期检查，而"配了却起不来就让 application 死"正是靠它成立的。
@@ -127,9 +136,6 @@ HTTP 档（openai / anthropic）也实现了原生批量：一次请求带数组
 - **`bitcask_embedder` 加可选 `close/1` 回调**（按 gate）：让 `bitcask:close/1`
   能自动释放 `{Provider, Cfg}` 那条路建的 ctx。当前用进程形态规避，动核心 API
   的收益不明显。
-- **`instances => auto`**（按 gate）：现在必须写明用哪几张卡。按机器上的卡数自动
-  开池需要先决定"一个库该不该默认占满整机的 GPU"，以及池内某个 worker 起不来时
-  是否放宽"整个 application 死"那条策略。两个都是策略问题，不是实现问题。
 - **批量的可信定标**（按 gate）：现有数字是在有外部负载的机器上测的，比值被放大，
   长文本档没有可信结论。安静机器上重测一遍才能给出该不该默认开的建议。
 - **多卡实测**（按 gate）：池的机制已用 mock provider 测透，但**多卡上的真实 GPU

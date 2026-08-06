@@ -109,6 +109,33 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   `test/bitcask_embedder_util_tests.erl` adds 14 network-free unit tests — that
   path previously had only a manual, skipped-by-default case needing a live
   endpoint, i.e. it was effectively untested.
+- **`instances => auto`**: the provider probes which cards to use — those **ggml
+  enumerates and that can fit the model** (the latter reuses the pre-load coarse
+  check, which incidentally skips cards someone else is already filling).
+  If none qualify → it degenerates to **one instance with no card bound** (pure
+  CPU) rather than erroring: `auto` means "use whatever is there", so it must
+  still work on a GPU-less machine.
+  ⚠️ It does **not** try to guess which cards it should take: which GPUs a process
+  can see is already an operator-side standard (`GGML_CUDA_DEVICES` /
+  `CUDA_VISIBLE_DEVICES` / `GGML_VK_VISIBLE_DEVICES` / container device
+  passthrough), and we do not invent a second mechanism.
+  ⚠️ **The failure policy is deliberately asymmetric**: an explicit card list means
+  **all must start** (writing a card number is a statement of intent, so failing
+  to start means the config disagrees with reality); `auto` is **best effort** —
+  a failing instance is skipped with a warning, and only zero started is a
+  failure.
+  ⚠️ Best effort has to come with saying so — the new
+  `bitcask_embedder_pool:status/1` reports `requested` / `started` / `missing`.
+  With 1 of 8 cards up the workload gets one eighth of the throughput while
+  everything looks fine; this function is the only clue in that situation.
+  When a provider does not implement `auto_instances/1` (the HTTP tier has no
+  notion of cards) `auto` is **rejected outright** rather than quietly degrading
+  to a single instance.
+- **`per_gpu => K`** (default 1): K contexts on the same card. ⚠️ A context serves
+  one forward at a time, so several do add concurrency, but they contend for the
+  same SMs — the gain is **not necessarily linear** — while VRAM grows with the
+  copy count. **No measured data, so it is an explicit option and never a
+  default.**
 - **Multi-GPU data-parallel pool** `bitcask_embedder_pool`: N embedder processes,
   **all layers on one card, one instance per card**, N requests genuinely
   concurrent. The application env gains `instances => [0,1,2,3]` (or card groups
@@ -123,9 +150,8 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   `gen_server:call`s the workers would make that process the new serialization
   point. Dispatch picks the shortest message queue (workers are serial, so queue
   length is the work owed).
-  ⚠️ **Only an explicit card list; no `auto`**: on a shared box other tenants use
-  the GPUs too, and an embedded library should not claim every card by default.
-  The same card in two instances is rejected.
+  ⚠️ The same card in two instances is rejected (a config error; `per_gpu` is the
+  explicit way to ask for replication).
   ⚠️ **Startup is sequential** (N model loads; 542 ms measured for 0.6B).
   Deliberately not parallel or lazy — that would let a worker's startup failure
   bypass the supervisor's start-time check, and the "a configured embedder that
@@ -214,7 +240,7 @@ self-check margin (near-synonym − unrelated) 0.59.
 
 ### Regression
 
-- `rebar3 eunit` **132/132** (23 local-embedding cases + 31 embedder
+- `rebar3 eunit` **138/138** (25 local-embedding cases + 39 embedder
   process/pool/batch cases + 14 network-free HTTP parsing unit tests; the
   model-dependent ones skip gracefully when the NIF is not built), `rebar3 xref`
   clean, `rebar3 dialyzer` **zero warnings**.
