@@ -36,6 +36,44 @@ C++23 NIF（`cask_cpp`）是唯一可用的模式。`bitcask_legacy.erl` 已被�
 | `bitcask:is_empty_estimate/1` | `cask_is_empty/1`  | O(1) 估算                                      |
 | `bitcask:is_frozen/1`         | `cask_is_frozen/1` | Keydir 冻结状态                               |
 | `bitcask:close_write_file/1`  | `cask_close_write_file/1` | 释放写锁，保持句柄可用        |
+| `bitcask:range/2,3`           | `cask_range_start/2` + iterators | **6.0.0**：`[Lo,Hi)` 有序范围查询，O(range) |
+| `bitcask:range_fold/5`        | `cask_range_start/2` + iterators | 同上，流式；回调 `Fun(K,V,Tstamp,Ord,Acc)` |
+| `bitcask:put_batch_atomic/2`  | `cask_put_batch_atomic/2` | **6.0.0**：跨崩溃原子批 |
+| `bitcask:txn_commit/2,3`      | `cask_txn_commit/3` | **6.0.0**：多键事务（原子批 + 校验 + fsync 策略） |
+
+## 版本升级：5.x → 6.0.0 的盘上格式门禁
+
+> ⚠️ **本仓库 5.x 写出的目录，用 6.0.0 打开会被干净拒绝**，必须先离线迁移一次。
+
+原因是上游 libbitcask 5.1.0 的 **hint 内嵌 ord flag-day**：hint 记录新增 `ord`
+字段（magic `BCH4` → `BCH5`），`bitcask.meta` v4 → **v5** 作为唯一纪元门禁。
+拒绝是刻意的——按新语义读旧字节会让 BCH4 hint 被逐文件判成校验失败、静默退回
+`fold(data)`，把纪元错位掩盖掉。
+
+迁移是**非破坏性**的：data 文件硬链接（字节零改动），只重生成 hint + meta；
+meta 最后写 = commit point，幂等可重跑。
+
+```sh
+# 先确认纪元
+_build/cmake/libbitcask-build/bitcask_migrate detect  <目录>
+# 迁移（源目录不动，产出新目录）
+_build/cmake/libbitcask-build/bitcask_migrate hintord <旧目录> <新目录>
+```
+
+`bitcask_migrate` 由本仓库的 CMake 构建顺带产出（`rebar3 compile` 之后就在
+`_build/cmake/libbitcask-build/` 下）。
+
+**打不开时怎么认出是这件事**：6.0.0 起 `open/2` 会把上游的原因带回来——
+
+```erlang
+{error, {io_error, <<"read meta failed: ord-less-hint era format (meta v4); "
+                     "run `bitcask_migrate hintord <src> <dst>` to migrate ...">>}}
+```
+
+> 反过来不成立：**6.0.0 写出的目录不能被旧版打开**。升级请单向进行。
+>
+> 另外，用过 `put_batch_atomic/2` 或 `txn_commit/2,3` 的目录 meta 会**懒升级为
+> v6**，此后连上游 5.1.0 都打不开。从不调用这两个入口的目录停留在 v5。
 
 ## 选项
 

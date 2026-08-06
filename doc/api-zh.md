@@ -38,6 +38,21 @@ reference。后续所有调用都传整个元组。未配 embedder 时 `Embedder
 | `{max_file_size, N}` | 超过 N 字节切下一个 active 文件 | 2 GiB | 字节 |
 | `{sync_strategy, S}` | `none` \| `o_sync` \| `{seconds, N}` | `none` | — |
 | `{tombstone_version, V}` | 墓碑编码版本 | `2` | `1` \| `2` |
+| `{max_read_handles, N}` | read 句柄缓存上限（每句柄 = 1 fd + 1 sealed mmap） | `0` = 自动 | 自动档由 `RLIMIT_NOFILE` 推导并**夹在 `[64, 1024]`**（6.0.0）；`unlimited` = 显式不限 |
+| `{keydir_cache_entries, N}` | **6.0.0**：keydir 磁盘驻留 Level B 的热点缓存条目预算 | `0` = 不限 = 全内存 | `> 0` 才 opt-in；见下 |
+
+**`keydir_cache_entries` 详解。** `0`（默认）= 现状，keydir 全内存。`> 0` 时
+keydir 降级为热点缓存（超预算分片内采样逐出），点查权威 = 缓存 → memdelta →
+BCOK v2 run（内嵌 bloom + 块 LRU，冷 get ≤2 次 pread）；`fold`/`range` 在逐出态
+经组合视图完整枚举。上游 1 亿 `doc:` key 实测：常驻 11 GB → **加载峰值 1.14 GB /
+重开 0.80 GB（-90%）**，热 get/put/merge 零回归。
+
+> ⚠️ 首次在未带 Level B 戳的目录上开启会**全量重建 OKI**（那一次 open 慢）；
+> 此后 manifest 带戳，重开快。
+> ⚠️ Level A（不设此项）的写者重开会**清戳**，再回 Level B 时重建自愈。
+> ⚠️ `merge_only` 旁车与 Level B 目录**互斥**——open 直接拒绝（旁车的无挂钩搬迁
+> 会静默腐蚀组合视图的位置权威）。
+> 预算是软目标（fold 活跃期暂停逐出）。
 
 *合并阈值*（供 `needs_merge`/`merge`）：`frag_merge_trigger`、
 `dead_bytes_merge_trigger`、`frag_threshold`、`dead_bytes_threshold`、
@@ -144,6 +159,69 @@ embedder 生成并写入向量；显式传 `vector` 则跳过。
 
 `MaxAge` 单位**微秒**（`-1`/负数 = 不限）。`MaxPut` 限制 fold 期间允许的写入次数
 （`-1` = 不限）。
+
+---
+
+## 有序范围查询（6.0.0）
+
+按 key 字典序遍历 `[Lo, Hi)`，代价 **O(range)**，不是 O(全表) 过滤。底座是 OKI
+有序 key 索引。
+
+> ⚠️ **不是快照。** 一致性是 per-key 弱一致（与 `parallel_scan` 同档）——迭代期间
+> 的并发写可能部分可见。需要快照请用 `fold`。
+
+| 函数 | 说明 |
+|------|------|
+| `range(Handle, {Lo, Hi}) -> [{Key, Value}] \| {error,_}` | `Lo` 含、`Hi` 不含；任一端可为 `undefined` = 无界 |
+| `range(Handle, {Lo, Hi}, Opts)` | 同上，带调优选项 |
+| `range_fold(Handle, {Lo, Hi}, Opts, Fun, Acc0)` | `Fun(K, V, Tstamp, Ord, Acc) -> Acc'`；流式，不在内存里堆全量结果 |
+
+`Opts`：
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `{prefetch, N}` | `0`（关） | `N > 1` 时一次归并 N 个 key 并发取值。**只改取值时机，输出序与内容不变。** 大窗口 + 冷值收益明显；小窗口反被线程创建成本吃掉 |
+| `{prefetch_threads, N}` | `0` | `0` = `min(在线核数, 4)`；批内 key 数不足时按 key 数收窄 |
+
+前缀扫描的惯用写法是把上界设成前缀的**下一个字节**：
+`range(H, {<<"user:">>, <<"user;">>})`。
+
+目录没有 OKI → `{error, no_index}`，这时候回落到 `fold` + 前缀过滤。
+
+> **只读打开有数据的库，range 是正常的**——RW 会话已把 OKI 落盘，RO 直接读，
+> 不需要（也无权）重建。会报 `no_index` 的是**从未写过的空目录**，以及 OKI
+> 损坏且当前句柄无法重建的情况。
+>
+> ⚠️ 这两种成因在引擎那一层看都是「拿不到 read view」，所以**没有**被统一压成
+> 空结果 `[]`——那样会让「一个有数据的库因为索引坏了而静静地返回空」变得
+> 无法察觉。报错让调用方自己决定怎么回落，是刻意的选择。
+
+---
+
+## 原子批与多键事务（6.0.0）
+
+`Ops :: [{put, Key, Value} | {remove, Key}]`，`Key`/`Value` 都是 `binary()`。
+形态不认（标签错 / 元数错 / 非 binary）一律 `badarg`——**绝不静默丢弃**，
+批里悄悄少一条会让「原子」失去意义。
+
+崩溃/掉电后**整批要么全生效要么全不生效**（盘上批头声明区间，恢复时区间不完整
+即整批截断）。
+
+> ⚠️ 原子性与持久性**正交**：没 fsync 就掉电仍可能整批丢失，但绝不半批。
+> ⚠️ **不提供隔离性（I）与 CAS**：中间态对并发读者可见；键集重叠的并发提交无
+> 定序保证，需应用层串行化。键集不相交则并发安全。
+> ⚠️ **首次调用把目录 `bitcask.meta` 懒升级为 v6**，此后不能被早于上游 5.1.0 的
+> 读端打开。从不调用的目录停留在 v5。
+
+| 函数 | 说明 |
+|------|------|
+| `put_batch_atomic(Handle, Ops) -> ok \| {error,_}` | 裸批。允许批内同 key 多次（依序 apply = 批内 LWW）；空批是 no-op |
+| `txn_commit(Handle, Ops) -> ok \| {error,_}` | 等价 `txn_commit(H, Ops, sync_on_commit)` |
+| `txn_commit(Handle, Ops, Sync)` | `Sync :: sync_on_commit \| no_sync` |
+
+`txn_commit` 比 `put_batch_atomic` 多一层校验：批非空、key 非空、key 互不重复、
+不占用 `"_txn:"` 保留前缀。违反任一条 → `{error, {invalid_option, Msg}}` 且
+**零副作用**。`Sync` 取值非法 → `function_clause`（Erlang 层就挡掉）。
 
 ---
 

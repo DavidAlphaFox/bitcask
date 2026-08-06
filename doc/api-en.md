@@ -39,6 +39,26 @@ on-disk meta), `{bad_embedder, _}`, `{bad_opt, _}`.
 | `{max_file_size, N}` | Roll active data file past N bytes | 2 GiB | bytes |
 | `{sync_strategy, S}` | `none` \| `o_sync` \| `{seconds, N}` | `none` | — |
 | `{tombstone_version, V}` | Tombstone encoding | `2` | `1` \| `2` |
+| `{max_read_handles, N}` | Read-handle cache cap (each handle = 1 fd + 1 sealed mmap) | `0` = automatic | The automatic tier derives from `RLIMIT_NOFILE` and is **clamped to `[64, 1024]`** (6.0.0); `unlimited` disables the cap explicitly |
+| `{keydir_cache_entries, N}` | **6.0.0**: hot-cache entry budget for the disk-resident keydir (Level B) | `0` = unlimited = fully in memory | Opt-in only when `> 0`; see below |
+
+**`keydir_cache_entries` in detail.** `0` (default) keeps today's behaviour: the
+keydir lives entirely in memory. With `> 0`, the keydir degrades to a hot cache
+(sampled eviction within over-budget shards), and point lookups resolve through
+cache → memdelta → BCOK v2 run (embedded bloom + block LRU, cold get ≤2 preads);
+`fold`/`range` enumerate completely through the combined view while evicting.
+Upstream measured 100M `doc:` keys: 11 GB resident → **1.14 GB peak while loading
+/ 0.80 GB on reopen (-90%)**, with no regression on hot get/put/merge.
+
+> ⚠️ Enabling it for the first time on a directory without the Level B stamp
+> triggers a **full OKI rebuild** (that one open is slow); afterwards the
+> manifest carries the stamp and reopens are fast.
+> ⚠️ A Level A writer (one that omits this option) **clears the stamp** on
+> reopen; going back to Level B rebuilds and self-heals.
+> ⚠️ `merge_only` sidecars and Level B directories are **mutually exclusive** —
+> open is refused outright (a sidecar's unhooked relocations would silently
+> corrupt the combined view's positional authority).
+> The budget is a soft target (eviction pauses while a fold is active).
 
 *Merge thresholds* (used by `needs_merge`/`merge`): `frag_merge_trigger`,
 `dead_bytes_merge_trigger`, `frag_threshold`, `dead_bytes_threshold`,
@@ -151,6 +171,81 @@ Iteration is a keydir **snapshot** — writes after the fold starts are not seen
 
 `MaxAge` is in **microseconds** (`-1`/negative = unlimited). `MaxPut` caps writes
 allowed during the fold (`-1` = unlimited).
+
+---
+
+## Ordered range queries (6.0.0)
+
+Walks `[Lo, Hi)` in key lexicographic order at **O(range)** cost rather than
+filtering the whole table. Backed by the OKI ordered-key index.
+
+> ⚠️ **Not a snapshot.** Consistency is per-key weak (the same tier as
+> `parallel_scan`) — writes concurrent with the iteration may be partially
+> visible. Use `fold` when you need a snapshot.
+
+| Function | Notes |
+|----------|-------|
+| `range(Handle, {Lo, Hi}) -> [{Key, Value}] \| {error,_}` | `Lo` inclusive, `Hi` exclusive; either may be `undefined` = unbounded |
+| `range(Handle, {Lo, Hi}, Opts)` | as above, with tuning options |
+| `range_fold(Handle, {Lo, Hi}, Opts, Fun, Acc0)` | `Fun(K, V, Tstamp, Ord, Acc) -> Acc'`; streaming, never materializes the full result |
+
+`Opts`:
+
+| Option | Default | Notes |
+|--------|---------|-------|
+| `{prefetch, N}` | `0` (off) | `N > 1` merges N keys at a time and fetches their values concurrently. **Changes only when values are read — never the output order or contents.** Pays off for large windows over cold values; loses to thread-creation cost on small ones |
+| `{prefetch_threads, N}` | `0` | `0` = `min(online cores, 4)`; narrowed to the key count when a batch is smaller |
+
+The idiomatic prefix scan sets the upper bound to the **byte after** the prefix:
+`range(H, {<<"user:">>, <<"user;">>})`.
+
+No OKI for the directory → `{error, no_index}`; fall back to `fold` plus prefix
+filtering.
+
+> **Read-only opens of a populated database work fine** — the read-write session
+> already persisted the OKI, so a read-only handle just reads it and never needs
+> (or is allowed) to rebuild. What returns `no_index` is a **never-written, empty
+> directory**, plus the case where the OKI is corrupt and the current handle
+> cannot rebuild it.
+>
+> ⚠️ Both causes look identical at the engine layer ("no read view available"),
+> which is why they are **not** collapsed into an empty result `[]` — that would
+> make "a populated database silently returns nothing because its index is
+> broken" undetectable. Surfacing the error and letting the caller choose a
+> fallback is the deliberate choice.
+
+---
+
+## Atomic batches and multi-key transactions (6.0.0)
+
+`Ops :: [{put, Key, Value} | {remove, Key}]`, with `Key`/`Value` both
+`binary()`. Any unrecognized shape (wrong tag, wrong arity, non-binary) raises
+`badarg` — entries are **never silently dropped**, since quietly losing one would
+make "atomic" meaningless.
+
+After a crash or power loss the batch **either fully applies or does not apply at
+all** (the on-disk batch header declares the extent; an incomplete extent
+truncates the whole batch at recovery).
+
+> ⚠️ Atomicity and durability are **orthogonal**: without an fsync, power loss can
+> still lose the entire batch — but never half of one.
+> ⚠️ **No isolation (I) and no CAS**: intermediate state is visible to concurrent
+> readers; concurrent commits with overlapping key sets have no ordering
+> guarantee and must be serialized by the application. Disjoint key sets are safe.
+> ⚠️ **The first call lazily upgrades the directory's `bitcask.meta` to v6**,
+> after which readers older than upstream 5.1.0 cannot open it. Directories that
+> never call it stay at v5.
+
+| Function | Notes |
+|----------|-------|
+| `put_batch_atomic(Handle, Ops) -> ok \| {error,_}` | Raw batch. The same key may repeat (applied in order = intra-batch LWW); an empty batch is a no-op |
+| `txn_commit(Handle, Ops) -> ok \| {error,_}` | Equivalent to `txn_commit(H, Ops, sync_on_commit)` |
+| `txn_commit(Handle, Ops, Sync)` | `Sync :: sync_on_commit \| no_sync` |
+
+`txn_commit` validates beyond `put_batch_atomic`: non-empty batch, non-empty
+keys, no duplicate keys, and no use of the reserved `"_txn:"` prefix. A violation
+returns `{error, {invalid_option, Msg}}` with **zero side effects**. An invalid
+`Sync` raises `function_clause` (rejected in the Erlang layer).
 
 ---
 

@@ -192,6 +192,92 @@ loop(S, Acc) ->
 
 可以在同一个 `Ref` 上同时打开多个流——每个流持有独立的迭代器。
 
+## 有序范围查询（6.0.0）
+
+`fold` 是全表快照，要在其上取一个 key 区间只能全扫再过滤。`range` 走 OKI 有序
+key 索引，代价降到 **O(range)**。
+
+```erlang
+1> R = bitcask:open("/tmp/db", [read_write]).
+2> [bitcask:put(R, K, <<"v">>) || K <- [<<"a">>, <<"user:1">>, <<"user:2">>, <<"z">>]].
+
+%% [Lo, Hi)：Lo 含、Hi 不含
+3> bitcask:range(R, {<<"user:1">>, <<"user:2">>}).
+[{<<"user:1">>,<<"v">>}]
+
+%% 前缀扫描的惯用写法：上界 = 前缀的下一个字节
+4> bitcask:range(R, {<<"user:">>, <<"user;">>}).
+[{<<"user:1">>,<<"v">>},{<<"user:2">>,<<"v">>}]
+
+%% 任一端 undefined = 无界
+5> bitcask:range(R, {<<"user:">>, undefined}).
+[{<<"user:1">>,<<"v">>},{<<"user:2">>,<<"v">>},{<<"z">>,<<"v">>}]
+
+%% 流式：不在内存里堆全量结果；回调多拿到 Tstamp 与 Ord
+6> bitcask:range_fold(R, {undefined, undefined}, [],
+6>                    fun(_K, _V, _T, _O, N) -> N + 1 end, 0).
+4
+```
+
+大范围 + 值不在页缓存时，`{prefetch, N}` 把取值并行化：
+
+```erlang
+7> bitcask:range(R, {<<"user:">>, undefined}, [{prefetch, 64}]).
+```
+
+`prefetch` **只改取值时机，输出序与内容不变**。小范围/热数据上线程创建成本可能
+反超，所以默认关。
+
+> ⚠️ **`range` 不是快照。** 一致性是 per-key 弱一致（与 `parallel_scan` 同档）：
+> 迭代期间的并发写可能部分可见。要快照语义就继续用 `fold`。
+>
+> ⚠️ 只读打开一个从未写过的目录没有 OKI → `{error, no_index}`，此时回落到
+> `fold` + 前缀过滤。
+
+## 原子批与多键事务（6.0.0）
+
+普通 `put` 逐条写，进程崩在中间就是写了一半。原子批把一组操作变成全有全无：
+
+```erlang
+%% Ops :: [{put, Key, Value} | {remove, Key}]
+1> bitcask:put_batch_atomic(R, [{put, <<"a">>, <<"1">>},
+1>                              {put, <<"b">>, <<"2">>},
+1>                              {remove, <<"stale">>}]).
+ok
+
+%% 事务：多一层校验 + 提交点 fsync 策略
+2> bitcask:txn_commit(R, [{put, <<"x">>, <<"1">>}, {put, <<"y">>, <<"2">>}]).
+ok
+3> bitcask:txn_commit(R, [{put, <<"x">>, <<"1">>}], no_sync).   % 不显式 fsync
+ok
+
+%% 校验失败零副作用
+4> bitcask:txn_commit(R, [{put, <<"d">>, <<"1">>}, {put, <<"d">>, <<"2">>}]).
+{error,{invalid_option,<<"txn: duplicate key in ops">>}}
+5> bitcask:get(R, <<"d">>).
+not_found
+```
+
+两者的区别只在校验与 fsync 策略，底层是同一条引擎原子批：
+
+| | `put_batch_atomic/2` | `txn_commit/2,3` |
+|---|---|---|
+| 批内同 key 多次 | 允许（依序 apply = 批内 LWW） | 拒绝（`duplicate key`） |
+| 空批 | no-op，返回 `ok` | 拒绝（`empty ops`） |
+| `"_txn:"` 前缀 key | 允许 | 拒绝（保留前缀） |
+| 提交点 fsync | 跟随 `{sync_strategy, _}` | `sync_on_commit`（默认）显式 fsync，或 `no_sync` |
+
+> ⚠️ **原子性 ≠ 持久性。** 没 fsync 就掉电，可能整批丢失——但绝不会只落一半。
+>
+> ⚠️ **没有隔离性（I），也没有 CAS。** 事务中间态对并发读者可见；键集重叠的并发
+> 提交无定序保证，需要应用层自己串行化。键集不相交则并发安全。
+>
+> ⚠️ **首次调用把目录 `bitcask.meta` 懒升级为 v6**，此后不能被早于上游 5.1.0 的
+> 读端打开。从不调用这两个入口的目录停留在 v5，与旧读端双向互开。
+>
+> ⚠️ 批里任何一条形态不认（标签错、元数错、非 binary、改进列表）一律
+> `badarg`——**绝不静默丢弃**，悄悄少一条会让「原子」失去意义。
+
 ## 崩溃恢复
 
 如果写入进程崩溃，下一次 `bitcask:open(D, [read_write])`
@@ -404,7 +490,14 @@ ok = bitcask_cpp_nifs:cask_close(R).
 | `cask_fold_start/3,4` | 开始迭代 |
 | `cask_fold_next/1` | 下一条目（K, V） |
 | `cask_fold_next_full/1` | 下一条目（K, V, FileId, Offset, Sz, Tstamp, IsTomb） |
+| `cask_fold_next_batch/2` | 批量取下一组 `[{K,V}]`（少 BEAM↔NIF 往返） |
 | `cask_fold_release/1` | 释放迭代器 |
+| `cask_range_start/2` | **6.0.0**：开 range 迭代器；`Opts = [{lo,Bin},{hi,Bin},{prefetch,N},{prefetch_threads,N}]` |
+| `cask_range_next/1` | 下一条 `{ok, K, V, Tstamp, Ord}` \| `done` |
+| `cask_range_next_batch/2` | 批量版；**返回列表短于 BatchSize 即到尾** |
+| `cask_range_release/1` | 释放 range 迭代器（幂等） |
+| `cask_put_batch_atomic/2` | **6.0.0**：裸原子批 |
+| `cask_txn_commit/3` | **6.0.0**：事务提交，第三参 `sync_on_commit` \| `no_sync` |
 | `cask_is_empty/1` | O(1) 空估计 |
 | `cask_is_frozen/1` | Keydir 冻结状态 |
 | `cask_status/1` | `{KeyCount, Files}` |
@@ -420,4 +513,8 @@ ok = bitcask_cpp_nifs:cask_close(R).
 | `{error, bad_crc}`      | 读取时磁盘损坏 | 从备份恢复；合并会跳过这些 |
 | `{error, key_too_large}` | 键 > 65 535 字节 | 格式限制；不可配置 |
 | `{error, value_too_large}` | 值 > 4 GiB | 格式限制 |
-| `{error, no_index}`     | 在 KV 模式 Cask 上调用搜索 | 使用 `{analyzer, ...}` 重新打开 |
+| `{error, no_index}`     | 在 KV 模式 Cask 上调用搜索；**或** `range` 时目录没有 OKI（只读打开一个从未写过的库） | 搜索：用 `{analyzer, ...}` 重开。range：改用 `fold` + 前缀过滤，或以 `read_write` 重开让 OKI 建起来 |
+| `{error, {io_error, Msg}}` | **6.0.0**：IO 域故障但没有 errno——最常见的是 open 撞上盘上格式纪元门禁 | 读 `Msg`，它带着具体做法。v4 目录 → 跑 `bitcask_migrate hintord <src> <dst>`；v1/v2/v3 → 须重灌 |
+| `{error, {invalid_option, Msg}}` | **6.0.0**：选项或参数校验失败（如事务里 key 重复 / 空批 / `_txn:` 保留前缀） | 读 `Msg`；事务类错误**零副作用**，改正后重提交即可 |
+| `{error, closed}`       | 对已 `close` 的句柄发起调用；或父 cask 已关而仍在用 range 迭代器 | 迭代器必须在 `close` 前用完 |
+| `badarg`（异常）        | 参数形态不对——如原子批里某条 op 的标签/元数/类型不合法 | 见「原子批与多键事务」一节的形态约定 |
