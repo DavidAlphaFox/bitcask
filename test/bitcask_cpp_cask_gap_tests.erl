@@ -247,10 +247,17 @@ write_lock_records_active_file_path_test_() ->
             try
                 ok = bitcask:put(R, <<"k">>, <<"v">>),
                 {ok, Bin} = file:read_file(filename:join(D, "bitcask.write.lock")),
-                %% Format: "<pid> <active_data_path>\n"
+                %% Format: "<pid> <active_data_path>\n<start_token>\n".
+                %% The second line is libbitcask 6.2.0 (S37-5): a process
+                %% instance token guarding against PID reuse in stale-lock
+                %% detection. It is always "0" on POSIX (no token available)
+                %% and is written purely to keep the format identical across
+                %% platforms; parsers read only the first line.
                 Lines = binary:split(Bin, <<"\n">>, [global, trim]),
-                ?assertEqual(1, length(Lines)),
-                [Line] = Lines,
+                ?assertEqual(2, length(Lines)),
+                [Line, TokenLine] = Lines,
+                ?assert(TokenLine =/= <<>>),
+                ?assertMatch({match, _}, re:run(TokenLine, "^[0-9]+$")),
                 Parts = binary:split(Line, <<" ">>),
                 ?assertEqual(2, length(Parts)),
                 [_PidBin, Path] = Parts,
