@@ -34,8 +34,11 @@ compile_commands.json
 
 # Third-party dependencies
 # NOTE: benchmark/cppjieba/googletest/limonp/oneTBB/utf8proc/unordered_dense
-# are symlinks into the libbitcask submodule, so they must NOT have a trailing
-# slash (gitignore trailing slash matches directories only, not symlink files).
+# used to be symlinks into the libbitcask submodule (see CMakeLists.txt);
+# libbitcask 6.2.1 resolves its own third_party/ paths, so they are no longer
+# created. The entries stay so leftovers in older checkouts don't show up as
+# untracked — no trailing slash, gitignore's trailing slash matches directories
+# only, not symlink files.
 third_party/benchmark
 third_party/cppjieba
 third_party/googletest
