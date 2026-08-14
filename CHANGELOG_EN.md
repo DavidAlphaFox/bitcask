@@ -3,6 +3,80 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [6.2.1] — 2026-08-14
+
+**Upgrade libbitcask 6.1.0 → 6.2.1** (spanning upstream 6.2.0 and 6.2.1): the
+Windows port, I/O robustness fixes, and a PATCH that touches nothing but the
+build system. Submodule `056127b` → `6e94f77` (tag `6.2.1`). This repo's version
+is aligned to **6.2.1**.
+
+> **No API change for Erlang callers — just rebuild.** Upstream's C API and
+> public C++ headers keep every function signature, enumerator and struct layout
+> unchanged (`SOVERSION` stays `6`); the on-disk format is untouched and there is
+> no migration.
+
+### Changed
+
+- **The `third_party/*` symlink workaround is gone** (`CMakeLists.txt`).
+  Upstream used to reference its own `third_party/` dependencies through
+  `CMAKE_SOURCE_DIR`, which points at the **downstream repo root** once the
+  library is pulled in with `add_subdirectory` — so this repo had to symlink
+  every `third_party/libbitcask/third_party/*` entry into `third_party/*` just
+  to make configure succeed. Upstream 6.2.1 switched all of those paths to
+  `PROJECT_SOURCE_DIR` / `PROJECT_BINARY_DIR`, so they resolve on their own and
+  the `file(CREATE_LINK)` block is deleted.
+  ⚠️ This could **only** be fixed upstream: CMake resets `CMAKE_SOURCE_DIR` when
+  entering a subdirectory scope, so a downstream override has no effect, and the
+  one injection point that could change it (`CMAKE_PROJECT_<name>_INCLUDE`) also
+  flips upstream's `PROJECT_IS_TOP_LEVEL` to true and clobbers the consumer's
+  build directory.
+  Leftover `third_party/{utf8proc,cppjieba,...}` symlinks in older checkouts are
+  harmless — just delete them (the `.gitignore` entries stay so the leftovers
+  don't show up as untracked noise).
+- **`bitcask.write.lock` / `bitcask.merge.lock` gained a second line**
+  (upstream 6.2.0, S37-5): a process instance token, guarding against "a new
+  process reused the crashed process's PID → a genuinely stale lock is never
+  reclaimed". The format becomes `"<pid> <activefile>\n<token>\n"`; on POSIX the
+  token is always `0` (none available) and is written purely to keep the format
+  identical across platforms.
+  ⚠️ It is deliberately a second line rather than an extension of the first:
+  both parsers read only the first line, so **old and new lock files are
+  compatible in both directions**. In this repo only
+  `bitcask_cpp_cask_gap_tests` asserted on the line count; it has been updated.
+- New nested submodule `third_party/zlib` (upstream moved Windows' zlib source
+  from vcpkg to a submodule). **Linux / BSD / macOS still use the system
+  `find_package(ZLIB)` and are unaffected**; `rebar.config`'s pre-hook is
+  already `--recursive`, so it comes along automatically.
+
+### Inherited from upstream 6.2.0 (pure upside here)
+
+- **Torn-tail coverage**: the write offset is anchored to the last complete
+  record, so a half-written record at the tail is no longer treated as valid
+  data after a crash or power loss; "a dropped write shifts field ids" is fixed
+  along with it.
+- **Every raw POSIX call is now behind the `bitcask::io` seam**, with Linux
+  behaviour unchanged; the last long-held `FILE*` is retired and the library
+  boundary only exchanges kernel handles.
+- **SIMD dispatch moved to runtime CPU detection** (CPUID/XGETBV plus a
+  `BITCASK_SIMD_MAX` clamp) with per-ISA translation units — no longer tied to
+  the build machine's instruction set, so moving the binary won't SIGILL.
+- **Windows' 2 GiB per-file ceiling lifted**, Win32 error codes no longer leak
+  into the C API's `errno` field, and narrow paths are UTF-8 on both sides of
+  `std::filesystem` (all Windows-side fixes; invisible on Linux).
+- Upstream CI toolchain moved GCC 13 → 14, with the new warnings cleaned up.
+
+### Verification
+
+- A from-scratch configure (after deleting `_build/cmake`) plus
+  `cmake --build --target bitcask_cpp`: every dependency resolves **without the
+  symlinks**; a `-DBUILD_TESTING=ON` configure was checked too (upstream 6.2.1's
+  second commit fixes the tests/bench subdirectory paths).
+- `rebar3 eunit` **158/158**. Before the test update it was 1 failed — the lock
+  file line-count assertion above, which is a deliberate upstream format
+  evolution, not a regression.
+
+---
+
 ## [6.1.0] — 2026-08-06
 
 **Upgrade libbitcask 6.0.0 → 6.1.0**: "OKI unavailable" is now split into two

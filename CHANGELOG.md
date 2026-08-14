@@ -3,6 +3,62 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [6.2.1] — 2026-08-14
+
+**升级 libbitcask 6.1.0 → 6.2.1**（跨上游 6.2.0 + 6.2.1 两版）：Windows 移植、
+I/O 稳健性收口，以及一个只动构建系统的 PATCH。submodule `056127b` → `6e94f77`
+（tag `6.2.1`）。本仓库版本对齐 **6.2.1**。
+
+> **对 Erlang 调用方零 API 变更，重编即得。** 上游 C API 与 C++ 公开头的
+> 函数签名 / 枚举值 / 结构体布局全部零改动（`SOVERSION` 保持 `6`），盘上格式
+> 不动、无迁移。
+
+### 变更
+
+- **删除 `third_party/*` 符号链接 workaround**（`CMakeLists.txt`）。此前上游用
+  `CMAKE_SOURCE_DIR` 引用自己的 `third_party/` 依赖，被 `add_subdirectory`
+  嵌入时那个变量指的是**本仓库根**，于是本仓库要把
+  `third_party/libbitcask/third_party/*` 逐个链射到 `third_party/*` 才能配置
+  成功。上游 6.2.1 全部改用 `PROJECT_SOURCE_DIR` / `PROJECT_BINARY_DIR`，路径
+  自解析，那段 `file(CREATE_LINK)` 随之删除。
+  ⚠️ 这件事**只能在上游修**：CMake 进入子目录作用域会重设 `CMAKE_SOURCE_DIR`，
+  下游覆盖无效；唯一能改它的注入点（`CMAKE_PROJECT_<name>_INCLUDE`）会把上游的
+  `PROJECT_IS_TOP_LEVEL` 判成真、污染下游构建目录。
+  老检出里遗留的 `third_party/{utf8proc,cppjieba,...}` 符号链接无害，删掉即可
+  （`.gitignore` 条目保留，免得残留变成未跟踪噪音）。
+- **`bitcask.write.lock` / `bitcask.merge.lock` 内容多了第二行**（上游 6.2.0
+  S37-5）：进程实例令牌，用来防「新进程复用了崩溃进程的 PID → 有效的 stale
+  lock 永远回收不掉」。格式变为 `"<pid> <activefile>\n<token>\n"`，POSIX 后端
+  恒为 `0`（无令牌可取），写出来只为两平台格式一致。
+  ⚠️ 刻意加成第二行而不是扩第一行：两个解析器都只看首行，**新旧锁文件双向
+  兼容**。本仓库只有 `bitcask_cpp_cask_gap_tests` 断言过行数，已随之更新。
+- 新增 `third_party/zlib` 嵌套子模块（上游把 Windows 的 zlib 来源从 vcpkg 改为
+  子模块）。**Linux / BSD / macOS 仍走系统 `find_package(ZLIB)`，不受影响**；
+  `rebar.config` 的 pre_hook 本来就是 `--recursive`，会自动带上。
+
+### 随库带入（上游 6.2.0，对本仓库是纯收益）
+
+- **撕裂尾部（torn tail）覆盖**：写入偏移锚定到最后一个完整 record，崩溃 /
+  掉电后尾部半条 record 不再被当成有效数据；「丢写导致字段 id 漂移」一并修复。
+- **全库裸 POSIX 调用收进 `bitcask::io` seam**，Linux 行为零变化；最后一处长驻
+  `FILE*` 退役，库边界只交换内核句柄。
+- **SIMD 改运行期 CPU 探测**（CPUID/XGETBV + `BITCASK_SIMD_MAX` 钳制）并按 ISA
+  分 TU——不再依赖构建机指令集，换机器不会 SIGILL。
+- **解除 Windows 单文件 2 GiB 上限**、Win32 错误码不再污染 C API 的 `errno`
+  字段、窄路径 UTF-8 双端对齐（均为 Windows 侧修复，Linux 无感）。
+- 上游 CI 工具链 GCC 13 → 14，配套清掉新增告警。
+
+### 验证
+
+- 全新 configure（删掉 `_build/cmake` 重来）+ `cmake --build --target
+  bitcask_cpp`：**无符号链接**也能解析到全部依赖；额外验了
+  `-DBUILD_TESTING=ON` 的 configure（上游 6.2.1 第二个 commit 修的是
+  tests/bench 子目录路径）。
+- `rebar3 eunit` **158/158**。改测试前是 1 failed —— 就是上面那条锁文件行数
+  断言，属于上游有意的格式演进，不是回归。
+
+---
+
 ## [6.1.0] — 2026-08-06
 
 **升级 libbitcask 6.0.0 → 6.1.0**：OKI 不可用按成因拆成两个错误码。
