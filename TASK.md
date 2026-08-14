@@ -370,6 +370,27 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## M10 — libbitcask 升级 6.1.0 → 6.2.1（Windows 移植 + 构建路径修复）
+
+> submodule `056127b` → `6e94f77`（tag `6.2.1`，跨上游 6.2.0 + 6.2.1 两版）。
+> C API 与 C++ 公开头零改动（`SOVERSION` 保持 6），盘上格式不动、无迁移。
+> 本仓库 `vsn` → 6.2.1。
+>
+> 起因是上游 6.2.1 修掉了本仓库 `CMakeLists.txt` 里那段 `third_party/*` 符号
+> 链接 workaround 的**成因**：上游用 `CMAKE_SOURCE_DIR` 引用自己的依赖，被
+> `add_subdirectory` 嵌入时那个变量指向下游仓库根。这件事只能在上游修——
+> CMake 进子目录作用域会重设该变量，下游覆盖无效。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M10-1** | submodule pin 6.1.0 → 6.2.1 + `git add` 暂存 gitlink（pre_hook 是 `--recursive`，不先入索引会被复位回 6.1.0——M5-1/M8-1 的老坑，照旧先做）。顺带 init 上游新增的 `third_party/zlib`（Windows 那一支才用，Linux 仍走系统 `find_package(ZLIB)`）。 | ✅ |
+| **M10-2** | 删掉 `CMakeLists.txt` 的 `file(CREATE_LINK)` 循环 + `third_party/` 下 7 个遗留符号链接。⚠️ `.gitignore` 条目**保留**：老检出里的残留不至于变成未跟踪噪音，注释改成说明来历。 | ✅ |
+| **M10-3** | 锁文件格式跟进：上游 6.2.0（S37-5）给 `write.lock` / `merge.lock` 加了第二行进程实例令牌（防 PID 复用误判 stale lock，POSIX 恒 `0`）。Erlang 侧只有 `bitcask_cpp_cask_gap_tests` 断言过行数（写死「恰好 1 行」），改为断言 2 行 + 首行仍是 `<pid> <path>`。⚠️ 这不是回归：两个解析器都只读首行，新旧锁文件双向兼容。 | ✅ |
+| **M10-4** | 回归：全新 configure（删 `_build/cmake` 重来）+ 构建 `bitcask_cpp` 通过，**无符号链接**也能解析全部依赖；额外验 `-DBUILD_TESTING=ON` 的 configure（上游第二个 commit 修的是 tests/bench 子目录路径）。`rebar3 eunit` **158/158**。 | ✅ |
+| **M10-5** | 文档：CHANGELOG / ROADMAP / README（中英）+ `CMakeLists.txt` 版本注释（补 6.2.0 / 6.2.1 两条，含锁格式那个坑）+ `rebar.config` 一句过时的子模块路径描述 + `bitcask.app.src`。⚠️ 无 API 变更，故 `api-zh/en.md` 与 `USAGE.md` **不动**——没有新错误码/新选项要写进错误表。 | ✅ |
+
+---
+
 ## 明确排除（V7+ 或永久取消）
 
 | 条目 | 决策 | 理由 |

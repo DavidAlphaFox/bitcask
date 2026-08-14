@@ -6,6 +6,35 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 6.2.1 shipped
+
+### Following upstream 6.2.0 + 6.2.1 ✅
+
+**No API change** for Erlang callers (zero changes to the C API and public C++
+headers, `SOVERSION` stays 6, on-disk format untouched, no migration) — just
+rebuild. Three things worth recording:
+
+- **Torn-tail coverage** — the write offset is anchored to the last complete
+  record, so a half-written record at the tail is no longer treated as valid
+  data after a crash or power loss. This is the entry with the most production
+  value in this upgrade.
+- **The symlink workaround is deleted** — upstream moved every path to
+  `PROJECT_SOURCE_DIR`, so nothing resolves into the downstream tree when
+  embedded via `add_subdirectory`. This could **only** be fixed upstream: CMake
+  resets `CMAKE_SOURCE_DIR` on entering a subdirectory scope, so a downstream
+  override has no effect.
+- **The lock file gained a second line** — a process instance token guarding
+  against PID reuse in stale-lock detection (always `0` on POSIX). Deliberately
+  a second line rather than an extension of the first, so both parsers (which
+  read only the first line) stay compatible in both directions.
+
+The Windows port (native MSVC x64) is not itself a deliverable here — this
+repo's NIF isn't built on Windows. What it brings is the hardening that came
+with it and that Linux gets too: the io seam, runtime SIMD detection, and the
+GCC 14 warning cleanup.
+
+---
+
 ## 6.1.0 shipped
 
 ### "OKI unavailable" split by cause ✅
