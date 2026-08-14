@@ -18,12 +18,16 @@ set(BITCASK_PRIV_DIR "${CMAKE_SOURCE_DIR}/priv")
 file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 
 # ---------------------------------------------------------------------------
-# libbitcask — git submodule at third_party/libbitcask (6.1.0, commit 056127b)。
+# libbitcask — git submodule at third_party/libbitcask (6.2.1, commit 6e94f77)。
 # 提供 C++ 核心库全部 target（bitcask_cask, bitcask_keydir, ...）。
 #
-# libbitcask 的 CMakeLists.txt 用 CMAKE_SOURCE_DIR 引用 third_party/
-# 依赖路径。在 add_subdirectory 上下文中 CMAKE_SOURCE_DIR 指向本项目根目录，
-# 所以需要把 libbitcask/third_party/* 链射到本项目的 third_party/* 下。
+# ⚠️ 6.2.1 起**不再需要 third_party 符号链接**。此前 libbitcask 的
+# CMakeLists.txt 用 CMAKE_SOURCE_DIR 引用自己的 third_party/ 依赖，被
+# add_subdirectory 进来时那个变量指的是**本仓库根**，于是要把
+# libbitcask/third_party/* 逐个链射到本仓库 third_party/* 下才找得到。
+# 上游改成 PROJECT_SOURCE_DIR 后路径自解析（且覆盖了链接方案从没覆盖到的
+# third_party/zlib），那段 file(CREATE_LINK) 已删除。旧检出里遗留的
+# third_party/{utf8proc,cppjieba,...} 符号链接无害，删掉即可。
 # v1.1.0 新增 unordered_dense（KeyDir 稠密扁平表）依赖。
 # v3.0.0：破坏性 ABI 变更（SOVERSION 1→3），同义词词典改为 open-time 不可变
 # 配置（CaskOptions::synonym_map），运行期 set_synonym_map 已删除。
@@ -62,16 +66,22 @@ file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 # kNoIndex（RO/merge_only 打开无 OKI 的目录 = 本就不建）与新增的
 # kIndexRebuildFailed（可写 open 试建而败 = IO/环境问题）。NIF 侧新增
 # `index_rebuild_failed` atom 映射；无盘上格式变更、无迁移。
+# 6.2.0：Windows 移植（MSVC 原生 x64）+ I/O 稳健性收口。C API 与 C++ 公开
+# 头的签名/枚举/结构体布局零改动（SOVERSION 保持 6），盘上格式不动、无迁移。
+# 对本仓库是纯收益：撕裂尾部覆盖（崩溃后尾部半条 record 不再当有效数据）、
+# 全库裸 POSIX 调用收进 bitcask::io seam、SIMD 改运行期 CPU 探测 + 按 ISA
+# 分 TU。新增 third_party/zlib 子模块（仅 Windows 自带 zlib 那一支用；
+# Linux 仍走系统 find_package(ZLIB)）——rebar.config 的 pre_hook 本来就是
+# `--recursive`，会自动带上。
+# ⚠️ 唯一对外可见的行为变化：bitcask.write.lock / merge.lock 的内容多了
+# **第二行**——进程实例令牌（防 PID 复用误判 stale lock，POSIX 恒为 "0"）。
+# 格式 "<pid> <activefile>\n<token>\n"，两个解析器都只看首行，新旧双向兼容；
+# 本仓库只有 test/bitcask_cpp_cask_gap_tests.erl 断言过行数，已随之更新。
+# 6.2.1：PATCH，只动构建系统——libbitcask 全部路径改用 PROJECT_SOURCE_DIR /
+# PROJECT_BINARY_DIR，被 add_subdirectory 嵌入时不再解析到下游仓库树里。
+# 这正是本文件上面那段符号链接 workaround 的成因，随本次升级一并删除。
 
 # ---------------------------------------------------------------------------
-foreach(_dep utf8proc cppjieba limonp googletest benchmark oneTBB unordered_dense)
-    set(_src "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libbitcask/third_party/${_dep}")
-    set(_dst "${CMAKE_CURRENT_SOURCE_DIR}/third_party/${_dep}")
-    if(EXISTS "${_src}" AND NOT EXISTS "${_dst}")
-        file(CREATE_LINK "${_src}" "${_dst}" SYMBOLIC)
-    endif()
-endforeach()
-
 add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/libbitcask"
                  "${CMAKE_BINARY_DIR}/libbitcask-build")
 
