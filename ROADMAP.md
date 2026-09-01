@@ -6,6 +6,31 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 6.2.2 落地
+
+### 跟随上游 6.2.2 ✅
+
+纯可移植性 PATCH：把上游编译到 **libc++**（FreeBSD 15 / macOS 的默认标准库）上。
+对 Erlang 调用方无 API 变更，对本仓库（GCC/libstdc++）**连生成的代码都不变**——
+重编即得。
+
+- **`AtomicSharedPtr<T>` 移植 shim** — 四处 `std::atomic<std::shared_ptr<T>>`
+  站点改走新头 `bitcask/detail/atomic_shared_ptr.hpp`。有 P0718R2 的标准库
+  （libstdc++）上它就是 `std::atomic` 的别名，逐字零开销；libc++ 至今没有那个
+  偏特化，落到互斥量兜底。这是本次唯一动到公开头的改动，且只换类型别名。
+- **`atomic_ref<const T>` / bundled TBB 头的 `-Werror`** — 两条同类的
+  「libstdc++ 恰好接受、libc++ 不接受」，都在上游收口。本仓库走系统 TBB，
+  第二条无感。
+- **一条真 UB 被 libc++ 抓出来** — `IndexPool.TimeoutReturnsFalseAndDoesNotHang`
+  里的 `ReducerGate` use-after-scope，Linux 上一直是绿的（libstdc++ 静默放过
+  「解锁未持有的 mutex」），libc++ 直接 SIGILL。值得记一笔：这类跨标准库编译
+  的价值不只是多一个平台，还包括把静默 UB 变成必现失败。
+
+FreeBSD / macOS 本身不构成本仓库的交付面（NIF 只在 Linux 构建），带入的是
+上面那条 UB 修复与移植层本身。
+
+---
+
 ## 6.2.1 落地
 
 ### 跟随上游 6.2.0 + 6.2.1 ✅

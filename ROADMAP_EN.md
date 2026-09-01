@@ -6,6 +6,38 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 6.2.2 shipped
+
+### Following upstream 6.2.2 ✅
+
+A pure portability PATCH: it makes upstream compile against **libc++** (the
+default standard library on FreeBSD 15 and macOS). No API change for Erlang
+callers, and for this repo (GCC/libstdc++) **not even the generated code
+changes** — just rebuild.
+
+- **The `AtomicSharedPtr<T>` portability shim** — four
+  `std::atomic<std::shared_ptr<T>>` sites now go through the new header
+  `bitcask/detail/atomic_shared_ptr.hpp`. On a standard library that has P0718R2
+  (libstdc++) it is an alias for `std::atomic`, zero overhead; libc++ still
+  lacks that specialization and falls back to a mutex-backed version. This is
+  the only public-header change in the release, and it swaps a type alias and
+  nothing else.
+- **`atomic_ref<const T>` and `-Werror` over bundled TBB headers** — two
+  instances of the same shape ("libstdc++ happens to accept it, libc++ does
+  not"), both closed upstream. This repo uses the system TBB, so the second one
+  is invisible here.
+- **libc++ caught a genuine UB** — a `ReducerGate` use-after-scope in
+  `IndexPool.TimeoutReturnsFalseAndDoesNotHang`. It had always been green on
+  Linux (libstdc++ silently tolerates unlocking a mutex it does not hold);
+  libc++ traps outright. Worth recording: compiling against a second standard
+  library buys more than one extra platform — it turns silent UB into a
+  deterministic failure.
+
+FreeBSD / macOS are not a delivery surface for this repo (the NIF is built on
+Linux only); what comes across is that UB fix and the portability layer itself.
+
+---
+
 ## 6.2.1 shipped
 
 ### Following upstream 6.2.0 + 6.2.1 ✅

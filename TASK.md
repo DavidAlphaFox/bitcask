@@ -391,6 +391,28 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## M11 — libbitcask 升级 6.2.1 → 6.2.2（libc++ / FreeBSD 可移植性）
+
+> submodule `6e94f77` → `f002e58`（tag `6.2.2`）。PATCH：纯可移植性，C API 与
+> C++ 公开头的签名/枚举/结构体布局零改动（`SOVERSION` 保持 `6`），盘上格式
+> 不动、无迁移。本仓库 `vsn` → 6.2.2。
+>
+> ⚠️ 上游动了公开头（`vector_plugin` / `text_plugin` / `oki_state` /
+> `sealed_segment_vector_plugin` 四处），但**只换类型别名**：
+> `std::atomic<std::shared_ptr<T>>` → `bitcask::detail::AtomicSharedPtr<T>`，
+> 而在 libstdc++ 上后者就是前者的 `using` 别名。本仓库（GCC/libstdc++）的
+> 生成代码逐字不变，Erlang / NIF 侧**零改动**——这是本次没有 M11-2「跟进
+> 代码」步骤的原因，不是漏了。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M11-1** | submodule pin 6.2.1 → 6.2.2 + **先** `git add` 暂存 gitlink 再跑 `git submodule update --recursive`（顺序反了会被复位回 6.2.1——M5-1/M8-1/M10-1 的老坑，这次又踩了一次，记在这里）。上游无新增嵌套子模块。 | ✅ |
+| **M11-2** | 影响面核对：`grep` 本仓库 `cpp/` 有无 `std::atomic<std::shared_ptr>` / `atomic_ref<const` 站点 → **零命中**，无需跟着改 shim；本仓库走系统 TBB（`find_package`），上游那条 bundled TBB 头标 SYSTEM 的修复对这里无感。 | ✅ |
+| **M11-3** | 回归：全新 configure（删 `_build/cmake` 重来，`-DBUILD_TESTING=ON`）+ 构建 `bitcask_cpp` 通过；`rebar3 eunit` **158/158**；`rebar3 do xref, dialyzer` 干净。 | ✅ |
+| **M11-4** | 文档：CHANGELOG / ROADMAP / README（中英）+ `CMakeLists.txt` 版本注释 + `bitcask.app.src` 的 `vsn`。⚠️ 无 API 变更、无新错误码、无新选项，故 `api-zh/en.md` 与 `USAGE.md` **不动**；`rebar.config` 也不动（pre_hook 早就是 `--recursive`）。 | ✅ |
+
+---
+
 ## 明确排除（V7+ 或永久取消）
 
 | 条目 | 决策 | 理由 |
