@@ -3,6 +3,53 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [6.2.2] — 2026-09-01
+
+**升级 libbitcask 6.2.1 → 6.2.2**：纯可移植性 PATCH——把上游编译到 libc++
+（FreeBSD 15 / macOS 的默认标准库）上。submodule `6e94f77` → `f002e58`
+（tag `6.2.2`）。本仓库版本对齐 **6.2.2**。
+
+> **对本仓库是零行为变化的重编。** C API 与 C++ 公开头的函数签名 / 枚举值 /
+> 结构体布局零改动（`SOVERSION` 保持 `6`），盘上格式不动、无迁移。本仓库的
+> Erlang / NIF 代码**一行没改**——上游动的四处都在 GCC/libstdc++ 下逐字
+> 等价（见下）。
+
+### 随库带入（上游 6.2.2）
+
+- **`std::atomic<std::shared_ptr<T>>` 走可移植 shim**。新头
+  `bitcask/detail/atomic_shared_ptr.hpp` 提供 `AtomicSharedPtr<T>`：标准库有
+  P0718R2 偏特化（libstdc++）就 `using` 到 `std::atomic`，**逐字零开销、
+  本仓库的构建产物与 6.2.1 等价**；没有（libc++ 至今未实现）则落到互斥量
+  兜底实现。四处站点换了类型别名：`vector_plugin` 的 `hnsw_`、`text_plugin`
+  的 building 槽、`oki_state` 的 `runs_snap_`、`sealed_segment_vector_plugin`
+  的 `sealed_`/`window_`。
+  ⚠️ 兜底特意不用 `std::atomic_load/store(shared_ptr*)` 那套自由函数——
+  C++20 起 deprecated、C++26 移除，等于把一个已知会到期的依赖写进移植层。
+- **`hnsw.cpp` 的 `adj_load` 去掉 `atomic_ref` 上的 `const`**：libstdc++ 接受
+  `std::atomic_ref<const T>`，libc++ 不接受。被引用的对象本身从不是 const
+  （`adj` 是 `NodeChunk` 堆分配的可变内存，写端 `adj_store` 就在改它），
+  `const_cast` 不引入新的 UB，语义与改前逐字相同。
+- **bundled oneTBB 的公开头改标 SYSTEM**：`find_package(TBB)` 那条本来就带
+  SYSTEM 语义，`add_subdirectory` 源码构建的 `tbb` 目标却只有普通
+  `INTERFACE_INCLUDE_DIRECTORIES`，于是 `oneapi/tbb/*.h` 里的 old-style cast
+  全算进 `-Wold-style-cast` / `-Wsign-conversion`——开 `BITCASK_WERROR` 直接
+  编不过。**本仓库走系统 TBB，不受影响**；受影响的是没有系统 TBB 可用的平台
+  （FreeBSD / macOS / Windows）与 TSan 构建。
+- 测试侧两条修复：`thread_pool_test` 的 `count_os_threads` 补 FreeBSD 实现
+  （`sysctl(KERN_PROC_PID)`；FreeBSD 的 `/proc` 不是 linprocfs，没有 `task/`），
+  以及 `IndexPool.TimeoutReturnsFalseAndDoesNotHang` 里一处真 use-after-scope
+  ——`ReducerGate` 声明在 `pool` 之后 ⇒ 先于 reducer join 析构，改为
+  `shared_ptr` 按值捕获。⚠️ 这条在 Linux 上一直是绿的：libstdc++ 对「解锁
+  一把并不持有的 mutex」静默放过，libc++ 检查返回值直接 SIGILL。
+
+### 验证
+
+- 全新 configure（删掉 `_build/cmake` 重来）+ `cmake --build --target
+  bitcask_cpp` 通过。
+- `rebar3 eunit` **158/158**，xref / dialyzer 干净。
+
+---
+
 ## [6.2.1] — 2026-08-14
 
 **升级 libbitcask 6.1.0 → 6.2.1**（跨上游 6.2.0 + 6.2.1 两版）：Windows 移植、

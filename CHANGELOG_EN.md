@@ -3,6 +3,63 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [6.2.2] — 2026-09-01
+
+**Upgrade libbitcask 6.2.1 → 6.2.2**: a pure portability PATCH — it makes
+upstream compile against libc++ (the default standard library on FreeBSD 15 and
+macOS). Submodule `6e94f77` → `f002e58` (tag `6.2.2`). This repo's version is
+aligned to **6.2.2**.
+
+> **For this repo it is a rebuild with zero behaviour change.** The C API and
+> public C++ headers keep every function signature, enumerator and struct layout
+> unchanged (`SOVERSION` stays `6`); the on-disk format is untouched and there is
+> no migration. Not one line of this repo's Erlang / NIF code changed — all four
+> upstream edits are literally equivalent under GCC/libstdc++ (see below).
+
+### Inherited from upstream 6.2.2
+
+- **`std::atomic<std::shared_ptr<T>>` now goes through a portable shim.** The
+  new header `bitcask/detail/atomic_shared_ptr.hpp` provides
+  `AtomicSharedPtr<T>`: where the standard library has the P0718R2
+  specialization (libstdc++) it is a `using` alias for `std::atomic` — **zero
+  overhead, and this repo's build output is equivalent to 6.2.1's**; where it
+  does not (libc++ still lacks it) it falls back to a mutex-backed equivalent.
+  Four sites switched to the alias: `vector_plugin`'s `hnsw_`, `text_plugin`'s
+  building slots, `oki_state`'s `runs_snap_`, and
+  `sealed_segment_vector_plugin`'s `sealed_`/`window_`.
+  ⚠️ The fallback deliberately avoids the free `std::atomic_load/store(shared_ptr*)`
+  functions — deprecated since C++20 and removed in C++26, i.e. writing a
+  known-expiring dependency into the portability layer.
+- **`adj_load` in `hnsw.cpp` drops the `const` on `atomic_ref`**: libstdc++
+  accepts `std::atomic_ref<const T>`, libc++ does not. The referenced object is
+  never actually const (`adj` is mutable heap memory owned by `NodeChunk`, and
+  the writer `adj_store` mutates it), so the `const_cast` introduces no new UB
+  and the semantics are literally what they were.
+- **Bundled oneTBB's public headers are now marked SYSTEM**: `find_package(TBB)`
+  already carried SYSTEM semantics, but the `tbb` target built from source via
+  `add_subdirectory` only has ordinary `INTERFACE_INCLUDE_DIRECTORIES`, so the
+  old-style casts inside `oneapi/tbb/*.h` counted against `-Wold-style-cast` /
+  `-Wsign-conversion` — a hard build failure with `BITCASK_WERROR` on. **This
+  repo uses the system TBB and is unaffected**; the platforms that were affected
+  are the ones with no system TBB to use (FreeBSD / macOS / Windows) plus TSan
+  builds.
+- Two test-side fixes: `count_os_threads` in `thread_pool_test` gains a FreeBSD
+  implementation (`sysctl(KERN_PROC_PID)` — FreeBSD's `/proc` is not linprocfs
+  and has no `task/`), and `IndexPool.TimeoutReturnsFalseAndDoesNotHang` had a
+  genuine use-after-scope — `ReducerGate` was declared after `pool`, so it was
+  destroyed before the reducer was joined; it is now captured by value as a
+  `shared_ptr`. ⚠️ That one had always been green on Linux: libstdc++ silently
+  tolerates unlocking a mutex it does not hold, libc++ checks the return value
+  and traps.
+
+### Verification
+
+- A from-scratch configure (after deleting `_build/cmake`) plus
+  `cmake --build --target bitcask_cpp` passes.
+- `rebar3 eunit` **158/158**, xref / dialyzer clean.
+
+---
+
 ## [6.2.1] — 2026-08-14
 
 **Upgrade libbitcask 6.1.0 → 6.2.1** (spanning upstream 6.2.0 and 6.2.1): the
