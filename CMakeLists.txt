@@ -18,7 +18,7 @@ set(BITCASK_PRIV_DIR "${CMAKE_SOURCE_DIR}/priv")
 file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 
 # ---------------------------------------------------------------------------
-# libbitcask — git submodule at third_party/libbitcask (6.2.1, commit 6e94f77)。
+# libbitcask — git submodule at third_party/libbitcask (6.2.2, commit f002e58)。
 # 提供 C++ 核心库全部 target（bitcask_cask, bitcask_keydir, ...）。
 #
 # ⚠️ 6.2.1 起**不再需要 third_party 符号链接**。此前 libbitcask 的
@@ -80,6 +80,16 @@ file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 # 6.2.1：PATCH，只动构建系统——libbitcask 全部路径改用 PROJECT_SOURCE_DIR /
 # PROJECT_BINARY_DIR，被 add_subdirectory 嵌入时不再解析到下游仓库树里。
 # 这正是本文件上面那段符号链接 workaround 的成因，随本次升级一并删除。
+# 6.2.2：PATCH，纯可移植性——把库编译到 libc++（FreeBSD 15 / macOS）上。
+# 公开头有改动但**只换类型别名**：四处 std::atomic<std::shared_ptr<T>> 站点
+# （vector_plugin 的 hnsw_、text_plugin 的 building 槽、oki_state 的
+# runs_snap_、sealed_segment_vector_plugin 的 sealed_/window_）改走新头
+# bitcask/detail/atomic_shared_ptr.hpp 的 AtomicSharedPtr<T>——libstdc++ 上
+# 它就是 std::atomic 的 alias，**本仓库（GCC/libstdc++）逐字零变化**，
+# 无 ABI/行为影响；libc++ 缺 P0718R2 偏特化，那边落到互斥量兜底实现。
+# 另有 hnsw adj_load 去掉 atomic_ref 的 const（libc++ 不接受 const 特化）、
+# bundled oneTBB 头改标 SYSTEM（-Werror 在没有系统 TBB 的平台上才可用）。
+# C API 零改动，SOVERSION 保持 6，盘上格式不动、无迁移。
 
 # ---------------------------------------------------------------------------
 add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/libbitcask"
