@@ -44,7 +44,7 @@
 | `bitcask_docmap`        | index.cpp, docmap_ckpt.cpp | text                       | 文档 side tables（`bitcask_index` 是兼容别名） |
 | `bitcask_bm25`          | intersect.cpp, inverted.cpp, query_parser.cpp, segment_v2.cpp | format, io, TBB | BM25 倒排索引 |
 | `bitcask_vector`        | hnsw.cpp, ivf_rq.cpp, diskann.cpp | format, io, TBB     | 向量三引擎 |
-| `bitcask_text`          | analyzer.cpp, jieba_analyzer.cpp | utf8proc, cppjieba   | 分词器 |
+| `bitcask_text`          | analyzer.cpp, jieba_analyzer.cpp | ICU, cppjieba        | 分词器（6.3 起 utf8proc → ICU） |
 | `bitcask_text_plugin`   | text_plugin.cpp, search_arena.cpp, search_cache.cpp, highlighter.cpp | docmap, bm25, text | 文本检索插件 |
 | `bitcask_vector_plugin` | vector_plugin.cpp, ivf_plugin.cpp, diskann_plugin.cpp | vector, docmap | 向量检索插件 |
 | `bitcask_hybrid`        | hybrid_searcher.cpp     | text_plugin, vector_plugin    | RRF 混合检索 |
@@ -94,13 +94,13 @@ endif()
                      │          │ └──────┬───────┘
         ┌──────────┐ │          │        v
         │  format  │─┘          │ ┌──────────────┐
-        └────┬─────┘            │ │ utf8proc     │
+        └────┬─────┘            │ │ ICU          │
              v                  │ └──────────────┘
         ┌──────────┐            │ ┌──────────────┐
         │   zlib   │            └─│ cppjieba     │
         └──────────┘              └──────────────┘
 
-外部依赖：zlib, TBB, utf8proc, cppjieba (全部非 BEAM)
+外部依赖：zlib, TBB, ICU, cppjieba (全部非 BEAM)
 ```
 
 ## NIF 层的胶水职责
@@ -215,6 +215,6 @@ NIF 层不做任何业务逻辑，仅负责类型转换和生命周期管理：
 1. 复制 `cpp/include/` + `cpp/src/` 到独立仓库
 2. 复制 `cpp/CMakeLists.txt` 中 `bitcask_io` 到 `bitcask_cask` 的 target 定义
 3. 移除顶层 `find_package(Erlang REQUIRED)`
-4. 保留 `find_package(ZLIB)`、`find_package(TBB)`、utf8proc、cppjieba 的 FetchContent
+4. 保留 `find_package(ZLIB)`、`find_package(TBB)`、ICU（`BitcaskICU.cmake`，默认系统包）、cppjieba 的 FetchContent
 
 工作量很小，因为核心层从一开始就是独立编译的——NIF 只是链接时的一个可选 consumer。

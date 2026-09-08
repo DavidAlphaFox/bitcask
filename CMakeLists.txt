@@ -18,7 +18,7 @@ set(BITCASK_PRIV_DIR "${CMAKE_SOURCE_DIR}/priv")
 file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 
 # ---------------------------------------------------------------------------
-# libbitcask — git submodule at third_party/libbitcask (6.2.2, commit f002e58)。
+# libbitcask — git submodule at third_party/libbitcask (6.3.1, commit d3d7ac8)。
 # 提供 C++ 核心库全部 target（bitcask_cask, bitcask_keydir, ...）。
 #
 # ⚠️ 6.2.1 起**不再需要 third_party 符号链接**。此前 libbitcask 的
@@ -90,6 +90,21 @@ file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 # 另有 hnsw adj_load 去掉 atomic_ref 的 const（libc++ 不接受 const 特化）、
 # bundled oneTBB 头改标 SYSTEM（-Werror 在没有系统 TBB 的平台上才可用）。
 # C API 零改动，SOVERSION 保持 6，盘上格式不动、无迁移。
+# 6.3.1：跨上游 6.3.0 + 6.3.1 两版。文本底座 utf8proc → **ICU**（S38）：
+# NFKC_Casefold、字符属性与文本编码转换（GB18030 等）改由 ICU 提供，
+# **新增构建依赖**——BITCASK_ICU_PROVIDER=auto（默认）先找系统 ICU 开发包
+# （libicu-dev，要求 ≥ 60），没有才回落 vendored third_party/icu 子模块
+# （380 MB，.gitmodules 标 update = none，`--recursive` 有意跳过，要用需
+# 按 -c submodule.third_party/icu.update=checkout 显式拉）。CI 的 apt 列表
+# 随之补 libicu-dev。C API 纯增量（S39：bitcask_put_doc_ex 多字段文档、
+# meta 编解码、search_text_ex / search_phrase_ex / bool_search_ex 分页、
+# bitcask_search_text_highlight 高亮），既有签名/枚举/结构体布局零改动，
+# SOVERSION 保持 6，NIF 源码零改动。盘上格式：bitcask.meta 保持 v5/v6，
+# 保留字节 [12]/[13] 现记建索引时的 ICU/Unicode 主版本（全零=未记录的
+# 零升级模式，无迁移）；运行期版本不一致只经 log_fn 告警、不拒开。
+# ⚠️ 索引可复现性：分词 = NFKC_Casefold 表 = ICU 版本，系统 ICU 随发行版
+# 漂移时新旧文档可能切成不同 term（召回悄悄变少、无显式症状）；要钉死
+# 版本用 -DBITCASK_ICU_PROVIDER=vendored。
 
 # ---------------------------------------------------------------------------
 add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/libbitcask"

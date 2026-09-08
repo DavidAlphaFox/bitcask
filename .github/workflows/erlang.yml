@@ -27,6 +27,13 @@ jobs:
     steps:
       - uses: lukka/get-cmake@latest
       - uses: actions/checkout@v4
+      # libbitcask 6.3+ 新增 ICU 依赖：BITCASK_ICU_PROVIDER=auto 走系统 ICU
+      # 开发包；vendored 回落（380 MB，update=none 被 --recursive 跳过）在 CI
+      # 不可行，系统包是唯一路。
+      - name: Install ICU (libbitcask 6.3+)
+        run: |
+          apt-get update
+          apt-get install -y libicu-dev
       - name: Compile
         run: ./rebar3 compile
       - name: Run xref and dialyzer
@@ -55,7 +62,7 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build
+          sudo apt-get install -y cmake ninja-build libicu-dev
       - name: Pick compiler
         run: |
           if [ "${{ matrix.compiler }}" = "clang" ]; then
@@ -91,7 +98,7 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build
+          sudo apt-get install -y cmake ninja-build libicu-dev
       - name: Configure
         run: |
           cmake -S . -B _build/asan -G Ninja \
@@ -119,7 +126,7 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build
+          sudo apt-get install -y cmake ninja-build libicu-dev
       - name: Configure
         run: |
           cmake -S . -B _build/tsan -G Ninja \
@@ -150,7 +157,7 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build lcov
+          sudo apt-get install -y cmake ninja-build lcov libicu-dev
       - name: Configure
         run: |
           cmake -S . -B _build/cov -G Ninja \
