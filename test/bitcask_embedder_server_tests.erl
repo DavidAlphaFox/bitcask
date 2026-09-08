@@ -241,6 +241,69 @@ sup_starts_configured_embedder_test_() ->
         end)
     end}.
 
+%% slots => K：K 个同配置并发槽位（池），{embedder, Name} 经 proxy 的
+%% least-queue 挑选透明分摊。这里用 mock provider——并发槽位机制与 provider
+%% 无关，混进模型加载只会让它在 CI 上跑不了。
+sup_slots_pool_test_() ->
+    {timeout, 60, fun() ->
+        with_env(#{name => bc_slots_embedder,
+                   slots => 3,
+                   provider => {custom, bitcask_embedder_mock},
+                   config => #{}},
+                 fun() ->
+            ?assertEqual(ok, application:start(bitcask)),
+            {ok, Ws} = bitcask_embedder_pool:workers(bc_slots_embedder),
+            ?assertEqual(3, length(Ws)),
+            %% 三个 worker 都是独立进程，且注册名稳定可查。
+            ?assertEqual(3, length(lists:usort([whereis(W) || W <- Ws]))),
+            %% 池没有 instances 的卡组语义：worker 不该被注入 gpu_index。
+            %% （间接验证：mock provider 对 config 不敏感，能起来即配置合法。）
+            %% embed 走 proxy 的 qlen 挑选，结果形状与单进程一致。
+            with_dir(fun(Dir) ->
+                H = bitcask:open(Dir, ?VOPTS ++ [{embedder, bc_slots_embedder}]),
+                ok = bitcask:put(H, <<"d1">>, #{text => <<"x x x">>}),
+                ?assertMatch({ok, [{<<"d1">>, _, _}]},
+                             bitcask:search_vector(H, {text, <<"x">>}, 1)),
+                ok = bitcask:close(H)
+            end),
+            {ok, #{started := 3, requested := 3}} =
+                bitcask_embedder_pool:status(bc_slots_embedder)
+        end)
+    end}.
+
+%% slots 与 instances 同时给 = 意图不明，启动期当场死（不是猜一个优先级）。
+sup_slots_conflicts_with_instances_test_() ->
+    {timeout, 60, fun() ->
+        with_env(#{name => bc_bad_embedder,
+                   slots => 2,
+                   instances => [0, 1],
+                   provider => {custom, bitcask_embedder_mock},
+                   config => #{}},
+                  fun() ->
+            ?assertMatch({error, _}, application:start(bitcask))
+        end)
+    end}.
+
+%% 池级别（不走 sup）：slots 展开成 K × 不绑卡 group，坏类型当场拒绝。
+slots_pool_rejects_bad_opts_test_() ->
+    {timeout, 60, fun() ->
+        process_flag(trap_exit, true),
+        ?assertMatch({error, {bad_opt, slots}},
+                     bitcask_embedder_pool:start_link(
+                       {local, bc_bad_slots},
+                       #{slots => zero,
+                         provider => {custom, bitcask_embedder_mock},
+                         config => #{}})),
+        ?assertMatch({error, {bad_opt, {slots_conflicts_with_instances, _}}},
+                     bitcask_embedder_pool:start_link(
+                       {local, bc_bad_slots2},
+                       #{slots => 2, instances => [0],
+                         provider => {custom, bitcask_embedder_mock},
+                         config => #{}})),
+        process_flag(trap_exit, false),
+        ok
+    end}.
+
 %% ⚠️ **本文件里最重要的一条。** 配了 embedder 但起不来（这里用缺 url 的
 %%    openai 模拟"GGUF 路径写错"那一类）时：
 %%      1. application 必须**起不来**——不能静静地降级成没有嵌入能力；

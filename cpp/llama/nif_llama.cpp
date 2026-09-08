@@ -575,12 +575,18 @@ ERL_NIF_TERM nif_backend_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM[]) {
         const char* name = d ? ggml_backend_dev_name(d) : "";
         const char* desc = d ? ggml_backend_dev_description(d) : "";
         // 设备类型让 Erlang 侧能直接数出 GPU 数，不必再过一次 NIF。
+        // ⚠️ b10859 起 ggml 把 integrated GPU 拆成独立的 IGPU 类型（此前一律
+        //    GPU）——设备选择只认 discrete GPU（见 select_devices 的
+        //    `== GGML_BACKEND_DEVICE_TYPE_GPU`），iGPU 在这里必须以自己的
+        //    类型现形，否则「为什么我的核显没被用上」无从诊断。
         const char* type = "unknown";
         if (d) {
             switch (ggml_backend_dev_type(d)) {
                 case GGML_BACKEND_DEVICE_TYPE_CPU:   type = "cpu";   break;
                 case GGML_BACKEND_DEVICE_TYPE_GPU:   type = "gpu";   break;
+                case GGML_BACKEND_DEVICE_TYPE_IGPU:  type = "igpu";  break;
                 case GGML_BACKEND_DEVICE_TYPE_ACCEL: type = "accel"; break;
+                case GGML_BACKEND_DEVICE_TYPE_META:  type = "meta";  break;
                 default: break;
             }
         }

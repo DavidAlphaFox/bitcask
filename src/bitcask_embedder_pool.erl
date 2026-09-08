@@ -106,7 +106,7 @@
 %%    校验本来就是纯函数，提前做，错误就是裸的 {error, {bad_opt, _}}。
 -spec start_link({local, atom()}, map()) -> {ok, pid()} | {error, term()}.
 start_link({local, Name} = Reg, Opts) when is_atom(Name), is_map(Opts) ->
-    case resolve_instances(Opts) of
+    case resolve_groups(Opts) of
         {error, _} = E ->
             E;
         {ok, Groups0, Mode} ->
@@ -134,13 +134,50 @@ start_link({local, Name} = Reg, Opts) when is_atom(Name), is_map(Opts) ->
             end
     end.
 
+%% slots 优先：`slots => K` 是"K 路并发"的直接表达，展开成 K 个不绑卡的
+%% group（worker_spec 对 none 组不注入 gpu_index，配置原样透传）；没给 slots
+%% 才走 instances 那条设备拓扑的路。失败策略沿用 explicit：你要了 K 个槽位，
+%% 起不满就该死给你看，而不是悄悄降成低并发。
+resolve_groups(Opts) ->
+    HasSlots = maps:is_key(slots, Opts),
+    HasInstances = maps:is_key(instances, Opts),
+    if
+        %% 冲突检查必须在这里做，不能留给 resolve_instances——slots 分支
+        %% 在它之前就返回了，留给它就是永远不可达（首版就栽在这）。
+        HasSlots andalso HasInstances ->
+            {error, {bad_opt, {slots_conflicts_with_instances, Opts}}};
+        HasSlots ->
+            case maps:get(slots, Opts) of
+                K when is_integer(K), K >= 1 ->
+                    {ok, lists:duplicate(K, none), explicit};
+                _ ->
+                    {error, {bad_opt, slots}}
+            end;
+        true ->
+            resolve_instances(Opts)
+    end.
+
 %% instances 的三种写法：
 %%   [0,1,2] / [[0,1],[2,3]]  显式 —— **全都必须起来**（见下）
 %%   auto                     由 provider 探测 —— 尽力而为
+%% slots 的写法：
+%%   K（正整数）              K 个**不绑卡**的并发槽位 —— 等价 K × [none]。
+%%
+%% === ⚠️ slots 与 instances 的语义差别 ===
+%%
+%%   instances 绑定的是**设备拓扑**（哪张卡放哪个 instance），每组注入
+%%   `gpu_index`；slots 表达的是**并发度**——K 个同配置 worker，配置原样
+%%   透传（不注入任何 gpu_index，绑卡与否由 config 自带的 backend /
+%%   gpu_index 决定）。K 个 worker = K 份权重 + K 个 context = K 路真正
+%%   并发的 forward；要的是并发就是它的用途，别拿它当"多卡"用。
 resolve_instances(Opts) ->
     case maps:get(instances, Opts, undefined) of
         undefined ->
-            {error, {missing_opt, instances}};
+            %% slots 与 instances 同时给 = 意图不明，当场拒绝而不是猜。
+            case maps:is_key(slots, Opts) of
+                true  -> {error, {bad_opt, {slots_conflicts_with_instances, Opts}}};
+                false -> {error, {missing_opt, instances}}
+            end;
         auto ->
             case provider_auto_instances(Opts) of
                 {error, _} = E -> E;
@@ -271,7 +308,7 @@ is_pool(Ref) ->
 
 %% Groups 已由 start_link 校验并归一（每项是非空的卡下标列表）。
 init({Name, Groups, Mode, Opts}) ->
-    Base = maps:without([instances, name, per_gpu], Opts),
+    Base = maps:without([instances, slots, name, per_gpu], Opts),
     Idxs = lists:seq(0, length(Groups) - 1),
     Names = [worker_name(Name, I) || I <- Idxs],
     %% worker 名字表写一次就不再变（名字稳定，worker 重启也不换），

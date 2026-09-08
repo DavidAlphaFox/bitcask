@@ -76,9 +76,11 @@ embedder_children() ->
         {ok, Spec} when is_map(Spec) ->
             Opts = maps:without([name], Spec),
             Name = maps:get(name, Spec, undefined),
-            case maps:is_key(instances, Spec) of
+            case maps:is_key(instances, Spec) orelse maps:is_key(slots, Spec) of
                 true ->
-                    %% 池：N 个各绑一张（组）卡的 worker，数据并行。
+                    %% 池：instances = N 个各绑一张（组）卡的 worker（设备拓扑，
+                    %% 每组注入 gpu_index）；slots = K 个同配置的并发槽位（配置
+                    %% 原样透传，绑卡与否由 config 自己决定）。
                     %% ⚠️ 必须有注册名——worker 的稳定名字由池名派生。
                     case Name of
                         N when is_atom(N), N =/= undefined ->
@@ -86,7 +88,7 @@ embedder_children() ->
                                bitcask_embedder, {local, N}, Opts)];
                         _ ->
                             erlang:error({bad_embedder_env,
-                                          {instances_requires_name, Name}})
+                                          {pool_requires_name, Name}})
                     end;
                 false ->
                     case Name of
