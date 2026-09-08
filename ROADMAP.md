@@ -6,6 +6,82 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 6.4.0 落地
+
+### 本地嵌入：`slots => K` 并发槽位 + 设备选择只认独立 GPU ✅
+
+两个产品决定，都只动本地嵌入后端（opt-in），核心 KV/检索零变化。
+
+- **`slots => K`（新配置）** — `instances` 表达设备拓扑，`slots` 表达并发度：
+  K 个同配置 worker，配置原样透传（不注入 `gpu_index`），K 份权重 = K 路真正
+  并发的 forward。实现零新机制——复用既有池 + proxy 的 least-queue 挑选，
+  这正是 select_devices 设计注释里"N 句柄 = N 路并行，上层开 N 个句柄"那条
+  路的配置化。起不满就死（意图声明语义）；与 `instances` 互斥，冲突当场拒。
+  ⚠️ "一份权重多 context" 是更好的终局（省 K−1 份权重），但需要新的 NIF API
+  形状（llama_context 不可跨线程共享），留作有实测诉求再动。
+- **iGPU 不参与 GPU 加速** — 随 b10859 的 `IGPU` 设备类型，`select_devices`
+  的 `== GPU` 过滤天然把核显排除；没有独显直接走 CPU。这是升级后"顺手就
+  对了"的一条，但要防退化：过滤点已用源码注释钉死（`!= CPU` 的"简化"会
+  静默把核显拉回来）。设备表 `type` 同步扩为五档，核显现形为 `igpu`，
+  `gpu_count` 不计——诊断时不再出现"核显在列表里却算不出 GPU 数"的糊涂账。
+- **首版即被自家测试抓住的一个真 bug**：冲突检查（slots + instances 同时给）
+  原本放在 `resolve_instances` 里，而 slots 分支在它之前就返回——那条检查
+  永远不可达。新测试当场红，修在 `resolve_groups`。教训同 M12-1：**新分支
+  的前置检查必须跟着分支走，不能留在旧路径里**。
+
+---
+
+## 6.3.2 落地
+
+### llama.cpp 升级 b10257 → b10859 + CPU/Vulkan 构建复核 ✅
+
+本地嵌入后端（opt-in）的 vendored 依赖刷新，**不涉及 libbitcask**——核心
+`bitcask_cpp.so` 零变化。submodule `22dc605` → `ca86fb2`（tag `b10859`）。
+
+- **NIF 零改动** — `nif_llama.cpp` 的 llama.h / ggml-backend.h 符号面（含较新
+  的 `llama_model_n_embd_out` / `llama_get_memory` / `llama_n_ctx_seq`）、
+  注入的全部 `GGML_*` / `LLAMA_*` 选项、后端子目录布局在 b10859 全部在位。
+  这验证了 5.1.0 的一条设计判断：NIF 只压在 llama/ggml 的**稳定公开面**上，
+  vendored 升级就应当是纯重编。
+- **三档构建全路径复核** — CPU-only（`vulkan_built => false` +
+  `cpu_only_build` 诊断如实）、CPU+Vulkan（AUTO 自动开，shader 现编，
+  `libggml-vulkan.so` 落 priv/）、Vulkan 运行期（强制可见设备下枚举/上报/
+  选择全通）。**llvmpipe 默认被上游过滤**（只认 Discrete/Integrated GPU）
+  是设计行为不是回归——软件渲染的 Vulkan 设备跑不动推理内核。
+- **原地升级的残骸** — ggml 0.18 → 0.23，旧 pin 的 `libggml-*.so.0.18.0`
+  留在 priv/（SONAME 链指新文件，无害；`rebar3 clean` 清除）。记一笔：
+  opt-in 后端做版本钉死（tag pin）的代价之一是升级即换 SONAME，priv/ 平铺
+  目录没有 GC，文档里明说比装聪明清理好。
+
+---
+
+## 6.3.1 落地
+
+### 跟随上游 6.3.0 + 6.3.1 ✅
+
+submodule `f002e58` → `d3d7ac8`（tag `6.3.1`）。对 Erlang 调用方**无 API 变更**
+（既有 C API 与 C++ 公开头签名/枚举/布局零改动，`SOVERSION` 保持 6，盘上格式
+不动、无迁移），NIF 源码零改动，重编即得。但**新增构建依赖 ICU**，两处随动：
+
+- **ICU 取代 utf8proc（上游 S38）** — NFKC_Casefold、Unicode 字符属性与文本
+  编码转换（GB18030 等）改由 ICU 提供。默认 `BITCASK_ICU_PROVIDER=auto` 走
+  系统 ICU 开发包（本机 76.1 即可，要求 ≥ 60）；vendored `third_party/icu`
+  是 380 MB 的 `update = none` 子模块，`--recursive` 有意跳过，只作回落。
+  **CI 五个 job 的 apt 列表补 `libicu-dev`**；`rebar.config` 头注释同步
+  （utf8proc 例子过时）。
+- **索引 ↔ Unicode 版本绑定** — `bitcask.meta` 保留字节 `[12]/[13]` 记建索引
+  时的 ICU/Unicode 主版本（全零=未记录，零升级模式，无迁移），重开不一致
+  只告警不拒开。值得记一笔：**分词 = NFKC_Casefold 表 = ICU 版本**——系统
+  ICU 随发行版漂移时召回悄悄变少且无显式症状，这是 utf8proc 时代（版本钉死
+  在源码里）没有的新故障类；要复现性就钉 vendored。
+- **S39 C API 增量（上游）** — 多字段文档 `bitcask_put_doc_ex`、meta 编解码
+  （encode/lookup/iter，调用方不再手拼 varint）、search 分页
+  `search_text_ex` / `search_phrase_ex` / `bool_search_ex`、高亮
+  `bitcask_search_text_highlight`。Erlang 门面暂未开到——没有调用方诉求，
+  先不让 API 面为「可能有用的绑定」扩表；有需求再随小版本加。
+
+---
+
 ## 6.2.2 落地
 
 ### 跟随上游 6.2.2 ✅

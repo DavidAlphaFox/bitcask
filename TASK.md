@@ -413,6 +413,69 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## M12 — libbitcask 升级 6.2.2 → 6.3.1（utf8proc → ICU + S39 C API 增量）
+
+> submodule `f002e58` → `d3d7ac8`（tag `6.3.1`，跨上游 6.3.0 + 6.3.1 两版）。
+> 既有 C API 与 C++ 公开头签名/枚举/结构体布局零改动（新增皆为 additive，
+> `SOVERSION` 保持 `6`），盘上格式不动、无迁移。本仓库 `vsn` → 6.3.1。
+>
+> 最大的一件事不是 API 而是**构建依赖**：上游把文本底座从 utf8proc 迁到
+> ICU（S38）——NFKC_Casefold、字符属性、编码转换全换 ICU。默认
+> `BITCASK_ICU_PROVIDER=auto` 走系统 ICU 开发包（≥ 60）；vendored
+> `third_party/icu` 是 380 MB 的 `update = none` 子模块，`--recursive`
+> 有意跳过（和 llama.cpp 同一哲学：不让全体用户为一个 opt-in 后端背下载）。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M12-1** | submodule pin 6.2.2 → 6.3.1 + **先** `git add` 暂存 gitlink 再跑任何 `rebar3 compile`（M5-1/M8-1/M10-1/M11-1 的老坑这次**又踩了一次**：先 checkout 后编译，pre_hook 把子模块复位回 6.2.2，第一轮 158+750 全绿测的是**旧版**——发现后删 `_build/cmake` 重来，全部门槛按 6.3.1 重验。教训升级：这个坑不再是「记得先 add」，是「**验证前先核对 `git -C third_party/libbitcask describe --tags`**」）。ICU 子模块不拉（`update = none`，系统 76.1 满足 ≥ 60）。 | ✅ |
+| **M12-2** | 影响面核对：S39 新增的 C API（`bitcask_put_doc_ex` / meta 编解码 / `*_ex` 分页 / `bitcask_search_text_highlight`）全是 additive，既有结构体布局零改动；`cask.hpp` 的 diff 是 DocInput 上的编码契约注释；`meta_codec.hpp`（NIF 引用的内部头）未动。**NIF 源码零改动**。 | ✅ |
+| **M12-3** | CI 跟进：五个 job（eunit 容器 / cpp / asan / tsan / coverage）的 apt 列表补 `libicu-dev`——`auto` provider 走系统 ICU，vendored 回落（380 MB，`update = none`）在 CI 不可行。eunit 容器（erlang 镜像）原本连 ICU 都没有，是本次唯一会**当场红**的 job。 | ✅ |
+| **M12-4** | 回归：全新 configure（删 `_build/cmake` 重来，系统 ICU 76.1）+ `rebar3 compile` 通过；`rebar3 eunit` **158/158**；`ctest`（BUILD_TESTING=ON）**769/769**（上游新增 19 例，含 `meta_unicode_version_test`）；`rebar3 do xref, dialyzer` 干净。⚠️ 换了 ICU 后归一化/分词行为可能有微差，文本用例全绿说明 NFKC_Casefold 路径在 76 与 78 间对本仓库测试语料等价。 | ✅ |
+| **M12-5** | 文档：CHANGELOG / ROADMAP / README（中英）+ `CMakeLists.txt` 版本注释（6.3.1 条：ICU 依赖、provider 三态、meta [12]/[13]、S39 增量）+ `rebar.config` 头注释（utf8proc 例子 → icu + `update = none` 说明）+ `bitcask.app.src` 的 `vsn`。⚠️ 无 Erlang 侧 API 变更，故 `api-zh/en.md` 与 `USAGE.md` **不动**。README 构建节补 ICU 依赖一句。 | ✅ |
+
+---
+
+## M13 — llama.cpp 升级 b10257 → b10859 + CPU/Vulkan 构建复核
+
+> submodule `22dc605` → `ca86fb2`（tag `b10859`，约 600 个上游提交）。本地嵌入
+> 后端（opt-in）的 vendored 依赖刷新，**不涉及 libbitcask**——核心
+> `bitcask_cpp.so` 零变化，无 ABI / 盘上格式变更。本仓库 `vsn` → 6.3.2。
+>
+> 用户诉求是「支持 Vulkan 和 CPU 的构建」——两条路在 5.1.0 就已铺好
+> （`BITCASK_LLAMA_VULKAN=AUTO|ON|OFF` + `GGML_CPU_ALL_VARIANTS`），本次的
+> 实质是**升级后全路径复核**并修掉路上撞到的东西。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M13-1** | 影响面盘点（升级前）：`nif_llama.cpp` 的 llama.h / ggml-backend.h 全符号清单 + 注入的全部 `GGML_*` / `LLAMA_*` 选项 + 后端子目录布局，逐项对照 b10859 源码——全在位（`LLAMA_CURL` 被上游标废弃但仍接受；`ggml_add_backend*` 函数族与 `ggml/src/ggml-<name>` 布局未变，cpp/llama 的递归 target 收集不受影响；`GGML_BACKEND_DL` 下后端改走 MODULE library，收集器本就覆盖）。**NIF 零改动**。 | ✅ |
+| **M13-2** | submodule fetch（shallow tag fetch，网络抖动重试一次）→ checkout `b10859` → `.gitmodules` `branch` 随动 → **先 `git add` 暂存 gitlink**（M5-1/M8-1/M10-1/M11-1/M12-1 老坑；本次 llama 的 pre_hook 是 path-scoped 且只在 `BITCASK_WITH_LLAMA=1` 时跑，风险面比 libbitcask 小，但流程照旧）。 | ✅ |
+| **M13-3** | `BITCASK_WITH_LLAMA=1 rebar3 compile` 全量通过：Vulkan AUTO 自动开（glslc + Vulkan 1.4.309 + SPIRV-Headers 三件齐全）、CUDA AUTO 静默关（无 Toolkit，STATUS 一条，符合设计）、vulkan-shaders-gen 现编、14 个 CPU 变体 + `libggml-vulkan.so`（约 55 MB）+ `bitcask_llama.so` 全部落 `priv/`。 | ✅ |
+| **M13-4** | 运行期复核：`rebar3 eunit --module=bitcask_llama_tests` **25/25**（tier-B 后端发现 / GPU 上报真值 / batch / pool 端到端）；`gpu_status` 三态诊断如实——`vulkan_built => true` + llvmpipe 被**上游默认过滤**（只认 Discrete/Integrated GPU，软件渲染设备跑不动推理内核，设计行为非回归）；`GGML_VK_VISIBLE_DEVICES=0` 强制下枚举出 `Vulkan0` 设备，选择路径全通；CPU-only 档（`BITCASK_LLAMA_VULKAN=OFF`）`vulkan_built => false` + `status => cpu_only_build`。 | ✅ |
+| **M13-5** | ⚠️ 流程坑记录：`rebar3 eunit` 不带 `BITCASK_WITH_LLAMA=1` 会触发 compile pre-hook 把缓存配置回 llama 关（hook 以环境变量为唯一真源，设计如此），之后裸 `cmake --build --target bitcask_llama` 报 `No rule to make target`——第一次 CPU-only 复核就是这样白跑的。教训：**测 llama 全程带环境变量**；per-build 的 `BITCASK_LLAMA_VULKAN` 不经 rebar hook 传递，要变它得直接 cmake configure。另：原地升级 ggml 0.18 → 0.23 会在 priv/ 留 `libggml-*.so.0.18.0` 残骸（SONAME 链指新文件，无害，`rebar3 clean` 清除）。 | ✅ |
+| **M13-6** | 文档：CHANGELOG / ROADMAP / README（中英）+ `doc/local-embedding-zh/en.md` 钉版 tag 行（b10257 → b10859）+ `CMakeLists.txt` llama 注释块（tag + CPU 变体数 13 → 14）+ `bitcask.app.src` 的 `vsn`。`api-zh/en.md`、`USAGE.md` 不动——Erlang 门面零变化。 | ✅ |
+
+---
+
+## M14 — 嵌入槽位（`slots => K`）+ 设备选择只认独立 GPU
+
+> 用户诉求两条：① Vulkan AUTO 不用 iGPU，没有独立 GPU 直接走 CPU；
+> ② 配置并发槽位，让嵌入可以并发执行。①随 6.3.2 的 b10859 升级已在
+> 类型层面成立（`IGPU` 拆分 + 既有 `== GPU` 过滤），本次补诊断与防退化；
+> ②是新配置。**不涉及 libbitcask，无 ABI / 盘上格式变更。** 本仓库
+> `vsn` → 6.4.0。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M14-1** | 影响面盘点（并发模型端到端）：单 `bitcask_embedder_server` 是硬串行点（gen_server 内联跑 NIF，mailbox 即队列）；真并发只有多句柄一条路（一句柄 = 一 model + 一 ctx + mutex，llama_context 不可跨线程共享）；池 + proxy 的 qlen 挑选是既有调度设施，但被 `instances` 的卡组语义绑着。结论：`slots => K` = K 个不绑卡 worker 的池，零新机制。 | ✅ |
+| **M14-2** | `bitcask_embedder_pool`：新增 `resolve_groups/1`——`slots => K` 优先展开成 K × `none`（复用 auto 无卡退化的"不绑卡"组，`worker_spec` 对它不注入 `gpu_index`），Mode 用 `explicit`（起不满就死，意图声明语义）；`init` 的 `maps:without` 补剥 `slots`。 | ✅ |
+| **M14-3** | `bitcask_sup:embedder_children`：池路径的判别从 `is_key(instances)` 扩成 `orelse is_key(slots)`；错误 tag `instances_requires_name` → `pool_requires_name`（无测试引用旧 tag，安全）。 | ✅ |
+| **M14-4** | ⚠️ 首版真 bug 被自家测试抓住：冲突检查（slots + instances 同时给）写在 `resolve_instances` 里，而 slots 分支在它之前返回——检查永不可达，`sup_slots_conflicts_with_instances_test_` 当场红（application 照常起来了）。修法：冲突检查上提 `resolve_groups`，与分支同在。**教训：新分支的前置检查必须跟着分支走。** | ✅ |
+| **M14-5** | iGPU 诊断跟进：`nif_backend_info` 的 type→atom 映射补 `IGPU`/`META` 两档（此前落到 `unknown`——b10859 前不存在这两个枚举值）。`== GGML_BACKEND_DEVICE_TYPE_GPU` 过滤点的"为什么"用源码注释钉死：防将来被简化成 `!= CPU` 静默把核显拉回 GPU 加速。 | ✅ |
+| **M14-6** | 回归：`rebar3 eunit` **161/161**（新增 3 例：slots 池端到端经 sup + `{embedder, Name}` 检索、冲突拒绝、坏参数拒绝）；llama tests **25/25**；xref / dialyzer 干净。 | ✅ |
+| **M14-7** | 文档：CHANGELOG / ROADMAP / README（中英）+ `doc/local-embedding-zh/en.md` 新增 slots 小节与"不用 iGPU"小节（type 五档、gpu_count 语义）+ `bitcask.app.src` 的 `vsn`。`api-zh/en.md` 不动——`{embedder, ...}` 的配置面在 USAGE 与 local-embedding 文档里。 | ✅ |
+
+---
+
 ## 明确排除（V7+ 或永久取消）
 
 | 条目 | 决策 | 理由 |

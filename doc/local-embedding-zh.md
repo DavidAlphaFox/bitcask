@@ -46,7 +46,7 @@ cmake -S . -B _build/cmake -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release \
 cmake --build _build/cmake --target bitcask_llama -j
 ```
 
-首次会拉 `third_party/llama.cpp` 子模块（约 200 MB，钉在 tag `b10257`）并全量
+首次会拉 `third_party/llama.cpp` 子模块（约 200 MB，钉在 tag `b10859`）并全量
 编译，是分钟级。之后增量是 no-op。
 
 构建完 `priv/` 下会多出一组共享库：
@@ -309,6 +309,41 @@ scripts/detect-llama-backends.sh             # 两段都跑
 context。⚠️ 一个 context 同时只服务一次前向，所以同卡多开确实能多几路并发；但它们
 抢同一批 SM，收益**不一定线性**，而显存按份数实打实地涨。这条**没有实测数据**，
 所以是显式选项、不进默认路径。
+
+#### `slots => K`：不绑卡语义的并发槽位（6.4.0）
+
+`instances` / `per_gpu` 表达的都是**设备拓扑**；`slots => K` 表达的是**并发度**：
+K 个同配置 worker，`config` 原样透传（**不注入** `gpu_index`——绑不绑卡、绑哪张，
+由 config 自己的 `backend` / `gpu_index` 决定）。
+
+```erlang
+{ok, _} = application:ensure_all_started(bitcask),
+%% application env:
+%% {embedder, #{name => my_embedder, slots => 4,
+%%              provider => {custom, bitcask_embedder_llama},
+%%              config => #{model_path => <<"...gguf">>, pooling => last}}}
+```
+
+- **K 个 worker = K 份权重 + K 个 context = K 路真正并发的 forward**。请求经
+  `{embedder, Name}` 引用时由 proxy 按 least-queue 分摊，对调用方透明。
+- ⚠️ **权重按份数涨**：0.6B Q8 ≈ 0.7 GB/份，K = 4 就是 ~2.8 GB（GPU 显存或
+  内存）。llama_context 不可跨线程共享，一份权重多 context 需要另一套 NIF API，
+  目前没有；所以并发的价格就是权重份数，文档明说比藏着你强。
+- **起不满就死**（同显式 `instances` 的意图声明语义）：`slots => 4` 只起来 3 个
+  = 配置与现实不符。`slots => 1` 合法但没意义，等于多绕一层池。
+- 与 `instances` 同时给 → 启动期当场拒绝（`{bad_opt,
+  {slots_conflicts_with_instances, _}}`），不猜优先级。
+
+#### 不用 iGPU：设备选择只认独立 GPU（6.4.0，随 llama.cpp b10859）
+
+b10859 起 ggml 把 integrated GPU 从 `GPU` 拆成独立的 **`IGPU`** 设备类型。本仓库
+的设备选择（`select_devices`）只认 `GPU` 类型——**核显（iGPU）不参与 GPU 加速**，
+没有独立 GPU 时直接走 CPU 路径。这是刻意的产品取舍：嵌入模型的推理负载小，
+iGPU 的驱动质量与显存共享策略又参差，收益为负的场景远多于为正的。
+
+诊断时注意 `backend_info()` / `gpu_status()` 的设备表里 `type` 现在有五档：
+`cpu / gpu / igpu / accel / meta`——你的核显会以 `igpu` 出现在列表里但
+`gpu_count` 不计它，这不是 bug，是本节的产品语义。
 
 #### `auto` 的两条规则
 

@@ -6,6 +6,108 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 6.4.0 shipped
+
+### Local embedding: `slots => K` concurrency slots + discrete-GPU-only device selection ✅
+
+Two product decisions, both confined to the local embedding backend (opt-in);
+core KV/search untouched.
+
+- **`slots => K` (new configuration)** — `instances` expresses device
+  topology; `slots` expresses concurrency: K identically-configured workers,
+  config passed through untouched (no `gpu_index` injection), K weight copies
+  = K genuinely concurrent forwards. Zero new mechanisms — it reuses the
+  existing pool + the proxy's least-queue pick, which is precisely the
+  configuration form of the "N handles = N parallel lanes, the upper layer
+  opens N handles" note in select_devices' design comment. Fewer than K
+  started is fatal (intent-declaration semantics); mutually exclusive with
+  `instances`, conflict rejected on the spot. ⚠️ "One weights copy, many
+  contexts" is the better end state (saves K−1 copies) but needs a new NIF
+  API shape (a llama_context cannot be shared across threads) — deferred
+  until a measured demand shows up.
+- **iGPUs never participate in GPU acceleration** — with b10859's `IGPU`
+  device type, `select_devices`' `== GPU` filter excludes iGPUs by nature;
+  no discrete GPU goes straight to CPU. This one came out right "for free"
+  with the upgrade, but regression-proofing matters: the filter point is
+  pinned by a source comment (an `!= CPU` "simplification" would silently
+  pull iGPUs back in). The device-list `type` grew to five values in sync —
+  an iGPU now shows as `igpu` and `gpu_count` does not count it, ending the
+  "the iGPU is in the list but the GPU count says zero" confusion.
+- **A real bug caught by our own tests on the first version**: the conflict
+  check (both `slots` and `instances` given) originally lived in
+  `resolve_instances`, but the slots branch returned before reaching it —
+  the check was unreachable. The new test went red immediately; fixed in
+  `resolve_groups`. Same lesson as M12-1: **precondition checks for a new
+  branch must travel with the branch, not stay behind in the old path**.
+
+---
+
+## 6.3.2 shipped
+
+### llama.cpp b10257 → b10859 + CPU/Vulkan build re-verification ✅
+
+A vendored-dependency refresh for the local embedding backend (opt-in), **no
+libbitcask change** — the core `bitcask_cpp.so` is untouched. Submodule
+`22dc605` → `ca86fb2` (tag `b10859`).
+
+- **Zero NIF changes** — every llama.h / ggml-backend.h symbol the NIF uses
+  (including the newer `llama_model_n_embd_out` / `llama_get_memory` /
+  `llama_n_ctx_seq`), every injected `GGML_*` / `LLAMA_*` option, and the
+  backend subdirectory layout all still exist in b10859. This validates a
+  5.1.0 design judgment: because the NIF sits only on the **stable public
+  surface** of llama/ggml, a vendored upgrade should be a pure rebuild.
+- **All three build modes re-verified end to end** — CPU-only
+  (`vulkan_built => false` + truthful `cpu_only_build` diagnostics),
+  CPU+Vulkan (AUTO turns on by itself, shaders compiled at build time,
+  `libggml-vulkan.so` flattened into priv/), and the Vulkan runtime path
+  (enumeration / reporting / device selection all pass with a forced-visible
+  device). **llvmpipe is filtered by upstream by default** (Discrete/
+  Integrated GPUs only) — that is by design, not a regression: a
+  software-rendered Vulkan device cannot run the inference kernels.
+- **Stale files on in-place upgrades** — ggml 0.18 → 0.23 leaves the old
+  pin's `libggml-*.so.0.18.0` in priv/ (the SONAME chain points at the new
+  files, harmless; `rebar3 clean` removes them). Worth recording: one cost of
+  pinning an opt-in backend to a tag is that an upgrade changes the SONAME,
+  and the flattened priv/ directory has no GC — saying so in the docs beats
+  being clever with cleanup logic.
+
+---
+
+## 6.3.1 shipped
+
+### Following upstream 6.3.0 + 6.3.1 ✅
+
+Submodule `f002e58` → `d3d7ac8` (tag `6.3.1`). **No API change** for Erlang
+callers (existing C API and public C++ header signatures/enumerators/layouts
+untouched, `SOVERSION` stays 6, on-disk format untouched, no migration), zero
+NIF source changes — just rebuild. However there is a **new build dependency:
+ICU**, with two follow-ons here:
+
+- **ICU replaces utf8proc (upstream S38)** — NFKC_Casefold, Unicode character
+  properties and text encoding conversion (GB18030 etc.) now come from ICU.
+  The default `BITCASK_ICU_PROVIDER=auto` uses the system ICU development
+  package (76.1 locally is fine, ≥ 60 required); the vendored
+  `third_party/icu` is a 380 MB `update = none` submodule deliberately skipped
+  by `--recursive`, kept only as a fallback. **All five CI jobs gain
+  `libicu-dev` in their apt lists**; the `rebar.config` header note is updated
+  (the utf8proc example had gone stale).
+- **Index ↔ Unicode version binding** — reserved bytes `[12]/[13]` of
+  `bitcask.meta` record the ICU/Unicode major version at index-build time
+  (all-zero = unrecorded, zero-upgrade pattern, no migration); a mismatch on
+  reopen warns but never refuses to open. Worth recording: **tokenization =
+  the NFKC_Casefold table = the ICU version** — when the system ICU drifts
+  with the distro, recall quietly shrinks with no visible symptom, a new
+  failure class that the utf8proc era (version pinned in-tree) did not have;
+  pin vendored when reproducibility matters.
+- **S39 additive C API (upstream)** — multi-field `bitcask_put_doc_ex`, meta
+  codec (encode/lookup/iter, no more hand-rolled varints), search pagination
+  `search_text_ex` / `search_phrase_ex` / `bool_search_ex`, and
+  `bitcask_search_text_highlight`. Not yet surfaced in the Erlang facade —
+  no caller demand yet, and the API surface should not grow for a "might be
+  useful" binding; add behind a minor release when a need shows up.
+
+---
+
 ## 6.2.2 shipped
 
 ### Following upstream 6.2.2 ✅

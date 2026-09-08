@@ -54,7 +54,7 @@ cmake --build _build/cmake --target bitcask_llama -j
 ```
 
 The first run fetches the `third_party/llama.cpp` submodule (~200 MB, pinned to
-tag `b10257`) and compiles all of it — minutes, not seconds. Incremental builds
+tag `b10859`) and compiles all of it — minutes, not seconds. Incremental builds
 after that are a no-op.
 
 Once built, `priv/` gains a set of shared libraries:
@@ -348,6 +348,51 @@ the same card. ⚠️ A context serves one forward at a time, so several on one 
 does add concurrency; but they contend for the same SMs, the gain is **not
 necessarily linear**, and VRAM grows with the copy count. There is **no measured
 data** for this, so it is an explicit option and never a default.
+
+#### `slots => K`: concurrency slots without device binding (6.4.0)
+
+`instances` / `per_gpu` express **device topology**; `slots => K` expresses
+**concurrency**: K identically-configured workers whose `config` is passed
+through untouched (**no** `gpu_index` is injected — whether and which card to
+bind is decided by the config's own `backend` / `gpu_index`).
+
+```erlang
+{ok, _} = application:ensure_all_started(bitcask),
+%% application env:
+%% {embedder, #{name => my_embedder, slots => 4,
+%%              provider => {custom, bitcask_embedder_llama},
+%%              config => #{model_path => <<"...gguf">>, pooling => last}}}
+```
+
+- **K workers = K weight copies + K contexts = K genuinely concurrent
+  forwards**. Requests via the `{embedder, Name}` reference are spread by the
+  proxy's least-queue pick, transparently to callers.
+- ⚠️ **Weights grow with the copy count**: a 0.6B Q8 model is ≈ 0.7 GB per
+  copy, so K = 4 is ~2.8 GB (GPU VRAM or RAM). A llama_context cannot be
+  shared across threads; one-weights-many-contexts would need a different NIF
+  API that does not exist today — the price of concurrency is weight copies,
+  and saying so beats hiding it.
+- **Failing to start K is fatal** (same intent-declaration semantics as
+  explicit `instances`): `slots => 4` with only 3 started is a config-vs-reality
+  mismatch. `slots => 1` is legal but pointless — extra indirection around a
+  single server.
+- Passing both `slots` and `instances` is rejected at startup
+  (`{bad_opt, {slots_conflicts_with_instances, _}}`) — no silent priority.
+
+#### No iGPU: device selection only accepts discrete GPUs (6.4.0, via llama.cpp b10859)
+
+Since b10859, ggml splits integrated GPUs out of `GPU` into a distinct
+**`IGPU`** device type. This repo's device selection (`select_devices`) only
+accepts the `GPU` type — **iGPUs never participate in GPU acceleration**; with
+no discrete GPU the build goes straight to the CPU path. That is a deliberate
+product call: embedding workloads are small, and iGPU driver quality and
+shared-memory policies are uneven — negative-payoff scenarios far outnumber
+positive ones.
+
+For diagnostics: the device lists in `backend_info()` / `gpu_status()` now have
+five `type` values — `cpu / gpu / igpu / accel / meta`. Your iGPU will appear as
+`igpu` in the list but `gpu_count` does not count it; that is not a bug, it is
+this section's product semantics.
 
 #### The two rules behind `auto`
 

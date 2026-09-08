@@ -24,7 +24,10 @@ rebar3 eunit          # Erlang/NIF 测试 (eunit)
 rebar3 do xref, dialyzer
 ```
 
-要求 Erlang ≥ 22.0。
+要求 Erlang ≥ 22.0；C++ NIF 构建另需 **ICU 开发包**（6.3 起：Debian/Ubuntu
+`libicu-dev`，Fedora `libicu-devel`，macOS `brew install icu4c`）——默认走
+系统 ICU，找不到才回落 vendored `third_party/icu`（380 MB，`--recursive`
+有意跳过）。
 
 可选的本地嵌入后端（llama.cpp），**默认不构建**：
 
@@ -274,7 +277,7 @@ ok
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
 | `doc/unified-architecture-plan-zh.md` | 统一架构计划（已实施） |
 | `doc/libcask-extraction-zh.md` | **libcask 独立库拆分可行性评估**（2.2.0 规划） |
-| `ROADMAP.md` / `ROADMAP_EN.md` | **路线图**：6.2.2 / 6.2.1 / 6.1.0 / 6.0.0 / 5.1.0 / 5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 落地 + 2.1.1 已落地（P5–P15）+ 2.2.0 规划（libcask 独立 / V7+ 向量优化）（中/英） |
+| `ROADMAP.md` / `ROADMAP_EN.md` | **路线图**：6.4.0 / 6.3.2 / 6.3.1 / 6.2.2 / 6.2.1 / 6.1.0 / 6.0.0 / 5.1.0 / 5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 落地 + 2.1.1 已落地（P5–P15）+ 2.2.0 规划（libcask 独立 / V7+ 向量优化）（中/英） |
 | `TASK.md` | 详细任务拆分与历史 |
 
 ## 项目状态
@@ -293,7 +296,10 @@ ok
 - **3.1.0**（2026-07-01）— 升级 libbitcask v3.1.0（ABI 不破坏）：`{max_read_handles, unlimited}` / `{auto_compact_dead_ratio, R}` 选项、错误原子 `closed`；随库引入 read 句柄默认上限（按 `RLIMIT_NOFILE` 自动推导）、`bitcask.meta` v3 加 CRC32、field.schema FSCH v1 头 + CRC
 - **4.0.0**（2026-07-13）— 升级 libbitcask v4.0.0（ABI 破坏，`SOVERSION` 3→4，源码级兼容）：`{vector_engine, hnsw|ivfrq|diskann}` 向量双引擎 + 调优选项、`{auto_checkpoint_min_docs, N}` 崩溃恢复重放有界；随库引入 IVF-RaBitQ-lite 引擎、DiskANN 引擎（实验性）、AVX2 int8 内核、HNSW `.qc8` mmap 化；`examples/` Wikipedia 检索库示例
 - **4.1.0**（2026-07-15）— 升级 libbitcask v4.1.0（ABI 不破坏，`SOVERSION` 保持 4，盘上格式不变）：对 Erlang 调用方**无 API 变更**，重编即得；随库引入 Phase 5/6 深度审计成果——修复 `close/1` 拆卸路径的进程级永久挂死（`IndexPool` 计数泄漏 + `unregister_lib` 无界 `flush`）、hnsw 三处原子写 rename 前补 `fdatasync`（此前崩溃即半截文件）、`RowChunks`/`MmapSegment` 资源泄漏；`file_util` 归并使 fsync 纪律 4 套收敛为 1 套
-- **6.2.2**（2026-09-01，当前版本）— 升级 libbitcask 6.2.1 → **6.2.2**（PATCH，纯可移植性；C API 与 C++ 公开头的签名/枚举/结构体布局零改动，`SOVERSION` 保持 6，盘上格式不动、无迁移）：对 Erlang 调用方**无 API 变更**，本仓库 Erlang / NIF 代码一行没改，重编即得。上游把库编译到 **libc++**（FreeBSD 15 / macOS 的默认标准库）上——四处 `std::atomic<std::shared_ptr<T>>` 改走新的 `AtomicSharedPtr<T>` shim（libstdc++ 上就是 `std::atomic` 的别名，**本仓库逐字零变化**；libc++ 缺 P0718R2 偏特化，落到互斥量兜底）、`hnsw` 的 `atomic_ref` 去 const、bundled oneTBB 头改标 SYSTEM。随库带入一条**真 UB 修复**：`IndexPool` 超时用例里的 use-after-scope，Linux 上一直静默通过（libstdc++ 放过「解锁未持有的 mutex」），libc++ 必炸
+- **6.4.0**（2026-09-08，当前版本）— 本地嵌入后端两个产品决定：**`slots => K` 并发槽位**（新配置：K 个同配置 worker = K 路真正并发的 forward，配置原样透传、proxy least-queue 透明分摊，起不满就死，与 `instances` 互斥）与**设备选择只认独立 GPU**（随 llama.cpp b10859 的 IGPU 类型：核显不参与 GPU 加速，没有独显直接走 CPU——刻意取舍：嵌入负载小、iGPU 驱动与显存共享策略参差）。`backend_info`/`gpu_status` 设备表 `type` 扩为 `cpu/gpu/igpu/accel/meta` 五档。复用既有池机制，核心 KV/检索零变化，无 ABI / 盘上格式变更
+- **6.3.2**（2026-09-08）— 升级 llama.cpp `b10257` → **`b10859`**（本地嵌入后端，opt-in；**不涉及 libbitcask**，核心 `bitcask_cpp.so` 零变化）：NIF 源码零改动，CPU 与 Vulkan 两档构建全路径复核通过——14 个 CPU 变体、`libggml-vulkan.so` 正常落 `priv/`、`build_info` / `gpu_status` 的构建期/运行期诊断三态（vulkan on/off、gpu_count、cpu_only_build）如实。⚠️ 上游沿用「只认 Discrete/Integrated GPU」的 Vulkan 设备过滤：llvmpipe 等 CPU 软件渲染设备默认跳过（`GGML_VK_VISIBLE_DEVICES` 可强制纳入，诊断用）。⚠️ 从旧 pin 原地升级会留下 `libggml-*.so.0.18.0` 残骸（无害，`rebar3 clean` 清除）
+- **6.3.1**（2026-09-08）— 升级 libbitcask 6.2.2 → **6.3.1**（跨上游 6.3.0 + 6.3.1 两版；既有 C API 与 C++ 公开头签名/枚举/结构体布局零改动，新增皆为 additive，`SOVERSION` 保持 6，盘上格式不动、无迁移）：对 Erlang 调用方**无 API 变更**，NIF 代码一行没改，重编即得。⚠️ **新增构建依赖 ICU**（≥ 60）：文本底座从 utf8proc 迁到 ICU（NFKC_Casefold / 字符属性 / GB18030 等编码转换），默认走系统 `libicu-dev`，vendored `third_party/icu`（380 MB，`update = none` 被有意跳过）为回落；CI apt 列表已随动。⚠️ 索引可复现性：分词 = NFKC_Casefold 表 = ICU 版本，系统 ICU 漂移时新旧文档可能切成不同 term（召回悄悄变少、无显式症状），`bitcask.meta` 现记录建索引时的 ICU/Unicode 主版本并在重开不一致时告警（只告警不拒开）；要钉死版本用 `-DBITCASK_ICU_PROVIDER=vendored`。随库带入 S39 C API 增量（多字段文档 `bitcask_put_doc_ex`、meta 编解码、search 分页 `*_ex`、`bitcask_search_text_highlight`），Erlang 门面暂未开到
+- **6.2.2**（2026-09-01）— 升级 libbitcask 6.2.1 → **6.2.2**（PATCH，纯可移植性；C API 与 C++ 公开头的签名/枚举/结构体布局零改动，`SOVERSION` 保持 6，盘上格式不动、无迁移）：对 Erlang 调用方**无 API 变更**，本仓库 Erlang / NIF 代码一行没改，重编即得。上游把库编译到 **libc++**（FreeBSD 15 / macOS 的默认标准库）上——四处 `std::atomic<std::shared_ptr<T>>` 改走新的 `AtomicSharedPtr<T>` shim（libstdc++ 上就是 `std::atomic` 的别名，**本仓库逐字零变化**；libc++ 缺 P0718R2 偏特化，落到互斥量兜底）、`hnsw` 的 `atomic_ref` 去 const、bundled oneTBB 头改标 SYSTEM。随库带入一条**真 UB 修复**：`IndexPool` 超时用例里的 use-after-scope，Linux 上一直静默通过（libstdc++ 放过「解锁未持有的 mutex」），libc++ 必炸
 - **6.2.1**（2026-08-14）— 升级 libbitcask 6.1.0 → **6.2.1**（跨上游 6.2.0 + 6.2.1 两版；C API 与 C++ 公开头零改动，`SOVERSION` 保持 6，盘上格式不动、无迁移）：对 Erlang 调用方**无 API 变更**，重编即得。随库带入上游 Windows 移植（MSVC 原生 x64）与 I/O 稳健性收口——**撕裂尾部覆盖**（写入偏移锚定到最后一个完整 record，崩溃/掉电后尾部半条 record 不再当有效数据）、裸 POSIX 调用收进 `bitcask::io` seam、SIMD 改运行期 CPU 探测（换机器不再 SIGILL）。构建侧：上游路径改用 `PROJECT_SOURCE_DIR` 后，本仓库那段 `third_party/*` 符号链接 workaround 已删除。⚠️ 唯一对外可见的行为变化是 `bitcask.write.lock` 多了第二行（进程实例令牌，POSIX 恒为 `0`），两个解析器都只看首行、新旧双向兼容
 - **6.1.0**（2026-08-06）— 升级 libbitcask 6.0.0 → **6.1.0**（MINOR，纯增量：新枚举值追加在尾部，ABI 未破坏，`SOVERSION` 保持 6，无盘上格式变更、无迁移）：`range` 的「索引不可用」按成因拆成两个错误码——`{error, no_index}`（本句柄本就不建索引：只读/`merge_only` 打开无 OKI 的目录，读写重开即建）与新增的 `{error, index_rebuild_failed}`（可写 open 试建而败，IO/环境问题）。⚠️ 后者意味着**数据在、只有索引不在**，值得告警而不是当成空库
 - **6.0.0**（2026-08-06）— 升级 libbitcask v5.0.0 → **6.0.0**（跨上游 5.1.0 + 6.0.0 两版；ABI 破坏，`SOVERSION` 5→6，本仓库源码级依赖重编即可）：新开三块 API——`range/2,3` + `range_fold/5` 有序范围查询（O(range)，上游实测 15×）、`put_batch_atomic/2` 跨崩溃原子批、`txn_commit/2,3` 多键事务；新增 `{keydir_cache_entries, N}` 选项（keydir 磁盘驻留 Level B，上游 1 亿 key 实测常驻 -90%）；`open/2` 的错误现在带 detail（`{error, {io_error \| invalid_option, Msg}}`）。⚠️ **存量目录必须先离线迁移**：上游 5.1.0 的 hint ord flag-day 使 `bitcask.meta` v4 → v5，5.x 写出的目录被干净拒开，用 `bitcask_migrate hintord <src> <dst>` 非破坏性迁移（data 字节零改动）

@@ -3,6 +3,164 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [6.4.0] — 2026-09-08
+
+本地嵌入后端的两个产品决定：**`slots => K` 并发槽位**（新配置）与
+**设备选择只认独立 GPU**（随 llama.cpp b10859 的 IGPU 类型）。不涉及
+libbitcask，无 ABI / 盘上格式变更。本仓库版本对齐 **6.4.0**。
+
+### Added
+
+- **`slots => K`（embedder application env 配置，6.4.0）**：K 个同配置的
+  并发槽位。与 `instances`（设备拓扑，注入 `gpu_index`）不同，`slots`
+  表达的是并发度——配置**原样透传**，K 个 worker = K 份权重 + K 个 context
+  = K 路真正并发的 forward，请求经 `{embedder, Name}` 引用时由 proxy 按
+  least-queue 透明分摊。失败策略沿用显式 `instances` 的意图声明语义：
+  起不满就死。与 `instances` 同时给 → 启动期当场拒绝，不猜优先级。
+  `slots => 1` 合法但无意义（等于多绕一层池）。实现完全复用既有池机制
+  （`bitcask_embedder_pool` + proxy 的 qlen 挑选），核心 KV/检索零变化。
+  ⚠️ 权重按份数涨（0.6B Q8 ≈ 0.7 GB/份）——llama_context 不可跨线程共享，
+  "一份权重多 context" 需要另一套 NIF API，目前没有；并发的价格文档明说。
+- `backend_info()` / `gpu_status()` 设备表的 `type` 从三档扩到五档：
+  `cpu / gpu / **igpu** / accel / **meta**`（随上游枚举扩展；此前 iGPU 会
+  落到 `unknown`，无从诊断）。
+
+### Changed
+
+- **设备选择只认独立 GPU，iGPU 不参与 GPU 加速**（随 llama.cpp b10859）。
+  b10859 起 ggml 把 integrated GPU 从 `GPU` 拆成独立的 `IGPU` 设备类型，
+  本仓库 `select_devices` 只认 `GPU` 类型——核显不再被当成加速卡，没有
+  独立 GPU 时直接走 CPU。这是刻意取舍：嵌入负载小，iGPU 驱动质量与显存
+  共享策略参差，负收益场景远多于正收益。诊断时核显以 `type => igpu`
+  出现在设备表里但 `gpu_count` 不计——不是 bug，是产品语义。
+
+### 验证
+
+- `rebar3 eunit` **161/161**（新增 3 例：slots 池端到端、冲突拒绝、坏参数
+  拒绝）；`rebar3 eunit --module=bitcask_llama_tests` **25/25**；
+  xref / dialyzer 干净。
+- iGPU 排除依赖真机核显才能端到端断言，本机（无 iGPU）验证的是枚举与
+  `gpu_count` 语义；`== GGML_BACKEND_DEVICE_TYPE_GPU` 的过滤点已在源码
+  注释钉死，防止将来被"简化"成 `!= CPU` 而静默回退。
+
+---
+
+## [6.3.2] — 2026-09-08
+
+**升级 llama.cpp `b10257` → `b10859`**（本地嵌入后端，opt-in），并全路径
+复核 **CPU 与 Vulkan 两档构建**。不涉及 libbitcask 升级——核心 KV/检索
+（`bitcask_cpp.so`）零变化，无 ABI / 盘上格式变更。本仓库版本对齐 **6.3.2**。
+
+### 变更
+
+- submodule `third_party/llama.cpp` `22dc605`（tag `b10257`）→ `ca86fb2`
+  （tag `b10859`），`.gitmodules` 的 `branch` 随动。约 600 个上游提交
+  （推理内核、后端、Vulkan shader 流水线vulkan-shaders-gen 等常规演进）。
+- **NIF 源码零改动**：`cpp/llama/nif_llama.cpp` 依赖的 llama.h / ggml-backend.h
+  符号面（含较新的 `llama_model_n_embd_out` / `llama_get_memory` /
+  `llama_memory_clear` / `llama_n_ctx_seq`）在 b10859 全部在位；根
+  CMakeLists 注入的全部 `GGML_*` / `LLAMA_*` 选项（`GGML_BACKEND_DL` /
+  `GGML_CPU_ALL_VARIANTS` / `LLAMA_BUILD_APP` 等）上游继续存在
+  （`LLAMA_CURL` 被上游标废弃，仍接受，仅告警）；后端子目录布局
+  （`ggml/src/ggml-vulkan` 等）与 `ggml_add_backend*` 函数族未变——
+  cpp/llama 的递归 target 收集不受影响。
+- ggml 版本号 0.18 → 0.23：**从旧 pin 原地升级的检出，`priv/` 会留下上一版
+  的 `libggml-*.so.0.18.0` 残骸**（SONAME 链 `libggml-*.so → .so.0 →
+  .so.0.<new>` 指向新文件，残骸无害但占空间）；`rebar3 clean` 一并清掉。
+
+### 构建复核（b10859，三档全绿）
+
+- **CPU**（`BITCASK_LLAMA_VULKAN=OFF`）：14 个 CPU 变体 + `bitcask_llama.so`，
+  `build_info` 如实上报 `vulkan_built => false`，运行期
+  `gpu_status` 报 `status => cpu_only_build`。
+- **CPU + Vulkan**（默认 `BITCASK_LLAMA_VULKAN=AUTO`，本机三件套齐全时自动
+  开）：`libggml-vulkan.so`（约 55 MB，含编译期生成的 SPIR-V shader）正常
+  产出并落 `priv/`；`vulkaninfo` 可见设备时运行期枚举正常。
+  ⚠️ 上游 b10859 沿用**只认 Discrete/Integrated GPU** 的枚举过滤——
+  llvmpipe 这类 CPU 软件渲染的 Vulkan 设备默认被跳过（设
+  `GGML_VK_VISIBLE_DEVICES` 可强制纳入，仅诊断用）。真机（独显/核显）
+  不受影响。
+- **Vulkan 运行期**：`GGML_VK_VISIBLE_DEVICES=0` 强制下 `gpu_status` 报
+  `gpu_count=1`（`Vulkan0` / llvmpipe / backend => Vulkan），枚举、上报与
+  设备选择路径全通。
+- `rebar3 eunit --module=bitcask_llama_tests` **25/25**（含 tier-B 后端发现、
+  GPU 上报真值、batch/pool 端到端）。
+
+### 验证
+
+- `BITCASK_WITH_LLAMA=1 rebar3 compile` 全量通过（Vulkan AUTO 开 + CUDA
+  AUTO 关，本机无 Toolkit）；关掉 `BITCASK_WITH_LLAMA` 时核心
+  `bitcask_cpp.so` 与 6.3.1 产物等价。
+- ⚠️ 复核流程注意：`rebar3 eunit` **不带** `BITCASK_WITH_LLAMA=1` 会触发
+  compile pre-hook 把缓存配置回 llama 关（设计如此：hook 以环境变量为准），
+  之后再用裸 `cmake --build --target bitcask_llama` 会得到
+  `No rule to make target`。测 llama 时全程带着环境变量跑。
+
+---
+
+## [6.3.1] — 2026-09-08
+
+**升级 libbitcask 6.2.2 → 6.3.1**（跨上游 6.3.0 + 6.3.1 两版）：文本处理底座
+从 utf8proc 整体迁到 **ICU**，外加一组 C API 增量。submodule `f002e58` →
+`d3d7ac8`（tag `6.3.1`）。本仓库版本对齐 **6.3.1**。
+
+> **对 Erlang 调用方零 API 变更，重编即得。** 上游 C API 与 C++ 公开头的
+> 既有签名 / 枚举值 / 结构体布局零改动（新增皆为 additive，`SOVERSION`
+> 保持 `6`），盘上格式不动、无迁移。本仓库的 Erlang / NIF 代码**一行没改**。
+> ⚠️ 但**新增构建依赖 ICU**——全新环境/CI 需要 `libicu-dev`（见下）。
+
+### 新增构建依赖：ICU（≥ 60）
+
+- 上游把 NFKC_Casefold 归一化、Unicode 字符属性与文本编码转换
+  （GB18030 / Big5 / Shift_JIS 等 → UTF-8）从 utf8proc 迁到 ICU（S38）。
+  **默认走系统 ICU 开发包**（Debian/Ubuntu `libicu-dev`，Fedora
+  `libicu-devel`，macOS `brew install icu4c`），找不到才回落 vendored
+  `third_party/icu` 子模块。该子模块约 380 MB 且标了 `update = none`，
+  `git submodule update --init --recursive` **有意跳过它**——要用 vendored
+  需按上游 README 的 `-c submodule.third_party/icu.update=checkout` 显式拉。
+- 本仓库两处随动：CI 工作流五个 job 的 apt 安装列表补 `libicu-dev`；
+  `rebar.config` 头注释的嵌套子模块说明同步（utf8proc 例子已过时）。
+- ⚠️ **索引可复现性**：分词结果 = NFKC_Casefold 表 = ICU 版本。系统 ICU
+  随发行版漂移时，新写入的文档可能与老文档切成不同 term——召回悄悄变少
+  且**没有任何显式症状**。需要钉死版本用
+  `-DBITCASK_ICU_PROVIDER=vendored`（这正是 vendored 模式最实际的用途）。
+
+### 随库带入（上游 6.3.0 / 6.3.1）
+
+- **索引与 Unicode 版本绑定**：`bitcask.meta` 的保留字节 `[12]/[13]` 现记
+  建索引时的 ICU / Unicode 主版本（`0` = 未记录；沿用「保留字节全零即
+  默认」的零升级模式，meta 版本不动、无迁移）。重开时版本不一致经
+  `CaskOptions::log_fn` 告警一条 `kWarn`，**只告警不拒开**。KV 模式目录
+  （无文本分析）与 S38 之前建的目录恒为 0，比对自动跳过。
+- **C API 纯增量（S39）**，Erlang 门面暂未开到（无 Erlang 侧 API 变更）：
+  - `bitcask_put_doc_ex`：多字段文档写入（`bitcask_doc_field_t` /
+    `bitcask_doc_input_ex_t`）——此前纯 C 调用方写不出能被
+    `field:term` 检索的命名字段；
+  - meta 编解码：`bitcask_meta_encode` / `bitcask_meta_blob_free` /
+    `bitcask_meta_lookup` / `bitcask_meta_iter_*`——调用方不再需要照
+    `meta_codec.hpp` 手拼 varint（编码器内部排序，重复 key 当场判非法，
+    那个「Release 下顺序错了静默失配」的坑封在库内）；
+  - 分页：`bitcask_search_text_ex`（filter + offset 全参超集）/
+    `bitcask_search_phrase_ex` / `bitcask_bool_search_ex`——C++ 侧 S13-D10
+    就有的 offset，C 侧此前三个函数全无；深分页成本线性（overfetch
+    k+offset），不提供总命中数；
+  - 高亮：`bitcask_search_text_highlight`（`bitcask_search_result_ex_t`）
+    ——片段来自原文 LRU（默认 1024 条），未命中的冷文档降级为
+    `highlights_count == 0` 的 hit，**结果集不因缓存容量缩水**。
+- 6.3.1 本身只动一处 CMake 输出路径配置；6.3.0 带入 ICU 78.3 与
+  「vendored 数据裁剪默认关」（ICU 78 已对裁剪清单里的部分内部 category
+  报「不存在」，失效点在运行期——省 25 MB 不划算，取舍见上游 README）。
+
+### 验证
+
+- 全新 configure（删掉 `_build/cmake` 重来，系统 ICU 76.1，ICU 子模块
+  未拉取）+ `rebar3 compile` 通过，NIF 源码零改动。
+- `rebar3 eunit` **158/158**；`ctest`（BUILD_TESTING=ON）**769/769**
+  （上游新增 19 个用例，含 `meta_unicode_version_test`）；xref / dialyzer
+  干净。
+
+---
+
 ## [6.2.2] — 2026-09-01
 
 **升级 libbitcask 6.2.1 → 6.2.2**：纯可移植性 PATCH——把上游编译到 libc++

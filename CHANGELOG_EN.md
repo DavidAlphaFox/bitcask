@@ -3,6 +3,203 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [6.4.0] — 2026-09-08
+
+Two product decisions for the local embedding backend: **`slots => K`
+concurrency slots** (new configuration) and **device selection accepting only
+discrete GPUs** (via llama.cpp b10859's IGPU type). No libbitcask change, no
+ABI / on-disk format change. This repo's version is aligned to **6.4.0**.
+
+### Added
+
+- **`slots => K`** (embedder application env, 6.4.0): K identically-configured
+  concurrency slots. Unlike `instances` (device topology, injects
+  `gpu_index`), `slots` expresses concurrency — `config` is passed through
+  untouched; K workers = K weight copies + K contexts = K genuinely concurrent
+  forwards, spread transparently by the proxy's least-queue pick behind the
+  `{embedder, Name}` reference. Failure policy follows the explicit
+  `instances` intent-declaration semantics: starting fewer than K is fatal.
+  Passing both `slots` and `instances` is rejected at startup — no guessed
+  priority. `slots => 1` is legal but pointless (extra indirection around a
+  single server). The implementation reuses the existing pool machinery
+  (`bitcask_embedder_pool` + the proxy's qlen pick); core KV/search untouched.
+  ⚠️ Weights grow with the copy count (0.6B Q8 ≈ 0.7 GB/copy) — a
+  llama_context cannot be shared across threads, and one-weights-many-contexts
+  would need a different NIF API that does not exist today; the price of
+  concurrency is documented, not hidden.
+- The `type` field of the `backend_info()` / `gpu_status()` device lists grew
+  from three to five values: `cpu / gpu / **igpu** / accel / **meta**`
+  (following the upstream enum extension; an iGPU previously fell into
+  `unknown`, which made the situation undiagnosable).
+
+### Changed
+
+- **Device selection only accepts discrete GPUs; iGPUs never participate in
+  GPU acceleration** (via llama.cpp b10859). Since b10859, ggml splits
+  integrated GPUs out of `GPU` into the separate `IGPU` device type, and this
+  repo's `select_devices` accepts only the `GPU` type — an iGPU is no longer
+  treated as an accelerator; with no discrete GPU the path goes straight to
+  CPU. A deliberate trade-off: embedding workloads are small, iGPU driver
+  quality and shared-memory policies are uneven, and negative-payoff scenarios
+  far outnumber positive ones. In diagnostics the iGPU appears as
+  `type => igpu` in the device list while `gpu_count` does not count it —
+  that is not a bug, it is the product semantics of this section.
+
+### Verification
+
+- `rebar3 eunit` **161/161** (3 new cases: slots pool end-to-end, conflict
+  rejection, bad-option rejection); `rebar3 eunit
+  --module=bitcask_llama_tests` **25/25**; xref / dialyzer clean.
+- The iGPU exclusion can only be asserted end-to-end on a machine with a real
+  iGPU; this machine (none) verifies the enumeration and `gpu_count`
+  semantics. The `== GGML_BACKEND_DEVICE_TYPE_GPU` filter point is pinned by a
+  source comment so a future "simplification" into `!= CPU` cannot silently
+  regress it.
+
+---
+
+## [6.3.2] — 2026-09-08
+
+**Upgrade llama.cpp `b10257` → `b10859`** (the local embedding backend,
+opt-in) and re-verify both the **CPU and Vulkan build paths** end to end. No
+libbitcask change — the core KV/search NIF (`bitcask_cpp.so`) is untouched, no
+ABI / on-disk format change. This repo's version is aligned to **6.3.2**.
+
+### Changed
+
+- Submodule `third_party/llama.cpp` `22dc605` (tag `b10257`) → `ca86fb2`
+  (tag `b10859`); the `.gitmodules` `branch` follows. ~600 upstream commits
+  (inference kernels, backends, the vulkan-shaders-gen pipeline, routine
+  evolution).
+- **Zero NIF source changes**: every llama.h / ggml-backend.h symbol the NIF
+  uses (including the newer `llama_model_n_embd_out` / `llama_get_memory` /
+  `llama_memory_clear` / `llama_n_ctx_seq`) still exists in b10859; all
+  `GGML_*` / `LLAMA_*` options injected by the root CMakeLists
+  (`GGML_BACKEND_DL` / `GGML_CPU_ALL_VARIANTS` / `LLAMA_BUILD_APP` etc.)
+  still exist upstream (`LLAMA_CURL` got deprecated upstream — still
+  accepted, warning only); the backend subdirectory layout
+  (`ggml/src/ggml-vulkan` etc.) and the `ggml_add_backend*` function family
+  are unchanged — the recursive target collection in cpp/llama is unaffected.
+- ggml version 0.18 → 0.23: **an in-place upgrade from the old pin leaves
+  stale `libggml-*.so.0.18.0` files behind in `priv/`** (the SONAME chain
+  `libggml-*.so → .so.0 → .so.0.<new>` points at the new files, so the stale
+  ones are harmless but take space); `rebar3 clean` removes them.
+
+### Build re-verification (b10859, all three modes green)
+
+- **CPU** (`BITCASK_LLAMA_VULKAN=OFF`): 14 CPU variants + `bitcask_llama.so`;
+  `build_info` truthfully reports `vulkan_built => false`, runtime
+  `gpu_status` reports `status => cpu_only_build`.
+- **CPU + Vulkan** (default `BITCASK_LLAMA_VULKAN=AUTO`, turns on by itself
+  when the machine has the full toolchain): `libggml-vulkan.so` (~55 MB,
+  including build-time-generated SPIR-V shaders) is produced and flattened
+  into `priv/`; runtime enumeration works when `vulkaninfo` sees a device.
+  ⚠️ b10859 keeps the **Discrete/Integrated-GPU-only enumeration filter** —
+  Vulkan devices backed by CPU software rendering (llvmpipe) are skipped by
+  default (`GGML_VK_VISIBLE_DEVICES` force-includes them, diagnostics only).
+  Real GPUs (discrete/integrated) are unaffected.
+- **Vulkan runtime**: with `GGML_VK_VISIBLE_DEVICES=0` forced, `gpu_status`
+  reports `gpu_count=1` (`Vulkan0` / llvmpipe / backend => Vulkan) —
+  enumeration, reporting and the device-selection path all work.
+- `rebar3 eunit --module=bitcask_llama_tests` **25/25** (including tier-B
+  backend discovery, truthful GPU reporting, batch/pool end-to-end).
+
+### Verification
+
+- `BITCASK_WITH_LLAMA=1 rebar3 compile` passes in full (Vulkan AUTO on +
+  CUDA AUTO off, no toolkit on this machine); with `BITCASK_WITH_LLAMA`
+  unset the core `bitcask_cpp.so` is equivalent to the 6.3.1 artifact.
+- ⚠️ Re-verification workflow note: running `rebar3 eunit` **without**
+  `BITCASK_WITH_LLAMA=1` triggers the compile pre-hook, which by design
+  reconfigures the cache back to llama-off (the env var is the source of
+  truth); a later bare `cmake --build --target bitcask_llama` then fails
+  with `No rule to make target`. Always keep the env var set while testing
+  the llama path.
+
+---
+
+## [6.3.1] — 2026-09-08
+
+**Upgrade libbitcask 6.2.2 → 6.3.1** (spanning upstream 6.3.0 + 6.3.1): the text
+processing substrate moves from utf8proc to **ICU**, plus a batch of additive C
+API. Submodule `f002e58` → `d3d7ac8` (tag `6.3.1`). This repo's version is
+aligned to **6.3.1**.
+
+> **No API change for Erlang callers — just rebuild.** The existing signatures,
+> enumerators and struct layouts of the C API and public C++ headers are all
+> unchanged (everything new is additive; `SOVERSION` stays `6`); the on-disk
+> format is untouched and there is no migration. Not one line of this repo's
+> Erlang / NIF code changed.
+> ⚠️ However there is a **new build dependency: ICU** — fresh environments /
+> CI now need `libicu-dev` (see below).
+
+### New build dependency: ICU (≥ 60)
+
+- Upstream moved NFKC_Casefold normalization, Unicode character properties and
+  text encoding conversion (GB18030 / Big5 / Shift_JIS etc. → UTF-8) from
+  utf8proc to ICU (S38). **The system ICU development package is the default**
+  (Debian/Ubuntu `libicu-dev`, Fedora `libicu-devel`, macOS
+  `brew install icu4c`); only when it is missing does the build fall back to
+  the vendored `third_party/icu` submodule. That submodule is ~380 MB and is
+  marked `update = none`, so `git submodule update --init --recursive`
+  **deliberately skips it** — using vendored ICU requires the explicit
+  `git -c submodule.third_party/icu.update=checkout` fetch from the upstream
+  README.
+- Two follow-ons in this repo: the apt lists of all five CI jobs gain
+  `libicu-dev`, and the nested-submodule note in the `rebar.config` header
+  comment is updated (the utf8proc example had gone stale).
+- ⚠️ **Index reproducibility**: tokenization = the NFKC_Casefold table = the
+  ICU version. When the system ICU drifts with the distro, newly indexed
+  documents may be tokenized into different terms than existing ones — recall
+  quietly shrinks with **no visible symptom at all**. To pin the version, use
+  `-DBITCASK_ICU_PROVIDER=vendored` (the most practical use of vendored mode).
+
+### Brought in with the library (upstream 6.3.0 / 6.3.1)
+
+- **Index ↔ Unicode version binding**: reserved bytes `[12]/[13]` of
+  `bitcask.meta` now record the ICU / Unicode major version at index-build
+  time (`0` = unrecorded; follows the existing "all-zero reserved bytes mean
+  default" zero-upgrade pattern — meta version unchanged, no migration). On
+  reopen with a mismatched version the library logs one `kWarn` through
+  `CaskOptions::log_fn` — **a warning, not a refusal to open**. KV-mode
+  directories (no text analysis) and directories built before S38 stay 0 and
+  are skipped automatically.
+- **Additive C API (S39)**, not yet surfaced in the Erlang facade (no Erlang
+  API change):
+  - `bitcask_put_doc_ex`: multi-field document writes
+    (`bitcask_doc_field_t` / `bitcask_doc_input_ex_t`) — pure C callers
+    previously could not write named fields retrievable via `field:term`;
+  - meta codec: `bitcask_meta_encode` / `bitcask_meta_blob_free` /
+    `bitcask_meta_lookup` / `bitcask_meta_iter_*` — callers no longer
+    hand-roll varints from `meta_codec.hpp` (the encoder sorts internally and
+    rejects duplicate keys on the spot, sealing the "wrong order silently
+    mismatches under NDEBUG" trap inside the library);
+  - pagination: `bitcask_search_text_ex` (a full superset with filter +
+    offset) / `bitcask_search_phrase_ex` / `bitcask_bool_search_ex` — the
+    offset that existed C++-side since S13-D10, previously absent from all
+    three C entry points; deep pagination costs grow linearly (overfetch
+    k+offset) and no total-hit count is provided;
+  - highlighting: `bitcask_search_text_highlight`
+    (`bitcask_search_result_ex_t`) — snippets come from a document-text LRU
+    (default 1024 entries); cold documents that miss degrade to hits with
+    `highlights_count == 0`, so **the result set never shrinks with cache
+    capacity**.
+- 6.3.1 itself changes only one CMake output-path setting; 6.3.0 brings ICU
+  78.3 and "vendored data trimming now defaults to OFF" (ICU 78 already warns
+  "category does not exist" for some internal categories in the trim list —
+  the failure point is at runtime, and saving 25 MB is not worth it; the full
+  trade-off lives in the upstream README).
+
+### Verification
+
+- Fresh configure (deleted `_build/cmake`, system ICU 76.1, ICU submodule not
+  fetched) + `rebar3 compile` passes with zero NIF source changes.
+- `rebar3 eunit` **158/158**; `ctest` (BUILD_TESTING=ON) **769/769** (upstream
+  added 19 cases, including `meta_unicode_version_test`); xref / dialyzer
+  clean.
+
+---
+
 ## [6.2.2] — 2026-09-01
 
 **Upgrade libbitcask 6.2.1 → 6.2.2**: a pure portability PATCH — it makes
