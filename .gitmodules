@@ -5,4 +5,4 @@
 	path = third_party/llama.cpp
 	url = https://github.com/ggml-org/llama.cpp
 	shallow = true
-	branch = b10257
+	branch = b10859
