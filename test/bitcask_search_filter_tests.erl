@@ -309,3 +309,43 @@ encode_meta_round_trip_test_() ->
             bitcask:close(R)
         end)
     end}.
+
+%% ===================================================================
+%% 重开回归(libbitcask 6.3.2 修复):meta 此前只活在内存,docmap ckpt 与
+%% fold 重放都不带,close→reopen 后 eval_meta 恒 false,带 filter 的检索
+%% 一律空集(无 filter 正常)。close 走全量 base ckpt;再写一批 + 再 close
+%% 覆盖「重开后增量 meta 再落盘」。fold/delta 链路径由 C++ 侧
+%% cask_docvalue_test::V5MetaFilterSurvivesReopen 覆盖。
+%% ===================================================================
+
+filter_survives_reopen_test_() ->
+    {"close → reopen 后 [eq category=tech] 仍命中 d1,d3;再写再重开亦然",
+     fun() ->
+        with_dir(fun(D) ->
+            R0 = open_corpus(D),
+            bitcask:close(R0),
+
+            R1 = bitcask:open(D, ?IDX),
+            F = [#{key => <<"category">>, op => eq, value => <<"tech">>}],
+            {ok, All} = bitcask:search_text(R1, <<"learning">>, 10),
+            ?assertEqual(2, length(All)),
+            {ok, Hits1} = bitcask:search_text(R1, <<"learning">>, 10, F),
+            ?assertEqual([<<"d1">>, <<"d3">>],
+                         lists:sort([K || {K, _, _} <- Hits1])),
+            FS = [#{key => <<"category">>, op => eq, value => <<"sport">>}],
+            {ok, []} = bitcask:search_text(R1, <<"learning">>, 10, FS),
+            %% 重开后增量写入(进 delta/base)再重开
+            put_doc(R1, <<"d7">>, <<"reinforcement learning agents">>,
+                    m(#{<<"category">> => <<"tech">>, <<"year">> => 2025})),
+            bitcask:close(R1),
+
+            R2 = bitcask:open(D, ?IDX),
+            {ok, Hits2} = bitcask:search_text(R2, <<"learning">>, 10, F),
+            ?assertEqual([<<"d1">>, <<"d3">>, <<"d7">>],
+                         lists:sort([K || {K, _, _} <- Hits2])),
+            FY = [#{key => <<"year">>, op => gte, value => 2025}],
+            {ok, Hits3} = bitcask:search_text(R2, <<"learning">>, 10, FY),
+            ?assertEqual([<<"d7">>], [K || {K, _, _} <- Hits3]),
+            bitcask:close(R2)
+        end)
+    end}.
