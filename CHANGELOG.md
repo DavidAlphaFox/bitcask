@@ -3,6 +3,41 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [6.5.0] — 2026-09-18
+
+**图处理层落地**：以 libbitcask 为单一存储的 KV-per-key 图存储 + 内存分析层
+（设计：[`doc/graph-layer-design-zh.md`](doc/graph-layer-design-zh.md) / 英文版，
+P1–P5 全部实现）。随库升级 libbitcask submodule `598d080` → `f618e82`
+（6.3.2 → **6.5.0**），含下游反馈三项的全部修复。无 ABI / 盘上格式变更
+（libbitcask C API 纯加法、SOVERSION 保持 6；图层为纯 Erlang）。
+
+### Added
+
+- **`graphdb` 图存储层（KV per-key）**：k=顶点（`n<vid>` DocValue——BM25/向量
+  检索对顶点内容免费生效）、边为定宽大端 key（`e`/`ei` 双向，经
+  `put_batch_atomic` 原子双写，反向键永不悬挂）；邻接 = OKI 前缀 range
+  （O(出度)）；`bfs`/`k_hop`/`shortest_path`（双向，frontier 一顶点一进程
+  并行）；`deg`/`degi` 计数器与 `et` 按类型索引同批维护；`neighbors_where/4`
+  属性过滤遍历；etype intern registry（open-time schema）。
+- **`graphdb_analytics` 图 OLAP（设计 §7 物化层）**：`materialize/2` 把
+  `e`/`et` 家族物化为内存二进制 CSR（出边 + 转置，重边去重）；`pagerank/2`
+  （阻尼 + dangling 校正）、`connected_components/1`（最小标号传播）、
+  `sssp/3`（无权 BFS 距离）。
+- 一致性语义测试（扫描中途插入/删除的可见性不变量）与 `test/graphdb_bench`
+  基准：稳态一跳 **~0.02 ms/op** @1 万顶点/5 万边（装载 ~76k edges/s）。
+
+### Changed
+
+- **libbitcask submodule `598d080` → `f618e82`（6.3.2 → 6.5.0）**：OKI
+  memdelta **排序视图缓存**——拔掉「批量装载后 range 静默变慢 4200×」的性能
+  悬崖（下游图基准实测：5 万边装载后一跳 110ms → **0.078ms**，与 flush 后
+  持平）；`status()` 新增 `oki_delta_rows`/`oki_delta_bytes`（memdelta 体量
+  可观测）；ord 溢出年数文档勘误（`5.8×10¹³ 年` 实为约 585 万年）。
+  C API 纯加法、SOVERSION 保持 6、盘上格式零改动。
+- embedder 池派发测试 `pool_dispatch_avoids_busy_worker` **采样合一**——
+  pick 判定与其依据的邮箱快照同刻，消除全量套件并行负载下的偶发假红
+  （上游 `feedbacks/2026-09-18-embedder-pool-dispatch-flaky-under-parallel-suite.md`）。
+
 ## [6.4.0] — 2026-09-08
 
 本地嵌入后端的两个产品决定：**`slots => K` 并发槽位**（新配置）与
