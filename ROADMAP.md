@@ -456,25 +456,29 @@ load_failed}`）；`StatusInfo::index_errors` 经新 `bitcask:index_errors/1` �
 > ⚠️ v1.1.0 改了盘上搜索格式（`search.ckpt` / 倒排 v6 / 外存向量），v1.0.0 建的索引
 > 目录需重建；KV data/hint（meta v2）不变。
 
-### 图处理层（libbitcask 存储 + Erlang 执行）✅
+### 图处理层（libbitcask 存储 + Erlang 执行）✅（设计 2026-09 重订）
 
 > 设计文档：[`doc/graph-layer-design-zh.md`](doc/graph-layer-design-zh.md)
 
-以 libbitcask 为单一存储、Erlang 为执行层的简单图处理方案。核心约束：**一个图整体
-序列化进一个 value**（CSR 格式），libbitcask 只做持久化与并发加载，遍历 / 计算在 BEAM
-内存完成、热路径零 bitcask 访问。
+以 libbitcask 为单一存储、Erlang 为执行层的图存储方案。**KV per-key 版**，覆盖本节
+原「CSR 整图一个 value」方案——其核心约束（keydir 无序、前缀扫描退化 O(全部 key)）
+已被 6.0.0 的 OKI 有序 range 推翻：
 
-- **CSR 盘上格式**：`xadj` 行偏移 + `adjncy` 邻居数组 + etype/vprops/eprops 侧表，全小端；
-  BEAM 二进制零拷贝切片直接遍历。
-- **执行模型**：owner gen_server 持有物化图（CSR + 写 overlay）；读 / 算纯内存，写进
-  overlay、批量检查点折叠回写。
-- **Erlang 特性**：并行度在「图之间」（N 图 = N actor）、崩溃隔离、单写多读对齐 bitcask、
-  Pregel/BSP（顶点=进程、边=消息）、LRU 逐出 + MVCC 一致快照。
-- **边界**：单图须整张进内存（`value_too_large` + LRU 封顶，超大图分区成多 value）；
-  写放大在图粒度（靠批量检查点摊薄）。读多写少 / 批量构建场景最适配。
+- **Key 布局**：`n<vid>` 顶点 DocValue + `e<src><etype><dst><rank>` 出边 + `ei` 反向
+  导航键，家族字节 + 定宽大端、零分隔符（字典序 = 数值序）；取邻居 = OKI 前缀 range，
+  O(出度)；点查 = O(1) keydir。
+- **写路径**：边经 `put_batch_atomic` 原子双写双向键（反向键值留空只做导航）；顶点走
+  `put_doc`，BM25 / 向量检索免费生效；每写即持久，无检查点窗口与 `value_too_large`
+  封顶。
+- **执行模型**：无 owner 进程——共享 Cask 句柄并发读写；遍历在 BEAM 逐跳展开，
+  frontier 进程级并行（一进程一 range 迭代器）；全图分析经 `parallel_scan` 物化内存
+  CSR（旧 CSR 方案降级为 OLAP 缓存层）。
+- **边界**：一跳成本比 CSR 切片慢 10–100×（图 OLTP 定位，全图迭代走物化层）；跨跳
+  per-key 弱一致（全局快照只有 fold）；单 key ≤ 64 KiB；etype intern 需 open-time
+  schema 或单进程注册。
 
-阶段：P1 CSR 编解码 + owner + CRUD → P2 内存遍历 → P3 overlay 压实 + LRU + MVCC →
-P4 Pregel/BSP + 样例算法 → P5 入边转置 + 边属性 + 顶点向量混合检索。
+阶段：P1 key codec + CRUD + 前缀遍历 → P2 BFS / k-hop / 双向最短路 → P3 属性过滤
+遍历 + deg/et 索引 → P4 CSR 物化 + 样例算法 → P5 基准与一致性测试。
 
 ---
 
