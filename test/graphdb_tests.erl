@@ -1,0 +1,268 @@
+%% -------------------------------------------------------------------
+%% graphdb_tests:
+%%   图存储层（doc/graph-layer-design-zh.md，KV per-key 方案）P1 + P2 覆盖：
+%%     - key codec      字节级精确性（n/e/ei 定宽大端）+ succ 字典序后继
+%%     - 顶点/边 CRUD   原子双写、点查、upsert、级联删除
+%%     - 邻接扫描       out/in 前缀 range、etype 收窄、limit、度数
+%%     - 遍历           BFS（depth/dir/etype）、k-hop、双向最短路
+%%     - etype registry 注册/回查/幂等
+%%     - 持久性         重开后的可见性
+%% -------------------------------------------------------------------
+-module(graphdb_tests).
+
+-include_lib("eunit/include/eunit.hrl").
+
+with_dir(Fun) ->
+    Dir = "/tmp/graphdb_tests_" ++ os:getpid() ++ "_" ++
+          integer_to_list(erlang:unique_integer([positive])),
+    ok = filelib:ensure_path(Dir),
+    try Fun(Dir)
+    after os:cmd("rm -rf " ++ Dir)
+    end.
+
+%% 顶点 1..4；边（etype 7）：1→2, 2→3, 3→4, 1→3；边（etype 8）：1→3。
+seeded(D) ->
+    R = graphdb:open(D, [read_write]),
+    ok = graphdb:put_vertex(R, 1, <<"alice">>),
+    ok = graphdb:put_vertex(R, 2, <<"bob">>),
+    ok = graphdb:put_vertex(R, 3, <<"carol">>),
+    ok = graphdb:put_vertex(R, 4, <<"dave">>),
+    ok = graphdb:put_edge(R, 1, 7, 2),
+    ok = graphdb:put_edge(R, 2, 7, 3),
+    ok = graphdb:put_edge(R, 3, 7, 4),
+    ok = graphdb:put_edge(R, 1, 7, 3),
+    ok = graphdb:put_edge(R, 1, 8, 3, #{props => <<"weight:0.9">>}),
+    R.
+
+dsts_of({ok, Edges}) -> [D || #{dst := D} <- Edges];
+dsts_of(Other)       -> {bad, Other}.
+
+srcs_of({ok, Edges}) -> [S || #{src := S} <- Edges];
+srcs_of(Other)       -> {bad, Other}.
+
+%% ===================================================================
+%% key codec：字节级精确 + succ
+%% ===================================================================
+
+nkey_codec_test_() ->
+    {"nkey = \"n\" + vid 大端 8 字节",
+     ?_assertEqual(<<"n", 0, 0, 0, 0, 0, 0, 0, 42>>, graphdb:nkey(42))}.
+
+ekey_codec_test_() ->
+    {"ekey 29 字节定宽大端；rank 缺省 0",
+     [?_assertEqual(<<"e", 1:64/big, 7:32/big, 2:64/big, 0:64/big>>,
+                    graphdb:ekey(1, 7, 2)),
+      ?_assertEqual(<<"e", 1:64/big, 7:32/big, 2:64/big, 9:64/big>>,
+                    graphdb:ekey(1, 7, 2, 9)),
+      ?_assertEqual(29, byte_size(graphdb:ekey(1, 7, 2))),
+      ?_assertEqual(<<"ei", 2:64/big, 7:32/big, 1:64/big, 0:64/big>>,
+                    graphdb:eikey(2, 7, 1)),
+      ?_assertEqual(30, byte_size(graphdb:eikey(2, 7, 1)))]}.
+
+succ_codec_test_() ->
+    {"succ = 去尾部 0xFF + 末字节进位；全 0xFF 无上界",
+     [?_assertEqual(<<"ac">>, graphdb:succ(<<"ab">>)),
+      ?_assertEqual(<<"b">>, graphdb:succ(<<"a", 255>>)),
+      ?_assertEqual(undefined, graphdb:succ(<<255, 255>>)),
+      ?_assertEqual(<<"f">>, graphdb:succ(<<"e">>)),
+      %% vid 进位：vid 255 的出边区间上界 = vid 256 的前缀
+      ?_assertEqual(<<"e", 0, 0, 0, 0, 0, 0, 1>>, graphdb:succ(<<"e", 0, 0, 0, 0, 0, 0, 0, 255>>))]}.
+
+codec_validation_test_() ->
+    {"非法 vid/etype/rank 拒绝（badarg）",
+     [?_assertError(badarg, graphdb:nkey(-1)),
+      ?_assertError(badarg, graphdb:ekey(1, 16#100000000, 2)),
+      ?_assertError(badarg, graphdb:ekey(1, 7, 2, -1))]}.
+
+%% ===================================================================
+%% 顶点 / 边 CRUD
+%% ===================================================================
+
+vertex_crud_test_() ->
+    {"顶点 put/get/缺失语义；Doc 原样回读",
+     fun() ->
+        with_dir(fun(D) ->
+            R = seeded(D),
+            ?assertEqual({ok, <<"alice">>}, graphdb:get_vertex(R, 1)),
+            ?assertEqual({error, not_found}, graphdb:get_vertex(R, 99)),
+            ok = graphdb:put_vertex(R, 1, <<"alice prime">>),
+            ?assertEqual({ok, <<"alice prime">>}, graphdb:get_vertex(R, 1)),
+            graphdb:close(R)
+        end)
+    end}.
+
+edge_point_lookup_test_() ->
+    {"边点查：props 回读 / 缺失 / upsert 后读到最后一次写",
+     fun() ->
+        with_dir(fun(D) ->
+            R = seeded(D),
+            ?assertEqual({ok, #{src => 1, etype => 8, dst => 3, rank => 0,
+                                props => <<"weight:0.9">>}},
+                         graphdb:edge(R, 1, 8, 3)),
+            ?assertEqual({error, not_found}, graphdb:edge(R, 3, 8, 1)),
+            ok = graphdb:put_edge(R, 1, 8, 3, #{props => <<"weight:1.0">>}),
+            ?assertEqual(<<"weight:1.0">>,
+                         maps:get(props, element(2, graphdb:edge(R, 1, 8, 3)))),
+            graphdb:close(R)
+        end)
+    end}.
+
+del_edge_removes_both_directions_test_() ->
+    {"del_edge 原子摘除双向键",
+     fun() ->
+        with_dir(fun(D) ->
+            R = seeded(D),
+            ok = graphdb:del_edge(R, 1, 8, 3),
+            ?assertEqual({error, not_found}, graphdb:edge(R, 1, 8, 3)),
+            ?assertEqual([1, 2], srcs_of(graphdb:in_edges(R, 3))),
+            ?assertEqual([2, 3], dsts_of(graphdb:out_edges(R, 1))),
+            graphdb:close(R)
+        end)
+    end}.
+
+del_vertex_cascade_test_() ->
+    {"del_vertex 级联删除全部 incident 边 + 顶点本体",
+     fun() ->
+        with_dir(fun(D) ->
+            R = seeded(D),
+            ok = graphdb:del_vertex(R, 2),
+            ?assertEqual({error, not_found}, graphdb:get_vertex(R, 2)),
+            %% 1→2 与 2→3 双向消失；1→3（etype 7/8）不受影响
+            ?assertEqual([3, 3], dsts_of(graphdb:out_edges(R, 1))),
+            ?assertEqual([4], dsts_of(graphdb:out_edges(R, 3))),
+            ?assertEqual([1], srcs_of(graphdb:in_edges(R, 3, #{etype => 7}))),
+            ?assertEqual([], srcs_of(graphdb:in_edges(R, 2))),
+            graphdb:close(R)
+        end)
+    end}.
+
+%% ===================================================================
+%% 邻接扫描
+%% ===================================================================
+
+out_in_edges_test_() ->
+    {"out/in 前缀扫描：key 序输出；etype 收窄；limit 提前停",
+     fun() ->
+        with_dir(fun(D) ->
+            R = seeded(D),
+            ?assertEqual([2, 3, 3], dsts_of(graphdb:out_edges(R, 1))),
+            ?assertEqual([3], dsts_of(graphdb:out_edges(R, 1, #{etype => 8}))),
+            ?assertEqual([2], dsts_of(graphdb:out_edges(R, 1, #{limit => 1}))),
+            ?assertEqual([], dsts_of(graphdb:out_edges(R, 1, #{limit => 0}))),
+            ?assertEqual([1, 2, 1], srcs_of(graphdb:in_edges(R, 3))),
+            ?assertEqual([1], srcs_of(graphdb:in_edges(R, 3, #{etype => 8}))),
+            ?assertEqual([3], srcs_of(graphdb:in_edges(R, 4))),
+            graphdb:close(R)
+        end)
+    end}.
+
+neighbors_test_() ->
+    {"neighbors out/in/both（both 去重保序）",
+     fun() ->
+        with_dir(fun(D) ->
+            R = seeded(D),
+            ?assertEqual({ok, [4]}, graphdb:neighbors(R, 3, out)),
+            ?assertEqual({ok, [1, 2, 1]}, graphdb:neighbors(R, 3, in)),
+            ?assertEqual({ok, [4, 1, 2]}, graphdb:neighbors(R, 3, both)),
+            graphdb:close(R)
+        end)
+    end}.
+
+degree_test_() ->
+    {"degree 按需计数（全类型 / 单类型 / 零度）",
+     fun() ->
+        with_dir(fun(D) ->
+            R = seeded(D),
+            ?assertEqual({ok, 3}, graphdb:degree(R, 1, undefined)),
+            ?assertEqual({ok, 1}, graphdb:degree(R, 1, 8)),
+            ?assertEqual({ok, 0}, graphdb:degree(R, 4, undefined)),
+            graphdb:close(R)
+        end)
+    end}.
+
+%% ===================================================================
+%% 遍历
+%% ===================================================================
+
+bfs_test_() ->
+    {"BFS：全深度 / depth 截断 / dir=in / etype 过滤",
+     fun() ->
+        with_dir(fun(D) ->
+            R = seeded(D),
+            ?assertEqual({ok, [{1, 0}, {2, 1}, {3, 1}, {4, 2}]},
+                         graphdb:bfs(R, 1, #{})),
+            ?assertEqual({ok, [{1, 0}, {2, 1}, {3, 1}]},
+                         graphdb:bfs(R, 1, #{depth => 1})),
+            ?assertEqual({ok, [{4, 0}, {3, 1}, {1, 2}, {2, 2}]},
+                         graphdb:bfs(R, 4, #{dir => in})),
+            ?assertEqual({ok, [{1, 0}, {3, 1}]},
+                         graphdb:bfs(R, 1, #{etype => 8})),
+            graphdb:close(R)
+        end)
+    end}.
+
+k_hop_test_() ->
+    {"k-hop 邻域（不含起点）",
+     fun() ->
+        with_dir(fun(D) ->
+            R = seeded(D),
+            ?assertEqual({ok, [2, 3]}, graphdb:k_hop(R, 1, 1, #{})),
+            ?assertEqual({ok, [2, 3, 4]}, graphdb:k_hop(R, 1, 2, #{})),
+            ?assertEqual({ok, []}, graphdb:k_hop(R, 4, 2, #{})),
+            graphdb:close(R)
+        end)
+    end}.
+
+shortest_path_test_() ->
+    {"双向最短路：正例 / 反向无路径 / 自身 / etype 过滤",
+     fun() ->
+        with_dir(fun(D) ->
+            R = seeded(D),
+            %% 1→2→3→4 长 3；1→3→4 长 2，最短
+            ?assertEqual({ok, [1, 3, 4]}, graphdb:shortest_path(R, 1, 4)),
+            ?assertEqual({error, no_path}, graphdb:shortest_path(R, 4, 1)),
+            ?assertEqual({ok, [2]}, graphdb:shortest_path(R, 2, 2)),
+            %% etype 8 只有 1→3，接不到 4
+            ?assertEqual({error, no_path},
+                         graphdb:shortest_path(R, 1, 4, #{etype => 8})),
+            graphdb:close(R)
+        end)
+    end}.
+
+%% ===================================================================
+%% etype registry
+%% ===================================================================
+
+etype_registry_test_() ->
+    {"etype 注册：id 从 1 起、幂等、双向回查",
+     fun() ->
+        with_dir(fun(D) ->
+            R = graphdb:open(D, [read_write]),
+            ?assertEqual({ok, 1}, graphdb:register_etype(R, <<"follows">>)),
+            ?assertEqual({ok, 2}, graphdb:register_etype(R, <<"likes">>)),
+            ?assertEqual({ok, 1}, graphdb:register_etype(R, <<"follows">>)),
+            ?assertEqual({ok, 1}, graphdb:etype_id(R, <<"follows">>)),
+            ?assertEqual({ok, <<"likes">>}, graphdb:etype_name(R, 2)),
+            ?assertEqual({error, not_found}, graphdb:etype_id(R, <<"hates">>)),
+            ?assertEqual({error, not_found}, graphdb:etype_name(R, 99)),
+            graphdb:close(R)
+        end)
+    end}.
+
+%% ===================================================================
+%% 持久性：重开可见
+%% ===================================================================
+
+reopen_persistence_test_() ->
+    {"close 后重开：顶点/边/遍历全部仍在",
+     fun() ->
+        with_dir(fun(D) ->
+            R0 = seeded(D),
+            ok = graphdb:close(R0),
+            R = graphdb:open(D, [read_write]),
+            ?assertEqual({ok, <<"carol">>}, graphdb:get_vertex(R, 3)),
+            ?assertEqual([2, 3, 3], dsts_of(graphdb:out_edges(R, 1))),
+            ?assertEqual({ok, [1, 3, 4]}, graphdb:shortest_path(R, 1, 4)),
+            graphdb:close(R)
+        end)
+    end}.
