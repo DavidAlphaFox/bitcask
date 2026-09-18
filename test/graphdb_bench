@@ -1,0 +1,92 @@
+#!/usr/bin/env escript
+
+%% graphdb_bench — 图存储层（graphdb / graphdb_analytics）手动基准。
+%%
+%% 用法：
+%%   test/graphdb_bench [n_vertices] [n_edges] [bfs_hops]
+%% 缺省：10000 顶点 / 50000 边 / BFS 3 跳。
+%%
+%% 口径（设计文档 P5）：
+%%   1. bulk load        — put_edge 逐条灌边（每条 = 原子批五键 + upsert 点查）
+%%   2. one-hop latency  — out_edges 单跳前缀扫描，随机顶点取平均
+%%   3. bfs K-hop        — 随机起点 K 跳 BFS 墙钟
+%%   4. materialize      — e 家族 → 内存 CSR
+%%   5. pagerank         — 20 轮迭代封顶
+%% 墙钟取 timer:tc；固定随机种子保证可复现。源为幂律近似（小 id 高频），
+%% 制造真实度分布（含 hub）。
+
+-mode(compile).
+
+main(Args) ->
+    [NV, NE, Hops] = case Args of
+                         [A, B, C] -> [list_to_integer(A), list_to_integer(B),
+                                       list_to_integer(C)];
+                         [A, B]    -> [list_to_integer(A), list_to_integer(B), 3];
+                         [A]       -> [list_to_integer(A), 50000, 3];
+                         _         -> [10000, 50000, 3]
+                     end,
+    run(NV, NE, Hops).
+
+run(NV, NE, Hops) ->
+    code:add_pathsz(filelib:wildcard("_build/test/lib/*/ebin")
+                    ++ filelib:wildcard("_build/default/lib/*/ebin")),
+    Dir = "/tmp/graphdb_bench_" ++ integer_to_list(erlang:unique_integer([positive])),
+    ok = filelib:ensure_path(Dir),
+    io:format("== graphdb bench: ~p vertices / ~p edges / BFS ~p hops ==~n",
+              [NV, NE, Hops]),
+    R = graphdb:open(Dir, [read_write]),
+    rand:seed(exsss, {42, 43, 44}),
+
+    {TLoad, ok} = timer:tc(fun() ->
+        [ok = graphdb:put_edge(R, src_vid(NV), 7, rand:uniform(NV))
+         || _ <- lists:seq(1, NE)],
+        ok
+    end),
+    report("bulk load (put_edge)", TLoad, NE, "edges"),
+
+    Probe = [rand:uniform(NV) || _ <- lists:seq(1, 1000)],
+    %% 预热：排除首次 iterator 打开的冷启动噪声
+    [graphdb:out_edges(R, V) || V <- lists:sublist(Probe, 50)],
+    {T1Hop, _} = timer:tc(fun() ->
+        [graphdb:out_edges(R, V) || V <- Probe]
+    end),
+    io:format("~-24s ~10.3f ms/op (~p ops)~n",
+              ["one-hop out_edges", T1Hop / 1000 / 1000, 1000]),
+
+    {TBfs, _Reach} = timer:tc(fun() ->
+        graphdb:bfs(R, 1, #{depth => Hops})
+    end),
+    io:format("~-24s ~10.1f ms (~p hops)~n", ["bfs", TBfs / 1000, Hops]),
+
+    {TMat, MatRes} = timer:tc(fun() ->
+        graphdb_analytics:materialize(R, #{})
+    end),
+    {ok, Csr} = MatRes,
+    io:format("~-24s ~10.1f ms (~p V, ~p E csr)~n",
+              ["materialize", TMat / 1000,
+               graphdb_analytics:vertex_count(Csr),
+               graphdb_analytics:edge_count(Csr)]),
+
+    {TPr, _Ranks} = timer:tc(fun() ->
+        graphdb_analytics:pagerank(Csr, #{max_iter => 20})
+    end),
+    io:format("~-24s ~10.1f ms~n", ["pagerank (<=20 it)", TPr / 1000]),
+
+    %% 6. steady-state one-hop（reopen 后：memdelta 已 flush 成 sealed run）
+    ok = graphdb:close(R),
+    R2 = graphdb:open(Dir, [read_write]),
+    {TSteady, _} = timer:tc(fun() ->
+        [graphdb:out_edges(R2, V) || V <- Probe]
+    end),
+    io:format("~-24s ~10.3f ms/op (~p ops, post-flush)~n",
+              ["one-hop steady-state", TSteady / 1000 / 1000, 1000]),
+    ok = graphdb:close(R2),
+    os:cmd("rm -rf " ++ Dir).
+
+%% 幂律近似：src = NV × U²（U 均匀）→ 小 id 高频，制造 hub。
+src_vid(NV) ->
+    max(1, trunc(NV * math:pow(rand:uniform(), 2.0))).
+
+report(Label, USec, Count, Unit) ->
+    io:format("~-24s ~10.1f ms total, ~10.1f ~s/s~n",
+              [Label, USec / 1000, Count / (USec / 1000000), Unit]).

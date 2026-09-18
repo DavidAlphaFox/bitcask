@@ -344,3 +344,95 @@ neighbors_where_test_() ->
             graphdb:close(R)
         end)
     end}.
+
+%% ===================================================================
+%% P5：一致性语义（设计文档 §6.5）
+%%
+%% 可确定性断言的不变量：
+%%   1. 写提交后，新开的扫描必然可见（read-your-writes）；
+%%   2. 迭代期间并发写：正在进行的扫描**要么看到要么看不到**该写——
+%%      两者都合法（per-key 弱一致），但输出必须依然 key 序、可解析、
+%%      无撕裂条目；
+%%   3. 删除提交后，新扫描必然不可见。
+%% ===================================================================
+
+read_your_writes_test_() ->
+    {"写提交返回后，新扫描立即可见",
+     fun() ->
+        with_dir(fun(D) ->
+            R = seeded(D),
+            ok = graphdb:put_edge(R, 1, 42, 777, #{props => <<"fresh">>}),
+            {ok, Fresh} = graphdb:out_edges(R, 1, #{etype => 42}),
+            ?assertEqual([777], [D || #{dst := D} <- Fresh]),
+            graphdb:close(R)
+        end)
+    end}.
+
+scan_insert_during_iteration_test_() ->
+    {"扫描中途插入：进行中的扫描看到与否均合法；输出 key 序无撕裂；新扫描必见",
+     fun() ->
+        with_dir(fun(D) ->
+            R = graphdb:open(D, [read_write]),
+            [ok = graphdb:put_edge(R, 1, 7, 100 + N) || N <- lists:seq(0, 99)],
+            Fun = fun(K, _V, _T, _O, {Inserted, Raw}) ->
+                          Raw2 = [K | Raw],
+                          case Inserted of
+                              false ->
+                                  ok = graphdb:put_edge(R, 1, 7, 999),
+                                  {true, Raw2};
+                              true ->
+                                  {true, Raw2}
+                          end
+                  end,
+            ELo = <<"e", 1:64/big, 7:32/big>>,            %% vid 1 × etype 7 前缀
+            {_Inserted, RawKeys} = bitcask:range_fold(R, {ELo, graphdb:succ(ELo)},
+                                                      [], Fun, {false, []}),
+            Dsts = [begin
+                        <<_:13/binary, Dst:64/big, _/binary>> = K,
+                        Dst
+                    end || K <- lists:reverse(RawKeys)],
+            %% 不变量：严格升序、定义域合法、999 看到与否均合法
+            ?assertEqual(lists:usort(Dsts), Dsts),
+            ?assert(lists:all(fun(D) -> (D >= 100 andalso D =< 199) orelse D =:= 999 end, Dsts)),
+            ?assert(length(Dsts) >= 100),                     %% 原有边绝不丢
+            ?assert(lists:member(999, Dsts) orelse not lists:member(999, Dsts)),
+            %% 提交已完成 → 新扫描必见
+            {ok, FreshEdges} = graphdb:out_edges(R, 1),
+            ?assert(lists:member(999, [D || #{dst := D} <- FreshEdges])),
+            graphdb:close(R)
+        end)
+    end}.
+
+scan_delete_during_iteration_test_() ->
+    {"扫描中途删除：被删边出现与否均合法；删除提交后新扫描必不可见",
+     fun() ->
+        with_dir(fun(D) ->
+            R = graphdb:open(D, [read_write]),
+            [ok = graphdb:put_edge(R, 2, 7, 300 + N) || N <- lists:seq(0, 99)],
+            Fun = fun(K, _V, _T, _O, {Deleted, Raw}) ->
+                          Raw2 = [K | Raw],
+                          case Deleted of
+                              false ->
+                                  ok = graphdb:del_edge(R, 2, 7, 350),
+                                  {true, Raw2};
+                              true ->
+                                  {true, Raw2}
+                          end
+                  end,
+            ELo2 = <<"e", 2:64/big, 7:32/big>>,
+            {true, RawKeys} = bitcask:range_fold(R, {ELo2, graphdb:succ(ELo2)},
+                                                 [], Fun, {false, []}),
+            Dsts = [begin
+                        <<_:13/binary, Dst:64/big, _/binary>> = K,
+                        Dst
+                    end || K <- lists:reverse(RawKeys)],
+            ?assertEqual(lists:usort(Dsts), Dsts),
+            ?assert(length(Dsts) =< 100),
+            %% 350 除外的 99 条必然还在
+            ?assertEqual(99, length([D || D <- Dsts, D =/= 350])),
+            %% 删除已提交 → 新扫描不可见
+            {ok, FreshEdges2} = graphdb:out_edges(R, 2),
+            ?assertNot(lists:member(350, [D || #{dst := D} <- FreshEdges2])),
+            graphdb:close(R)
+        end)
+    end}.
