@@ -72,7 +72,7 @@ all-or-nothing，但不提供隔离性：事务中间态对并发读者可见，
    │   read(Tx,K) ── acquire(r) ─────────>│  授予/入等待队列          │
    │     └── 本地: 缓冲命中? 缓冲 : get ──────────────────────────>│
    │   write(Tx,K,V) ─ acquire(w) ───────>│  授予/入等待队列+检测     │
-   │     └── 本地: 写入 per-txn ETS 缓冲                              │
+   │     └── 本地: 写入 pdict 缓冲(同 Mnesia)                              │
    │── commit(Tx) ───────────────────────>│  校验( deadline / 状态)  │
    │── bitcask:txn_commit(H, Ops, sync) ──────────────────────────>│
    │── release_all(TxnId) ───────────────>│  放锁 + 唤醒等待者+检测   │
@@ -128,8 +128,17 @@ all-or-nothing，但不提供隔离性：事务中间态对并发读者可见，
 
 ### 4.4 写缓冲与读路径
 
-- 每事务一张 `ets`（`set`），caller 进程私有：`Key -> {put, Val} | delete`；
-  同事务内重复写天然 LWW。
+- **缓冲用调用方进程字典（pdict），不用 per-txn ETS**（Mnesia
+  `mnesia_tm` 同款）：单个命名键 `{?MODULE, TxnId} => #{Key => {put, Val}
+  | delete}`，同事务内重复写天然 LWW（map 覆盖）。理由：① ETS 表是
+  配额资源——默认每节点 1400 张（`+e` 可调），且 `ets:new/delete` 走
+  全局表注册锁，per-txn 建表在高事务率下既耗配额又串行化创建；
+  ② pdict 随进程死亡自动消失，崩溃安全与 ETS 所有权语义**等价**；
+  ③ 单次访问更快。**代价**：放弃 `ordered_set` 的免费有序遍历——提交
+  组装时对小缓冲 `lists:sort/1`（O(n log n)，n = 缓冲键数，通常
+  < 100，可忽略）。
+- ETS 只保留 locker 的三张常驻表（§4.1）：每节点 ETS 用量**恒定**，
+  与事务并发度无关。分工原则：**共享状态归 ETS，事务私有状态归 pdict**。
 - `read(Tx, K)`：缓冲命中 → 按标记返回；否则 `bitcask:get/2`。
   **读自己的写**（read-your-writes）由此保证。
 - 缓冲只进不出，直到 commit 组装 ops：按 key 升序（确定性序）展开为
@@ -229,7 +238,7 @@ dirty op）。同一批 key 要么全走事务、要么全走直通，混用自�
 ## 6. 模块与工程布局
 
 ```
-src/bitcask_txn.erl          门面 + 重启循环 + 缓冲 ETS 管理（~300 行）
+src/bitcask_txn.erl          门面 + 重启循环 + pdict 写缓冲（~300 行）
 src/bitcask_txn_locker.erl   gen_server：锁/等待/检测/监控（~400 行）
 src/bitcask_sup.erl          加一个 ?CHILD(bitcask_txn_locker, worker)
 test/bitcask_txn_tests.erl   eunit（meck 已在 test profile）
