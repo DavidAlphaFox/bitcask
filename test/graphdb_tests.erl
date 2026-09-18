@@ -162,7 +162,7 @@ neighbors_test_() ->
         with_dir(fun(D) ->
             R = seeded(D),
             ?assertEqual({ok, [4]}, graphdb:neighbors(R, 3, out)),
-            ?assertEqual({ok, [1, 2, 1]}, graphdb:neighbors(R, 3, in)),
+            ?assertEqual({ok, [1, 2]}, graphdb:neighbors(R, 3, in)),
             ?assertEqual({ok, [4, 1, 2]}, graphdb:neighbors(R, 3, both)),
             graphdb:close(R)
         end)
@@ -263,6 +263,84 @@ reopen_persistence_test_() ->
             ?assertEqual({ok, <<"carol">>}, graphdb:get_vertex(R, 3)),
             ?assertEqual([2, 3, 3], dsts_of(graphdb:out_edges(R, 1))),
             ?assertEqual({ok, [1, 3, 4]}, graphdb:shortest_path(R, 1, 4)),
+            graphdb:close(R)
+        end)
+    end}.
+
+%% ===================================================================
+%% P3：deg/degi 计数器 + et 家族 + 属性过滤遍历
+%% ===================================================================
+
+degree_counters_test_() ->
+    {"deg 计数器：插入 +1、del -1、upsert 不重复计数、per-etype 分立",
+     fun() ->
+        with_dir(fun(D) ->
+            R = seeded(D),
+            %% 计数器路径（key 存在 → O(1) 读）
+            ?assertEqual({ok, 2}, graphdb:degree(R, 1, 7)),
+            ?assertEqual({ok, 1}, graphdb:degree(R, 1, 8)),
+            ?assertEqual({ok, 1}, graphdb:degree(R, 2, 7)),
+            %% upsert：同边重写属性，计数不变
+            ok = graphdb:put_edge(R, 1, 7, 2, #{props => <<"x">>}),
+            ?assertEqual({ok, 2}, graphdb:degree(R, 1, 7)),
+            %% del_edge：-1
+            ok = graphdb:del_edge(R, 1, 8, 3),
+            ?assertEqual({ok, 0}, graphdb:degree(R, 1, 8)),
+            graphdb:close(R)
+        end)
+    end}.
+
+del_vertex_updates_neighbor_counters_test_() ->
+    {"del_vertex 级联同步修正邻居计数器（聚合一次 RMW）",
+     fun() ->
+        with_dir(fun(D) ->
+            R = graphdb:open(D, [read_write]),
+            [ok = graphdb:put_vertex(R, V, <<"v">>) || V <- [1, 2, 3, 4]],
+            ok = graphdb:put_edge(R, 1, 7, 2),   %% 1→2
+            ok = graphdb:put_edge(R, 3, 7, 2),   %% 3→2
+            ok = graphdb:put_edge(R, 2, 7, 3),   %% 2→3
+            ok = graphdb:put_edge(R, 2, 9, 4),   %% 2→4
+            ?assertEqual({ok, 1}, graphdb:degree(R, 2, 7)),
+            ok = graphdb:del_vertex(R, 2),
+            %% in 边 (1→2, 3→2) 摘除 → 1、3 的出度 -1
+            ?assertEqual({ok, 0}, graphdb:degree(R, 1, 7)),
+            ?assertEqual({ok, 0}, graphdb:degree(R, 3, 7)),
+            %% out 边 (2→3) 摘除 → 3 的入度 -1；（2→4）→ 4 的入度 -1
+            ?assertEqual({ok, 0}, graphdb:degree(R, 3, 7)),
+            ?assertEqual({ok, 0}, graphdb:degree(R, 4, 9)),
+            ?assertEqual({error, not_found}, graphdb:get_vertex(R, 2)),
+            graphdb:close(R)
+        end)
+    end}.
+
+edges_by_type_test_() ->
+    {"et 家族：按类型全局列边，key 序 = (src,dst,rank)",
+     fun() ->
+        with_dir(fun(D) ->
+            R = seeded(D),
+            {ok, E7} = graphdb:edges_by_type(R, 7),
+            ?assertEqual([{1, 2}, {1, 3}, {2, 3}, {3, 4}],
+                         [{S, D} || #{src := S, dst := D} <- E7]),
+            {ok, E8} = graphdb:edges_by_type(R, 8),
+            ?assertEqual([{1, 3}], [{S, D} || #{src := S, dst := D} <- E8]),
+            ?assertEqual({ok, []}, graphdb:edges_by_type(R, 99)),
+            graphdb:close(R)
+        end)
+    end}.
+
+neighbors_where_test_() ->
+    {"属性过滤遍历：Pred 作用于邻居顶点值；悬挂边 Value=undefined",
+     fun() ->
+        with_dir(fun(D) ->
+            R = seeded(D),
+            %% 只留顶点值以 "a" 开头的邻居（alice 通过，bob 不通过）
+            {ok, Ns} = graphdb:neighbors_where(
+                         R, 3, in,
+                         fun(_V, Val) when is_binary(Val) ->
+                                 hd(binary_to_list(Val)) =:= $a;
+                            (_V, undefined) -> false
+                         end),
+            ?assertEqual([1], Ns),
             graphdb:close(R)
         end)
     end}.

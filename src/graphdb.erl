@@ -13,6 +13,14 @@
 %%   ei <dst:64> <etype:32> <src:64> <rank:64>   → 反向导航键（值恒 <<>>）
 %%   t  <etype:32>                        → etype intern 名字
 %%   tn <len:16> <name>                   → name → etype id
+%%   et <etype:32> <src:64> <dst:64> <rank:64>   → 按类型全局列边（值恒 <<>>，
+%%                                          P3：edges_by_type 的 O(该类型边数) 索引）
+%%   deg  <vid:64> <etype:32> → u64       → 出度计数（P3，put_edge/del_edge 同批维护）
+%%   degi <vid:64> <etype:32> → u64       → 入度计数（P3，同上）
+%%
+%% ⚠️ deg/degi 是读-判-写计数（引擎无 CAS）：并发对同一端点加边可能丢计数，
+%% 单写者语义（每图一个写进程 / 串行写）下精确。del_vertex 级联会聚合
+%% 邻居计数器增量，一次 RMW 对齐。per-etype 计数缺失时 degree/3 回退按需计数。
 %%
 %% 关键性质：
 %%   * 取邻居 = 一次 OKI 前缀 range，O(出度)（bitcask:range/3，[Lo,Hi) 字典序）
@@ -46,7 +54,8 @@
          put_edge/4, put_edge/5, edge/4, edge/5, del_edge/4, del_edge/5,
 
          out_edges/2, out_edges/3, in_edges/2, in_edges/3,
-         neighbors/3, degree/3,
+         neighbors/3, neighbors_where/4,
+         degree/2, degree/3, edges_by_type/2, edges_by_type/3,
 
          bfs/3, k_hop/4, shortest_path/3, shortest_path/4,
 
@@ -151,16 +160,35 @@ del_vertex(Handle, Vid) ->
         {_, {error, _} = E, _} -> E;
         {_, _, {error, _} = E} -> E;
         {_, {ok, Out}, {ok, In}} ->
-            %% 每条 incident 边（无论从哪侧收集）都要摘掉正向 + 反向两个键；
+            %% 每条 incident 边（无论从哪侧收集）都要摘掉正向 + 反向 + et 三个键；
             %% 自环会在两侧各出现一次 → 重复 remove，原子批按 LWW apply，无害。
             PairF = fun(#{src := S, etype := T, dst := D, rank := R}) ->
-                        [{remove, ekey(S, T, D, R)}, {remove, eikey(D, T, S, R)}]
+                        [{remove, ekey(S, T, D, R)},
+                         {remove, eikey(D, T, S, R)},
+                         {remove, etkey(T, S, D, R)}]
                     end,
             PairI = fun(#{dst := D, etype := T, src := S, rank := R}) ->
-                        [{remove, ekey(S, T, D, R)}, {remove, eikey(D, T, S, R)}]
+                        [{remove, ekey(S, T, D, R)},
+                         {remove, eikey(D, T, S, R)},
+                         {remove, etkey(T, S, D, R)}]
                     end,
+            %% 邻居计数器增量聚合：in 边 (X→vid) 使 X 的出度 -1；
+            %% out 边 (vid→Y) 使 Y 的入度 -1。同 (端点, etype) 合并成一次 RMW。
+            DecOut = agg_counts([{S, T} || #{src := S, etype := T} <- In]),
+            DecIn  = agg_counts([{D, T} || #{dst := D, etype := T} <- Out]),
+            CounterOps =
+                [counter_delta(Handle, degkey(X, T), -C)
+                 || {{X, T}, C} <- maps:to_list(DecOut)]
+                ++ [counter_delta(Handle, degikey(Y, T), -C)
+                    || {{Y, T}, C} <- maps:to_list(DecIn)],
+            OwnEtypes = lists:usort([T || #{etype := T} <- Out]
+                                    ++ [T || #{etype := T} <- In]),
+            OwnCounters = [{remove, degkey(Vid, T)}  || T <- OwnEtypes]
+                        ++ [{remove, degikey(Vid, T)} || T <- OwnEtypes],
             Ops = lists:flatmap(PairF, Out)
                 ++ lists:flatmap(PairI, In)
+                ++ CounterOps
+                ++ OwnCounters
                 ++ [{remove, nkey(Vid)}],
             del_chunks(Handle, Ops)
     end.
@@ -188,9 +216,27 @@ put_edge(Handle, Src, Etype, Dst, Opts) when is_map(Opts) ->
     Props = maps:get(props, Opts, <<>>),
     true = is_binary(Props) orelse erlang:error(badarg, [Handle, Src, Etype, Dst, Opts]),
     _ = ekey(Src, Etype, Dst, Rank),            %% 借 codec 校验四元组
-    bitcask:put_batch_atomic(
-      Handle, [{put, ekey(Src, Etype, Dst, Rank), Props},
-               {put, eikey(Dst, Etype, Src, Rank), <<>>}]).
+    %% upsert：边已存在 → 只改属性（计数器/et 不动）；否则全量插入。
+    case edge(Handle, Src, Etype, Dst, Rank) of
+        {ok, _} ->
+            bitcask:put_batch_atomic(Handle, [{put, ekey(Src, Etype, Dst, Rank), Props}]);
+        {error, not_found} ->
+            bitcask:put_batch_atomic(
+              Handle, [{put, ekey(Src, Etype, Dst, Rank), Props},
+                       {put, eikey(Dst, Etype, Src, Rank), <<>>},
+                       {put, etkey(Etype, Src, Dst, Rank), <<>>},
+                       {put, degkey(Src, Etype),  <<(bump(Handle, degkey(Src, Etype), 1)):64/big>>},
+                       {put, degikey(Dst, Etype), <<(bump(Handle, degikey(Dst, Etype), 1)):64/big>>}]);
+        {error, _} = E ->
+            E
+    end.
+
+%% 读-改-写计数基值（缺 key = 0）。
+bump(Handle, Key, Delta) ->
+    case bitcask:get(Handle, Key) of
+        {ok, <<N:64/big>>} -> max(0, N + Delta);
+        _                  -> max(0, Delta)
+    end.
 
 %% 点查（rank = 0 的简单图语义）。upsert 后读到的是最后一次写入。
 edge(Handle, Src, Etype, Dst) -> edge(Handle, Src, Etype, Dst, 0).
@@ -206,8 +252,19 @@ edge(Handle, Src, Etype, Dst, Rank) ->
 del_edge(Handle, Src, Etype, Dst) -> del_edge(Handle, Src, Etype, Dst, 0).
 del_edge(Handle, Src, Etype, Dst, Rank) ->
     _ = ekey(Src, Etype, Dst, Rank),
-    bitcask:put_batch_atomic(Handle, [{remove, ekey(Src, Etype, Dst, Rank)},
-                                      {remove, eikey(Dst, Etype, Src, Rank)}]).
+    case edge(Handle, Src, Etype, Dst, Rank) of
+        {error, not_found} ->
+            ok;                                  %% 幂等删除
+        {ok, _} ->
+            bitcask:put_batch_atomic(
+              Handle, [{remove, ekey(Src, Etype, Dst, Rank)},
+                       {remove, eikey(Dst, Etype, Src, Rank)},
+                       {remove, etkey(Etype, Src, Dst, Rank)},
+                       {put, degkey(Src, Etype),  <<(bump(Handle, degkey(Src, Etype), -1)):64/big>>},
+                       {put, degikey(Dst, Etype), <<(bump(Handle, degikey(Dst, Etype), -1)):64/big>>}]);
+        {error, _} = E ->
+            E
+    end.
 
 %% =========================================================================
 %% 邻接扫描 — OKI 前缀 range（设计文档 §6.1）
@@ -262,21 +319,70 @@ neighbors(Handle, Vid, both) ->
 edge_endpoints(Handle, Vid, out) ->
     case out_edges(Handle, Vid) of
         {error, _} = E -> E;
-        {ok, Edges}    -> {ok, [D || #{dst := D} <- Edges]}
+        {ok, Edges}    -> {ok, dedupe([D || #{dst := D} <- Edges])}
     end;
 edge_endpoints(Handle, Vid, in) ->
     case in_edges(Handle, Vid) of
         {error, _} = E -> E;
-        {ok, Edges}    -> {ok, [S || #{src := S} <- Edges]}
+        {ok, Edges}    -> {ok, dedupe([S || #{src := S} <- Edges])}
     end.
 
-%% 度数：按需计数（deg 计数键家族是设计文档 P3，未启用）。
-degree(Handle, Vid, Etype) ->
-    {Lo, Hi} = out_range(Vid, Etype),
+%% 度数。per-etype：O(1) 读 deg 计数键（P3 前的存量数据无计数键 → 回退按需
+%% 计数）；undefined：O(出度) 全量计数（计数键按 etype 分立，无总数键）。
+degree(Handle, Vid) -> degree(Handle, Vid, undefined).
+degree(Handle, Vid, undefined) ->
+    {Lo, Hi} = out_range(Vid, undefined),
     case range_take(Handle, Lo, Hi, infinity, fun(_K, _V) -> {ok, count} end) of
         {error, _} = E -> E;
         {ok, Items}    -> {ok, length(Items)}
+    end;
+degree(Handle, Vid, Etype) ->
+    ok = v_t32(Etype),
+    case bitcask:get(Handle, degkey(Vid, Etype)) of
+        {ok, <<N:64/big>>} -> {ok, N};
+        {ok, _}            -> {error, invalid_degree_record};
+        not_found          -> degree(Handle, Vid, undefined);
+        {error, _} = E     -> E
     end.
+
+%% et 家族：按类型全局列边（key 序 = (src, dst, rank) 字典序）。
+%% 边属性不落在 et 键上——需要属性时对结果逐条 edge/5 点查。
+edges_by_type(Handle, Etype) -> edges_by_type(Handle, Etype, #{}).
+edges_by_type(Handle, Etype, Opts) when is_map(Opts) ->
+    ok = v_t32(Etype),
+    Lo = <<"et", Etype:32/big>>,
+    Limit = opt_limit(Opts),
+    range_take(Handle, Lo, succ(Lo), Limit,
+               fun(K, _V) ->
+                   case K of
+                       <<"et", Etype:32/big, S:64/big, D:64/big, R:64/big>> ->
+                           {ok, #{src => S, etype => Etype, dst => D,
+                                  rank => R, props => <<>>}};
+                       _ -> skip
+                   end
+               end).
+
+%% 属性过滤遍历：逐跳在 Erlang 侧过滤（设计文档 §6.5 两阶段法的朴素版——
+%% 检索候选集求交可用 search_fields 的结果直接与 neighbors 的 vid 集求交）。
+%% Pred(neighbor_vid, VertexValue | undefined) -> boolean()；端点顶点缺失
+%% （悬挂边）时 Value 为 undefined。
+neighbors_where(Handle, Vid, Dir, Pred) when is_function(Pred, 2) ->
+    case neighbors(Handle, Vid, Dir) of
+        {error, _} = E -> E;
+        {ok, Ns} ->
+            {ok, lists:filter(fun(N) ->
+                                  Pred(N, case get_vertex(Handle, N) of
+                                              {ok, V}   -> V;
+                                              _Other    -> undefined
+                                          end)
+                              end, Ns)}
+    end.
+
+counter_delta(Handle, Key, Delta) ->
+    {put, Key, <<(bump(Handle, Key, Delta)):64/big>>}.
+
+agg_counts(Pairs) ->
+    lists:foldl(fun(K, M) -> M#{K => maps:get(K, M, 0) + 1} end, #{}, Pairs).
 
 %% [Lo, Hi) 构造：谓词左到右下推——给 vid 收全部，给 vid+etype 收窄一段。
 out_range(Vid, undefined) ->
@@ -474,6 +580,11 @@ etype_name(Handle, Id) ->
     end.
 
 tnkey(Name) -> <<"tn", (byte_size(Name)):16/big, Name/binary>>.
+
+degkey(Vid, Etype)  -> <<"deg",  Vid:64/big, Etype:32/big>>.
+degikey(Vid, Etype) -> <<"degi", Vid:64/big, Etype:32/big>>.
+etkey(Etype, Src, Dst, Rank) ->
+    <<"et", Etype:32/big, Src:64/big, Dst:64/big, Rank:64/big>>.
 
 %% t 家族扫描：["t", "u")（"u" = succ("t")）。同区间里会混进 "tn"/"t…" 更长的
 %% key（如 "tn…"），strict 5 字节解析过滤。id 从 1 起。
