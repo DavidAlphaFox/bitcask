@@ -426,7 +426,8 @@ pool_dispatch_avoids_busy_worker_test_() ->
         with_pool([0, 1], fun(Pool) ->
             {ok, [W0, W1]} = bitcask_embedder_pool:workers(Pool),
             %% 空闲时是确定性的：取第一个最小。
-            ?assertEqual(W0, pick_probe([W0, W1])),
+            {PickedIdle, _} = pick_probe([W0, W1]),
+            ?assertEqual(W0, PickedIdle),
             %% 把 W0 灌忙，派发必须换到 W1。
             Parent = self(),
             Pids = [spawn(fun() ->
@@ -441,9 +442,16 @@ pool_dispatch_avoids_busy_worker_test_() ->
                          _ -> timer:sleep(5), Wait(N - 1)
                      end
              end)(100),
-            case qlen_probe(W0) of
-                {0, L} when L > 0 -> ?assertEqual(W1, pick_probe([W0, W1]));
-                _ -> ok      %% mock 太快没堆起来，这条就不作数
+            %% 采样合一（feedbacks/2026-09-18-embedder-pool-dispatch-flaky）：
+            %% pick 判定与其依据的邮箱快照取自同一时刻。快照里 W0 确实 >0
+            %% 才断言选了 W1；若 mock 在采样前排空（两个 0 平局回退首元素
+            %% W0），本条自动不作数——与上面 Wait 的「没堆起来就不作数」
+            %% 同一意图，但不再有「guard 采样 >0、pick 再采样已排空」的
+            %% 竞态窗口（全量套件并行负载下偶发假红的根因）。
+            {Picked, Qlens} = pick_probe([W0, W1]),
+            case maps:get(W0, Qlens) of
+                L when L > 0 -> ?assertEqual(W1, Picked);
+                0 -> ok      %% mock 在 pick 采样前排空，这条不作数
             end,
             [receive done -> ok after 5000 -> ok end || _ <- Pids],
             ok
@@ -504,9 +512,12 @@ open_with_pool_test_() ->
     end}.
 
 %% 与 proxy 的 pick/1 同语义的探针（proxy 那个是私有函数）。
+%% 返回 {胜者, 各 worker 采样到的邮箱长度映射}——判定与依据出自同一份
+%% 快照，调用方能分辨「真选了忙的那个」和「采样后平局回退首元素」。
 pick_probe(Ws) ->
-    {_, W} = lists:min([{qlen_probe(X), X} || X <- Ws]),
-    W.
+    Probes = [{qlen_probe(X), X} || X <- Ws],
+    {{_, _Qlen}, W} = lists:min(Probes),
+    {W, maps:from_list([{X, Q} || {{_, Q}, X} <- Probes])}.
 
 qlen_probe(W) ->
     case whereis(W) of
