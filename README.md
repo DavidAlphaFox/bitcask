@@ -273,6 +273,7 @@ ok
 | `doc/put-flow-zh.md` | put(K,V) 完整调用链 |
 | `doc/vector-db-design-zh.md` | 向量库设计方案（V1–V6 蓝图） |
 | `doc/vector-search-extension-zh.md` | 向量搜索扩展：HNSW + RRF 混合检索 |
+| `doc/graph-layer-design-zh.md` / `-en.md` | **图处理层设计**（KV per-key：k=顶点、OKI range 遍历 + OLAP 物化层；已落地 `graphdb`/`graphdb_analytics`） |
 | `doc/hnsw-design-zh.md` | HNSW 向量索引设计（并发/持久化/RRF/实施表） |
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
 | `doc/unified-architecture-plan-zh.md` | 统一架构计划（已实施） |

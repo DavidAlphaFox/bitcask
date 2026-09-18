@@ -479,6 +479,10 @@ load_failed}`）；`StatusInfo::index_errors` 经新 `bitcask:index_errors/1` �
 
 阶段：P1 key codec + CRUD + 前缀遍历 → P2 BFS / k-hop / 双向最短路 → P3 属性过滤
 遍历 + deg/et 索引 → P4 CSR 物化 + 样例算法 → P5 基准与一致性测试。
+**落地（2026-09）**：P1–P5 全部实现——`graphdb`（codec/CRUD/遍历/计数器/et 索引/
+etype registry）+ `graphdb_analytics`（CSR 物化 + PageRank/连通分量/SSSP）+
+一致性语义测试 + `test/graphdb_bench`（稳态一跳 ~0.02 ms/op，未 flush memdelta
+上 ~12 ms/跳——装载型负载装载后建议 checkpoint/reopen）。
 
 ---
 

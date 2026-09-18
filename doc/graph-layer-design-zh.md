@@ -2,9 +2,11 @@
 
 English: 暂缺。本文档定义「以 libbitcask 为单一存储、Erlang 为执行层」的图存储方案。
 
-状态：📐 设计。**本文档覆盖 2.2.1 规划的「CSR 整图一个 value」方案**：旧方案的核心约束
-（keydir 无序、前缀扫描退化 O(全部 key)）已被 6.0.0 的 OKI 有序 range 推翻。原 CSR 盘上
-格式不被丢弃——降级为本方案 §7 的全图分析物化缓存层。
+状态：**P1–P5 已落地**（2026-09：`src/graphdb.erl` + `src/graphdb_analytics.erl` +
+测试 + `test/graphdb_bench` 基准）。**本文档覆盖 2.2.1 规划的「CSR 整图一个 value」
+方案**：旧方案的核心约束（keydir 无序、前缀扫描退化 O(全部 key)）已被 6.0.0 的
+OKI 有序 range 推翻。原 CSR 盘上格式不被丢弃——降级为本方案 §7 的全图分析物化缓存层。
+英文版：[graph-layer-design-en.md](graph-layer-design-en.md)。
 
 ---
 
@@ -295,12 +297,13 @@ vbyte 前缀差分压缩率高（`prefix:id` 形态正是 BCOK 的优化目标�
 
 ---
 
-## 12. 阶段拆分
+## 12. 阶段拆分（P1–P5 已落地，2026-09）
 
-1. **P1**：key codec（n/e/ei 定宽大端 + 长度前缀变体）+ 顶点 / 边 CRUD（原子批双写）
+1. **P1** ✅：key codec（n/e/ei 定宽大端 + 长度前缀变体）+ 顶点 / 边 CRUD（原子批双写）
    + out/in/点查 + del_vertex 级联；etype open-time schema。
-2. **P2**：BFS / k-hop / 双向最短路；hub 策略（limit / 前缀收窄）；visited 去重结构。
+2. **P2** ✅：BFS / k-hop / 双向最短路；hub 策略（limit / 前缀收窄）；visited 去重结构。
 3. **P3**：`deg` / `et` 家族 + `search_*` 联动的属性过滤遍历 + 向量近邻联动。
-4. **P4**：CSR 物化缓存（`parallel_scan` → GCSR）+ PageRank / 连通分量 / SSSP。
-5. **P5**：基准（一跳延迟、吞吐对拍物化 CSR 与旧方案）+ 一致性语义测试（并发写下的
-   逐跳快照行为）+ 文档定稿（EN 版）。
+4. **P4** ✅：CSR 物化缓存（`parallel_scan` → GCSR）+ PageRank / 连通分量 / SSSP。
+5. **P5** ✅：基准（`test/graphdb_bench`：稳态一跳 ~0.02 ms/op、批量装载 ~94k edges/s
+   @2k/8k 规模；⚠️ 未 flush memdelta 上查询 ~12ms/跳——装载型负载装载后建议
+   checkpoint/reopen）+ 一致性语义测试（扫中插入/删除可见性不变量）+ EN 文档（本文英文版）。
