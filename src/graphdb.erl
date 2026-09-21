@@ -39,13 +39,20 @@
 %%   **精确**（2PL 可串行化）；死锁自动重跑。计数器 RMW 直接拿写锁
 %%（read/3 的 write 模式），避免读锁升级型死锁。
 %%
+%%   前缀锁版本（X1-6）：out_edges_txn / in_edges_txn 对 e<vid>/ei<vid>
+%%   前缀拿读锁再扫（bitcask_txn:prefix_range，合并本事务缓冲）——扫描期间
+%%   没人能往这个顶点上加/删边（无幻读）；degree_txn/2 同理。del_vertex_txn
+%%   对两个前缀拿**写**锁做级联：incident 边三键、邻居计数器 RMW、自身全部
+%%   计数键（deg<vid>/degi<vid> 前缀扫）、顶点键，一批提交。
+%%
 %%   ⚠️ 直通 put_edge 与 put_edge_txn **不要混用于同一图的边写入**：直通
 %%      绕过锁，与事务并发时计数器行为未定义（bitcask_txn §4.8）。要么全走
 %%      事务，要么全走直通 + 单写者。只读的直通扫描（out_edges/bfs/…）随便用，
 %%      仍是 per-key 弱一致。
 %%   ⚠️ put_vertex_txn 的 Doc 只收 binary（事务批只装 binary；索引模式的
-%%      #{text=>...} 文档请走直通 put_vertex）。del_vertex 无事务版：级联要
-%%      range 扫描，P1 没有范围锁（幻读），留 P2。
+%%      #{text=>...} 文档请走直通 put_vertex）。
+%%   ⚠️ hub 顶点的 del_vertex_txn 是一条大批（不像直通版分 @DEL_BATCH 段）：
+%%      要么全成要么全不成，但持前缀写锁的时间 = 扫 + 提交。
 %%   ⚠️ Fun 必须无副作用（可能重跑）。
 %%
 %% 关键性质：
@@ -82,7 +89,9 @@
          transaction/2, transaction/3,
          put_vertex_txn/3, get_vertex_txn/2,
          put_edge_txn/4, put_edge_txn/5, edge_txn/4, edge_txn/5,
-         del_edge_txn/4, del_edge_txn/5, degree_txn/3,
+         del_edge_txn/4, del_edge_txn/5, del_vertex_txn/2,
+         out_edges_txn/2, out_edges_txn/3, in_edges_txn/2, in_edges_txn/3,
+         degree_txn/2, degree_txn/3,
 
          out_edges/2, out_edges/3, in_edges/2, in_edges/3,
          neighbors/3, neighbors_where/4,
@@ -362,14 +371,77 @@ del_edge_txn(Tx, Src, Etype, Dst, Rank) ->
             bump_txn(Tx, degikey(Dst, Etype), -1)
     end.
 
-%% per-etype 度数，读锁下读计数键；计数键缺失（P3 前存量）→ 回退按需扫描，
-%% 扫描走 bitcask_txn:handle 的直通 range，**不上锁**（P1 无范围锁）。
+%% 度数。per-etype：读锁下读计数键；计数键缺失（P3 前存量）→ 前缀读锁
+%% 下按需扫描。undefined：前缀读锁下数全部出边（无总数键）。
+degree_txn(Tx, Vid) -> degree_txn(Tx, Vid, undefined).
+degree_txn(Tx, Vid, undefined) ->
+    {Lo, _Hi} = out_range(Vid, undefined),
+    {ok, length(txn_prefix_range(Tx, Lo, read))};
 degree_txn(Tx, Vid, Etype) ->
     ok = v_t32(Etype),
     case txn_read(Tx, degkey(Vid, Etype), read) of
         {ok, <<N:64/big>>} -> {ok, N};
         {ok, _}            -> {error, invalid_degree_record};
-        not_found          -> count_out(bitcask_txn:handle(Tx), Vid, Etype)
+        not_found          ->
+            {Lo, _Hi} = out_range(Vid, Etype),
+            {ok, length(txn_prefix_range(Tx, Lo, read))}
+    end.
+
+%% 邻接扫描的事务版：前缀读锁 + 合并缓冲。Opts 同直通版（etype / limit）。
+%% 返回 {ok, [edge()]}（与直通版同形；引擎错误已在事务内 abort）。
+out_edges_txn(Tx, Vid) -> out_edges_txn(Tx, Vid, #{}).
+out_edges_txn(Tx, Vid, Opts) when is_map(Opts) ->
+    {Lo, _Hi} = out_range(Vid, maps:get(etype, Opts, undefined)),
+    Rows = txn_prefix_range(Tx, Lo, read),
+    Edges = [#{src => Src, etype => T, dst => D, rank => R, props => maybe_props(V)}
+             || {K, V} <- Rows, {ok, Src, T, D, R} <- [parse_e(K)], Src =:= Vid],
+    {ok, take_limit(Edges, opt_limit(Opts))}.
+
+in_edges_txn(Tx, Vid) -> in_edges_txn(Tx, Vid, #{}).
+in_edges_txn(Tx, Vid, Opts) when is_map(Opts) ->
+    {Lo, _Hi} = in_range(Vid, maps:get(etype, Opts, undefined)),
+    Rows = txn_prefix_range(Tx, Lo, read),
+    Edges = [#{dst => Dst, etype => T, src => S, rank => R, props => maybe_props(V)}
+             || {K, V} <- Rows, {ok, Dst, T, S, R} <- [parse_ei(K)], Dst =:= Vid],
+    {ok, take_limit(Edges, opt_limit(Opts))}.
+
+take_limit(L, infinity) -> L;
+take_limit(L, N)        -> lists:sublist(L, N).
+
+%% 级联删除的事务版（与直通 del_vertex 语义对齐，但一批提交、无幻读）：
+%%   1. e<vid> / ei<vid> 两个前缀拿写锁——扫描期间没人能再挂边上来；
+%%   2. 每条 incident 边摘正向 + 反向 + et 三键；邻居计数器逐条 RMW
+%%      （缓冲读自己的写，同邻居多条边自然累加，不必像直通版先聚合）；
+%%   3. 自身计数键按 deg<vid> / degi<vid> 前缀扫掉（直通版只删有边的 etype，
+%%      这里连零值残留一起清）；自环的邻居 RMW 会被随后的 delete 覆盖；
+%%   4. 顶点键。
+del_vertex_txn(Tx, Vid) ->
+    {OutLo, _} = out_range(Vid, undefined),
+    {InLo, _}  = in_range(Vid, undefined),
+    ok = bitcask_txn:lock_prefix(Tx, OutLo, write),
+    ok = bitcask_txn:lock_prefix(Tx, InLo, write),
+    {ok, Out} = out_edges_txn(Tx, Vid),
+    {ok, In}  = in_edges_txn(Tx, Vid),
+    lists:foreach(
+      fun(#{src := S, etype := T, dst := D, rank := R}) ->
+              ok = bitcask_txn:delete(Tx, ekey(S, T, D, R)),
+              ok = bitcask_txn:delete(Tx, eikey(D, T, S, R)),
+              ok = bitcask_txn:delete(Tx, etkey(T, S, D, R))
+      end, Out ++ In),
+    [ok = bump_txn(Tx, degikey(D, T), -1) || #{dst := D, etype := T} <- Out],
+    [ok = bump_txn(Tx, degkey(S, T), -1)  || #{src := S, etype := T} <- In],
+    DegLo  = <<"deg",  Vid:64/big>>,
+    DegiLo = <<"degi", Vid:64/big>>,
+    [ok = bitcask_txn:delete(Tx, K) || {K, _} <- txn_prefix_range(Tx, DegLo, write),
+                                        byte_size(K) =:= 3 + 8 + 4],
+    [ok = bitcask_txn:delete(Tx, K) || {K, _} <- txn_prefix_range(Tx, DegiLo, write),
+                                        byte_size(K) =:= 4 + 8 + 4],
+    bitcask_txn:delete(Tx, nkey(Vid)).
+
+txn_prefix_range(Tx, Prefix, Lock) ->
+    case bitcask_txn:prefix_range(Tx, Prefix, [{lock, Lock}]) of
+        {error, Reason} -> bitcask_txn:abort(Reason);
+        Rows            -> Rows
     end.
 
 %% 计数 RMW：写锁下读、算、写回缓冲。缺 key = 0，不下穿 0。
