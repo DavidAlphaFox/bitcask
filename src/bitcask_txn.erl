@@ -45,6 +45,12 @@
 %%                                    op 的 key 在提交前补写锁；与缓冲里的
 %%                                    key 重合 → {aborted, {index_conflict, K}}。
 %%
+%%   前缀锁（P2）：lock_prefix(Tx, Prefix, read|write) 锁住以 Prefix 开头的
+%%   全部 key（现有的和将来的）——事务内 range 扫描的幻读防护。
+%%   prefix_range(Tx, Prefix) = 前缀读锁 + bitcask:range + 合并本事务缓冲
+%%   （读自己的写），返回 [{Key, Val}] 按 key 升序。持有前缀锁后对其下 key 的
+%%   read/write/delete 不再过 locker（本地判定覆盖）。
+%%
 %%   锁的粒度是 {CaskRef, Key}：不同 cask 的同名 key 互不干扰。
 %%
 %% Copyright (c) 2010 Basho Technologies, Inc. — Apache License 2.0.
@@ -53,6 +59,7 @@
 
 -export([transaction/2, transaction/3,
          read/2, read/3, write/3, delete/2, abort/1,
+         lock_prefix/3, prefix_range/2, prefix_range/3,
          handle/1]).
 
 -define(ACTIVE,  '$bitcask_txn_active').      % pdict：嵌套检测
@@ -140,7 +147,7 @@ run_once(Handle, Fun, Cfg) ->
                           sync = Cfg#cfg.sync},
     BufKey = buf_key(TxnId),
     put(BufKey, #{}),
-    put(locks_key(TxnId), #{}),
+    put(locks_key(TxnId), {#{}, #{}}),        % {点锁 Key => Mode, 前缀锁 Prefix => Mode}
     try
         Result = Fun(Tx),
         commit(Tx, Result)
@@ -211,6 +218,50 @@ delete(#bitcask_txn_ctx{id = TxnId} = Tx, Key) when is_binary(Key) ->
 abort(Reason) ->
     throw({?ABORT, Reason}).
 
+%% 前缀锁：罩住以 Prefix 开头的全部 key（现有的与将来的）。
+-spec lock_prefix(term(), binary(), read | write) -> ok.
+lock_prefix(#bitcask_txn_ctx{} = Tx, Prefix, Mode)
+  when is_binary(Prefix), (Mode =:= read orelse Mode =:= write) ->
+    _ = buffer(Tx),                % owner 检查
+    lock_prefix_(Tx, Prefix, Mode).
+
+%% 前缀扫描：前缀锁（默认 read；Opts 里 {lock, write} 给"扫了就删"的场景）
+%% + bitcask:range [Prefix, succ(Prefix)) + 合并本事务缓冲里前缀下的
+%% put/delete。返回 [{Key, Val}] 按 key 升序；引擎错误原样 {error, R}。
+-spec prefix_range(term(), binary()) -> [{binary(), binary()}] | {error, term()}.
+prefix_range(Tx, Prefix) ->
+    prefix_range(Tx, Prefix, []).
+
+-spec prefix_range(term(), binary(), list()) -> [{binary(), binary()}] | {error, term()}.
+prefix_range(#bitcask_txn_ctx{handle = Handle} = Tx, Prefix, Opts)
+  when is_binary(Prefix), is_list(Opts) ->
+    Buf = buffer(Tx),
+    lock_prefix_(Tx, Prefix, proplists:get_value(lock, Opts, read)),
+    case bitcask:range(Handle, {Prefix, succ(Prefix)}) of
+        {error, _} = E -> E;
+        Rows ->
+            Size = byte_size(Prefix),
+            Mine = [KV || {<<P:Size/binary, _/binary>>, _} = KV <- maps:to_list(Buf),
+                          P =:= Prefix],
+            case Mine of
+                [] -> Rows;
+                _  ->
+                    Merged = lists:foldl(
+                               fun({K, {put, V}}, M) -> M#{K => V};
+                                  ({K, delete}, M)   -> maps:remove(K, M)
+                               end, maps:from_list(Rows), Mine),
+                    lists:sort(maps:to_list(Merged))
+            end
+    end.
+
+%% 字典序后继：去尾部连续 0xFF、末字节 +1；全 0xFF → undefined（无上界）。
+succ(<<>>) -> undefined;
+succ(Bin) ->
+    case binary:last(Bin) of
+        16#FF -> succ(binary_part(Bin, 0, byte_size(Bin) - 1));
+        B     -> <<(binary_part(Bin, 0, byte_size(Bin) - 1))/binary, (B + 1)>>
+    end.
+
 %% 事务绑定的 cask 句柄。给上层（graphdb）在事务内做**不上锁**的辅助读
 %% （如计数键缺失时的按需扫描）用；经它做的读写不受 2PL 保护。
 -spec handle(term()) -> term().
@@ -224,24 +275,51 @@ buffer(#bitcask_txn_ctx{id = TxnId}) ->
     end.
 
 %% 本地记着已持有的锁（pdict）：2PL 到事务结束才放锁，所以这份缓存永远
-%% 准确——重入（读后写同一 key、计数器 RMW）不必再过一次 locker。
-%% 实测 put_edge_txn 每边省 2~3 次 gen_server:call。
+%% 准确——重入（读后写同一 key、计数器 RMW）、被已持前缀锁覆盖的 key，
+%% 都不必再过一次 locker。实测 put_edge_txn 每边省 2~3 次 gen_server:call。
 lock(#bitcask_txn_ctx{id = TxnId, ref = Ref}, Key, Mode) ->
     LK = locks_key(TxnId),
-    Held = get(LK),
-    case maps:find(Key, Held) of
-        {ok, write}                  -> ok;
-        {ok, read} when Mode =:= read -> ok;
-        _ ->
-            case bitcask_txn_locker:acquire(TxnId, {Ref, Key}, Mode) of
-                ok ->
-                    put(LK, Held#{Key => Mode}),
-                    ok;
-                {error, deadlock}          -> throw({?RESTART, deadlock});
-                {error, lock_wait_timeout} -> throw({?RESTART, lock_wait_timeout});
-                {error, timeout}           -> throw(?TIMEOUT);
-                {error, unknown_txn}       -> throw({?ABORT, locker_restarted})
-            end
+    {Points, Prefixes} = Held = get(LK),
+    case covers(maps:find(Key, Points), Mode)
+         orelse prefix_covers(Key, Mode, Prefixes) of
+        true  -> ok;
+        false ->
+            acquire(TxnId, {Ref, Key, point}, Mode),
+            put(LK, setelement(1, Held, Points#{Key => Mode})),
+            ok
+    end.
+
+lock_prefix_(#bitcask_txn_ctx{id = TxnId, ref = Ref}, Prefix, Mode) ->
+    LK = locks_key(TxnId),
+    {_Points, Prefixes} = Held = get(LK),
+    case prefix_covers(Prefix, Mode, Prefixes) of
+        true  -> ok;
+        false ->
+            acquire(TxnId, {Ref, Prefix, prefix}, Mode),
+            put(LK, setelement(2, Held, Prefixes#{Prefix => Mode})),
+            ok
+    end.
+
+covers({ok, write}, _)    -> true;
+covers({ok, read}, read)  -> true;
+covers(_, _)              -> false.
+
+%% 已持有的前缀锁里有没有一把罩住 Bin（含相等）且模式够用的。
+prefix_covers(Bin, Mode, Prefixes) ->
+    Size = byte_size(Bin),
+    lists:any(fun({P, PM}) ->
+                      PS = byte_size(P),
+                      PS =< Size andalso binary_part(Bin, 0, PS) =:= P
+                          andalso covers({ok, PM}, Mode)
+              end, maps:to_list(Prefixes)).
+
+acquire(TxnId, LockId, Mode) ->
+    case bitcask_txn_locker:acquire(TxnId, LockId, Mode) of
+        ok                         -> ok;
+        {error, deadlock}          -> throw({?RESTART, deadlock});
+        {error, lock_wait_timeout} -> throw({?RESTART, lock_wait_timeout});
+        {error, timeout}           -> throw(?TIMEOUT);
+        {error, unknown_txn}       -> throw({?ABORT, locker_restarted})
     end.
 
 %% =========================================================================
