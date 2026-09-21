@@ -3,7 +3,13 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
-## [Unreleased]
+## [6.5.1] — 2026-09-21
+
+**事务协调层落地**：在引擎原子批（A+D）之上补齐隔离性——纯 OTP 的 2PL +
+死锁检测 + 事务重启，含前缀锁（无幻读范围扫描）、分片锁管理器与最年轻
+优先的受害者选择；`graphdb` 据此获得计数精确的事务式 API。**引擎零改动、
+零新依赖、无 ABI / 盘上格式变更**（libbitcask 保持 6.5.0）。设计
+[`doc/txn-layer-design-zh.md`](doc/txn-layer-design-zh.md)。`rebar3 eunit` 235/235。
 
 ### Added
 

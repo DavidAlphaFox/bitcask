@@ -3,7 +3,15 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [6.5.1] — 2026-09-21
+
+**Transaction layer lands**: isolation on top of the engine's atomic batches
+(A+D) — pure-OTP 2PL + deadlock detection + transaction restart, with prefix
+locks (phantom-free range scans), a sharded lock manager and youngest-first
+victim selection; `graphdb` gains an exact-count transactional API on top of
+it. **Zero engine changes, zero new dependencies, no ABI / on-disk format
+change** (libbitcask stays at 6.5.0). Design:
+[`doc/txn-layer-design-zh.md`](doc/txn-layer-design-zh.md). `rebar3 eunit` 235/235.
 
 ### Added
 
