@@ -476,6 +476,23 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## X1 — 事务协调层 bitcask_txn（2PL + 死锁检测 + 重跑）
+
+> 设计：`doc/txn-layer-design-zh.md`。引擎原子批只有 A+D 没有 I，
+> `graphdb` 的 deg/degi 计数已经在靠"调用方自觉串行"。本任务在 BEAM 侧
+> 补齐 Mnesia 三件套，**引擎零改动、零新依赖**。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **X1-1** | `bitcask_txn_locker` gen_server：点锁 `{CaskRef, Key}`、read/write 兼容矩阵（重入、唯一 holder 升级越过队列）、FIFO + 读段合并 + 防写饿死、monitor 清理、单锁等待兜底计时器（`min(lock_wait_timeout, deadline 剩余)`）。⚠️ wait-for 边**不存表**，由锁表推导（冲突 holder ∪ 队列里排前面的冲突请求者）——推导式的图永远与锁表一致；死锁只在入队时检（授予/删边都不造环）。`bitcask_sup` 常驻 child。 | ✅ |
+| **X1-2** | `bitcask_txn` 门面：`transaction/2,3` + `read/write/delete/abort`；pdict 写缓冲（同 mnesia_tm），read-your-writes；提交按 key 升序展开为一条 `txn_commit/3`；只读事务不碰引擎；死锁/lock_wait_timeout → 丢缓冲原样重跑（预算 + 抖动）；`{timeout, Ms}` 跨重跑总预算；`index_fun` 额外 op 补写锁 + 同批提交；嵌套 → `tx_nested`；非 owner 进程用 Tx → `error({bitcask_txn, not_owner})`。 | ✅ |
+| **X1-3** | eunit `bitcask_txn_tests` 18 例（设计 §7 全部 8 项）。⚠️ 测试 harness 两个坑：① locker 裸 API 的 agent 进程 `release_all` 后事务就注销了，再 acquire 是 `unknown_txn`——agent 要自动重注册；② eunit 用例失败是 normal 退出，**link 不传播**，spawn_link 的 agent 会把锁留给下一个用例——agent 必须 monitor 测试进程。放大压测 8 进程 × 400 次：3200 个高冲突事务 ~170ms（≈19k txn/s），总额守恒，锁表清零。全量 `rebar3 eunit` **218/218**。 | ✅ |
+| **X1-4** | 文档：设计稿状态 + §11 实现对账、README（中/英）API 表 + 示例（输出真跑）、CHANGELOG [Unreleased]。 | ✅ |
+| X1-5 | `graphdb` 事务式 API（`put_edge_txn` 族，deg/degi 计数入事务）消除"单写者语义下精确"的限制。 | ⏳ |
+| X1-6 | P2：前缀/表锁（事务内 range 的幻读防护）；P3：locker 分片、victim 启发式。触发条件见设计 §9。 | ⏳ |
+
+---
+
 ## 明确排除（V7+ 或永久取消）
 
 | 条目 | 决策 | 理由 |

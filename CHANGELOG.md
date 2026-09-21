@@ -3,6 +3,23 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [Unreleased]
+
+### Added
+
+- **`bitcask_txn` 事务协调层（隔离性）**：在引擎原子批之上补齐 I——悲观 2PL
+  点锁 + wait-for 图死锁检测 + 受害者自动重跑（`{retries, N}` 预算 + 1~10ms
+  抖动退避），Mnesia 三件套的单节点版。写进调用进程 pdict 缓冲，提交时按
+  key 升序展开成**一条** `txn_commit/3` 批（A+D 归引擎）；`index_fun` 把二级
+  索引 op 并入同批并补写锁；`{timeout, Ms}` 跨重跑总预算；进程死亡 monitor
+  自动清锁。**引擎零改动、零新依赖**：锁管理器 `bitcask_txn_locker` 是
+  `bitcask_sup` 常驻 child。设计 [`doc/txn-layer-design-zh.md`](doc/txn-layer-design-zh.md)
+  （§11 记录实现与设计稿的偏差）；`test/bitcask_txn_tests.erl` 18 例（锁矩阵、
+  FIFO 防写饿死、双方/三方死锁、重启预算、死亡清理、缓冲语义、提交失败、
+  timeout、index_fun、跨 cask、8 进程并发转账守恒）。
+
+---
+
 ## [6.5.0] — 2026-09-18
 
 **图处理层落地**：以 libbitcask 为单一存储的 KV-per-key 图存储 + 内存分析层

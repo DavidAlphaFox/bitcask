@@ -124,6 +124,38 @@ ok
 > 需应用层串行化。⚠️ **首次调用把目录 meta 懒升级为 v6**，此后不能被早于
 > 上游 5.1.0 的读端打开。
 
+**事务（隔离性）**（`bitcask_txn`，未发布）— 在原子批之上补齐隔离：悲观 2PL +
+死锁检测 + 自动重跑（Mnesia 三件套的单节点版），引擎零改动、纯 OTP：
+
+```erlang
+1> bitcask_txn:transaction(R, fun(Tx) ->
+       {ok, A} = bitcask_txn:read(Tx, <<"a">>),          % 读锁
+       {ok, B} = bitcask_txn:read(Tx, <<"b">>),
+       ok = bitcask_txn:write(Tx, <<"a">>, integer_to_binary(binary_to_integer(A) - 30)),
+       ok = bitcask_txn:write(Tx, <<"b">>, integer_to_binary(binary_to_integer(B) + 30)),
+       moved                                             % 提交 = 一条 txn_commit 批
+   end).
+{atomic,moved}
+2> [bitcask:get(R, K) || K <- [<<"a">>, <<"b">>]].
+[{ok,<<"70">>},{ok,<<"30">>}]
+3> bitcask_txn:transaction(R, fun(Tx) ->
+       {ok, A} = bitcask_txn:read(Tx, <<"a">>),
+       case binary_to_integer(A) < 1000 of
+           true  -> bitcask_txn:abort(insufficient);    % 不写、不重跑
+           false -> ok
+       end
+   end).
+{aborted,insufficient}
+4> bitcask_txn_locker:status().
+#{waiting => 0,deadlocks_total => 0,locks => 0,txns => 0}
+```
+
+> 写只进调用进程的缓冲，提交时按 key 升序展开成一条 `txn_commit/3`；
+> 死锁 / 单锁等待超时 → 丢缓冲**原样重跑 Fun**（`{retries, N}` 默认 10，耗尽
+> `{aborted, {retry_limit, N}}`）；`{timeout, Ms}` 是跨重跑的总预算。
+> ⚠️ **Fun 必须无副作用**（可能执行多次）；⚠️ `bitcask:put/get` 直通 API 绕过锁，
+> 与事务混用同一批 key 的行为未定义。设计：`doc/txn-layer-design-zh.md`。
+
 **BM25 全文检索** — 用 `{analyzer, ...}` 打开即可启用。每次 `put` 自动索引；
 返回 `{ok, [{Key, Ord, Score}, ...]}`，按分数降序：
 
@@ -250,6 +282,7 @@ ok
 | `fold/3,6`, `fold_keys/3,6`, `list_keys/1` | 迭代（**快照一致**，代价 O(全表)） |
 | `range/2,3`, `range_fold/5` | 有序范围查询 `[Lo, Hi)`，代价 **O(range)**；per-key 弱一致（非快照）；`{prefetch, N}` 可批量并发取值 |
 | `put_batch_atomic/2`, `txn_commit/2,3` | 跨崩溃原子批 / 多键事务；`Ops :: [{put,K,V} \| {remove,K}]`；⚠️ 首次调用把目录 meta 懒升级为 v6 |
+| `bitcask_txn:transaction/2,3`, `read/2`, `write/3`, `delete/2`, `abort/1` | **隔离事务**：2PL 点锁 + 死锁检测 + 重跑；`{atomic,R} \| {aborted,Why}`；选项 `retries`/`timeout`/`lock_wait_timeout`/`sync`/`index_fun` |
 | `stream/1`, `next/1`, `stop/1`, `with_stream/2` | 流式迭代 |
 | `merge/1,2,3`, `needs_merge/1,2`, `status/1` | 合并管理 |
 | `search_text/2,3`, `search_phrase/2,3`, `search_fields/2,3` | BM25 检索（全文 / 短语 / `field:term^boost`） |

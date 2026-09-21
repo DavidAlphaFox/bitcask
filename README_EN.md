@@ -284,6 +284,7 @@ ok
 | `fold/3,6`, `fold_keys/3,6`, `list_keys/1` | Iteration (**snapshot-consistent**, costs O(whole table)) |
 | `range/2,3`, `range_fold/5` | Ordered range query over `[Lo, Hi)`, costs **O(range)**; per-key weak consistency (not a snapshot); `{prefetch, N}` fetches values concurrently |
 | `put_batch_atomic/2`, `txn_commit/2,3` | Crash-atomic batch / multi-key transaction; `Ops :: [{put,K,V} \| {remove,K}]`; ⚠️ the first call lazily upgrades the directory's meta to v6 |
+| `bitcask_txn:transaction/2,3`, `read/2`, `write/3`, `delete/2`, `abort/1` | **Isolated transactions** (unreleased): pessimistic 2PL point locks + deadlock detection + automatic restart, Mnesia-style; `{atomic,R} \| {aborted,Why}`; options `retries`/`timeout`/`lock_wait_timeout`/`sync`/`index_fun`; Fun must be side-effect free (may run more than once) |
 | `stream/1`, `next/1`, `stop/1`, `with_stream/2` | Streaming iteration |
 | `merge/1,2,3`, `needs_merge/1,2`, `status/1` | Merge management |
 | `search_text/2,3`, `search_phrase/2,3`, `search_fields/2,3` | BM25 search (full-text / phrase / `field:term^boost`) |

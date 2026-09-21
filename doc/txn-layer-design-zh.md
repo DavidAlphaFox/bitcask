@@ -1,6 +1,7 @@
 # 事务协调层设计（bitcask_txn）：2PL + 死锁检测 + 事务重启
 
-> 状态：设计稿（未实施）。落地版本：TBD（当前 6.5.0）。
+> 状态：**P1 已实施**（2026-09-21，`src/bitcask_txn.erl` + `src/bitcask_txn_locker.erl`，
+> `test/bitcask_txn_tests.erl` 18 例），未发布（当前 6.5.0）。实现与本稿的偏差见 §11。
 > 前置阅读：`third_party/libbitcask/doc/multikey-txn-zh.md` §4（引擎事务边界：
 > 只有 A+D，没有 I，也没有 CAS）、`doc/graph-layer-design-zh.md`。
 
@@ -297,3 +298,22 @@ eunit（`rebar3 eunit`；并发用例用 spawn + 确定性同步，不引新框�
 - **重启风暴**：对称死锁 + 无退避 = 活锁；抖动退避已入设计，预算耗尽
   有显式返回。
 - **与 merge 的关系**：无。事务提交走常规写路径，merge 锁模型不变。
+
+## 11. 实现对账（P1 落地时与设计稿的偏差）
+
+| 设计稿 | 实现 | 为什么 |
+|--------|------|--------|
+| `LockId :: binary()`（用户 key） | `LockId = {CaskRef, Key}` | 单 locker 服务全部 cask；不带 ref 会让两个库的同名 key 假冲突。零成本 |
+| `waits` 边表（第三张 ETS） | **不存边**，从锁表按需推导：等待者 W 等 (a) 与它冲突的 holder，(b) 队列里排它前面且冲突的请求者；`txns` 记 `waiting => LockId` | 推导式的图永远与锁表一致，没有"边表漏删"这一类 bug；DFS 每步多一次 O(队列长) 扫描，可忽略 |
+| `Holders :: #{TxnId => N}` 重入计数 | `#{TxnId => read \| write}` | 严格 2PL 事务结束才放锁，重入不需要计数；只需记模式（read 升 write 只升不降） |
+| 授予时补做死锁检测 | 只在**入队**时检 | 授予不造环（被授予者不再等任何人），删边（释放/死亡/中止）也不造环；入队是唯一会加边的时刻 |
+| `status/0` 列在 P2 | P1 就有：`#{txns, waiting, locks, deadlocks_total}`，直读 protected ETS 不过 locker | 测试要靠它断言"锁清零"；`deadlocks_total` 替代设计里的 `restarts_total`（locker 只看得见死锁，看不见重跑） |
+| `{timeout, Ms}` 语义未定 | **整个 transaction 调用的总预算**（跨重跑），deadline 注册时算好；等锁中过点由兜底计时器（`min(lock_wait_timeout, 剩余)`）叫醒 | 超时是调用方的预算，重跑不应把预算刷新 |
+| `index_fun` 额外 op 只并批 | 额外 op 的 key 在提交前**补写锁**（仍属增长段，可能死锁 → 照常重跑）；与缓冲 key 重合 → `{aborted, {index_conflict, K}}` | 不锁的话两个事务的索引写会互相覆盖，"同批原子"只保住了崩溃安全没保住隔离 |
+| 提交固定 `sync_on_commit` | 加 `{sync, sync_on_commit \| no_sync}` 选项，默认不变 | 测试/批量装载不必每次 fsync |
+| `lock_wait_timeout` 只是默认值 | 也是 `transaction/3` 选项 | 测试要短超时；生产也可能按负载调 |
+| `{aborted, {Class, Reason}}` 形态未定 | 与 Mnesia 对齐：`{aborted, {throw, V}}` / `{aborted, {Reason, Stack}}` | — |
+
+实测（`concurrent_transfers_conserve_test_` 放大到 8 进程 × 400 次，10 账户，
+`no_sync`）：3200 个高冲突事务 ~170ms（≈19k txn/s，含死锁重跑），总额守恒，
+锁表清零。
