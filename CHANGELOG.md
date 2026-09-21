@@ -25,6 +25,13 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
   5 例（含 16 进程并发 hub 计数）。
 - `bitcask_txn:read/3`：`Lock = write` 读前直接拿写锁（Mnesia `wlock_read`），
   读-改-写模式用它避免读锁升级型死锁。
+- **前缀锁**（txn 设计 P2）：`bitcask_txn:lock_prefix/3` 罩住以 Prefix 开头的
+  全部 key（含将来的）；`prefix_range/2,3` = 前缀锁 + `range` + 合并本事务
+  缓冲——事务内范围扫描**无幻读**。锁表改 ordered_set，请求与重叠记录集比
+  （跨记录 FIFO，前缀写等待者不被点锁请求饿死；持覆盖锁再要其下锁免费）；
+  无前缀锁时点锁路径开销不变。graphdb 据此新增 `out_edges_txn`/
+  `in_edges_txn`/`degree_txn/2`/`del_vertex_txn`（级联一批提交）；加边 vs
+  删点随机交错的全图不变式测试。
 
 ### Fixed
 

@@ -489,7 +489,8 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 | **X1-3** | eunit `bitcask_txn_tests` 18 例（设计 §7 全部 8 项）。⚠️ 测试 harness 两个坑：① locker 裸 API 的 agent 进程 `release_all` 后事务就注销了，再 acquire 是 `unknown_txn`——agent 要自动重注册；② eunit 用例失败是 normal 退出，**link 不传播**，spawn_link 的 agent 会把锁留给下一个用例——agent 必须 monitor 测试进程。放大压测 8 进程 × 400 次：3200 个高冲突事务 ~170ms（≈19k txn/s），总额守恒，锁表清零。全量 `rebar3 eunit` **218/218**。 | ✅ |
 | **X1-4** | 文档：设计稿状态 + §11 实现对账、README（中/英）API 表 + 示例（输出真跑）、CHANGELOG [Unreleased]。 | ✅ |
 | **X1-5** | `graphdb` 事务式 API：`transaction/2,3` + `put_edge_txn`/`del_edge_txn`/`edge_txn`/`degree_txn`/`put_vertex_txn`/`get_vertex_txn`——与直通版逐一对应，只换 IO 路径（读走 `bitcask_txn:read/3`、写进缓冲）。边键 + 反向键 + et + 两个计数器全在锁下同批提交，16 进程并发对同一 hub 加边（出入度都是热点）计数精确（`graphdb_txn_tests` 5 例）。顺手：直通 `degree/3` 计数键缺失时的回退原来数**全部** etype，现在只数该 etype。⚠️ 两个性能坑都是这一步压出来的：① locker 把持有锁列表放 `#txn{}` 记录里，ETS insert 整条拷贝 → 大事务 O(n²)，100 边/事务比 1 边/事务还慢——拆成 bag 表后 12.8k → 25.6k edges/s；② 计数器 RMW 先读锁再升级是确定死锁（能跑对但白跑）→ 加 `read/3` 的 write 模式；门面本地缓存已持有锁，重入不再过 locker。代价（8 核被别的进程压着，只记比值）：单边事务 ≈ 直通的 0.4×，100 边/事务批量 ≈ 0.75×。全量 eunit **223/223**。 | ✅ |
-| X1-6 | P2：前缀/表锁（事务内 range 的幻读防护）；P3：locker 分片、victim 启发式。触发条件见设计 §9。 | ⏳ |
+| **X1-6** | **前缀锁**（txn P2，设计 §12）：`LockId = {Ref, Bin, point\|prefix}`，锁表改 ordered_set；请求与**重叠记录集**（自身 + 罩住它的前缀记录〔按现存前缀长度集合 `plens` 逐长度查〕+ 自己是前缀时其下全部记录〔一段顺序扫〕）上的 holder / 早到等待者比——跨记录 FIFO 天然防前缀写饿死；持覆盖锁的事务再要其下的锁免费（不建记录）。无前缀锁时点锁路径只查自身一条，与 P1 同价（bench 比值无回退）。门面 `lock_prefix/3`、`prefix_range/2,3`（前缀锁 + range + 合并缓冲）。graphdb：`out_edges_txn`/`in_edges_txn`/`degree_txn/2`/`del_vertex_txn`。测试 +4（locker 矩阵、跨记录公平、覆盖免费 + 经前缀锁的死锁、幻读）+3（缓冲合并、级联含自环、**加边 vs 删点随机交错的全图不变式**，放大 10× 跑 3 轮）。⚠️ 测试 harness 又两个坑：一个 agent 同一时刻只能挂一个 acquire（被阻塞时发第二个请求会 timeout）；测试数据里"abx"不在前缀"abc"下——先写清 key 再断言。全量 eunit **230/230**。 | ✅ |
+| X1-7 | P3：locker 分片、victim 启发式（最老事务优先）、环境式 API。触发条件：锁竞争 profiling 证明单点瓶颈。 | ⏳ |
 
 ---
 
