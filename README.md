@@ -147,8 +147,8 @@ ok
    end).
 {aborted,insufficient}
 4> bitcask_txn_locker:status().
-#{waiting => 0,lock_wait_timeouts => 0,deadlocks_total => 0,locks => 0,
-  prefix_locks => 0,shards => 8,txns => 0}
+#{waiting => 0,victims_other => 0,lock_wait_timeouts => 0,
+  deadlocks_total => 0,locks => 0,prefix_locks => 0,shards => 8,txns => 0}
 ```
 
 > 写只进调用进程的缓冲，提交时按 key 升序展开成一条 `txn_commit/3`；

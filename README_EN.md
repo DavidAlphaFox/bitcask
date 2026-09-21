@@ -159,8 +159,8 @@ single-node version of Mnesia's trio), zero engine changes, pure OTP:
    end).
 {aborted,insufficient}
 4> bitcask_txn_locker:status().
-#{waiting => 0,lock_wait_timeouts => 0,deadlocks_total => 0,locks => 0,
-  prefix_locks => 0,shards => 8,txns => 0}
+#{waiting => 0,victims_other => 0,lock_wait_timeouts => 0,
+  deadlocks_total => 0,locks => 0,prefix_locks => 0,shards => 8,txns => 0}
 ```
 
 > Writes go into a per-process buffer and are expanded at commit, in key order,

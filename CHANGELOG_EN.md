@@ -53,6 +53,12 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   microbench: flat 26k txn/s → 50k+ at P=16; `status()` gained `shards` /
   `lock_wait_timeouts`. A shard crash restarts the whole group and in-flight
   transactions get `{aborted, locker_restarted}`.
+- **Deadlock victim = the youngest transaction on the cycle** (no longer always
+  the requester); age is assigned per `transaction/3` call and preserved across
+  restarts (as Mnesia keeps the Tid on restart), so the oldest transaction is
+  never sacrificed and a long transaction cannot be starved by a stream of
+  short ones. A victim waiting on another shard is aborted via a cast.
+  `status()` gained `victims_other`.
 
 ### Fixed
 

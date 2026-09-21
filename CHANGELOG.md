@@ -39,6 +39,10 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
   （同 mnesia_locker）、提交前校验直读 ETS。locker-only 微基准 26k txn/s 平线
   → P=16 50k+；`status()` 新增 `shards` / `lock_wait_timeouts`。分片崩溃全组
   重启，进行中事务 `{aborted, locker_restarted}`。
+- **死锁受害者 = 环上最年轻的事务**（不再固定是请求者），年龄按一次
+  `transaction/3` 调用算、重跑不变（同 Mnesia 重启保 Tid）：最老的永远不被
+  牺牲，长事务不会被短事务反复打断。在别的分片上等的受害者经 cast 中止。
+  `status()` 新增 `victims_other`。
 
 ### Fixed
 
