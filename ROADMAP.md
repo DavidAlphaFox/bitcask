@@ -6,6 +6,36 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 6.5.1 落地
+
+### 事务协调层：2PL + 死锁检测 + 重跑（含前缀锁、分片、victim 启发式）✅
+
+引擎原子批只有 A+D 没有 I；`graphdb` 的 deg/degi 计数此前靠"调用方自觉
+串行"。6.5.1 在 BEAM 侧补齐 Mnesia 三件套，**引擎零改动、零新依赖**：
+
+- **P1**：`bitcask_txn:transaction/2,3` + `read/write/delete/abort`；pdict 写缓冲、
+  提交为一条 `txn_commit` 批；wait-for 图推导式死锁检测（不存边表）；
+  `{retries,N}` + 抖动退避重跑；`{timeout,Ms}` 跨重跑总预算；`index_fun`。
+- **P2 前缀锁**：`lock_prefix/3`、`prefix_range/2,3`——重叠记录集模型（无意向
+  锁），持覆盖锁再要其下锁免费；`graphdb` 的 `out_edges_txn`/`del_vertex_txn`。
+- **P3 分片 + victim**：profiling 证明单 locker 26k txn/s 平线后才动手；
+  N 分片（默认 8）、前缀锁每分片各拿一份、跨分片 DFS"先写边再检"不漏报、
+  释放异步 cast；受害者 = 环上最年轻、年龄跨重跑不变。
+- **消费**：`graphdb` 事务式 API 全套，并发加边计数精确；加边 vs 删点随机
+  交错的全图不变式测试。
+- 两个被压测逼出来的实现坑记在 `TASK.md` X1-5/X1-7：locker 记录里放持有锁
+  列表是 O(n²)（ETS 整条拷贝）；同一 cask 重复灌边走 upsert 路径会把基准读歪。
+
+设计：`doc/txn-layer-design-zh.md`（§11 实现对账、§12 前缀锁、§13 分片/victim）。
+不做：环境式 API（显式 Tx 更清楚）、跨 cask 事务、MVCC 读视图（见设计 §2）。
+
+## 6.5.0 落地
+
+### 图处理层 ✅
+
+`graphdb` + `graphdb_analytics`（KV per-key 图存储 + 内存 CSR 分析层），随
+libbitcask 6.3.2 → 6.5.0。详见 `doc/graph-layer-design-zh.md` §12 与 CHANGELOG。
+
 ## 6.4.0 落地
 
 ### 本地嵌入：`slots => K` 并发槽位 + 设备选择只认独立 GPU ✅

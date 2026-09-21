@@ -6,6 +6,45 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 6.5.1 shipped
+
+### Transaction layer: 2PL + deadlock detection + restart (prefix locks, sharding, victim heuristic) ✅
+
+The engine's atomic batches give A+D but no I; `graphdb`'s deg/degi counters
+relied on "callers serialize themselves". 6.5.1 adds Mnesia's trio on the BEAM
+side, **zero engine changes, zero new dependencies**:
+
+- **P1**: `bitcask_txn:transaction/2,3` + `read/write/delete/abort`; pdict write
+  buffer committed as one `txn_commit` batch; wait-for graph derived from the
+  lock table (no edge table); `{retries,N}` restart with jittered backoff;
+  `{timeout,Ms}` total budget across restarts; `index_fun`.
+- **P2 prefix locks**: `lock_prefix/3`, `prefix_range/2,3` — overlapping-record
+  model (no intention locks), sub-locks are free under a covering lock;
+  `graphdb`'s `out_edges_txn`/`del_vertex_txn`.
+- **P3 sharding + victim**: done only after profiling showed a single locker
+  flat at 26k txn/s; N shards (default 8), prefix locks taken on every shard,
+  cross-shard DFS "write the edge, then check" never misses a cycle, async
+  release; victim = youngest on the cycle, age preserved across restarts.
+- **Consumer**: the full `graphdb` transactional API with exact counts under
+  concurrency; full-graph invariant test with inserts interleaved with vertex
+  deletes.
+- Two pitfalls the stress tests forced out are recorded in `TASK.md` X1-5/X1-7:
+  a held-lock list inside the locker record is O(n²) (ETS copies whole
+  records); re-inserting the same edges into one cask takes the upsert path
+  and skews benchmarks.
+
+Design: `doc/txn-layer-design-zh.md` (§11 deviations, §12 prefix locks,
+§13 sharding/victim). Not doing: implicit-context API (explicit Tx is clearer),
+cross-cask transactions, MVCC read views (design §2).
+
+## 6.5.0 shipped
+
+### Graph layer ✅
+
+`graphdb` + `graphdb_analytics` (KV per-key graph store + in-memory CSR
+analytics), with libbitcask 6.3.2 → 6.5.0. See `doc/graph-layer-design-en.md`
+§12 and the changelog.
+
 ## 6.4.0 shipped
 
 ### Local embedding: `slots => K` concurrency slots + discrete-GPU-only device selection ✅
