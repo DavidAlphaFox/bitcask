@@ -287,7 +287,7 @@ eunit（`rebar3 eunit`；并发用例用 spawn + 确定性同步，不引新框�
 | P2 | 前缀/表锁（事务内 range 扫描的幻读防护）、`timeout` 指标、`status/0` | graphdb 遍历入事务的需求 |
 | P3 | locker 分片、环境式 API（Mnesia 习惯法）、victim 启发式（最老事务优先） | 锁竞争 profiling 证明单点瓶颈 |
 | 交汇 | **与引擎条件批（CAS/`expected_rev`）融合**：2PL 管跨 key 不变式，条件批管单 key 乐观并发，两者共享条件校验语义 | CouchDB 风格条件更新立项时 |
-| 消费 | `graphdb` 新增事务式 API（`put_edge_txn` 族，deg/degi 计数入事务），消除"单写者语义下精确"的限制 | P1 落地后跟进 |
+| 消费 ✅ | `graphdb` 事务式 API（`transaction/2,3` + `put_edge_txn` 族，deg/degi 计数入事务），消除"单写者语义下精确"的限制。已落地（2026-09-21），见 graph 设计 §12 第 6 条 | — |
 
 ## 10. 风险与开放问题
 
@@ -313,6 +313,10 @@ eunit（`rebar3 eunit`；并发用例用 spawn + 确定性同步，不引新框�
 | 提交固定 `sync_on_commit` | 加 `{sync, sync_on_commit \| no_sync}` 选项，默认不变 | 测试/批量装载不必每次 fsync |
 | `lock_wait_timeout` 只是默认值 | 也是 `transaction/3` 选项 | 测试要短超时；生产也可能按负载调 |
 | `{aborted, {Class, Reason}}` 形态未定 | 与 Mnesia 对齐：`{aborted, {throw, V}}` / `{aborted, {Reason, Stack}}` | — |
+| `read/2` 只有读锁 | 加 `read/3`，`Lock = write` 直接拿写锁再读（Mnesia `wlock_read`） | 读-改-写模式两个事务都先读锁再升级 = 确定死锁，能跑对但白白重跑；graphdb 计数器全走它 |
+| `txns` 记录里放 `locks => [LockId]` | 持有锁单独一张 bag 表 `bitcask_txn_held` | ETS insert 整条拷贝，列表放记录里每拿一把新锁拷一遍已持有的——大事务 O(n²)。实测 100 边/事务从 12.8k → 25.6k edges/s |
+| 每个 read/write 一次 `gen_server:call` | 门面在 pdict 记已持有锁，重入（读后写、RMW）不再过 locker | 2PL 到事务结束才放锁，本地缓存永远准确；put_edge_txn 每边省 2~3 次往返 |
+| `handle(Tx)` 未列 | 加 `handle/1` | graphdb 计数键缺失时的按需扫描要句柄（不上锁，文档已声明） |
 
 实测（`concurrent_transfers_conserve_test_` 放大到 8 进程 × 400 次，10 账户，
 `no_sync`）：3200 个高冲突事务 ~170ms（≈19k txn/s，含死锁重跑），总额守恒，

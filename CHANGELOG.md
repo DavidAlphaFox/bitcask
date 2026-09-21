@@ -17,6 +17,19 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
   （§11 记录实现与设计稿的偏差）；`test/bitcask_txn_tests.erl` 18 例（锁矩阵、
   FIFO 防写饿死、双方/三方死锁、重启预算、死亡清理、缓冲语义、提交失败、
   timeout、index_fun、跨 cask、8 进程并发转账守恒）。
+- **`graphdb` 事务式 API**：`transaction/2,3` + `put_edge_txn`/`del_edge_txn`/
+  `edge_txn`/`degree_txn`/`put_vertex_txn`/`get_vertex_txn`。边键 + 反向键 +
+  et + deg/degi 计数器全在锁下同批提交，并发对同一端点加边**计数精确**——
+  消除了 6.5.0 里"deg/degi 只在单写者语义下精确"的限制。直通 `put_edge` 与
+  `put_edge_txn` 不要混用于同一图（直通绕过锁）。`test/graphdb_txn_tests.erl`
+  5 例（含 16 进程并发 hub 计数）。
+- `bitcask_txn:read/3`：`Lock = write` 读前直接拿写锁（Mnesia `wlock_read`），
+  读-改-写模式用它避免读锁升级型死锁。
+
+### Fixed
+
+- `graphdb:degree/3` 在 per-etype 计数键缺失（P3 前存量）时的回退原来数的是
+  **全部** etype 的出边，现在只数该 etype。
 
 ---
 

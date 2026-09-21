@@ -155,6 +155,8 @@ ok
 > `{aborted, {retry_limit, N}}`）；`{timeout, Ms}` 是跨重跑的总预算。
 > ⚠️ **Fun 必须无副作用**（可能执行多次）；⚠️ `bitcask:put/get` 直通 API 绕过锁，
 > 与事务混用同一批 key 的行为未定义。设计：`doc/txn-layer-design-zh.md`。
+> 图层同款：`graphdb:transaction(R, fun(Tx) -> graphdb:put_edge_txn(Tx, 1, 7, 2) end)`
+> ——边的五个键（正向/反向/et/deg/degi）锁下同批提交，并发加边计数精确。
 
 **BM25 全文检索** — 用 `{analyzer, ...}` 打开即可启用。每次 `put` 自动索引；
 返回 `{ok, [{Key, Ord, Score}, ...]}`，按分数降序：
@@ -282,7 +284,8 @@ ok
 | `fold/3,6`, `fold_keys/3,6`, `list_keys/1` | 迭代（**快照一致**，代价 O(全表)） |
 | `range/2,3`, `range_fold/5` | 有序范围查询 `[Lo, Hi)`，代价 **O(range)**；per-key 弱一致（非快照）；`{prefetch, N}` 可批量并发取值 |
 | `put_batch_atomic/2`, `txn_commit/2,3` | 跨崩溃原子批 / 多键事务；`Ops :: [{put,K,V} \| {remove,K}]`；⚠️ 首次调用把目录 meta 懒升级为 v6 |
-| `bitcask_txn:transaction/2,3`, `read/2`, `write/3`, `delete/2`, `abort/1` | **隔离事务**：2PL 点锁 + 死锁检测 + 重跑；`{atomic,R} \| {aborted,Why}`；选项 `retries`/`timeout`/`lock_wait_timeout`/`sync`/`index_fun` |
+| `bitcask_txn:transaction/2,3`, `read/2,3`, `write/3`, `delete/2`, `abort/1` | **隔离事务**：2PL 点锁 + 死锁检测 + 重跑；`{atomic,R} \| {aborted,Why}`；选项 `retries`/`timeout`/`lock_wait_timeout`/`sync`/`index_fun`；`read/3` 的 `write` 模式给读-改-写用 |
+| `graphdb:transaction/2,3`, `put_edge_txn/4,5`, `del_edge_txn/4,5`, `edge_txn/4,5`, `degree_txn/3`, `put_vertex_txn/3`, `get_vertex_txn/2` | 图层事务式写：边五键 + 计数器锁下同批提交，并发计数精确；与直通 `put_edge` 不要混用于同一图 |
 | `stream/1`, `next/1`, `stop/1`, `with_stream/2` | 流式迭代 |
 | `merge/1,2,3`, `needs_merge/1,2`, `status/1` | 合并管理 |
 | `search_text/2,3`, `search_phrase/2,3`, `search_fields/2,3` | BM25 检索（全文 / 短语 / `field:term^boost`） |

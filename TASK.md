@@ -488,7 +488,7 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 | **X1-2** | `bitcask_txn` 门面：`transaction/2,3` + `read/write/delete/abort`；pdict 写缓冲（同 mnesia_tm），read-your-writes；提交按 key 升序展开为一条 `txn_commit/3`；只读事务不碰引擎；死锁/lock_wait_timeout → 丢缓冲原样重跑（预算 + 抖动）；`{timeout, Ms}` 跨重跑总预算；`index_fun` 额外 op 补写锁 + 同批提交；嵌套 → `tx_nested`；非 owner 进程用 Tx → `error({bitcask_txn, not_owner})`。 | ✅ |
 | **X1-3** | eunit `bitcask_txn_tests` 18 例（设计 §7 全部 8 项）。⚠️ 测试 harness 两个坑：① locker 裸 API 的 agent 进程 `release_all` 后事务就注销了，再 acquire 是 `unknown_txn`——agent 要自动重注册；② eunit 用例失败是 normal 退出，**link 不传播**，spawn_link 的 agent 会把锁留给下一个用例——agent 必须 monitor 测试进程。放大压测 8 进程 × 400 次：3200 个高冲突事务 ~170ms（≈19k txn/s），总额守恒，锁表清零。全量 `rebar3 eunit` **218/218**。 | ✅ |
 | **X1-4** | 文档：设计稿状态 + §11 实现对账、README（中/英）API 表 + 示例（输出真跑）、CHANGELOG [Unreleased]。 | ✅ |
-| X1-5 | `graphdb` 事务式 API（`put_edge_txn` 族，deg/degi 计数入事务）消除"单写者语义下精确"的限制。 | ⏳ |
+| **X1-5** | `graphdb` 事务式 API：`transaction/2,3` + `put_edge_txn`/`del_edge_txn`/`edge_txn`/`degree_txn`/`put_vertex_txn`/`get_vertex_txn`——与直通版逐一对应，只换 IO 路径（读走 `bitcask_txn:read/3`、写进缓冲）。边键 + 反向键 + et + 两个计数器全在锁下同批提交，16 进程并发对同一 hub 加边（出入度都是热点）计数精确（`graphdb_txn_tests` 5 例）。顺手：直通 `degree/3` 计数键缺失时的回退原来数**全部** etype，现在只数该 etype。⚠️ 两个性能坑都是这一步压出来的：① locker 把持有锁列表放 `#txn{}` 记录里，ETS insert 整条拷贝 → 大事务 O(n²)，100 边/事务比 1 边/事务还慢——拆成 bag 表后 12.8k → 25.6k edges/s；② 计数器 RMW 先读锁再升级是确定死锁（能跑对但白跑）→ 加 `read/3` 的 write 模式；门面本地缓存已持有锁，重入不再过 locker。代价（8 核被别的进程压着，只记比值）：单边事务 ≈ 直通的 0.4×，100 边/事务批量 ≈ 0.75×。全量 eunit **223/223**。 | ✅ |
 | X1-6 | P2：前缀/表锁（事务内 range 的幻读防护）；P3：locker 分片、victim 启发式。触发条件见设计 §9。 | ⏳ |
 
 ---
