@@ -4,6 +4,7 @@
 %%   bitcask 的顶层 supervisor。child：
 %%
 %%     bitcask_merge_worker    — 全局 merge 调度器（窗口 + 去重 + 限流）
+%%     bitcask_txn_locker      — 事务锁管理器（2PL + 死锁检测），常驻
 %%     bitcask_embedder_server — **可选**，只在 application env 里配了
 %%                               {embedder, Spec} 时才有。见下。
 %%
@@ -63,7 +64,8 @@ start_link() ->
 
 init([]) ->
     {ok, {{one_for_one, 5, 10},
-          [?CHILD(bitcask_merge_worker, worker) | embedder_children()]}}.
+          [?CHILD(bitcask_merge_worker, worker),
+           ?CHILD(bitcask_txn_locker, worker) | embedder_children()]}}.
 
 %% application env 里配了 {embedder, Spec} 才有这个 child。
 %%
