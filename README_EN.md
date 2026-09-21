@@ -135,6 +135,46 @@ ok
 > directory's meta to v6**, after which readers older than upstream 5.1.0 cannot
 > open it.
 
+**Transactions (isolation)** (`bitcask_txn`, unreleased) — adds isolation on top
+of atomic batches: pessimistic 2PL + deadlock detection + automatic restart (the
+single-node version of Mnesia's trio), zero engine changes, pure OTP:
+
+```erlang
+1> bitcask_txn:transaction(R, fun(Tx) ->
+       {ok, A} = bitcask_txn:read(Tx, <<"a">>),          % read lock
+       {ok, B} = bitcask_txn:read(Tx, <<"b">>),
+       ok = bitcask_txn:write(Tx, <<"a">>, integer_to_binary(binary_to_integer(A) - 30)),
+       ok = bitcask_txn:write(Tx, <<"b">>, integer_to_binary(binary_to_integer(B) + 30)),
+       moved                                             % commit = one txn_commit batch
+   end).
+{atomic,moved}
+2> [bitcask:get(R, K) || K <- [<<"a">>, <<"b">>]].
+[{ok,<<"70">>},{ok,<<"30">>}]
+3> bitcask_txn:transaction(R, fun(Tx) ->
+       {ok, A} = bitcask_txn:read(Tx, <<"a">>),
+       case binary_to_integer(A) < 1000 of
+           true  -> bitcask_txn:abort(insufficient);    % nothing written, no restart
+           false -> ok
+       end
+   end).
+{aborted,insufficient}
+4> bitcask_txn_locker:status().
+#{waiting => 0,lock_wait_timeouts => 0,deadlocks_total => 0,locks => 0,
+  prefix_locks => 0,shards => 8,txns => 0}
+```
+
+> Writes go into a per-process buffer and are expanded at commit, in key order,
+> into a single `txn_commit/3`; a deadlock or lock-wait timeout discards the
+> buffer and **re-runs Fun as is** (`{retries, N}`, default 10, exhausted →
+> `{aborted, {retry_limit, N}}`); `{timeout, Ms}` is the total budget across
+> restarts. ⚠️ **Fun must be side-effect free** (it may run more than once);
+> ⚠️ the direct `bitcask:put/get` API bypasses the locks — mixing it with
+> transactions on the same keys is undefined. Design: `doc/txn-layer-design-zh.md`.
+> Same thing for the graph layer:
+> `graphdb:transaction(R, fun(Tx) -> graphdb:put_edge_txn(Tx, 1, 7, 2) end)` — an
+> edge's five keys (forward/reverse/et/deg/degi) commit in one locked batch, so
+> concurrent edge inserts keep exact counts.
+
 **BM25 full-text search** — open with `{analyzer, ...}` to enable. Each `put`
 indexes the value; results are `{ok, [{Key, Ord, Score}, ...]}` sorted by score:
 
@@ -310,6 +350,8 @@ ok
 | `doc/put-flow-zh.md` | put(K,V) 完整调用链 |
 | `doc/vector-db-design-zh.md` | 向量库设计方案（V1–V6 蓝图） |
 | `doc/vector-search-extension-zh.md` | 向量搜索扩展：HNSW + RRF 混合检索 |
+| `doc/graph-layer-design-en.md` / `-zh.md` | **Graph layer design** (KV per-key: k = vertex, OKI range traversal + OLAP materialization layer; shipped as `graphdb`/`graphdb_analytics`) (EN/中) |
+| `doc/txn-layer-design-zh.md` | **Transaction layer design** (2PL + deadlock detection + restart on top of atomic batches; §11 implementation deviations, §12 prefix locks, §13 sharded lock manager) (中) |
 | `doc/hnsw-design-zh.md` | HNSW 向量索引设计（并发/持久化/RRF/实施表） |
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
 | `doc/unified-architecture-plan-zh.md` | 统一架构计划（已实施） |

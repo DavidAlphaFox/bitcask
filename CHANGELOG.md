@@ -33,6 +33,13 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
   `in_edges_txn`/`degree_txn/2`/`del_vertex_txn`（级联一批提交）；加边 vs
   删点随机交错的全图不变式测试。
 
+- **锁管理器分片**（txn 设计 P3）：`bitcask_txn_locker_sup` 之下 N 个分片
+  （env `{txn_locker_shards, N}`，默认 8），点锁按 `{CaskRef, Key}` 哈希、前缀锁
+  每分片各拿一份；跨分片死锁检测（先写边再检，不漏报）；释放改异步 cast
+  （同 mnesia_locker）、提交前校验直读 ETS。locker-only 微基准 26k txn/s 平线
+  → P=16 50k+；`status()` 新增 `shards` / `lock_wait_timeouts`。分片崩溃全组
+  重启，进行中事务 `{aborted, locker_restarted}`。
+
 ### Fixed
 
 - `graphdb:degree/3` 在 per-etype 计数键缺失（P3 前存量）时的回退原来数的是

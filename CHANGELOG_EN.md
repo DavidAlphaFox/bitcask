@@ -3,6 +3,109 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+
+- **`bitcask_txn` transaction layer (isolation)**: adds the I on top of the
+  engine's atomic batches — pessimistic 2PL point locks + wait-for graph
+  deadlock detection + automatic victim restart (`{retries, N}` budget with
+  1–10 ms jittered backoff), the single-node version of Mnesia's trio. Writes
+  go into the calling process's pdict buffer and are expanded at commit, in key
+  order, into **one** `txn_commit/3` batch (A+D belong to the engine);
+  `index_fun` folds secondary-index ops into the same batch and write-locks
+  their keys; `{timeout, Ms}` is a total budget across restarts; process death
+  is monitored and releases locks. **Zero engine changes, zero new
+  dependencies.** Design [`doc/txn-layer-design-zh.md`](doc/txn-layer-design-zh.md)
+  (§11 records where the implementation deviates from the draft);
+  `test/bitcask_txn_tests.erl` (lock matrix, FIFO / writer anti-starvation,
+  two- and three-way deadlocks, retry budget, death cleanup, buffer semantics,
+  commit failure, timeout, index_fun, cross-cask isolation, 8-process
+  concurrent transfers with sum conservation).
+- **`graphdb` transactional API**: `transaction/2,3` +
+  `put_edge_txn`/`del_edge_txn`/`edge_txn`/`degree_txn`/`put_vertex_txn`/
+  `get_vertex_txn`. An edge's key + reverse key + et + deg/degi counters are
+  all held under locks and committed in one batch, so concurrent edge inserts
+  on the same endpoint keep **exact counts** — removing 6.5.0's "deg/degi are
+  only exact under single-writer discipline" caveat. Do not mix direct
+  `put_edge` with `put_edge_txn` on the same graph (direct bypasses the locks).
+  `test/graphdb_txn_tests.erl` (incl. 16 processes hammering one hub).
+- `bitcask_txn:read/3`: `Lock = write` takes the write lock before reading
+  (Mnesia's `wlock_read`); read-modify-write patterns use it to avoid
+  read-lock-upgrade deadlocks.
+- **Prefix locks** (txn design P2): `bitcask_txn:lock_prefix/3` covers every
+  key starting with Prefix (including future ones); `prefix_range/2,3` = prefix
+  lock + `range` + merge with the transaction's own buffer — **phantom-free**
+  range scans inside a transaction. The lock table became an ordered_set and a
+  request is checked against its overlapping record set (cross-record FIFO:
+  a waiting prefix writer is not starved by point requests; holding a covering
+  lock makes sub-locks free); the point-lock path costs nothing extra while no
+  prefix locks exist. graphdb gained `out_edges_txn`/`in_edges_txn`/
+  `degree_txn/2`/`del_vertex_txn` (cascade in one batch) on top of it, plus a
+  full-graph invariant test with edge inserts randomly interleaved with vertex
+  deletes.
+- **Sharded lock manager** (txn design P3): N shards under
+  `bitcask_txn_locker_sup` (env `{txn_locker_shards, N}`, default 8); point
+  locks hash on `{CaskRef, Key}`, prefix locks are taken on every shard;
+  cross-shard deadlock detection (edge written before checking, so cycles are
+  never missed); lock release became an asynchronous cast (as in
+  `mnesia_locker`) and the pre-commit check reads ETS directly. Locker-only
+  microbench: flat 26k txn/s → 50k+ at P=16; `status()` gained `shards` /
+  `lock_wait_timeouts`. A shard crash restarts the whole group and in-flight
+  transactions get `{aborted, locker_restarted}`.
+
+### Fixed
+
+- `graphdb:degree/3`'s fallback when the per-etype counter key is missing
+  (pre-P3 data) counted out-edges of **all** etypes; it now counts only the
+  requested one.
+
+---
+
+## [6.5.0] — 2026-09-18
+
+**Graph layer lands**: a KV-per-key graph store + in-memory analytics layer with
+libbitcask as the single storage (design:
+[`doc/graph-layer-design-en.md`](doc/graph-layer-design-en.md) / Chinese,
+P1–P5 all implemented). Ships the libbitcask submodule bump `598d080` →
+`f618e82` (6.3.2 → **6.5.0**) with all three downstream-feedback fixes. No
+ABI / on-disk format change (libbitcask C API purely additive, SOVERSION stays
+6; the graph layer is pure Erlang).
+
+### Added
+
+- **`graphdb` graph store (KV per-key)**: k = vertex (`n<vid>` DocValue — BM25 /
+  vector search works on vertex content for free), edges as fixed-width
+  big-endian keys (`e`/`ei` both directions, dual-written via
+  `put_batch_atomic` so the reverse key never dangles); adjacency = one OKI
+  prefix range (O(out-degree)); `bfs`/`k_hop`/`shortest_path` (bidirectional,
+  frontier expanded one process per vertex); `deg`/`degi` counters and the
+  per-type `et` index maintained in the same batch; `neighbors_where/4`
+  property-filtered traversal; etype intern registry (open-time schema).
+- **`graphdb_analytics` graph OLAP (design §7 materialization layer)**:
+  `materialize/2` turns the `e`/`et` families into an in-memory binary CSR
+  (out-edges + transpose, multi-edges deduplicated); `pagerank/2` (damping +
+  dangling correction), `connected_components/1` (min-label propagation),
+  `sssp/3` (unweighted BFS distance).
+- Consistency-semantics tests (visibility invariants for inserts/deletes during
+  a scan) and the `test/graphdb_bench` benchmark: steady-state one-hop
+  **~0.02 ms/op** @10k vertices / 50k edges (load ~76k edges/s).
+
+### Changed
+
+- **libbitcask submodule `598d080` → `f618e82` (6.3.2 → 6.5.0)**: OKI memdelta
+  **sorted view cache** — removes the "range silently slows down 4200× after a
+  bulk load" performance cliff (downstream graph bench: one-hop after loading
+  50k edges 110 ms → **0.078 ms**, on par with post-flush); `status()` gains
+  `oki_delta_rows`/`oki_delta_bytes` (memdelta size observable); doc erratum on
+  ord overflow horizon (`5.8×10¹³ years` is really ~5.85 million years). C API
+  purely additive, SOVERSION stays 6, zero on-disk format change.
+- Embedder pool dispatch test `pool_dispatch_avoids_busy_worker` **unified
+  sampling** — the pick decision and the mailbox snapshot it is judged against
+  are taken at the same instant, eliminating the occasional false red under the
+  full suite's parallel load (upstream
+  `feedbacks/2026-09-18-embedder-pool-dispatch-flaky-under-parallel-suite.md`).
+
 ## [6.4.0] — 2026-09-08
 
 Two product decisions for the local embedding backend: **`slots => K`

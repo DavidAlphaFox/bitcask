@@ -147,7 +147,8 @@ ok
    end).
 {aborted,insufficient}
 4> bitcask_txn_locker:status().
-#{waiting => 0,deadlocks_total => 0,locks => 0,txns => 0}
+#{waiting => 0,lock_wait_timeouts => 0,deadlocks_total => 0,locks => 0,
+  prefix_locks => 0,shards => 8,txns => 0}
 ```
 
 > 写只进调用进程的缓冲，提交时按 key 升序展开成一条 `txn_commit/3`；
@@ -311,6 +312,7 @@ ok
 | `doc/vector-db-design-zh.md` | 向量库设计方案（V1–V6 蓝图） |
 | `doc/vector-search-extension-zh.md` | 向量搜索扩展：HNSW + RRF 混合检索 |
 | `doc/graph-layer-design-zh.md` / `-en.md` | **图处理层设计**（KV per-key：k=顶点、OKI range 遍历 + OLAP 物化层；已落地 `graphdb`/`graphdb_analytics`） |
+| `doc/txn-layer-design-zh.md` | **事务协调层设计**（原子批之上的 2PL + 死锁检测 + 重跑；§11 实现对账、§12 前缀锁、§13 锁管理器分片） |
 | `doc/hnsw-design-zh.md` | HNSW 向量索引设计（并发/持久化/RRF/实施表） |
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
 | `doc/unified-architecture-plan-zh.md` | 统一架构计划（已实施） |
