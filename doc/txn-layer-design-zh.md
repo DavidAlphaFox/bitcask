@@ -2,8 +2,8 @@
 
 > 状态：**P1 + P2（前缀锁）+ P3（分片 + victim 启发式）已实施**（2026-09-21，`src/bitcask_txn.erl` +
 > `src/bitcask_txn_locker.erl` + `src/bitcask_txn_locker_sup.erl`，
-> `test/bitcask_txn_tests.erl` 25 例），未发布（当前 6.5.0）。实现与本稿的偏差见
-> §11，前缀锁模型见 §12，分片见 §13。
+> `test/bitcask_txn_tests.erl` 27 例），**随 6.5.1 发布**（2026-09-21）。实现与本稿的
+> 偏差见 §11，前缀锁模型见 §12，分片与 victim 启发式见 §13。
 > 前置阅读：`third_party/libbitcask/doc/multikey-txn-zh.md` §4（引擎事务边界：
 > 只有 A+D，没有 I，也没有 CAS）、`doc/graph-layer-design-zh.md`。
 
