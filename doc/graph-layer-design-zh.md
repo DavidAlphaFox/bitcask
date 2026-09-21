@@ -263,9 +263,10 @@ graphdb:transaction(R, fun(Tx) ->
     ok = graphdb:del_edge_txn(Tx, Src2, Etype, Dst2),
     graphdb:degree_txn(Tx, Src, Etype)
 end, [{retries, 10}])                                   -> {atomic, R} | {aborted, Why}.
-%% 另有 edge_txn / put_vertex_txn（Doc 只收 binary）/ get_vertex_txn。
-%% ⚠️ 同一图的边写要么全走事务、要么全走直通（直通绕过锁）。del_vertex 无
-%% 事务版（级联要范围锁，txn P2）。
+%% 另有 edge_txn / put_vertex_txn（Doc 只收 binary）/ get_vertex_txn；前缀锁版
+%% out_edges_txn / in_edges_txn / degree_txn/2（扫描无幻读）、del_vertex_txn
+%%（e<vid>/ei<vid> 前缀写锁下级联，一批提交）。
+%% ⚠️ 同一图的边写要么全走事务、要么全走直通（直通绕过锁）。
 
 %% 检索联动（复用引擎能力）
 graphdb:search_vertex(R, Query).                        %% search_fields/search_text 直通
@@ -323,3 +324,5 @@ vbyte 前缀差分压缩率高（`prefix:id` 形态正是 BCOK 的优化目标�
 6. **X1-5** ✅（2026-09-21）：事务式 API（`transaction/2,3` + `put_edge_txn` /
    `del_edge_txn` / `edge_txn` / `degree_txn` / `put_vertex_txn` / `get_vertex_txn`），
    建在 `bitcask_txn` 上；16 进程并发对同一 hub 加边计数精确（`test/graphdb_txn_tests.erl`）。
+7. **X1-6** ✅（2026-09-21）：前缀锁版 `out_edges_txn` / `in_edges_txn` / `degree_txn/2`
+   / `del_vertex_txn`（txn 设计 §12）；加边 vs 删点随机交错的全图不变式测试。

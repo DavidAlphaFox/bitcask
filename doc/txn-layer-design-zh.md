@@ -1,7 +1,8 @@
 # 事务协调层设计（bitcask_txn）：2PL + 死锁检测 + 事务重启
 
-> 状态：**P1 已实施**（2026-09-21，`src/bitcask_txn.erl` + `src/bitcask_txn_locker.erl`，
-> `test/bitcask_txn_tests.erl` 18 例），未发布（当前 6.5.0）。实现与本稿的偏差见 §11。
+> 状态：**P1 + P2（前缀锁）已实施**（2026-09-21，`src/bitcask_txn.erl` +
+> `src/bitcask_txn_locker.erl`，`test/bitcask_txn_tests.erl` 22 例），未发布
+>（当前 6.5.0）。实现与本稿的偏差见 §11，前缀锁模型见 §12。
 > 前置阅读：`third_party/libbitcask/doc/multikey-txn-zh.md` §4（引擎事务边界：
 > 只有 A+D，没有 I，也没有 CAS）、`doc/graph-layer-design-zh.md`。
 
@@ -284,7 +285,7 @@ eunit（`rebar3 eunit`；并发用例用 spawn + 确定性同步，不引新框�
 | 阶段 | 内容 | 触发条件 |
 |------|------|---------|
 | P1 | 点锁 2PL + 缓冲 + 检测/重启 + eunit 全量 | 本设计 |
-| P2 | 前缀/表锁（事务内 range 扫描的幻读防护）、`timeout` 指标、`status/0` | graphdb 遍历入事务的需求 |
+| P2 ✅ | 前缀锁（事务内 range 扫描的幻读防护）、`status/0`。已落地（2026-09-21），模型见 §12 | graphdb `del_vertex_txn` / `out_edges_txn` |
 | P3 | locker 分片、环境式 API（Mnesia 习惯法）、victim 启发式（最老事务优先） | 锁竞争 profiling 证明单点瓶颈 |
 | 交汇 | **与引擎条件批（CAS/`expected_rev`）融合**：2PL 管跨 key 不变式，条件批管单 key 乐观并发，两者共享条件校验语义 | CouchDB 风格条件更新立项时 |
 | 消费 ✅ | `graphdb` 事务式 API（`transaction/2,3` + `put_edge_txn` 族，deg/degi 计数入事务），消除"单写者语义下精确"的限制。已落地（2026-09-21），见 graph 设计 §12 第 6 条 | — |
@@ -321,3 +322,54 @@ eunit（`rebar3 eunit`；并发用例用 spawn + 确定性同步，不引新框�
 实测（`concurrent_transfers_conserve_test_` 放大到 8 进程 × 400 次，10 账户，
 `no_sync`）：3200 个高冲突事务 ~170ms（≈19k txn/s，含死锁重跑），总额守恒，
 锁表清零。
+
+## 12. P2 前缀锁（已实施）
+
+### 12.1 语义
+
+- `LockId = {CaskRef, Bin, point | prefix}`。前缀锁罩住以 `Bin` 开头的**全部
+  key——现有的和将来的**，所以持前缀读锁扫描不会有幻读。
+- 两把锁**重叠**当且仅当一方的 Bin 是另一方的前缀（点锁视为等长前缀；两把
+  点锁只在相等时重叠）。重叠 + 模式冲突（非 read/read）= 互斥。
+- 门面：`lock_prefix(Tx, Prefix, read|write)`；`prefix_range(Tx, Prefix[, Opts])`
+  = 前缀锁（默认 read，`{lock, write}` 给扫了就删的场景）+ `bitcask:range`
+  `[Prefix, succ(Prefix))` + 合并本事务缓冲（读自己的写），按 key 升序返回。
+- 持有覆盖锁后对其下 key 的 read/write/delete **免费**：门面本地判定覆盖，
+  不过 locker；即使过了 locker，`covered/3` 也直接 ok、不建记录。
+
+### 12.2 锁表模型（一张表，不用意向锁）
+
+DB 教科书做法是层级锁 + IS/IX 意向锁。这里 key 空间是扁平的字节串、层级
+由前缀关系隐含，用不着意向锁：
+
+- `bitcask_txn_locks` 改成 **ordered_set**，键 `{Ref, Bin, Kind}`。
+- 请求 X 的**重叠记录集** `overlapping(X)`：
+  1. X 自身；
+  2. 罩住 X 的前缀记录——`bitcask_txn_plens` 记着现存前缀锁的**长度集合**
+     `{Len, Count}`，只按这几个长度截 X.Bin 去查（典型应用 1~3 个长度）；
+  3. X 是前缀时，它罩住的全部记录——从 `{Ref, Bin, 0}` 起 `ets:next` 顺序扫
+     （数字 < 原子，所以同 Bin 的 point/prefix 都在其后），直到第二元不再以
+     Bin 开头。
+  没有前缀锁时 `plens` 为空，点锁路径只查自身一条——与纯点锁实现同价。
+- 可授予 ⇔ `blockers(TxnId, Mode, Seq, overlapping(X)) =:= []`：
+  - 重叠记录上与 Mode 冲突的其它 holder；
+  - 若请求者不是任一重叠记录的 holder：重叠记录上**比它早到**（全局 seq 更小）
+    且冲突的等待者。这就是 FIFO 公平 / 防写饿死的跨记录推广——前缀写等待者
+    不会被源源不断的点锁请求饿死（`prefix_writer_fairness_test_`）。
+  - "holder 不被等待者挡"是 P1"唯一 holder 升级越过队列"的推广：队列里的
+    写在等它放锁，不让它过就是死锁。
+- 唤醒 `wake_around(X)`：X 附近状态变了（holder 释放 / 等待者出队），把
+  `overlapping(X)` 里的全部等待者按 seq 依次重判。重叠是对称的，所以释放
+  点锁会重判罩住它的前缀等待者，释放前缀锁会重判其下所有点等待者。
+- 死锁检测不变：`blockers_of(N)` 就是上面的 `blockers`，DFS 照旧。
+  `prefix_covered_is_free_test_` 验证经前缀锁形成的环也能检出。
+- `#txn.waiting` 语义不变（同一时刻最多等一把）。
+
+### 12.3 graphdb 消费
+
+`out_edges_txn` / `in_edges_txn`（前缀读锁 + 合并缓冲，etype/limit 同直通版）、
+`degree_txn/2`、`del_vertex_txn`（`e<vid>` / `ei<vid>` 前缀**写**锁下级联：
+三键删除、邻居计数逐条 RMW、自身 `deg<vid>`/`degi<vid>` 前缀扫清、顶点键，
+一批提交）。`concurrent_insert_vs_del_vertex_test_`：8 个加边进程 vs 2 个
+del_vertex_txn 进程随机交错（放大到 4800 + 300 次 × 3 轮），全图不变式
+（每个 (vid, etype) 的 deg/degi == 实际 e/ei 键数；e/ei/et 三键两两配对）成立。
