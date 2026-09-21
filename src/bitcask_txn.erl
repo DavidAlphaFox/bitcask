@@ -52,7 +52,8 @@
 -module(bitcask_txn).
 
 -export([transaction/2, transaction/3,
-         read/2, write/3, delete/2, abort/1]).
+         read/2, read/3, write/3, delete/2, abort/1,
+         handle/1]).
 
 -define(ACTIVE,  '$bitcask_txn_active').      % pdict：嵌套检测
 -define(ABORT,   bitcask_txn_abort).          % throw 标签：显式中止
@@ -139,6 +140,7 @@ run_once(Handle, Fun, Cfg) ->
                           sync = Cfg#cfg.sync},
     BufKey = buf_key(TxnId),
     put(BufKey, #{}),
+    put(locks_key(TxnId), #{}),
     try
         Result = Fun(Tx),
         commit(Tx, Result)
@@ -154,7 +156,8 @@ run_once(Handle, Fun, Cfg) ->
         Class:Reason:Stack when Class =:= error; Class =:= exit ->
             release(TxnId), {aborted, {Reason, Stack}}
     after
-        erase(BufKey)
+        erase(BufKey),
+        erase(locks_key(TxnId))
     end.
 
 release(TxnId) ->
@@ -165,16 +168,25 @@ release(TxnId) ->
 handle_ref({Ref, _Ctx}) when is_reference(Ref) -> Ref;
 handle_ref(Bad) -> erlang:error({badarg, Bad}).
 
-buf_key(TxnId) -> {?MODULE, TxnId}.
+buf_key(TxnId)   -> {?MODULE, TxnId}.
+locks_key(TxnId) -> {?MODULE, locks, TxnId}.
 
 %% =========================================================================
 %% 事务内 API
 %% =========================================================================
 
 -spec read(term(), binary()) -> {ok, binary()} | not_found | {error, term()}.
-read(#bitcask_txn_ctx{handle = Handle} = Tx, Key) when is_binary(Key) ->
+read(Tx, Key) ->
+    read(Tx, Key, read).
+
+%% read/3 的 Lock = write：读之前直接拿**写**锁（Mnesia 的 wlock_read）。
+%% 读-改-写模式必须用它：两个事务都先读锁再升级，就是一个确定的死锁
+%% （各自等对方放读锁）——能跑对（检测 + 重跑），但纯属浪费。
+-spec read(term(), binary(), read | write) -> {ok, binary()} | not_found | {error, term()}.
+read(#bitcask_txn_ctx{handle = Handle} = Tx, Key, Lock)
+  when is_binary(Key), (Lock =:= read orelse Lock =:= write) ->
     Buf = buffer(Tx),              % 先做 owner 检查，再去拿锁
-    lock(Tx, Key, read),
+    lock(Tx, Key, Lock),
     case maps:find(Key, Buf) of
         {ok, {put, Val}} -> {ok, Val};
         {ok, delete}     -> not_found;
@@ -199,6 +211,11 @@ delete(#bitcask_txn_ctx{id = TxnId} = Tx, Key) when is_binary(Key) ->
 abort(Reason) ->
     throw({?ABORT, Reason}).
 
+%% 事务绑定的 cask 句柄。给上层（graphdb）在事务内做**不上锁**的辅助读
+%% （如计数键缺失时的按需扫描）用；经它做的读写不受 2PL 保护。
+-spec handle(term()) -> term().
+handle(#bitcask_txn_ctx{handle = Handle}) -> Handle.
+
 %% 缓冲只在调用进程的 pdict 里——别的进程拿着 Tx 来调，这里就是 undefined。
 buffer(#bitcask_txn_ctx{id = TxnId}) ->
     case get(buf_key(TxnId)) of
@@ -206,13 +223,25 @@ buffer(#bitcask_txn_ctx{id = TxnId}) ->
         Buf       -> Buf
     end.
 
+%% 本地记着已持有的锁（pdict）：2PL 到事务结束才放锁，所以这份缓存永远
+%% 准确——重入（读后写同一 key、计数器 RMW）不必再过一次 locker。
+%% 实测 put_edge_txn 每边省 2~3 次 gen_server:call。
 lock(#bitcask_txn_ctx{id = TxnId, ref = Ref}, Key, Mode) ->
-    case bitcask_txn_locker:acquire(TxnId, {Ref, Key}, Mode) of
-        ok                         -> ok;
-        {error, deadlock}          -> throw({?RESTART, deadlock});
-        {error, lock_wait_timeout} -> throw({?RESTART, lock_wait_timeout});
-        {error, timeout}           -> throw(?TIMEOUT);
-        {error, unknown_txn}       -> throw({?ABORT, locker_restarted})
+    LK = locks_key(TxnId),
+    Held = get(LK),
+    case maps:find(Key, Held) of
+        {ok, write}                  -> ok;
+        {ok, read} when Mode =:= read -> ok;
+        _ ->
+            case bitcask_txn_locker:acquire(TxnId, {Ref, Key}, Mode) of
+                ok ->
+                    put(LK, Held#{Key => Mode}),
+                    ok;
+                {error, deadlock}          -> throw({?RESTART, deadlock});
+                {error, lock_wait_timeout} -> throw({?RESTART, lock_wait_timeout});
+                {error, timeout}           -> throw(?TIMEOUT);
+                {error, unknown_txn}       -> throw({?ABORT, locker_restarted})
+            end
     end.
 
 %% =========================================================================

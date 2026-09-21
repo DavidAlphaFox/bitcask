@@ -18,9 +18,35 @@
 %%   deg  <vid:64> <etype:32> → u64       → 出度计数（P3，put_edge/del_edge 同批维护）
 %%   degi <vid:64> <etype:32> → u64       → 入度计数（P3，同上）
 %%
-%% ⚠️ deg/degi 是读-判-写计数（引擎无 CAS）：并发对同一端点加边可能丢计数，
-%% 单写者语义（每图一个写进程 / 串行写）下精确。del_vertex 级联会聚合
-%% 邻居计数器增量，一次 RMW 对齐。per-etype 计数缺失时 degree/3 回退按需计数。
+%% ⚠️ deg/degi 是读-判-写计数（引擎无 CAS）：直通 API（put_edge/del_edge）
+%% 下并发对同一端点加边可能丢计数，单写者语义（每图一个写进程 / 串行写）
+%% 下精确。**要并发写且计数精确，用事务式 API**（见下）。del_vertex 级联会
+%% 聚合邻居计数器增量，一次 RMW 对齐。per-etype 计数缺失时 degree/3 回退
+%% 按需计数。
+%%
+%% === 事务式 API（X1-5，doc/txn-layer-design-zh.md）===
+%%
+%%   graphdb:transaction(H, fun(Tx) ->
+%%       ok = graphdb:put_edge_txn(Tx, 1, 7, 2),
+%%       ok = graphdb:del_edge_txn(Tx, 1, 7, 3),
+%%       graphdb:degree_txn(Tx, 1, 7)
+%%   end)                                   → {atomic, {ok, N}} | {aborted, Why}
+%%
+%%   put_edge_txn / del_edge_txn / edge_txn / degree_txn / put_vertex_txn /
+%%   get_vertex_txn 是对应直通函数的事务内版本：读走 bitcask_txn:read
+%%（上锁），写进事务缓冲，提交时与同事务的其它改动一起进**一条** txn_commit
+%%   批。边键 + 反向键 + et + 两个计数器全在锁下，并发加边到同一端点的计数
+%%   **精确**（2PL 可串行化）；死锁自动重跑。计数器 RMW 直接拿写锁
+%%（read/3 的 write 模式），避免读锁升级型死锁。
+%%
+%%   ⚠️ 直通 put_edge 与 put_edge_txn **不要混用于同一图的边写入**：直通
+%%      绕过锁，与事务并发时计数器行为未定义（bitcask_txn §4.8）。要么全走
+%%      事务，要么全走直通 + 单写者。只读的直通扫描（out_edges/bfs/…）随便用，
+%%      仍是 per-key 弱一致。
+%%   ⚠️ put_vertex_txn 的 Doc 只收 binary（事务批只装 binary；索引模式的
+%%      #{text=>...} 文档请走直通 put_vertex）。del_vertex 无事务版：级联要
+%%      range 扫描，P1 没有范围锁（幻读），留 P2。
+%%   ⚠️ Fun 必须无副作用（可能重跑）。
 %%
 %% 关键性质：
 %%   * 取邻居 = 一次 OKI 前缀 range，O(出度)（bitcask:range/3，[Lo,Hi) 字典序）
@@ -52,6 +78,11 @@
 
          put_vertex/3, get_vertex/2, del_vertex/2,
          put_edge/4, put_edge/5, edge/4, edge/5, del_edge/4, del_edge/5,
+
+         transaction/2, transaction/3,
+         put_vertex_txn/3, get_vertex_txn/2,
+         put_edge_txn/4, put_edge_txn/5, edge_txn/4, edge_txn/5,
+         del_edge_txn/4, del_edge_txn/5, degree_txn/3,
 
          out_edges/2, out_edges/3, in_edges/2, in_edges/3,
          neighbors/3, neighbors_where/4,
@@ -267,6 +298,96 @@ del_edge(Handle, Src, Etype, Dst, Rank) ->
     end.
 
 %% =========================================================================
+%% 事务式 API — 计数器精确的并发写（bitcask_txn 之上，模块头有说明）
+%%
+%% 与直通版本逐一对应；区别只在 IO 走哪条路：
+%%   读  bitcask:get            →  bitcask_txn:read/3（上锁；RMW 直接写锁）
+%%   写  bitcask:put_batch_atomic →  bitcask_txn:write / delete（进缓冲）
+%% 引擎读错误在事务里没法继续，直接 abort(Reason) → {aborted, Reason}。
+%% =========================================================================
+
+-spec transaction(handle(), fun((term()) -> term())) -> {atomic, term()} | {aborted, term()}.
+transaction(Handle, Fun) -> bitcask_txn:transaction(Handle, Fun).
+
+-spec transaction(handle(), fun((term()) -> term()), list()) ->
+          {atomic, term()} | {aborted, term()}.
+transaction(Handle, Fun, Opts) -> bitcask_txn:transaction(Handle, Fun, Opts).
+
+put_vertex_txn(Tx, Vid, Doc) when is_binary(Doc) ->
+    bitcask_txn:write(Tx, nkey(Vid), Doc).
+
+get_vertex_txn(Tx, Vid) ->
+    normalize_not_found(txn_read(Tx, nkey(Vid), read)).
+
+put_edge_txn(Tx, Src, Etype, Dst) -> put_edge_txn(Tx, Src, Etype, Dst, #{}).
+put_edge_txn(Tx, Src, Etype, Dst, Opts) when is_map(Opts) ->
+    Rank  = maps:get(rank, Opts, 0),
+    Props = maps:get(props, Opts, <<>>),
+    true = is_binary(Props) orelse erlang:error(badarg, [Tx, Src, Etype, Dst, Opts]),
+    EK = ekey(Src, Etype, Dst, Rank),
+    %% 边键本来就要写，直接写锁读——两个事务同时 upsert 同一条边不会
+    %% 各自持读锁再互等升级。
+    case txn_read(Tx, EK, write) of
+        {ok, _} ->
+            bitcask_txn:write(Tx, EK, Props);          %% upsert：只改属性
+        not_found ->
+            ok = bitcask_txn:write(Tx, EK, Props),
+            ok = bitcask_txn:write(Tx, eikey(Dst, Etype, Src, Rank), <<>>),
+            ok = bitcask_txn:write(Tx, etkey(Etype, Src, Dst, Rank), <<>>),
+            ok = bump_txn(Tx, degkey(Src, Etype), 1),
+            bump_txn(Tx, degikey(Dst, Etype), 1)
+    end.
+
+edge_txn(Tx, Src, Etype, Dst) -> edge_txn(Tx, Src, Etype, Dst, 0).
+edge_txn(Tx, Src, Etype, Dst, Rank) ->
+    case txn_read(Tx, ekey(Src, Etype, Dst, Rank), read) of
+        {ok, Props} when is_binary(Props) ->
+            {ok, #{src => Src, etype => Etype, dst => Dst,
+                   rank => Rank, props => Props}};
+        {ok, _}   -> {error, invalid_edge_props};
+        not_found -> {error, not_found}
+    end.
+
+del_edge_txn(Tx, Src, Etype, Dst) -> del_edge_txn(Tx, Src, Etype, Dst, 0).
+del_edge_txn(Tx, Src, Etype, Dst, Rank) ->
+    EK = ekey(Src, Etype, Dst, Rank),
+    case txn_read(Tx, EK, write) of
+        not_found ->
+            ok;                                  %% 幂等删除（边键仍留写锁，无害）
+        {ok, _} ->
+            ok = bitcask_txn:delete(Tx, EK),
+            ok = bitcask_txn:delete(Tx, eikey(Dst, Etype, Src, Rank)),
+            ok = bitcask_txn:delete(Tx, etkey(Etype, Src, Dst, Rank)),
+            ok = bump_txn(Tx, degkey(Src, Etype), -1),
+            bump_txn(Tx, degikey(Dst, Etype), -1)
+    end.
+
+%% per-etype 度数，读锁下读计数键；计数键缺失（P3 前存量）→ 回退按需扫描，
+%% 扫描走 bitcask_txn:handle 的直通 range，**不上锁**（P1 无范围锁）。
+degree_txn(Tx, Vid, Etype) ->
+    ok = v_t32(Etype),
+    case txn_read(Tx, degkey(Vid, Etype), read) of
+        {ok, <<N:64/big>>} -> {ok, N};
+        {ok, _}            -> {error, invalid_degree_record};
+        not_found          -> count_out(bitcask_txn:handle(Tx), Vid, Etype)
+    end.
+
+%% 计数 RMW：写锁下读、算、写回缓冲。缺 key = 0，不下穿 0。
+bump_txn(Tx, Key, Delta) ->
+    N = case txn_read(Tx, Key, write) of
+            {ok, <<Cur:64/big>>} -> max(0, Cur + Delta);
+            _                    -> max(0, Delta)
+        end,
+    bitcask_txn:write(Tx, Key, <<N:64/big>>).
+
+%% 事务内读：引擎错误直接中止事务（拿到一半的读没法给出正确结果）。
+txn_read(Tx, Key, Lock) ->
+    case bitcask_txn:read(Tx, Key, Lock) of
+        {error, Reason} -> bitcask_txn:abort(Reason);
+        Other           -> Other
+    end.
+
+%% =========================================================================
 %% 邻接扫描 — OKI 前缀 range（设计文档 §6.1）
 %%
 %% Opts（map）：
@@ -331,18 +452,22 @@ edge_endpoints(Handle, Vid, in) ->
 %% 计数）；undefined：O(出度) 全量计数（计数键按 etype 分立，无总数键）。
 degree(Handle, Vid) -> degree(Handle, Vid, undefined).
 degree(Handle, Vid, undefined) ->
-    {Lo, Hi} = out_range(Vid, undefined),
-    case range_take(Handle, Lo, Hi, infinity, fun(_K, _V) -> {ok, count} end) of
-        {error, _} = E -> E;
-        {ok, Items}    -> {ok, length(Items)}
-    end;
+    count_out(Handle, Vid, undefined);
 degree(Handle, Vid, Etype) ->
     ok = v_t32(Etype),
     case bitcask:get(Handle, degkey(Vid, Etype)) of
         {ok, <<N:64/big>>} -> {ok, N};
         {ok, _}            -> {error, invalid_degree_record};
-        not_found          -> degree(Handle, Vid, undefined);
+        not_found          -> count_out(Handle, Vid, Etype);   %% 只数该类型
         {error, _} = E     -> E
+    end.
+
+%% 按需计数：O(出度) 前缀扫描，Etype = undefined 数全部。
+count_out(Handle, Vid, Etype) ->
+    {Lo, Hi} = out_range(Vid, Etype),
+    case range_take(Handle, Lo, Hi, infinity, fun(_K, _V) -> {ok, count} end) of
+        {error, _} = E -> E;
+        {ok, Items}    -> {ok, length(Items)}
     end.
 
 %% et 家族：按类型全局列边（key 序 = (src, dst, rank) 字典序）。

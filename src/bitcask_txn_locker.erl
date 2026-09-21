@@ -28,10 +28,14 @@
 %%   为什么单实例：锁操作与检测需要一个全局串行点，Mnesia 的 mnesia_locker
 %%   同样是单点且撑得住生产规模。分片留 P3。
 %%
-%%   ETS 表两张（protected、命名），status/0 直接读表不过 locker 进程：
-%%     bitcask_txn_locks  #lock{}  按 LockId
-%%     bitcask_txn_txns   #txn{}   按 TxnId
+%%   ETS 表三张（protected、命名），status/0 直接读表不过 locker 进程：
+%%     bitcask_txn_locks  #lock{}          按 LockId
+%%     bitcask_txn_txns   #txn{}           按 TxnId
+%%     bitcask_txn_held   {TxnId, LockId}  bag：事务持有的锁（释放时用）
 %%   全部写操作只发生在 locker 进程内。
+%%   ⚠️ held 单独成表而不是 #txn{} 里的列表：ETS insert 是整条拷贝，列表
+%%      放记录里意味着每拿一把新锁都把已持有的全部拷一遍——大事务
+%%      （几百个 key）O(n²)，实测 100 边/事务比 1 边/事务还慢。
 %%
 %%   API（全部由 bitcask_txn 门面调用，不面向用户）：
 %%     register(Pid, Opts)             -> {ok, TxnId}
@@ -61,6 +65,7 @@
 
 -define(LOCKS, bitcask_txn_locks).
 -define(TXNS,  bitcask_txn_txns).
+-define(HELD,  bitcask_txn_held).
 
 %% 单锁等待兜底上限（ms）。正常路径死锁检测必达，这只是防御。
 -define(DEFAULT_LOCK_WAIT_TIMEOUT, 5000).
@@ -82,14 +87,13 @@
                holders = #{} :: #{txn_id() => mode()},
                queue   = []  :: [#waiter{}]}).
 
-%% 事务：held 是它持有的锁（释放时用，不必扫全表）；waiting 是它当前
-%% 阻塞在哪把锁上（推导 wait-for 边用），同一时刻最多等一把。
+%% 事务：waiting 是它当前阻塞在哪把锁上（推导 wait-for 边用），同一时刻
+%% 最多等一把。持有的锁在 ?HELD 表里（见模块头）。
 -record(txn, {id       :: txn_id(),
               pid      :: pid(),
               mon      :: reference(),
               deadline :: integer() | infinity,      % erlang:monotonic_time(ms)
               lock_wait_timeout :: timeout(),
-              held     = [] :: [lock_id()],
               waiting  = undefined :: undefined | lock_id()}).
 
 -record(state, {deadlocks = 0 :: non_neg_integer()}).
@@ -141,6 +145,7 @@ status() ->
 init([]) ->
     _ = ets:new(?LOCKS, [named_table, set, protected, {keypos, #lock.id}]),
     _ = ets:new(?TXNS,  [named_table, set, protected, {keypos, #txn.id}]),
+    _ = ets:new(?HELD,  [named_table, bag, protected]),
     {ok, #state{}}.
 
 handle_call({register, Pid, Opts}, _From, S) ->
@@ -244,7 +249,7 @@ do_acquire(#txn{id = TxnId} = T, LockId, Mode, From, S) ->
     L = get_lock(LockId),
     case grantable_now(TxnId, Mode, L) of
         true ->
-            grant(T, L, Mode),
+            grant(TxnId, L, Mode),
             {reply, ok, S};
         false ->
             Timer = start_wait_timer(T, LockId),
@@ -291,8 +296,8 @@ grantable(TxnId, Mode, H) ->
 has_writer(H) ->
     lists:member(write, maps:values(H)).
 
-%% 授予：更新 holders（read 升 write 只升不降），首次持有记进 held。
-grant(#txn{id = TxnId} = T, #lock{holders = H} = L, Mode) ->
+%% 授予：更新 holders（read 升 write 只升不降），首次持有记进 ?HELD。
+grant(TxnId, #lock{holders = H} = L, Mode) ->
     {NewMode, First} =
         case maps:find(TxnId, H) of
             {ok, write} -> {write, false};
@@ -301,7 +306,7 @@ grant(#txn{id = TxnId} = T, #lock{holders = H} = L, Mode) ->
         end,
     true = ets:insert(?LOCKS, L#lock{holders = H#{TxnId => NewMode}}),
     case First of
-        true  -> true = ets:insert(?TXNS, T#txn{held = [L#lock.id | T#txn.held]});
+        true  -> true = ets:insert(?HELD, {TxnId, L#lock.id});
         false -> ok
     end.
 
@@ -355,7 +360,7 @@ conflicts(_, _)       -> true.
 %% =========================================================================
 
 %% 事务彻底退出：出队（若在等）、放全部持有锁并逐把 wake、删记录。
-drop_txn(#txn{id = TxnId, held = Held, waiting = Waiting}) ->
+drop_txn(#txn{id = TxnId, waiting = Waiting}) ->
     case Waiting of
         undefined -> ok;
         LockId ->
@@ -369,7 +374,8 @@ drop_txn(#txn{id = TxnId, held = Held, waiting = Waiting}) ->
                 error -> ok
             end
     end,
-    lists:foreach(fun(LockId) -> release_one(LockId, TxnId) end, Held),
+    lists:foreach(fun({_, LockId}) -> release_one(LockId, TxnId) end,
+                  ets:take(?HELD, TxnId)),
     true = ets:delete(?TXNS, TxnId),
     ok.
 
@@ -407,9 +413,7 @@ wake(LockId) ->
                                 true ->
                                     cancel_timer(W#waiter.timer),
                                     true = ets:insert(?TXNS, T#txn{waiting = undefined}),
-                                    %% grant 读的是 ETS 里的 txn 记录，先把 waiting 清掉再授予
-                                    [T1] = ets:lookup(?TXNS, TxnId),
-                                    grant(T1, L#lock{queue = Rest}, Mode),
+                                    grant(TxnId, L#lock{queue = Rest}, Mode),
                                     gen_server:reply(W#waiter.from, ok),
                                     wake(LockId);
                                 false ->
