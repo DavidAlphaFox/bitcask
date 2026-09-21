@@ -710,13 +710,15 @@ prefix_covered_is_free_test_() ->
         %% 前缀锁每个分片一条记录，点锁一条都没建
         N = ?L:shard_count(),
         ?assertMatch(#{locks := N, prefix_locks := N}, ?L:status()),
-        %% 死锁：B 持 q 点锁等 P 下的 key；A 持 P 要 q
+        %% 死锁：B 持 q 点锁等 P 下的 key；A 持 P 要 q。A 先注册（更老），
+        %% 受害者是更年轻的 B——即使闭环的是 A。
         acq(B, {Ref, <<"q">>, point}, write), ok = expect(B, {Ref, <<"q">>, point}, 500),
         acq(B, {Ref, <<"p9">>, point}, read), ?assertEqual(blocked, blocked(B, {Ref, <<"p9">>, point})),
         acq(A, {Ref, <<"q">>, point}, read),
-        ?assertEqual({error, deadlock}, expect(A, {Ref, <<"q">>, point}, 500)),
-        rel(A), ok = expect(B, {Ref, <<"p9">>, point}, 500),
-        rel(B),
+        ?assertEqual({error, deadlock}, expect(B, {Ref, <<"p9">>, point}, 500)),
+        rel(B),                                        % B 重跑前放锁 → A 拿到 q
+        ?assertEqual(ok, expect(A, {Ref, <<"q">>, point}, 500)),
+        rel(A),
         ?assertMatch(#{locks := 0, prefix_locks := 0}, wait_clean()),
         stop(A), stop(B)
      end}.
@@ -846,3 +848,78 @@ wait_for(Pred, N) ->
         true -> ok;
         _    -> timer:sleep(20), wait_for(Pred, N - 1)
     end.
+
+%% ===================================================================
+%% victim 启发式（X1-7 收尾）：牺牲环上最年轻的，年龄跨重跑不变
+%% ===================================================================
+
+younger_is_victim_across_shards_test_() ->
+    {"闭环者更老 → 受害者是更年轻的那个，哪怕它在别的分片上等（cast 中止）",
+     fun() ->
+        setup(),
+        N = ?L:shard_count(), ?assert(N >= 2),
+        Ref = make_ref(),
+        K1 = key_in_shard(Ref, <<"v">>, fun(S) -> S =:= 1 end),
+        K2 = key_in_shard(Ref, <<"v">>, fun(S) -> S =:= N end),
+        A = agent_start(#{age => 1}),               % 老
+        B = agent_start(#{age => 2}),               % 年轻
+        acq(A, K1, write), ok = expect(A, K1, 500),
+        acq(B, K2, write), ok = expect(B, K2, 500),
+        acq(B, K1, write), ?assertEqual(blocked, blocked(B, K1)),   % B 在分片 1 等
+        #{victims_other := V0} = ?L:status(),
+        acq(A, K2, write),                                          % A 在分片 N 闭环
+        ?assertEqual({error, deadlock}, expect(B, K1, 500)),        % 受害者是 B
+        ?assertEqual(blocked, blocked(A, K2)),                      % A 还在等 B 放 K2
+        rel(B),
+        ?assertEqual(ok, expect(A, K2, 500)),
+        ?assertMatch(#{victims_other := V1} when V1 =:= V0 + 1, ?L:status()),
+        rel(A),
+        ?assertMatch(#{locks := 0, waiting := 0}, wait_clean()),
+        stop(A), stop(B)
+     end}.
+
+older_txn_never_restarts_test_() ->
+    {"门面：老事务闭环也不重跑，年轻的重跑一次；年龄按 transaction 调用算",
+     {timeout, 30, fun() ->
+        with_dir(fun(D) ->
+            R = open(D),
+            ok = bitcask:put(R, <<"k1">>, <<"0">>), ok = bitcask:put(R, <<"k2">>, <<"0">>),
+            Parent = self(),
+            Old = counters:new(1, []), Young = counters:new(1, []),
+            POld = spawn_link(fun() ->
+                Res = ?T:transaction(R, fun(Tx) ->
+                    counters:add(Old, 1, 1),
+                    ok = ?T:write(Tx, <<"k1">>, <<"old">>),
+                    Parent ! {self(), has_k1},
+                    receive go -> ok end,                 % 测试专用同步
+                    ?T:write(Tx, <<"k2">>, <<"old">>)     % 闭环：老事务是请求者
+                end, ?FAST),
+                Parent ! {self(), Res}
+            end),
+            receive {POld, has_k1} -> ok end,
+            PYoung = spawn_link(fun() ->
+                Res = ?T:transaction(R, fun(Tx) ->
+                    counters:add(Young, 1, 1),
+                    ok = ?T:write(Tx, <<"k2">>, <<"young">>),
+                    case counters:get(Young, 1) of
+                        1 -> Parent ! {self(), has_k2};   % 只在首次尝试同步
+                        _ -> ok
+                    end,
+                    ?T:write(Tx, <<"k1">>, <<"young">>)   % 首次：等老事务 → 被牺牲
+                end, ?FAST),
+                Parent ! {self(), Res}
+            end),
+            receive {PYoung, has_k2} -> ok end,
+            timer:sleep(100),                              % 让 young 真的挂在 k1 上
+            POld ! go,
+            ?assertEqual({atomic, ok}, receive {POld, R1} -> R1 after 5000 -> timeout end),
+            ?assertEqual({atomic, ok}, receive {PYoung, R2} -> R2 after 5000 -> timeout end),
+            ?assertEqual(1, counters:get(Old, 1)),         % 老的一次过
+            ?assertEqual(2, counters:get(Young, 1)),       % 年轻的重跑了一次
+            %% 年轻的重跑在老的提交之后：终值是 young
+            ?assertEqual({ok, <<"young">>}, bitcask:get(R, <<"k1">>)),
+            ?assertEqual({ok, <<"young">>}, bitcask:get(R, <<"k2">>)),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}}.
