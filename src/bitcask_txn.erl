@@ -20,7 +20,9 @@
 %%       缓冲命中先于引擎 get。
 %%     * 死锁 / 单锁等待超时 → 丢缓冲、新 TxnId、**原样重跑 Fun**，
 %%       预算 {retries, N}（默认 10），耗尽 {aborted, {retry_limit, N}}；
-%%       每次重跑前 1~10ms 随机退避，打散对称死锁的重启风暴。
+%%       每次重跑前 1~10ms 随机退避，打散对称死锁的重启风暴。死锁受害者是
+%%       环上**最年轻**的事务，年龄按 transaction 调用算、重跑不变——最老
+%%       的永远不会被牺牲，长事务不会被短事务反复打断。
 %%     * {timeout, Ms} 是整个 transaction 调用的总预算（跨重启），到点
 %%       {aborted, timeout}，**不重启**——超时是调用方的问题。
 %%     * abort(Reason) → {aborted, Reason}，不重启。Fun 抛异常 →
@@ -78,6 +80,7 @@
                           sync      :: sync_on_commit | no_sync}).
 
 -record(cfg, {retries   :: non_neg_integer() | infinity,
+              age       :: pos_integer(),          % 一次 transaction 调用一个，重跑不变
               deadline  :: integer() | infinity,
               lock_wait :: timeout(),
               sync      :: sync_on_commit | no_sync,
@@ -118,6 +121,7 @@ parse_opts(Opts) ->
     IndexFun = proplists:get_value(index_fun, Opts, undefined),
     true = IndexFun =:= undefined orelse is_function(IndexFun, 2),
     #cfg{retries   = Retries,
+         age       = erlang:unique_integer([positive, monotonic]),
          deadline  = Deadline,
          lock_wait = proplists:get_value(lock_wait_timeout, Opts,
                                          ?DEFAULT_LOCK_WAIT_TIMEOUT),
@@ -138,9 +142,12 @@ run_loop(Handle, Fun, #cfg{retries = Retries} = Cfg, Attempt) ->
 
 %% 单次尝试：注册 → 跑 Fun → 提交。所有出口都 release_all（幂等）。
 run_once(Handle, Fun, Cfg) ->
+    %% age 跨重跑不变：死锁时牺牲环上最年轻的，重跑的事务不会因为换了
+    %% TxnId 又变成"最年轻"而被反复牺牲（同 Mnesia 重启保 Tid）。
     {ok, TxnId} = bitcask_txn_locker:register(
                     self(), #{deadline => Cfg#cfg.deadline,
-                              lock_wait_timeout => Cfg#cfg.lock_wait}),
+                              lock_wait_timeout => Cfg#cfg.lock_wait,
+                              age => Cfg#cfg.age}),
     Tx = #bitcask_txn_ctx{id = TxnId, handle = Handle,
                           ref = handle_ref(Handle),
                           index_fun = Cfg#cfg.index_fun,

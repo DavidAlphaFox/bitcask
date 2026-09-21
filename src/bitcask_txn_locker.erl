@@ -15,8 +15,13 @@
 %%        还有它罩住的全部记录（ordered_set 一段顺序扫）。持有覆盖锁的事务
 %%        再要被覆盖的锁**免费**（不建记录、不过锁表）。
 %%     3. **死锁检测**：入队即检——从请求者出发沿 wait-for 图 DFS，回到
-%%        自己即死锁，请求者作为受害者被中止（它是最新的那条边，中止它
-%%        必破环）。wait-for 边**不单独存表**，由锁表按需推导：等待者 W
+%%        自己即死锁。**受害者 = 环上最年轻的事务**（age 最大；age 在门面
+%%        里一次 transaction 调用内跨重跑保持不变，同 Mnesia 重启保 Tid）：
+%%        最老的事务永远不会被牺牲，所以长事务不会被源源不断的短事务反复
+%%        打断——有进展保证。受害者是请求者就地回复 {error, deadlock}；在
+%%        本分片等的直接出队回复；在别的分片等的 cast 过去中止（那边核对它
+%%        仍在等同一把锁才动手，否则环已自行解开）。
+%%        wait-for 边**不单独存表**，由锁表按需推导：等待者 W
 %%        等 (a) 重叠记录上与它冲突的 holder，(b) 重叠记录上比它**早到**
 %%        （全局 seq 更小）且与它冲突的等待者——后者就是 FIFO 公平 / 防写
 %%        饿死，跨记录也成立。DFS 会跨分片：某事务在别的分片上等，就读那个
@@ -117,6 +122,7 @@
 -record(txn, {id       :: txn_id(),
               pid      :: pid(),
               mon      :: reference(),
+              age      :: pos_integer(),             % 越小越老；重跑不变
               deadline :: integer() | infinity,      % erlang:monotonic_time(ms)
               lock_wait_timeout :: timeout(),
               waiting  = undefined :: undefined | {pos_integer(), lock_id()}}).
@@ -165,7 +171,9 @@ shard_of({_, _, prefix})     -> all.
 %% =========================================================================
 
 %% Opts :: #{deadline => integer() | infinity,      %% monotonic ms，缺省 infinity
-%%           lock_wait_timeout => timeout()}         %% 缺省 5000
+%%           lock_wait_timeout => timeout(),         %% 缺省 5000
+%%           age => pos_integer()}                   %% 缺省 = 新的单调整数（最年轻）；
+%%                                                   %% 重跑时传首次的值，年龄不变
 -spec register(pid(), map()) -> {ok, txn_id()}.
 register(Pid, Opts) when is_pid(Pid), is_map(Opts) ->
     TxnId = erlang:unique_integer([positive, monotonic]),
@@ -219,7 +227,7 @@ release_all(TxnId) ->
 %% 直接读 ETS，不过分片进程——观测不挡锁操作。
 -spec status() -> #{txns => non_neg_integer(), waiting => non_neg_integer(),
                     locks => non_neg_integer(), prefix_locks => non_neg_integer(),
-                    deadlocks_total => non_neg_integer(),
+                    deadlocks_total => non_neg_integer(), victims_other => non_neg_integer(),
                     lock_wait_timeouts => non_neg_integer(), shards => pos_integer()}.
 status() ->
     N = shard_count(),
@@ -234,6 +242,7 @@ status() ->
       locks               => Locks,
       prefix_locks        => Prefix,
       deadlocks_total     => Stat(deadlocks),
+      victims_other       => Stat(victims_other),   % 受害者不是请求者的次数
       lock_wait_timeouts  => Stat(lock_wait_timeouts),
       shards              => N}.
 
@@ -264,6 +273,7 @@ handle_call(_Req, _From, tables) ->
 handle_call({register, TxnId, Pid, Opts}, _From, S) ->
     Mon = erlang:monitor(process, Pid),
     T = #txn{id = TxnId, pid = Pid, mon = Mon,
+             age = maps:get(age, Opts, erlang:unique_integer([positive, monotonic])),
              deadline = maps:get(deadline, Opts, infinity),
              lock_wait_timeout = maps:get(lock_wait_timeout, Opts,
                                           ?DEFAULT_LOCK_WAIT_TIMEOUT)},
@@ -300,6 +310,14 @@ handle_cast({release, TxnId}, #state{} = S) ->
 %% 事务死亡的级联清理：本分片上它等的出队、持的全放。
 handle_cast({drop, TxnId}, #state{} = S) ->
     {noreply, drop_local(TxnId, S)};
+
+%% 别的分片检出死锁、选中在本分片等的事务当受害者。它得仍在等同一把锁
+%% 才动手——否则那个环已经（被授予/超时/死亡）解开了。
+handle_cast({abort_waiter, TxnId, LockId}, #state{} = S) ->
+    case maps:find(TxnId, S#state.waiting) of
+        {ok, LockId} -> {noreply, abort_waiter(TxnId, LockId, S)};
+        _            -> {noreply, S}
+    end;
 
 handle_cast(_Msg, S) ->
     {noreply, S}.
@@ -385,17 +403,27 @@ do_acquire(#txn{id = TxnId} = T, LockId, Mode, From, #state{tabs = Tabs} = S) ->
                     %% 依赖这个顺序（模块头第 3 条）。
                     requeue(Tabs, LockId, W),
                     S1 = set_waiting(TxnId, LockId, S),
-                    case has_cycle(TxnId) of
+                    case find_cycle(TxnId) of
                         false ->
                             {noreply, S1};
-                        true ->
-                            %% 受害者 = 请求者。出队、取消计时器、回复；它身后可能
-                            %% 有人因此变得可授予，wake。
-                            {ok, W1} = take_waiter(Tabs, LockId, TxnId),
-                            cancel_timer(W1#waiter.timer),
-                            S2 = wake_around(LockId, set_waiting(TxnId, undefined, S1)),
+                        Cycle ->
                             _ = ets:update_counter(?STATS, deadlocks, 1, {deadlocks, 0}),
-                            {reply, {error, deadlock}, S2}
+                            case youngest(Cycle) of
+                                TxnId ->
+                                    %% 受害者 = 请求者。出队、取消计时器、回复；它身后可能
+                                    %% 有人因此变得可授予，wake。
+                                    {ok, W1} = take_waiter(Tabs, LockId, TxnId),
+                                    cancel_timer(W1#waiter.timer),
+                                    S2 = wake_around(LockId, set_waiting(TxnId, undefined, S1)),
+                                    {reply, {error, deadlock}, S2};
+                                Victim ->
+                                    %% 别人当受害者：请求者留在队里等，受害者出局后
+                                    %% 它自然被唤醒（受害者要么是它等的锁上的先到
+                                    %% 等待者，要么持着它等的锁、重跑前会放掉）。
+                                    _ = ets:update_counter(?STATS, victims_other, 1,
+                                                           {victims_other, 0}),
+                                    {noreply, abort_victim(Victim, S1)}
+                            end
                     end
             end
     end.
@@ -482,22 +510,63 @@ scan_under(_Locks, _Ref, _Bin, _K, Acc) ->
 
 %% =========================================================================
 %% 死锁检测：从 Start 出发沿推导边 DFS，再碰到 Start 即有环（可跨分片读表）
+%% 返回环上的事务列表（含 Start），无环 false。
 %% =========================================================================
 
-has_cycle(Start) ->
-    search([Start], #{Start => true}, Start).
+find_cycle(Start) ->
+    case dfs(Start, [Start], #{Start => true}, Start) of
+        {cycle, Path} -> Path;
+        _Seen         -> false
+    end.
 
-search([], _Seen, _Start) ->
-    false;
-search([N | Rest], Seen, Start) ->
-    Bs = blockers_of(N),
-    case lists:member(Start, Bs) of
+%% 带路径的 DFS：Path 是从 Start 到当前节点的栈，碰到 Start 时它就是环。
+dfs(N, Path, Seen, Start) ->
+    dfs_edges(blockers_of(N), Path, Seen, Start).
+
+dfs_edges([], _Path, Seen, _Start) ->
+    Seen;
+dfs_edges([Start | _], Path, _Seen, Start) ->
+    {cycle, Path};
+dfs_edges([B | Rest], Path, Seen, Start) ->
+    case maps:is_key(B, Seen) of
         true ->
-            true;
+            dfs_edges(Rest, Path, Seen, Start);
         false ->
-            New = [B || B <- Bs, not maps:is_key(B, Seen)],
-            Seen1 = lists:foldl(fun(B, Acc) -> Acc#{B => true} end, Seen, New),
-            search(New ++ Rest, Seen1, Start)
+            case dfs(B, [B | Path], Seen#{B => true}, Start) of
+                {cycle, _} = C -> C;
+                Seen1          -> dfs_edges(Rest, Path, Seen1, Start)
+            end
+    end.
+
+%% 环上 age 最大（最年轻）的事务。记录已没了的（刚死/刚注销）当作最老，不选。
+youngest(Cycle) ->
+    {_, V} = lists:max([{case ets:lookup(?TXNS, X) of
+                             [#txn{age = A}] -> A;
+                             []              -> 0
+                         end, X} || X <- Cycle]),
+    V.
+
+%% 中止一个不是请求者的受害者：它在本分片等就地处理，否则 cast 给它等的分片。
+abort_victim(Victim, #state{tabs = #tabs{idx = Me}} = S) ->
+    case ets:lookup(?TXNS, Victim) of
+        [#txn{waiting = {Me, LockId}}] ->
+            abort_waiter(Victim, LockId, S);
+        [#txn{waiting = {Shard, LockId}}] ->
+            gen_server:cast(shard(Shard), {abort_waiter, Victim, LockId}),
+            S;
+        _ ->
+            S
+    end.
+
+%% 把在本分片等 LockId 的 TxnId 出队并回复 {error, deadlock}。
+abort_waiter(TxnId, LockId, #state{tabs = Tabs} = S) ->
+    case take_waiter(Tabs, LockId, TxnId) of
+        {ok, W} ->
+            cancel_timer(W#waiter.timer),
+            gen_server:reply(W#waiter.from, {error, deadlock}),
+            wake_around(LockId, set_waiting(TxnId, undefined, S));
+        error ->
+            S
     end.
 
 %% N 在等谁：不在等 → []；否则到它等的那个分片的表里按等待条目重算 blockers。
