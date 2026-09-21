@@ -257,6 +257,16 @@ graphdb:k_hop(R, Start, K, Opts).
 graphdb:shortest_path(R, Src, Dst).
 graphdb:degree(R, Vid, Etype).                          %% deg 家族或按需计数
 
+%% 事务式写（X1-5 已落地；bitcask_txn 之上，2PL + 死锁重跑，计数器精确）
+graphdb:transaction(R, fun(Tx) ->
+    ok = graphdb:put_edge_txn(Tx, Src, Etype, Dst, Opts),
+    ok = graphdb:del_edge_txn(Tx, Src2, Etype, Dst2),
+    graphdb:degree_txn(Tx, Src, Etype)
+end, [{retries, 10}])                                   -> {atomic, R} | {aborted, Why}.
+%% 另有 edge_txn / put_vertex_txn（Doc 只收 binary）/ get_vertex_txn。
+%% ⚠️ 同一图的边写要么全走事务、要么全走直通（直通绕过锁）。del_vertex 无
+%% 事务版（级联要范围锁，txn P2）。
+
 %% 检索联动（复用引擎能力）
 graphdb:search_vertex(R, Query).                        %% search_fields/search_text 直通
 graphdb:search_vector(R, Q).                            %% 顶点向量近邻
@@ -277,6 +287,9 @@ graphdb:pregel(CsrRef, ComputeFun, Opts).
   OLTP 遍历可接受，全图迭代必须走 §7 物化层，两层定位不同。
 - ⚠️ **每边 2 个 KV**（+ 可选 deg 计数），边写放大 ×2；`ei` 值留空缓解属性侧翻倍。
 - ⚠️ **跨跳 per-key 弱一致**；全局快照只有 fold（O(全表)）。多跳事务不存在。
+- ⚠️ **deg/degi 计数在直通 API 下只在单写者语义下精确**；并发写用 `*_txn`
+  族（`doc/txn-layer-design-zh.md`），代价约 2–2.5× 单边写延迟（锁管理器
+  往返），100 边/事务批量装载可收回大半。
 - ⚠️ **hub 顶点**：无服务端 LIMIT，靠调用层提前停 / 前缀收窄；超级 hub（>10⁶ 度）
   应在建模层拆分。
 - ⚠️ **key ≤ 64 KiB**；u64 vid 之外的 id 走长度前缀变体（+2 B/字段）。
@@ -307,3 +320,6 @@ vbyte 前缀差分压缩率高（`prefix:id` 形态正是 BCOK 的优化目标�
 5. **P5** ✅：基准（`test/graphdb_bench`：稳态一跳 ~0.02 ms/op、批量装载 ~94k edges/s
    @2k/8k 规模；⚠️ 未 flush memdelta 上查询 ~12ms/跳——装载型负载装载后建议
    checkpoint/reopen）+ 一致性语义测试（扫中插入/删除可见性不变量）+ EN 文档（本文英文版）。
+6. **X1-5** ✅（2026-09-21）：事务式 API（`transaction/2,3` + `put_edge_txn` /
+   `del_edge_txn` / `edge_txn` / `degree_txn` / `put_vertex_txn` / `get_vertex_txn`），
+   建在 `bitcask_txn` 上；16 进程并发对同一 hub 加边计数精确（`test/graphdb_txn_tests.erl`）。
