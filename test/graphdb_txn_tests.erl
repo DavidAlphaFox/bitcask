@@ -171,3 +171,123 @@ degree_fallback_per_etype_test_() ->
             ?G:close(R)
         end)
      end}.
+
+%% ===================================================================
+%% 前缀锁版本（X1-6）：out/in_edges_txn、degree_txn/2、del_vertex_txn
+%% ===================================================================
+
+out_edges_txn_merges_buffer_test_() ->
+    {"out_edges_txn/in_edges_txn：看到本事务未提交的加/删；etype、limit 生效",
+     fun() ->
+        with_dir(fun(D) ->
+            R = ?G:open(D, [read_write]),
+            ok = ?G:put_edge(R, 1, 7, 2),
+            ok = ?G:put_edge(R, 1, 7, 3),
+            ok = ?G:put_edge(R, 1, 8, 4),
+            Res = ?G:transaction(R, fun(Tx) ->
+                ok = ?G:put_edge_txn(Tx, 1, 7, 9),
+                ok = ?G:del_edge_txn(Tx, 1, 7, 2),
+                {ok, Out}  = ?G:out_edges_txn(Tx, 1),
+                {ok, Out7} = ?G:out_edges_txn(Tx, 1, #{etype => 7}),
+                {ok, Lim}  = ?G:out_edges_txn(Tx, 1, #{limit => 2}),
+                {ok, In9}  = ?G:in_edges_txn(Tx, 9),
+                {ok, In2}  = ?G:in_edges_txn(Tx, 2),
+                {ok, Deg}  = ?G:degree_txn(Tx, 1),
+                {[E || #{dst := E} <- Out], [E || #{dst := E} <- Out7], length(Lim),
+                 [S || #{src := S} <- In9], In2, Deg}
+            end, ?FAST),
+            ?assertEqual({atomic, {[3, 9, 4], [3, 9], 2, [1], [], 3}}, Res),
+            %% 直通视图与提交一致
+            ?assertEqual([3, 9, 4], dsts(?G:out_edges(R, 1))),
+            ?assertMatch(#{locks := 0, prefix_locks := 0}, bitcask_txn_locker:status()),
+            ?G:close(R)
+        end)
+     end}.
+
+del_vertex_txn_test_() ->
+    {"del_vertex_txn：级联删 incident 边三键、邻居计数回落、自身计数/顶点清空；自环",
+     fun() ->
+        with_dir(fun(D) ->
+            R = ?G:open(D, [read_write]),
+            [ok = ?G:put_vertex(R, V, <<"v">>) || V <- [1, 2, 3]],
+            ok = ?G:put_edge(R, 1, 7, 2),
+            ok = ?G:put_edge(R, 1, 8, 2),
+            ok = ?G:put_edge(R, 3, 7, 1),
+            ok = ?G:put_edge(R, 1, 7, 1),                      % 自环
+            ok = ?G:put_edge(R, 2, 7, 3),                      % 无关边
+            ?assertEqual({atomic, ok},
+                         ?G:transaction(R, fun(Tx) -> ?G:del_vertex_txn(Tx, 1) end, ?FAST)),
+            ?assertEqual({error, not_found}, ?G:get_vertex(R, 1)),
+            ?assertEqual([], dsts(?G:out_edges(R, 1))),
+            ?assertEqual([], srcs(?G:in_edges(R, 1))),
+            ?assertEqual([], srcs(?G:in_edges(R, 2))),
+            ?assertEqual([], dsts(?G:out_edges(R, 3))),
+            ?assertEqual([3], dsts(?G:out_edges(R, 2))),       % 无关边还在
+            ?assertEqual([{2, 3}], [{S, Dd} || #{src := S, dst := Dd} <- element(2, ?G:edges_by_type(R, 7))]),
+            ?assertEqual([], element(2, ?G:edges_by_type(R, 8))),
+            %% 邻居计数：3 的出度 7 → 0；2 的入度 7/8 → 0；2 的出度 7 仍 1
+            ?assertEqual({ok, 0}, ?G:degree(R, 3, 7)),
+            ?assertEqual({ok, 1}, ?G:degree(R, 2, 7)),
+            %% 自身计数键全没了（不是归零，是删除）
+            ?assertEqual([], bitcask:range(R, {<<"deg", 1:64/big>>, <<"deg", 2:64/big>>})),
+            ?assertEqual([], bitcask:range(R, {<<"degi", 1:64/big>>, <<"degi", 2:64/big>>})),
+            ?assertMatch(#{locks := 0, prefix_locks := 0}, bitcask_txn_locker:status()),
+            ?G:close(R)
+        end)
+     end}.
+
+%% 全图不变式：每个 (vid, etype) 的 deg/degi 计数 == 实际 e/ei 键数；
+%% 每条 e 键有配对的 ei 与 et，反之亦然。
+check_invariants(R) ->
+    Es  = [{S, T, Dd, Rk} || {<<"e", S:64/big, T:32/big, Dd:64/big, Rk:64/big>>, _}
+                              <- bitcask:range(R, {<<"e">>, <<"f">>})],
+    Eis = [{S, T, Dd, Rk} || {<<"ei", Dd:64/big, T:32/big, S:64/big, Rk:64/big>>, _}
+                              <- bitcask:range(R, {<<"ei">>, <<"ej">>})],
+    Ets = [{S, T, Dd, Rk} || {<<"et", T:32/big, S:64/big, Dd:64/big, Rk:64/big>>, _}
+                              <- bitcask:range(R, {<<"et">>, <<"eu">>})],
+    ?assertEqual(lists:sort(Es), lists:sort(Eis)),
+    ?assertEqual(lists:sort(Es), lists:sort(Ets)),
+    Degs  = [{{V, T}, N} || {<<"deg", V:64/big, T:32/big>>, <<N:64/big>>}
+                             <- bitcask:range(R, {<<"deg">>, <<"deh">>})],
+    Degis = [{{V, T}, N} || {<<"degi", V:64/big, T:32/big>>, <<N:64/big>>}
+                             <- bitcask:range(R, {<<"degi">>, <<"degj">>})],
+    Count = fun(Pairs) -> lists:foldl(fun(K, M) -> M#{K => maps:get(K, M, 0) + 1} end, #{}, Pairs) end,
+    OutC = Count([{S, T} || {S, T, _, _} <- Es]),
+    InC  = Count([{Dd, T} || {_, T, Dd, _} <- Es]),
+    %% 计数键可以多（值为 0 的残留），但凡存在必须等于实际数；有边必有计数键
+    [?assertEqual({K, maps:get(K, OutC, 0)}, {K, N}) || {K, N} <- Degs],
+    [?assertEqual({K, maps:get(K, InC, 0)}, {K, N})  || {K, N} <- Degis],
+    [?assert(lists:keymember(K, 1, Degs))  || K <- maps:keys(OutC)],
+    [?assert(lists:keymember(K, 1, Degis)) || K <- maps:keys(InC)],
+    length(Es).
+
+concurrent_insert_vs_del_vertex_test_() ->
+    {"8 个加边进程 vs 2 个 del_vertex_txn 进程随机交错 → 计数/三键不变式成立",
+     {timeout, 120, fun() ->
+        with_dir(fun(D) ->
+            R = ?G:open(D, [read_write]),
+            NV = 12,
+            Parent = self(),
+            Ins = [spawn_link(fun() ->
+                      rand:seed(exsss, {P, P, P}),
+                      [{atomic, ok} = ?G:transaction(R, fun(Tx) ->
+                           ?G:put_edge_txn(Tx, rand:uniform(NV), 7, rand:uniform(NV),
+                                           #{rank => rand:uniform(3)})
+                       end, [{retries, infinity} | ?FAST]) || _ <- lists:seq(1, 60)],
+                      Parent ! {self(), done}
+                  end) || P <- lists:seq(1, 8)],
+            Del = [spawn_link(fun() ->
+                      rand:seed(exsss, {P, P, P}),
+                      [{atomic, ok} = ?G:transaction(R, fun(Tx) ->
+                           ?G:del_vertex_txn(Tx, rand:uniform(NV))
+                       end, [{retries, infinity} | ?FAST]) || _ <- lists:seq(1, 15)],
+                      Parent ! {self(), done}
+                  end) || P <- lists:seq(100, 101)],
+            [receive {P, done} -> ok end || P <- Ins ++ Del],
+            NEdges = check_invariants(R),
+            ?assert(NEdges >= 0),
+            ?assertMatch(#{locks := 0, prefix_locks := 0, txns := 0, waiting := 0},
+                         bitcask_txn_locker:status()),
+            ?G:close(R)
+        end)
+     end}}.

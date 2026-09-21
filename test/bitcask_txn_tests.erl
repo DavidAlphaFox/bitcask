@@ -121,7 +121,7 @@ lock_matrix_test_() ->
     {"读读合并 / 读写互斥 / 写写互斥 / 重入 / 唯一 holder 升级",
      fun() ->
         setup(),
-        K = {make_ref(), <<"k">>},
+        K = {make_ref(), <<"k">>, point},
         A = agent_start(), B = agent_start(),
         %% read + read
         acq(A, K, read),  ?assertEqual(ok, expect(A, K, 500)),
@@ -153,7 +153,7 @@ fifo_no_writer_starvation_test_() ->
     {"读持有中来了写等待者，之后的读必须排在写后面",
      fun() ->
         setup(),
-        K = {make_ref(), <<"k">>},
+        K = {make_ref(), <<"k">>, point},
         R1 = agent_start(), W = agent_start(), R2 = agent_start(), R3 = agent_start(),
         acq(R1, K, read),  ?assertEqual(ok, expect(R1, K, 500)),
         acq(W, K, write),  ?assertEqual(blocked, blocked(W, K)),
@@ -179,7 +179,7 @@ deadlock_detected_at_locker_test_() ->
      fun() ->
         setup(),
         Ref = make_ref(),
-        K1 = {Ref, <<"k1">>}, K2 = {Ref, <<"k2">>},
+        K1 = {Ref, <<"k1">>, point}, K2 = {Ref, <<"k2">>, point},
         A = agent_start(), B = agent_start(),
         acq(A, K1, write), ?assertEqual(ok, expect(A, K1, 500)),
         acq(B, K2, write), ?assertEqual(ok, expect(B, K2, 500)),
@@ -201,7 +201,7 @@ three_way_cycle_test_() ->
      fun() ->
         setup(),
         Ref = make_ref(),
-        [K1, K2, K3] = [{Ref, K} || K <- [<<"1">>, <<"2">>, <<"3">>]],
+        [K1, K2, K3] = [{Ref, K, point} || K <- [<<"1">>, <<"2">>, <<"3">>]],
         A = agent_start(), B = agent_start(), C = agent_start(),
         acq(A, K1, write), ok = expect(A, K1, 500),
         acq(B, K2, write), ok = expect(B, K2, 500),
@@ -226,7 +226,7 @@ holder_death_releases_test_() ->
     {"持锁进程被 kill → 等待者放行；等待中被 kill → 出队不挡后面的人",
      fun() ->
         setup(),
-        K = {make_ref(), <<"k">>},
+        K = {make_ref(), <<"k">>, point},
         {PA, _} = A = agent_start(),
         B = agent_start(), C = agent_start(),
         process_flag(trap_exit, true),
@@ -250,7 +250,7 @@ lock_wait_timeout_at_locker_test_() ->
     {"单锁等待兜底：到点 {error,lock_wait_timeout}，锁表不残留等待者",
      fun() ->
         setup(),
-        K = {make_ref(), <<"k">>},
+        K = {make_ref(), <<"k">>, point},
         A = agent_start(),
         B = agent_start(#{lock_wait_timeout => 100}),
         acq(A, K, write), ok = expect(A, K, 500),
@@ -421,18 +421,18 @@ retry_limit_test_() ->
             {Ref, _} = R,
             %% A：裸事务持 k1，并在 B 拿到 k2 后去等 k2
             A = agent_start(),
-            acq(A, {Ref, <<"k1">>}, write), ok = expect(A, {Ref, <<"k1">>}, 500),
+            acq(A, {Ref, <<"k1">>, point}, write), ok = expect(A, {Ref, <<"k1">>, point}, 500),
             Res = ?T:transaction(R, fun(Tx) ->
                 ok = ?T:write(Tx, <<"k2">>, <<"1">>),
-                acq(A, {Ref, <<"k2">>}, write),
-                blocked = blocked(A, {Ref, <<"k2">>}),
+                acq(A, {Ref, <<"k2">>, point}, write),
+                blocked = blocked(A, {Ref, <<"k2">>, point}),
                 ok = ?T:write(Tx, <<"k1">>, <<"1">>),   % 闭环 → 自己是受害者
                 unreachable
             end, [{retries, 0} | ?FAST]),
             ?assertEqual({aborted, {retry_limit, 0}}, Res),
             ?assertEqual({ok, <<"0">>}, bitcask:get(R, <<"k2">>)),
             %% B 退出后 A 拿到 k2
-            ?assertEqual(ok, expect(A, {Ref, <<"k2">>}, 500)),
+            ?assertEqual(ok, expect(A, {Ref, <<"k2">>, point}, 500)),
             rel(A), stop(A),
             bitcask:close(R)
         end)
@@ -445,7 +445,7 @@ lock_wait_timeout_restarts_test_() ->
             R = open(D),
             {Ref, _} = R,
             A = agent_start(),
-            acq(A, {Ref, <<"k">>}, write), ok = expect(A, {Ref, <<"k">>}, 500),
+            acq(A, {Ref, <<"k">>, point}, write), ok = expect(A, {Ref, <<"k">>, point}, 500),
             Cnt = counters:new(1, []),
             Res = ?T:transaction(R, fun(Tx) ->
                 counters:add(Cnt, 1, 1),
@@ -475,7 +475,7 @@ timeout_test_() ->
             %% 等锁期间过 deadline 同样 timeout
             {Ref, _} = R,
             A = agent_start(),
-            acq(A, {Ref, <<"k">>}, write), ok = expect(A, {Ref, <<"k">>}, 500),
+            acq(A, {Ref, <<"k">>, point}, write), ok = expect(A, {Ref, <<"k">>, point}, 500),
             ?assertEqual({aborted, timeout},
                          ?T:transaction(R, fun(Tx) -> ?T:write(Tx, <<"k">>, <<"v">>) end,
                                         [{timeout, 50} | ?FAST])),
@@ -571,7 +571,7 @@ cross_cask_no_conflict_test_() ->
                 R1 = open(D1), R2 = open(D2),
                 {Ref1, _} = R1,
                 A = agent_start(),
-                acq(A, {Ref1, <<"k">>}, write), ok = expect(A, {Ref1, <<"k">>}, 500),
+                acq(A, {Ref1, <<"k">>, point}, write), ok = expect(A, {Ref1, <<"k">>, point}, 500),
                 ?assertEqual({atomic, ok},
                              ?T:transaction(R2, fun(Tx) -> ?T:write(Tx, <<"k">>, <<"v">>) end,
                                             [{lock_wait_timeout, 200}, {retries, 0} | ?FAST])),
@@ -614,6 +614,129 @@ concurrent_transfers_conserve_test_() ->
             Sum = lists:sum([int(element(2, bitcask:get(R, Acc(I)))) || I <- lists:seq(1, NAcc)]),
             ?assertEqual(NAcc * Init, Sum),
             ?assertMatch(#{locks := 0, txns := 0, waiting := 0}, ?L:status()),
+            bitcask:close(R)
+        end)
+     end}}.
+
+%% ===================================================================
+%% 前缀锁（X1-6 / 设计 P2）
+%% ===================================================================
+
+prefix_lock_matrix_test_() ->
+    {"前缀 vs 点：覆盖即冲突（双向）；不相干前缀互不挡；读读合并；扩展前缀冲突",
+     fun() ->
+        setup(),
+        Ref = make_ref(),
+        P  = {Ref, <<"ab">>, prefix},
+        PL = {Ref, <<"abx">>, prefix},         % 更长的前缀（被 P 罩住，罩住 K1）
+        Q  = {Ref, <<"b">>, prefix},           % 不相干
+        K1 = {Ref, <<"abx">>, point},          % P 之下
+        K2 = {Ref, <<"zz">>, point},           % P 之外
+        A = agent_start(), B = agent_start(), C = agent_start(),
+        %% 前缀写挡点写/点读，不挡外面的
+        acq(A, P, write),  ok = expect(A, P, 500),
+        acq(B, K1, write), ?assertEqual(blocked, blocked(B, K1)),
+        acq(C, K2, read),  ok = expect(C, K2, 500),     % P 之外：无关
+        rel(A),            ok = expect(B, K1, 500),
+        %% 点写挡前缀读；不相干前缀不挡
+        acq(A, P, read),   ?assertEqual(blocked, blocked(A, P)),
+        acq(C, Q, write),  ok = expect(C, Q, 500),
+        rel(B),            ok = expect(A, P, 500),
+        rel(C),
+        %% 前缀读 + 点读合并；点写等
+        acq(B, K1, read),  ok = expect(B, K1, 500),
+        acq(B, K1, write), ?assertEqual(blocked, blocked(B, K1)),
+        rel(A),            ok = expect(B, K1, 500),
+        %% 扩展前缀：PL 写 vs P 读
+        acq(A, PL, write), ?assertEqual(blocked, blocked(A, PL)),   % B 持 K1 写在 PL 下
+        rel(B),            ok = expect(A, PL, 500),
+        acq(B, P, read),   ?assertEqual(blocked, blocked(B, P)),
+        rel(A),            ok = expect(B, P, 500),
+        rel(B),
+        ?assertMatch(#{locks := 0, prefix_locks := 0, waiting := 0}, ?L:status()),
+        stop(A), stop(B), stop(C)
+     end}.
+
+prefix_writer_fairness_test_() ->
+    {"前缀写等待者不被后来的点请求饿死（跨记录 FIFO）",
+     fun() ->
+        setup(),
+        Ref = make_ref(),
+        P = {Ref, <<"e">>, prefix},
+        K1 = {Ref, <<"e1">>, point}, K2 = {Ref, <<"e2">>, point},
+        H = agent_start(), W = agent_start(), L = agent_start(),
+        acq(H, K1, write), ok = expect(H, K1, 500),
+        acq(W, P, write),  ?assertEqual(blocked, blocked(W, P)),   % 等 H
+        acq(L, K2, write), ?assertEqual(blocked, blocked(L, K2)),  % 空闲 key，但排在 W 后
+        rel(H),
+        ok = expect(W, P, 500),
+        ?assertEqual(blocked, blocked(L, K2)),
+        rel(W),
+        ok = expect(L, K2, 500),
+        rel(L),
+        ?assertMatch(#{locks := 0, prefix_locks := 0}, ?L:status()),
+        [stop(X) || X <- [H, W, L]]
+     end}.
+
+prefix_covered_is_free_test_() ->
+    {"持前缀写锁后其下点锁免费：不建记录、不过 locker；死锁经前缀锁也能检出",
+     fun() ->
+        setup(),
+        Ref = make_ref(),
+        P = {Ref, <<"p">>, prefix},
+        A = agent_start(), B = agent_start(),
+        acq(A, P, write), ok = expect(A, P, 500),
+        [begin acq(A, {Ref, <<"p", I>>, point}, write), ok = expect(A, {Ref, <<"p", I>>, point}, 500) end
+         || I <- lists:seq(1, 20)],
+        ?assertMatch(#{locks := 1, prefix_locks := 1}, ?L:status()),
+        %% 死锁：B 持 q 点锁等 P 下的 key；A 持 P 要 q
+        acq(B, {Ref, <<"q">>, point}, write), ok = expect(B, {Ref, <<"q">>, point}, 500),
+        acq(B, {Ref, <<"p9">>, point}, read), ?assertEqual(blocked, blocked(B, {Ref, <<"p9">>, point})),
+        acq(A, {Ref, <<"q">>, point}, read),
+        ?assertEqual({error, deadlock}, expect(A, {Ref, <<"q">>, point}, 500)),
+        rel(A), ok = expect(B, {Ref, <<"p9">>, point}, 500),
+        rel(B),
+        ?assertMatch(#{locks := 0, prefix_locks := 0}, ?L:status()),
+        stop(A), stop(B)
+     end}.
+
+prefix_range_phantom_test_() ->
+    {"prefix_range：合并本事务缓冲；持前缀读锁期间并发插入被挡（无幻读）",
+     {timeout, 30, fun() ->
+        with_dir(fun(D) ->
+            R = open(D),
+            [ok = bitcask:put(R, <<"u:", I>>, <<I>>) || I <- lists:seq(1, 5)],
+            ok = bitcask:put(R, <<"v:1">>, <<"other">>),
+            Parent = self(),
+            Scanner = spawn_link(fun() ->
+                Res = ?T:transaction(R, fun(Tx) ->
+                    First = ?T:prefix_range(Tx, <<"u:">>),
+                    Parent ! {self(), scanned, length(First)},
+                    receive go -> ok end,            % 测试专用同步（Fun 不会重跑）
+                    ok = ?T:write(Tx, <<"u:", 7>>, <<"mine">>),
+                    ok = ?T:delete(Tx, <<"u:", 1>>),
+                    Second = ?T:prefix_range(Tx, <<"u:">>),
+                    {length(First), Second}
+                end, ?FAST),
+                Parent ! {self(), Res}
+            end),
+            receive {Scanner, scanned, 5} -> ok end,
+            %% 并发写者想插 u:9：前缀读锁在手，必须等
+            spawn_link(fun() ->
+                Parent ! {writer, ?T:transaction(R, fun(Tx) ->
+                                       ?T:write(Tx, <<"u:", 9>>, <<"phantom">>)
+                                   end, ?FAST)}
+            end),
+            receive {writer, _} -> ?assert(false) after 150 -> ok end,
+            Scanner ! go,
+            {atomic, {5, Second}} = receive {Scanner, Res} -> Res end,
+            %% 缓冲合并：u:1 没了、u:7 有了、u:9 不可见
+            ?assertEqual([<<"u:", I>> || I <- [2, 3, 4, 5, 7]], [K || {K, _} <- Second]),
+            ?assertEqual(<<"mine">>, proplists:get_value(<<"u:", 7>>, Second)),
+            ?assertEqual({atomic, ok}, receive {writer, W} -> W after 2000 -> timeout end),
+            ?assertEqual({ok, <<"phantom">>}, bitcask:get(R, <<"u:", 9>>)),
+            ?assertEqual(not_found, bitcask:get(R, <<"u:", 1>>)),
+            ?assertMatch(#{locks := 0, prefix_locks := 0, txns := 0}, ?L:status()),
             bitcask:close(R)
         end)
      end}}.
