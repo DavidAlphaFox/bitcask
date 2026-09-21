@@ -87,6 +87,15 @@ agent_loop(Parent, TxnId) ->
             ok
     end.
 
+%% 锁的释放是异步的（cast），断言"锁表清零"要等一下：最多 1s，返回末次 status。
+wait_clean() -> wait_clean(50).
+wait_clean(0) -> ?L:status();
+wait_clean(N) ->
+    case ?L:status() of
+        #{locks := 0, txns := 0, waiting := 0} = S -> S;
+        _ -> timer:sleep(20), wait_clean(N - 1)
+    end.
+
 %% 发 acquire 指令；不等结果。
 acq({Pid, _}, LockId, Mode) -> Pid ! {acquire, LockId, Mode}, ok.
 
@@ -141,7 +150,7 @@ lock_matrix_test_() ->
         acq(B, K, write), ?assertEqual(blocked, blocked(B, K)),
         rel(A),           ?assertEqual(ok, expect(B, K, 500)),
         rel(B),
-        ?assertMatch(#{locks := 0}, ?L:status()),
+        ?assertMatch(#{locks := 0}, wait_clean()),
         stop(A), stop(B)
      end}.
 
@@ -166,7 +175,7 @@ fifo_no_writer_starvation_test_() ->
         ?assertEqual(ok, expect(R2, K, 500)),                         % 读段合并
         ?assertEqual(ok, expect(R3, K, 500)),
         rel(R2), rel(R3),
-        ?assertMatch(#{locks := 0}, ?L:status()),
+        ?assertMatch(#{locks := 0}, wait_clean()),
         [stop(X) || X <- [R1, W, R2, R3]]
      end}.
 
@@ -192,7 +201,7 @@ deadlock_detected_at_locker_test_() ->
         rel(B),
         ?assertEqual(ok, expect(A, K2, 500)),
         rel(A),
-        ?assertMatch(#{locks := 0, waiting := 0}, ?L:status()),
+        ?assertMatch(#{locks := 0, waiting := 0}, wait_clean()),
         stop(A), stop(B)
      end}.
 
@@ -214,7 +223,7 @@ three_way_cycle_test_() ->
         rel(B),
         ok = expect(A, K2, 500),
         rel(A),
-        ?assertMatch(#{locks := 0}, ?L:status()),
+        ?assertMatch(#{locks := 0}, wait_clean()),
         [stop(X) || X <- [A, B, C]]
      end}.
 
@@ -242,7 +251,7 @@ holder_death_releases_test_() ->
         ?assertEqual(ok, expect(C, K, 500)),
         rel(C),
         process_flag(trap_exit, false),
-        ?assertMatch(#{locks := 0, waiting := 0}, ?L:status()),
+        ?assertMatch(#{locks := 0, waiting := 0}, wait_clean()),
         stop(C)
      end}.
 
@@ -289,7 +298,7 @@ buffer_semantics_test_() ->
             ?assertEqual({ok, <<"11">>}, bitcask:get(R, <<"a">>)),
             ?assertEqual(not_found, bitcask:get(R, <<"b">>)),
             ?assertEqual({ok, <<"new">>}, bitcask:get(R, <<"c">>)),
-            ?assertMatch(#{locks := 0, txns := 0}, ?L:status()),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
             bitcask:close(R)
         end)
      end}.
@@ -316,7 +325,7 @@ readonly_and_abort_test_() ->
             ?assertEqual({aborted, {throw, oops}},
                          ?T:transaction(R, fun(_Tx) -> throw(oops) end)),
             ?assertEqual({ok, <<"1">>}, bitcask:get(R, <<"a">>)),
-            ?assertMatch(#{locks := 0, txns := 0}, ?L:status()),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
             bitcask:close(R)
         end)
      end}.
@@ -406,7 +415,7 @@ deadlock_restart_conserves_test_() ->
             {ok, Y} = bitcask:get(R, <<"y">>),
             ?assertEqual(200, int(X) + int(Y)),
             ?assertMatch(#{deadlocks_total := D1} when D1 > D0, ?L:status()),
-            ?assertMatch(#{locks := 0, txns := 0}, ?L:status()),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
             bitcask:close(R)
         end)
      end}}.
@@ -480,7 +489,7 @@ timeout_test_() ->
                          ?T:transaction(R, fun(Tx) -> ?T:write(Tx, <<"k">>, <<"v">>) end,
                                         [{timeout, 50} | ?FAST])),
             rel(A), stop(A),
-            ?assertMatch(#{locks := 0, txns := 0}, ?L:status()),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
             bitcask:close(R)
         end)
      end}.
@@ -499,7 +508,7 @@ commit_failed_test_() ->
             try
                 ?assertEqual({aborted, {commit_failed, io_error}},
                              ?T:transaction(R, fun(Tx) -> ?T:write(Tx, <<"k">>, <<"v">>) end)),
-                ?assertMatch(#{locks := 0, txns := 0}, ?L:status())
+                ?assertMatch(#{locks := 0, txns := 0}, wait_clean())
             after
                 meck:unload(bitcask)
             end,
@@ -531,7 +540,7 @@ txn_process_death_test_() ->
             exit(P1, kill),
             ?assertEqual({atomic, ok}, receive {P2, Res} -> Res after 2000 -> timeout end),
             ?assertEqual({ok, <<"p2">>}, bitcask:get(R, <<"k">>)),
-            ?assertMatch(#{locks := 0, txns := 0}, ?L:status()),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
             bitcask:close(R)
         end)
      end}.
@@ -558,7 +567,7 @@ index_fun_test_() ->
                              ?T:write(Tx, <<"b">>, <<"v1">>)
                          end, [{index_fun, IdxFun} | ?FAST])),
             ?assertEqual(not_found, bitcask:get(R, <<"b">>)),
-            ?assertMatch(#{locks := 0, txns := 0}, ?L:status()),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
             bitcask:close(R)
         end)
      end}.
@@ -613,7 +622,7 @@ concurrent_transfers_conserve_test_() ->
             ?assertEqual([], [X || X <- All, element(1, X) =/= atomic]),
             Sum = lists:sum([int(element(2, bitcask:get(R, Acc(I)))) || I <- lists:seq(1, NAcc)]),
             ?assertEqual(NAcc * Init, Sum),
-            ?assertMatch(#{locks := 0, txns := 0, waiting := 0}, ?L:status()),
+            ?assertMatch(#{locks := 0, txns := 0, waiting := 0}, wait_clean()),
             bitcask:close(R)
         end)
      end}}.
@@ -653,17 +662,27 @@ prefix_lock_matrix_test_() ->
         acq(B, P, read),   ?assertEqual(blocked, blocked(B, P)),
         rel(A),            ok = expect(B, P, 500),
         rel(B),
-        ?assertMatch(#{locks := 0, prefix_locks := 0, waiting := 0}, ?L:status()),
+        ?assertMatch(#{locks := 0, prefix_locks := 0, waiting := 0}, wait_clean()),
         stop(A), stop(B), stop(C)
      end}.
 
+%% 找一把落在 Pred(Shard) 为真的分片上的点锁（前缀固定，枚举后缀）。
+key_in_shard(Ref, Prefix, Pred) ->
+    hd([K || I <- lists:seq(1, 1000),
+             K <- [{Ref, <<Prefix/binary, I:16>>, point}],
+             Pred(?L:shard_of(K))]).
+
 prefix_writer_fairness_test_() ->
-    {"前缀写等待者不被后来的点请求饿死（跨记录 FIFO）",
+    {"前缀写等待者不被后来的点请求饿死（跨记录 FIFO；分片版只对已到达的分片成立）",
      fun() ->
         setup(),
         Ref = make_ref(),
         P = {Ref, <<"e">>, prefix},
-        K1 = {Ref, <<"e1">>, point}, K2 = {Ref, <<"e2">>, point},
+        %% 前缀写按分片序推进：它卡在 K1 所在分片时，已持有编号更小的分片——
+        %% K2 必须落在这样的分片上，后来的点请求才会排在它后面。
+        N = ?L:shard_count(),
+        K1 = key_in_shard(Ref, <<"e">>, fun(S) -> S =:= N end),
+        K2 = key_in_shard(Ref, <<"e">>, fun(S) -> S < N orelse N =:= 1 end),
         H = agent_start(), W = agent_start(), L = agent_start(),
         acq(H, K1, write), ok = expect(H, K1, 500),
         acq(W, P, write),  ?assertEqual(blocked, blocked(W, P)),   % 等 H
@@ -674,7 +693,7 @@ prefix_writer_fairness_test_() ->
         rel(W),
         ok = expect(L, K2, 500),
         rel(L),
-        ?assertMatch(#{locks := 0, prefix_locks := 0}, ?L:status()),
+        ?assertMatch(#{locks := 0, prefix_locks := 0}, wait_clean()),
         [stop(X) || X <- [H, W, L]]
      end}.
 
@@ -688,7 +707,9 @@ prefix_covered_is_free_test_() ->
         acq(A, P, write), ok = expect(A, P, 500),
         [begin acq(A, {Ref, <<"p", I>>, point}, write), ok = expect(A, {Ref, <<"p", I>>, point}, 500) end
          || I <- lists:seq(1, 20)],
-        ?assertMatch(#{locks := 1, prefix_locks := 1}, ?L:status()),
+        %% 前缀锁每个分片一条记录，点锁一条都没建
+        N = ?L:shard_count(),
+        ?assertMatch(#{locks := N, prefix_locks := N}, ?L:status()),
         %% 死锁：B 持 q 点锁等 P 下的 key；A 持 P 要 q
         acq(B, {Ref, <<"q">>, point}, write), ok = expect(B, {Ref, <<"q">>, point}, 500),
         acq(B, {Ref, <<"p9">>, point}, read), ?assertEqual(blocked, blocked(B, {Ref, <<"p9">>, point})),
@@ -696,7 +717,7 @@ prefix_covered_is_free_test_() ->
         ?assertEqual({error, deadlock}, expect(A, {Ref, <<"q">>, point}, 500)),
         rel(A), ok = expect(B, {Ref, <<"p9">>, point}, 500),
         rel(B),
-        ?assertMatch(#{locks := 0, prefix_locks := 0}, ?L:status()),
+        ?assertMatch(#{locks := 0, prefix_locks := 0}, wait_clean()),
         stop(A), stop(B)
      end}.
 
@@ -736,7 +757,92 @@ prefix_range_phantom_test_() ->
             ?assertEqual({atomic, ok}, receive {writer, W} -> W after 2000 -> timeout end),
             ?assertEqual({ok, <<"phantom">>}, bitcask:get(R, <<"u:", 9>>)),
             ?assertEqual(not_found, bitcask:get(R, <<"u:", 1>>)),
-            ?assertMatch(#{locks := 0, prefix_locks := 0, txns := 0}, ?L:status()),
+            ?assertMatch(#{locks := 0, prefix_locks := 0, txns := 0}, wait_clean()),
             bitcask:close(R)
         end)
      end}}.
+
+%% ===================================================================
+%% 分片（X1-7）
+%% ===================================================================
+
+
+cross_shard_deadlock_test_() ->
+    {"两把锁明确落在不同分片：A:K1→K2，B:K2→K1 → 跨分片 DFS 检出",
+     fun() ->
+        setup(),
+        N = ?L:shard_count(),
+        ?assert(N >= 2),
+        Ref = make_ref(),
+        K1 = key_in_shard(Ref, <<"x">>, fun(S) -> S =:= 1 end),
+        K2 = key_in_shard(Ref, <<"x">>, fun(S) -> S =:= N end),
+        A = agent_start(), B = agent_start(),
+        acq(A, K1, write), ok = expect(A, K1, 500),
+        acq(B, K2, write), ok = expect(B, K2, 500),
+        acq(A, K2, write), ?assertEqual(blocked, blocked(A, K2)),
+        acq(B, K1, write), ?assertEqual({error, deadlock}, expect(B, K1, 500)),
+        rel(B), ok = expect(A, K2, 500),
+        rel(A),
+        ?assertMatch(#{locks := 0, waiting := 0}, wait_clean()),
+        stop(A), stop(B)
+     end}.
+
+death_cleanup_across_shards_test_() ->
+    {"持有跨分片的 20 把点锁 + 1 把前缀锁的进程被 kill → 全部分片清零，等待者放行",
+     fun() ->
+        setup(),
+        Ref = make_ref(),
+        {PA, _} = A = agent_start(), B = agent_start(),
+        process_flag(trap_exit, true),
+        Ks = [{Ref, <<"d", I>>, point} || I <- lists:seq(1, 20)],
+        [begin acq(A, K, write), ok = expect(A, K, 500) end || K <- Ks],
+        acq(A, {Ref, <<"pre">>, prefix}, write), ok = expect(A, {Ref, <<"pre">>, prefix}, 500),
+        ?assert(length(lists:usort([?L:shard_of(K) || K <- Ks])) > 1),
+        acq(B, {Ref, <<"pre", 1>>, point}, write),
+        ?assertEqual(blocked, blocked(B, {Ref, <<"pre", 1>>, point})),
+        exit(PA, kill), receive {'EXIT', PA, killed} -> ok end,
+        ?assertEqual(ok, expect(B, {Ref, <<"pre", 1>>, point}, 1000)),
+        rel(B), stop(B),
+        process_flag(trap_exit, false),
+        ?assertMatch(#{locks := 0, prefix_locks := 0, txns := 0}, wait_clean())
+     end}.
+
+shard_crash_aborts_txn_test_() ->
+    {"某个分片崩溃 → one_for_all 全部重启，进行中的事务下一步 {aborted, locker_restarted}",
+     {timeout, 30, fun() ->
+        with_dir(fun(D) ->
+            R = open(D),
+            Parent = self(),
+            P = spawn_link(fun() ->
+                Res = ?T:transaction(R, fun(Tx) ->
+                    ok = ?T:write(Tx, <<"a">>, <<"1">>),
+                    Parent ! {self(), holding},
+                    receive go -> ok end,
+                    ?T:write(Tx, <<"b">>, <<"2">>)          %% 新分片不认识这个事务
+                end, ?FAST),
+                Parent ! {self(), Res}
+            end),
+            receive {P, holding} -> ok end,
+            Shard = whereis(bitcask_txn_locker_1),
+            exit(Shard, kill),
+            %% 等 supervisor 把整组拉起来
+            ok = wait_for(fun() -> is_pid(whereis(bitcask_txn_locker_1))
+                                   andalso whereis(bitcask_txn_locker_1) =/= Shard
+                                   andalso ets:info(bitcask_txn_txns) =/= undefined end),
+            P ! go,
+            ?assertEqual({aborted, locker_restarted}, receive {P, Res} -> Res after 5000 -> timeout end),
+            ?assertEqual(not_found, bitcask:get(R, <<"a">>)),
+            %% 重启后照常工作
+            ?assertEqual({atomic, ok}, ?T:transaction(R, fun(Tx) -> ?T:write(Tx, <<"c">>, <<"3">>) end, ?FAST)),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}}.
+
+wait_for(Pred) -> wait_for(Pred, 100).
+wait_for(_Pred, 0) -> timeout;
+wait_for(Pred, N) ->
+    case catch Pred() of
+        true -> ok;
+        _    -> timer:sleep(20), wait_for(Pred, N - 1)
+    end.
