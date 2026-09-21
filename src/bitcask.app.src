@@ -35,6 +35,13 @@
          %% {embedder, {openai, Cfg}} at open/2 instead; no process needed.
          {embedder, undefined},
 
+         %% Transaction lock-manager shards (bitcask_txn_locker_sup). Point
+         %% locks hash to one shard; prefix locks are taken on every shard.
+         %% Do NOT derive this from schedulers_online -- inside a VM the BEAM
+         %% sees the host's core count. 8 is plenty: the engine's commit path
+         %% is the next ceiling on an 8-vCPU box.
+         {txn_locker_shards, 8},
+
          %% Default max file size (in bytes)
          {max_file_size, 16#80000000}, % 2GB default
 
