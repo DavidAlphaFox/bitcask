@@ -1,8 +1,9 @@
 # 事务协调层设计（bitcask_txn）：2PL + 死锁检测 + 事务重启
 
-> 状态：**P1 + P2（前缀锁）已实施**（2026-09-21，`src/bitcask_txn.erl` +
-> `src/bitcask_txn_locker.erl`，`test/bitcask_txn_tests.erl` 22 例），未发布
->（当前 6.5.0）。实现与本稿的偏差见 §11，前缀锁模型见 §12。
+> 状态：**P1 + P2（前缀锁）+ P3（分片）已实施**（2026-09-21，`src/bitcask_txn.erl` +
+> `src/bitcask_txn_locker.erl` + `src/bitcask_txn_locker_sup.erl`，
+> `test/bitcask_txn_tests.erl` 25 例），未发布（当前 6.5.0）。实现与本稿的偏差见
+> §11，前缀锁模型见 §12，分片见 §13。
 > 前置阅读：`third_party/libbitcask/doc/multikey-txn-zh.md` §4（引擎事务边界：
 > 只有 A+D，没有 I，也没有 CAS）、`doc/graph-layer-design-zh.md`。
 
@@ -286,7 +287,7 @@ eunit（`rebar3 eunit`；并发用例用 spawn + 确定性同步，不引新框�
 |------|------|---------|
 | P1 | 点锁 2PL + 缓冲 + 检测/重启 + eunit 全量 | 本设计 |
 | P2 ✅ | 前缀锁（事务内 range 扫描的幻读防护）、`status/0`。已落地（2026-09-21），模型见 §12 | graphdb `del_vertex_txn` / `out_edges_txn` |
-| P3 | locker 分片、环境式 API（Mnesia 习惯法）、victim 启发式（最老事务优先） | 锁竞争 profiling 证明单点瓶颈 |
+| P3 ✅（分片） | locker 分片已落地（2026-09-21，§13）；环境式 API、victim 启发式**未做**（受害者仍是请求者，见 §13.4） | profiling：单 locker 26k txn/s 且不随并发增长 |
 | 交汇 | **与引擎条件批（CAS/`expected_rev`）融合**：2PL 管跨 key 不变式，条件批管单 key 乐观并发，两者共享条件校验语义 | CouchDB 风格条件更新立项时 |
 | 消费 ✅ | `graphdb` 事务式 API（`transaction/2,3` + `put_edge_txn` 族，deg/degi 计数入事务），消除"单写者语义下精确"的限制。已落地（2026-09-21），见 graph 设计 §12 第 6 条 | — |
 
@@ -373,3 +374,68 @@ DB 教科书做法是层级锁 + IS/IX 意向锁。这里 key 空间是扁平的
 一批提交）。`concurrent_insert_vs_del_vertex_test_`：8 个加边进程 vs 2 个
 del_vertex_txn 进程随机交错（放大到 4800 + 300 次 × 3 轮），全图不变式
 （每个 (vid, etype) 的 deg/degi == 实际 e/ei 键数；e/ei/et 三键两两配对）成立。
+
+## 13. P3 locker 分片（已实施）
+
+### 13.1 触发：profiling
+
+locker-only 微基准（每事务 register + 6 把点写锁 + release_all）：单 locker
+**~26k txn/s，P=1/4/8/16 一条平线**——每事务 ~8 次 `gen_server:call` 全串行在
+一个进程上；引擎自己 P=8 能到 44–55k commit/s。锁管理器成了天花板，符合 §9 的
+触发条件。
+
+### 13.2 拓扑
+
+- `bitcask_txn_locker_sup`（one_for_all）：1 个共享表持有者 + N 个分片
+  gen_server，N = application env `{txn_locker_shards, N}`，默认 8。
+  ⚠️ 不按 `schedulers_online` 推：容器里 BEAM 看到的是宿主核数（开发机 128）。
+- 点锁按 `phash2({CaskRef, Key})` 落一个分片；**前缀锁在每个分片上各拿一份**
+  （按分片序依次 acquire）——于是分片判点锁只看自己的表，分片之间没有锁语义
+  上的交互，§12 的重叠模型原样搬进每个分片。
+- 事务归属分片 `phash2(TxnId)`：register / monitor / DOWN / unregister 在那里。
+- 共享表（public，tables 进程持有）：`txns`（waiting = `{Shard, LockId}`）、
+  `held`（`{TxnId, Shard, LockId}` bag）、`stats`。每分片自有 `locks_I`
+  （ordered_set）与 `plens_I`（protected，谁都能读——跨分片 DFS 用）。
+- `check/1` 直读 `txns`，不再过任何进程。
+
+### 13.3 跨分片死锁检测
+
+DFS 不变；`blockers_of(N)` 读 N 所等分片的表（无锁快照）。正确性论证：每个
+分片都是**先写边（入队 + 写 `txns.waiting`）再检**。两个分片并发各加一条边
+（A 在 s1 等 B 持有的锁，B 在 s2 等 A 持有的锁）：设 A 写完在 a1、检在 a2，
+B 写完在 b1、检在 b2；a2 > b1 则 A 看见 B 的边，否则 b2 > b1 > a2 > a1 则 B 看见
+A 的边——环至少被一方检出。过期快照最多造成**误报**（多重跑一次，安全），
+不会漏报。兜底计时器仍在，且 `status()` 新增 `lock_wait_timeouts` 计数：
+它不为零就说明检测漏了。`concurrent_insert_vs_del_vertex_test_` 断言该计数
+在 4800 加边 + 300 删点随机交错（3 轮）后**不变**。
+
+### 13.4 释放与清理
+
+- 正常释放由**调用进程**驱动：按 `held` 分组向各分片 **cast** `{release, TxnId}`
+  （同 `mnesia_locker` 的 `release_tid`：异步），再 call 归属分片 unregister。
+  同步版每个触及的分片一次 call，多 key 事务里比拿锁还贵；异步的代价只是
+  返回后锁还挂几十微秒（等待者稍晚放行、`status()` 短暂可见），严格 2PL
+  不受影响。已提交的事务不在等任何人，误报环不会经过它。
+- DOWN：归属分片向其它分片 cast `{drop, TxnId}`，各自出队/放锁。
+  **分片之间只 cast 不 call**——两个分片互相 call 就是分布式死锁。
+- 分片崩溃：one_for_all 全组重启、锁表清零；进行中的事务下一步 acquire 拿到
+  `unknown_txn` → `{aborted, locker_restarted}`（`shard_crash_aborts_txn_test_`）。
+
+### 13.5 语义变化
+
+- 跨分片的 FIFO 公平只对前缀写**已到达**的分片成立：它在分片 s 上等时，
+  分片 > s 上的点请求照常授予。每到一个分片它都会排进那里的队列、后来者
+  挡不住它，所以有进展保证，只是不是全局先来先得。
+- 前缀锁 = N 条记录（`status()` 的 `prefix_locks` 按记录数）。
+- victim 仍是请求者（最新边）。"最老事务优先"要中止别的分片上的等待者
+  （跨分片 cast + 异步中止），收益不明，没做。
+
+### 13.6 实测（8 vCPU、宿主有别的负载，比值为准）
+
+| | shards=1 | shards=8 |
+|---|---|---|
+| locker-only P=1 | 27k txn/s | 21k（多了 phash2 / persistent_term / held 分组） |
+| locker-only P=8 | 27k | 36–39k |
+| locker-only P=16 | 26k（平线） | **50k**（仍在涨） |
+| put_edge_txn 插入 P=1 | 15.4k edges/s | 15.8k（call 地板） |
+| put_edge_txn 插入 P=8 | 22.1k | **28.3k**（+28%；再往上是引擎 commit 与 8 核共享） |
