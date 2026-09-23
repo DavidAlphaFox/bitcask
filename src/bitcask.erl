@@ -47,6 +47,7 @@
          is_empty_estimate/1,
          status/1,
          index_errors/1,
+         set_thread_limits/2, thread_limits/0,
            search_text/2, search_text/3, search_text/4,
            search_phrase/2, search_phrase/3,
            search_fields/2, search_fields/3,
@@ -78,7 +79,8 @@
     hnsw_m, hnsw_ef_construction, hnsw_build_nav_int8,
     vector_rebase_min_docs, vector_ivf_nlist, vector_ivf_nprobe,
     vector_diskann_r, vector_diskann_l_build,
-    keydir_cache_entries
+    keydir_cache_entries,
+    segment_verify_crc
 ]).
 
 %% =========================================================================
@@ -119,6 +121,10 @@ open(Dirname) -> open(Dirname, []).
 %%                            即异步落 keydir 快照 + search ckpt，崩溃恢复重放
 %%                            窗口恒 ≤ N（分词重放是恢复主成本）。默认 65536；
 %%                            0 = 关。仅索引模式生效
+%%     {segment_verify_crc, B} — 6.6.0：开库时 BM25 段逐节 CRC 校验（默认 true；
+%%                            6.6.0 起改分块定位读，不再把整段扫进工作集）。
+%%                            false = 只验页脚 / 目录、信任盘上节内容，省掉开库
+%%                            整读段目录的 I/O（大库冷启动用）。仅索引模式生效
 %%
 %%   向量模式选项：
 %%     {embedder, {Provider, Cfg}} — 推荐。Provider = openai | anthropic |
@@ -659,6 +665,26 @@ index_errors(Handle) ->
     {_KCount, _KBytes, _Epoch, _Files, IndexErrors} =
         bitcask_cpp_nifs:cask_status(ref(Handle)),
     IndexErrors.
+
+%% libbitcask 6.6.0：进程级线程数上限（整个 VM 所有 cask 共享两处池）。
+%%   IndexWorkers — 索引池 map worker 数（首个索引模式库 open 时建池）
+%%   SearchSlots  — 批量查询 task_arena 槽数；非 0 时顺带把本库经 TBB 跑的
+%%                  并行段封到 SearchSlots - 1 条 worker
+%% 0 = 缺省 max(hardware_concurrency, 2)，即旧行为。⚠️ hardware_concurrency 在
+%% 容器 / 亲和性受限的机器上可能报宿主机核数——这种环境请显式设置。
+%%
+%% 「首个索引模式库 open 定终身」：须在那之前调（或用 application env
+%% `{thread_limits, {IW, SS}}`，bitcask_app 启动时自动应用）；之后再调且值不同
+%% → {error, {thread_limits_frozen, {生效IW, 生效SS}}}，值相同 → ok。
+-spec set_thread_limits(non_neg_integer(), non_neg_integer()) ->
+    ok | {error, {thread_limits_frozen, {non_neg_integer(), non_neg_integer()}}}.
+set_thread_limits(IndexWorkers, SearchSlots) ->
+    bitcask_cpp_nifs:set_thread_limits(IndexWorkers, SearchSlots).
+
+%% 当前登记值 {IndexWorkers, SearchSlots}（原样，0 = 缺省未解析）。
+-spec thread_limits() -> {non_neg_integer(), non_neg_integer()}.
+thread_limits() ->
+    bitcask_cpp_nifs:thread_limits().
 
 %% =========================================================================
 %% 内部：cask 迭代器收集器 + 单位换算

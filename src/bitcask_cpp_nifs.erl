@@ -50,7 +50,10 @@
          cask_range_release/1,
          %% v5.1.0 S34/S35：引擎原子批 + 多键事务
          cask_put_batch_atomic/2,
-         cask_txn_commit/3]).
+         cask_txn_commit/3,
+         %% libbitcask 6.6.0：进程级线程数上限
+         set_thread_limits/2,
+         thread_limits/0]).
 
 -on_load(init/0).
 
@@ -185,3 +188,15 @@ cask_put_batch_atomic(_Ref, _Ops) -> erlang:nif_error({error, not_loaded}).
 -spec cask_txn_commit(reference(), list(), sync_on_commit | no_sync) ->
     ok | {error, term()} | atom().
 cask_txn_commit(_Ref, _Ops, _Sync) -> erlang:nif_error({error, not_loaded}).
+
+%% -----------------------------------------------------------------------
+%% libbitcask 6.6.0：进程级线程数上限（索引池 map worker / Search 池槽数）。
+%% 0 = 缺省 max(hardware_concurrency, 2)。须在首个索引模式库 open 之前调；
+%% 之后值不同 → {error, {thread_limits_frozen, {IW, SS}}}（生效值），相同 → ok。
+%% 非负整数以外 → badarg。门面见 bitcask:set_thread_limits/2。
+%% -----------------------------------------------------------------------
+-spec set_thread_limits(non_neg_integer(), non_neg_integer()) ->
+    ok | {error, {thread_limits_frozen, {non_neg_integer(), non_neg_integer()}}}.
+set_thread_limits(_IndexWorkers, _SearchSlots) -> erlang:nif_error({error, not_loaded}).
+-spec thread_limits() -> {non_neg_integer(), non_neg_integer()}.
+thread_limits() -> erlang:nif_error({error, not_loaded}).

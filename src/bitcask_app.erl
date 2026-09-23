@@ -20,7 +20,24 @@
 -export([start/2, stop/1]).
 
 start(_StartType, _StartArgs) ->
-    bitcask_sup:start_link().
+    case apply_thread_limits() of
+        ok             -> bitcask_sup:start_link();
+        {error, _} = E -> E
+    end.
 
 stop(_State) ->
     ok.
+
+%% libbitcask 6.6.0：env `{thread_limits, {IndexWorkers, SearchSlots}}` 在首个
+%% 索引模式库 open 之前应用（bitcask:open/2 先 start application）。undefined
+%% （默认）= 不设，沿用 hardware_concurrency。已冻结且值不同 → application
+%% 起不来：配了上限却静默不生效，比起不来更难查（同 embedder 的取舍）。
+apply_thread_limits() ->
+    case application:get_env(bitcask, thread_limits, undefined) of
+        undefined ->
+            ok;
+        {IW, SS} when is_integer(IW), IW >= 0, is_integer(SS), SS >= 0 ->
+            bitcask:set_thread_limits(IW, SS);
+        Other ->
+            {error, {bad_thread_limits, Other}}
+    end.
