@@ -94,6 +94,8 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     vector_ivf_nprobe      = a("vector_ivf_nprobe");
     vector_diskann_r       = a("vector_diskann_r");
     vector_diskann_l_build = a("vector_diskann_l_build");
+    segment_verify_crc     = a("segment_verify_crc");
+    thread_limits_frozen   = a("thread_limits_frozen");
     auto_checkpoint_min_docs = a("auto_checkpoint_min_docs");
     keydir_cache_entries     = a("keydir_cache_entries");
 

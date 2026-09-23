@@ -166,6 +166,13 @@ void parse_vector_cfg_option(ErlNifEnv* env, const ERL_NIF_TERM* tup,
     else if (key == atoms().vector_ivf_nprobe)      opt_u32_min(env, val, 0, &sc.vector_ivf_nprobe);
     else if (key == atoms().vector_diskann_r)       opt_u32_min(env, val, 0, &sc.vector_diskann_r);
     else if (key == atoms().vector_diskann_l_build) opt_u32_min(env, val, 0, &sc.vector_diskann_l_build);
+    else if (key == atoms().segment_verify_crc) {
+        // libbitcask 6.6.0：默认 true（开库逐节 CRC，已改分块定位读、不再把段扫进
+        // 工作集）；false = 只验页脚 / 目录，信任盘上节内容，省开库整读段的 I/O。
+        // 与 C API bitcask_open_tuning_t::segment_verify_crc 同源。
+        if      (val == atoms().atom_true)  sc.mmap_verify_crc = true;
+        else if (val == atoms().atom_false) sc.mmap_verify_crc = false;
+    }
 }
 
 // 判断某二元组键是否属于「向量引擎调优」类。
@@ -174,7 +181,8 @@ bool is_vector_cfg_key(ERL_NIF_TERM key) {
         || key == atoms().hnsw_build_nav_int8
         || key == atoms().vector_rebase_min_docs
         || key == atoms().vector_ivf_nlist || key == atoms().vector_ivf_nprobe
-        || key == atoms().vector_diskann_r || key == atoms().vector_diskann_l_build;
+        || key == atoms().vector_diskann_r || key == atoms().vector_diskann_l_build
+        || key == atoms().segment_verify_crc;
 }
 
 // 二元组选项总分发：general → merge → analyzer。

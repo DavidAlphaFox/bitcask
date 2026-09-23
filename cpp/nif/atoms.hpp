@@ -113,6 +113,11 @@ struct Atoms {
     ERL_NIF_TERM vector_diskann_r;        // S32-M5：DiskANN 邻接容量
     ERL_NIF_TERM vector_diskann_l_build;  // S32-M5：DiskANN 建图 beam 宽
 
+    // libbitcask 6.6.0：开库调优 {segment_verify_crc, false}（BM25 段只验页脚 /
+    // 目录，省开库整读段的 I/O）；进程级线程上限的 already_set 错误形态。
+    ERL_NIF_TERM segment_verify_crc;
+    ERL_NIF_TERM thread_limits_frozen;
+
     // v4.0.0 S14-1/S31.5：自动 checkpoint 的 ord 增量锚点（0 = 关）。
     ERL_NIF_TERM auto_checkpoint_min_docs;
 

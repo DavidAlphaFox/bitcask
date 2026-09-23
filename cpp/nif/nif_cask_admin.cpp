@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "atoms.hpp"
+#include "bitcask/thread_limits.hpp"
 #include "nif_helpers.hpp"
 #include "resources.hpp"
 #include "term_conv.hpp"
@@ -83,6 +84,36 @@ ERL_NIF_TERM nif_cask_merge(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM arg
             enif_make_uint64(env, r->records_kept),
             enif_make_uint64(env, r->records_stale),
             enif_make_uint64(env, r->records_tombs)));
+}
+
+// libbitcask 6.6.0：进程级线程数上限（索引池 map worker 数 / Search 池槽数，
+// 后者非 0 时兼作 TBB worker 上限 search_slots - 1）。0 = 缺省
+// max(hardware_concurrency, 2)。「首个 search 库 open 定终身」：之后值不同 →
+// {error, {thread_limits_frozen, {生效IW, 生效SS}}}，值相同 → ok（幂等）。
+// 不碰 cask handle，纯进程级；内部加锁，可并发调用。
+//
+// set_thread_limits(IndexWorkers, SearchSlots) -> ok | {error, {thread_limits_frozen, {IW, SS}}}
+ERL_NIF_TERM nif_set_thread_limits(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
+    ErlNifUInt64 iw = 0, ss = 0;
+    if (!enif_get_uint64(env, argv[0], &iw) || !enif_get_uint64(env, argv[1], &ss)) {
+        return enif_make_badarg(env);
+    }
+    if (bitcask::set_thread_limits({static_cast<std::size_t>(iw),
+                                    static_cast<std::size_t>(ss)})) {
+        return atoms().ok;
+    }
+    const auto cur = bitcask::thread_limits();
+    return enif_make_tuple2(env, atoms().error,
+        enif_make_tuple2(env, atoms().thread_limits_frozen,
+            enif_make_tuple2(env, enif_make_uint64(env, cur.index_workers),
+                                  enif_make_uint64(env, cur.search_slots))));
+}
+
+// thread_limits() -> {IndexWorkers, SearchSlots}（登记原值，0 = 缺省未解析）。
+ERL_NIF_TERM nif_thread_limits(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM /*argv*/[]) {
+    const auto cur = bitcask::thread_limits();
+    return enif_make_tuple2(env, enif_make_uint64(env, cur.index_workers),
+                                 enif_make_uint64(env, cur.search_slots));
 }
 
 }  // namespace bitcask::nif

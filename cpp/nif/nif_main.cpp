@@ -71,6 +71,9 @@ ERL_NIF_TERM nif_cask_range_release     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 // v5.1.0 S34/S35：引擎原子批 + 多键事务（nif_cask_batch.cpp）
 ERL_NIF_TERM nif_cask_put_batch_atomic  (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_txn_commit        (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+// libbitcask 6.6.0：进程级线程数上限（nif_cask_admin.cpp）
+ERL_NIF_TERM nif_set_thread_limits      (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_thread_limits          (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 
 namespace {
 
@@ -131,6 +134,11 @@ ErlNifFunc kNifFuncs[] = {
     // 批大小无上界 + 提交点可能 fsync，一律 dirty IO。
     {"cask_put_batch_atomic",  2, nif_cask_put_batch_atomic, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"cask_txn_commit",        3, nif_cask_txn_commit,       ERL_NIF_DIRTY_JOB_IO_BOUND},
+
+    // --- libbitcask 6.6.0 进程级线程上限 ---
+    // 只动一把全局锁与两个整数，主调度线程即可。
+    {"set_thread_limits",      2, nif_set_thread_limits,     0},
+    {"thread_limits",          0, nif_thread_limits,         0},
 };
 
 int on_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM /*load_info*/) {
