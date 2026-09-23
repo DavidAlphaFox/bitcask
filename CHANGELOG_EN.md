@@ -3,6 +3,55 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [6.6.0] — 2026-09-23
+
+**Follow-up upgrade libbitcask 6.5.0 → 6.6.0** (`f618e82` → `1a6d698`). Upstream C
+API is purely additive, `SOVERSION` stays 6; the only on-disk change is a
+backward-compatible optional trailer in `bitcask.meta` (analyzer fingerprint).
+The C++ headers this NIF uses (`cask.hpp` etc.) are signature-unchanged; the
+adaptation just exposes the two new knobs through the Erlang facade.
+
+### Added
+
+- **`{segment_verify_crc, B}` open option** (search mode only): passes through
+  `SearchLayerConfig::mmap_verify_crc`. Default `true` (per-section CRC at open;
+  since 6.6.0 done via chunked positioned reads, no longer pulling all of
+  `bm25_segments/` into the working set); `false` = verify footer / directory
+  only and trust section contents, skipping the full segment read at open. Same
+  knob as the C API's `bitcask_open_tuning_t::segment_verify_crc`.
+- **`bitcask:set_thread_limits/2` / `bitcask:thread_limits/0`**: process-wide
+  thread caps (`IndexWorkers` = index-pool map workers; `SearchSlots` = search
+  arena slots, non-zero also caps TBB workers at `SearchSlots - 1`; 0 = default
+  `hardware_concurrency`). Frozen by the first search-enabled open: a different
+  value afterwards → `{error, {thread_limits_frozen, {IW, SS}}}` (effective
+  values), the same value → `ok`. NIF entries `bitcask_cpp_nifs:set_thread_limits/2`
+  / `thread_limits/0`. ⚠️ In containers / affinity-restricted hosts
+  `hardware_concurrency` may report the host's core count — set this explicitly.
+- **application env `{thread_limits, {IW, SS}}`** (default `undefined` = unset):
+  applied when `bitcask_app` starts (before the first open); frozen-with-different
+  value or malformed → the application fails to start (`open/2` returns
+  `{error, {bitcask_app_start_failed, _}}`) rather than silently not applying.
+- Tests: `test/bitcask_libbitcask_660_tests.erl` (`segment_verify_crc` round-trip,
+  thread-limit freeze semantics, badarg).
+
+### Changed (inherited from upstream; no Erlang API change)
+
+- Lower resident memory when opening search-mode stores: chunked BM25 segment CRC
+  verification, checkpoints read section-by-section (peak 2× → 1× file size),
+  streamed docmap / keydir snapshot loading; search keys held twice instead of four
+  times (upstream: 1M × 20B keys, open heap −110.5 MB / −19.5%).
+- Core-path file handles are all `O_CLOEXEC`: child processes spawned by the host
+  (`os:cmd`, `open_port`) no longer inherit library fds.
+- Analyzer config fingerprint recorded in an optional `bitcask.meta` trailer;
+  reopening with a different tokenizer config logs a `kWarn` (still opens). Older
+  directories are unrecorded and don't warn.
+- `Index::ord_to_ext` returns empty for deleted / overwritten ords: hits whose doc
+  is concurrently deleted / overwritten between liveness check and key
+  materialization (highlight, vector search) are now dropped instead of returning a
+  stale key.
+
+---
+
 ## [6.5.1] — 2026-09-21
 
 **Transaction layer lands**: isolation on top of the engine's atomic batches

@@ -3,6 +3,47 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [6.6.0] — 2026-09-23
+
+**跟随升级 libbitcask 6.5.0 → 6.6.0**（`f618e82` → `1a6d698`）。上游 C API 纯加法、
+`SOVERSION` 保持 6；盘上格式仅 `bitcask.meta` 一处向后兼容的可选尾段（analyzer
+指纹）。本仓库 NIF 只用到的 C++ 头（`cask.hpp` 等）签名无变化，适配仅为把两个新
+旋钮开到 Erlang 门面。
+
+### Added
+
+- **`{segment_verify_crc, B}` open 选项**（仅索引模式）：透传 `SearchLayerConfig::
+  mmap_verify_crc`。默认 `true`（开库逐节 CRC，6.6.0 起分块定位读、不再把整个
+  `bm25_segments/` 扫进工作集）；`false` = 只验页脚 / 目录，信任盘上节内容，省掉
+  开库整读段的 I/O。与 C API `bitcask_open_tuning_t::segment_verify_crc` 同源。
+- **`bitcask:set_thread_limits/2` / `bitcask:thread_limits/0`**：进程级线程数上限
+  （`IndexWorkers` = 索引池 map worker 数；`SearchSlots` = 批量查询 arena 槽数，
+  非 0 时兼作 TBB worker 上限 `SearchSlots - 1`；0 = 缺省 `hardware_concurrency`）。
+  首个索引模式库 open 即冻结：之后值不同 → `{error, {thread_limits_frozen,
+  {IW, SS}}}`（带生效值），同值 → `ok`。NIF 入口 `bitcask_cpp_nifs:set_thread_limits/2`
+  / `thread_limits/0`。⚠️ 容器 / 亲和性受限环境下 `hardware_concurrency` 可能报宿主机
+  核数，此类环境应显式设置。
+- **application env `{thread_limits, {IW, SS}}`**（默认 `undefined` = 不设）：
+  `bitcask_app` 启动时（即首个 open 之前）应用；已冻结且值不同或形态不对 →
+  application 起不来（`open/2` 返回 `{error, {bitcask_app_start_failed, _}}`），不
+  静默失效。
+- 测试：`test/bitcask_libbitcask_660_tests.erl`（`segment_verify_crc` 开关往返、
+  线程上限冻结语义、badarg）。
+
+### Changed（随库带入，Erlang 侧无 API 变更）
+
+- 索引模式库开库常驻内存下降：BM25 段 CRC 校验改分块读、checkpoint 按目录逐段读
+  （峰值 2× → 1× 文件大小）、docmap / keydir 快照流式载入；检索 key 常驻四份 → 两份
+  （上游实测 1M × 20B key 开库堆 −110.5 MB / −19.5%）。
+- 核心路径文件句柄一律 `O_CLOEXEC`：宿主 `os:cmd` / `open_port` 起的子进程不再继承
+  库 fd。
+- analyzer 配置指纹写入 `bitcask.meta` 可选尾段；以不同分词配置重开同一目录会
+  `kWarn` 告警（仍开库）。旧目录未记录则不告警。
+- `Index::ord_to_ext` 对已删 / 被覆盖的 ord 返回空：检索判活与物化 key 之间被并发
+  删除 / 覆盖的命中（高亮、向量检索）现被丢弃，而非返回过期 key。
+
+---
+
 ## [6.5.1] — 2026-09-21
 
 **事务协调层落地**：在引擎原子批（A+D）之上补齐隔离性——纯 OTP 的 2PL +
