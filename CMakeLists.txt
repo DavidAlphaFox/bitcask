@@ -18,7 +18,7 @@ set(BITCASK_PRIV_DIR "${CMAKE_SOURCE_DIR}/priv")
 file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 
 # ---------------------------------------------------------------------------
-# libbitcask — git submodule at third_party/libbitcask (6.3.1, commit d3d7ac8)。
+# libbitcask — git submodule at third_party/libbitcask (6.6.0, commit 1a6d698)。
 # 提供 C++ 核心库全部 target（bitcask_cask, bitcask_keydir, ...）。
 #
 # ⚠️ 6.2.1 起**不再需要 third_party 符号链接**。此前 libbitcask 的
