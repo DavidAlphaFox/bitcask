@@ -132,34 +132,12 @@ ERL_NIF_TERM nif_cask_range_start(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TE
     }
 
     auto it = h->cask->make_range_iter(opts);
-    if (!it) return fault_to_term_detailed(env, it.error());
+    if (!it) return fault_to_term(env, it.error());
 
     auto term = make_resource<CaskRangeIterHandle>(
         env, g_cask_range_iter_resource_type, std::move(*it), h);
     if (!term) return make_error(env, atoms().allocation_error);
     return make_ok(env, term);
-}
-
-// cask_range_next(IterRef) -> {ok, K, V, Tstamp, Ord} | done | {error, Reason}
-ERL_NIF_TERM nif_cask_range_next(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
-    ERL_NIF_TERM err;
-    auto* ih = live_range_handle(env, argv[0], err);
-    if (!ih) return err;
-
-    auto r = ih->iter->next();
-    if (!r) return fault_to_term_detailed(env, r.error());
-    if (!r->has_value()) return atoms().done;
-
-    const auto& e = **r;
-    ERL_NIF_TERM key_bin = make_binary_checked(env, e.key);
-    ERL_NIF_TERM val_bin = make_binary_checked(env, e.value);
-    if (!key_bin || !val_bin) return make_error(env, atoms().allocation_error);
-    ERL_NIF_TERM tup[5] = {
-        atoms().ok, key_bin, val_bin,
-        enif_make_uint64(env, e.tstamp),
-        enif_make_uint64(env, e.ord),
-    };
-    return enif_make_tuple_from_array(env, tup, 5);
 }
 
 // cask_range_next_batch(IterRef, N) -> {ok, [{K,V,Tstamp,Ord}]} | done | {error,_}
@@ -182,7 +160,7 @@ ERL_NIF_TERM nif_cask_range_next_batch(ErlNifEnv* env, int /*argc*/, const ERL_N
     out.reserve(static_cast<std::size_t>(batch_size));
     for (int i = 0; i < batch_size; ++i) {
         auto r = ih->iter->next();
-        if (!r) return fault_to_term_detailed(env, r.error());
+        if (!r) return fault_to_term(env, r.error());
         if (!r->has_value()) break;
         out.push_back(std::move(**r));
     }

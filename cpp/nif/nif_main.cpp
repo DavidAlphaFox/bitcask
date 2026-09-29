@@ -43,7 +43,6 @@ ERL_NIF_TERM nif_cask_close_write_file  (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_text       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_text_4     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_phrase     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_cask_bool_search       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_fields     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_near       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_fuzzy      (ErlNifEnv*, int, const ERL_NIF_TERM[]);
@@ -60,9 +59,6 @@ ERL_NIF_TERM nif_cask_fold_next_full    (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_fold_next_batch   (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_fold_next_keys_batch(ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_fold_release      (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_cask_iterator          (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_cask_iterator_next     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_cask_iterator_release  (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_is_empty          (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_is_frozen         (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_status            (ErlNifEnv*, int, const ERL_NIF_TERM[]);
@@ -70,7 +66,6 @@ ERL_NIF_TERM nif_cask_needs_merge       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_merge             (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 // v5.1.0 S33-5：OKI 有序 range 迭代器（nif_cask_range.cpp）
 ERL_NIF_TERM nif_cask_range_start       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM nif_cask_range_next        (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_range_next_batch  (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_range_release     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 // v5.1.0 S34/S35：引擎原子批 + 多键事务（nif_cask_batch.cpp）
@@ -103,7 +98,6 @@ ErlNifFunc kNifFuncs[] = {
     {"cask_search_text",       3, guarded<nif_cask_search_text>,     ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"cask_search_text",       4, guarded<nif_cask_search_text_4>,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"cask_search_phrase",      3, guarded<nif_cask_search_phrase>,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"cask_bool_search",        3, guarded<nif_cask_bool_search>,     ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"cask_search_fields",      3, guarded<nif_cask_search_fields>,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"cask_search_near",        4, guarded<nif_cask_search_near>,     ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"cask_search_fuzzy",       4, guarded<nif_cask_search_fuzzy>,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
@@ -124,10 +118,6 @@ ErlNifFunc kNifFuncs[] = {
     {"cask_fold_next_batch",   2, guarded<nif_cask_fold_next_batch>,  ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"cask_fold_next_keys_batch", 2, guarded<nif_cask_fold_next_keys_batch>, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"cask_fold_release",      1, guarded<nif_cask_fold_release>,     0},
-    // 迭代：iterator 系列（挂在 CaskHandle 上，同 cask 同时只允许一个）
-    {"cask_iterator",          3, guarded<nif_cask_iterator>,         0},
-    {"cask_iterator_next",    1, guarded<nif_cask_iterator_next>,    0},
-    {"cask_iterator_release",  1, guarded<nif_cask_iterator_release>, 0},
     // 管理
     {"cask_is_empty",          1, guarded<nif_cask_is_empty>,         0},
     {"cask_is_frozen",         1, guarded<nif_cask_is_frozen>,        0},
@@ -137,10 +127,10 @@ ErlNifFunc kNifFuncs[] = {
 
     // --- v5.1.0 range 迭代器 ---
     // start 要为每个 OKI run 建游标 + seek（每路一次 pread），next_batch 一次
-    // 最多跑 1024 条取值——两者都可能远超 1ms，挂 dirty IO。单条 next 与
-    // cask_fold_next 同档，留在主调度线程。
+    // 最多跑 1024 条取值——两者都可能远超 1ms，挂 dirty IO。没有单条 next：
+    // prefetch > 1 时一次 next 可能触发 fill_prefetch（归并 N 个 key + 起线程），
+    // 放在主调度线程上不对；6.7.0 连同它唯一的（测试）调用者一起删了。
     {"cask_range_start",       2, guarded<nif_cask_range_start>,      ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"cask_range_next",        1, guarded<nif_cask_range_next>,       0},
     {"cask_range_next_batch",  2, guarded<nif_cask_range_next_batch>, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"cask_range_release",     1, guarded<nif_cask_range_release>,    0},
 

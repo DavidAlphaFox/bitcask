@@ -145,10 +145,32 @@ bool parse_doc_map(ErlNifEnv* env, ERL_NIF_TERM map_term, DocInput& doc,
 // 错误翻译
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// {error, {Tag, DetailBinary}}；detail 为空或分配失败 → {error, Tag}。
+ERL_NIF_TERM tagged_detail(ErlNifEnv* env, ERL_NIF_TERM tag, const std::string& detail) noexcept {
+    if (!detail.empty()) {
+        ERL_NIF_TERM d = make_binary_checked(
+            env, std::as_bytes(std::span<const char>(detail.data(), detail.size())));
+        if (d) return enif_make_tuple2(env, atoms().error, enif_make_tuple2(env, tag, d));
+    }
+    return enif_make_tuple2(env, atoms().error, tag);
+}
+
+}  // namespace
+
 ERL_NIF_TERM fault_to_term(ErlNifEnv* env, const CaskFault& f) noexcept {
     ERL_NIF_TERM tag;
     switch (f.kind) {
-        case CaskError::kIo:             tag = errno_atom(env, f.errnum); break;
+        case CaskError::kIo:
+            // errnum == 0 走不到 errno 表（erl_errno_id(0) = `unknown`，纯噪音）：
+            // 用 io_error 明确「是 IO 域故障，但没有 errno」，并带上消息。
+            if (f.errnum == 0) return tagged_detail(env, atoms().io_error, f.detail);
+            tag = errno_atom(env, f.errnum);
+            break;
+        case CaskError::kInvalidOption:
+            return tagged_detail(env, atoms().invalid_option, f.detail);
+        case CaskError::kAnalyzerMismatch: tag = atoms().analyzer_mismatch; break;
         case CaskError::kBadCrc:         tag = atoms().bad_crc; break;
         case CaskError::kNotFound:       return atoms().not_found;
         case CaskError::kKeyTooLarge:    tag = atoms().key_too_large; break;
@@ -164,31 +186,11 @@ ERL_NIF_TERM fault_to_term(ErlNifEnv* env, const CaskFault& f) noexcept {
         // ——而这两个码调用方通常写在同一个 case 里分流。
         case CaskError::kIndexRebuildFailed:
                                          tag = atoms().index_rebuild_failed; break;
-        case CaskError::kModeMismatch:  return atoms().mode_mismatch;
+        case CaskError::kModeMismatch:   return atoms().mode_mismatch;
         case CaskError::kClosed:         return atoms().closed;
-        case CaskError::kAnalyzerMismatch:
-        case CaskError::kInvalidOption:
-        default:                          tag = atoms().error; break;
+        default:                         tag = atoms().error; break;
     }
     return enif_make_tuple2(env, atoms().error, tag);
-}
-
-ERL_NIF_TERM fault_to_term_detailed(ErlNifEnv* env, const CaskFault& f) noexcept {
-    const bool message_only =
-        (f.kind == CaskError::kIo && f.errnum == 0) ||
-        f.kind == CaskError::kInvalidOption;
-    if (!message_only || f.detail.empty()) return fault_to_term(env, f);
-
-    // errnum == 0 走不到 errno 表（erl_errno_id(0) = `unknown`，纯噪音），
-    // 用 io_error 明确「是 IO 域故障，但没有 errno」。
-    const ERL_NIF_TERM tag = (f.kind == CaskError::kInvalidOption)
-                                 ? atoms().invalid_option
-                                 : atoms().io_error;
-    ERL_NIF_TERM detail = make_binary_checked(
-        env, std::as_bytes(std::span<const char>(f.detail.data(), f.detail.size())));
-    if (!detail) return fault_to_term(env, f);  // OOM：退回无 detail 形态
-    return enif_make_tuple2(env, atoms().error,
-                            enif_make_tuple2(env, tag, detail));
 }
 
 // ---------------------------------------------------------------------------

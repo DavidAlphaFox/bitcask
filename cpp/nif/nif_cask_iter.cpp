@@ -1,8 +1,8 @@
-// 粗粒度 cask_* NIF — 迭代操作：fold 系列 + iterator 系列。
+// 粗粒度 cask_* NIF — 迭代操作：fold 系列。
 //
-// 两条迭代链路：
-//   fold 系列：独立 IterRef 资源，可多个并发（每个 fold/3 / fold/6 一个）。
-//   iterator 系列：迭代状态挂在 CaskHandle 上，同 cask 同时只允许一个。
+// 每个 fold / stream 一个独立 IterRef 资源，可多个并发。legacy iterator 系列
+//（迭代状态挂在 CaskHandle 上、同 cask 只允许一个）6.7.0 删除：没有调用者，
+// 那个槽位还是两个进程可并发改写的无同步字段。
 //
 // 线程模型见 nif_main.cpp 顶部的统一说明。
 
@@ -53,7 +53,6 @@ static EntryMeta meta_of(const CaskIter::Entry& e) noexcept {
 static std::optional<EntryMeta> iter_next_common(
     ErlNifEnv* env,
     CaskIter* iter,
-    ERL_NIF_TERM eoi_term,    // EOI 时返回的 term（done 或 not_found）
     ERL_NIF_TERM& out_term,   // 错误/EOI 时的输出 term
     ERL_NIF_TERM& key_bin,
     ERL_NIF_TERM& val_bin)
@@ -64,7 +63,7 @@ static std::optional<EntryMeta> iter_next_common(
         return std::nullopt;
     }
     if (!r->has_value()) {
-        out_term = eoi_term;
+        out_term = atoms().done;
         return std::nullopt;
     }
     const auto& e = **r;
@@ -134,7 +133,7 @@ ERL_NIF_TERM nif_cask_fold_next(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM
     auto* ih = il.ih;
     if (!ih) return err;
     ERL_NIF_TERM out, key_bin, val_bin;
-    auto e = iter_next_common(env, ih->iter.get(), atoms().done, out, key_bin, val_bin);
+    auto e = iter_next_common(env, ih->iter.get(), out, key_bin, val_bin);
     if (!e) return out;
     return enif_make_tuple3(env, atoms().ok, key_bin, val_bin);
 }
@@ -147,7 +146,7 @@ ERL_NIF_TERM nif_cask_fold_next_full(ErlNifEnv* env, int /*argc*/, const ERL_NIF
     auto* ih = il.ih;
     if (!ih) return err;
     ERL_NIF_TERM out, key_bin, val_bin;
-    auto e = iter_next_common(env, ih->iter.get(), atoms().done, out, key_bin, val_bin);
+    auto e = iter_next_common(env, ih->iter.get(), out, key_bin, val_bin);
     if (!e) return out;
     ERL_NIF_TERM tup[8] = {
         atoms().ok,
@@ -242,64 +241,6 @@ ERL_NIF_TERM nif_cask_fold_release(ErlNifEnv* env, int /*argc*/, const ERL_NIF_T
     // 只需别与 close 并发：持父的 shared 锁。
     std::shared_lock<std::shared_mutex> lk(ih->owner->mu);
     release_iter(ih->iter);
-    return atoms().ok;
-}
-
-// =============================================================================
-// iterator 系列（状态化迭代器，挂在 CaskHandle 上）
-//
-// 同 cask 同时只能有一个状态化迭代器；尝试启动第二个返回
-// {error, iteration_in_process}。这是 legacy iterator/3 的契约。
-// =============================================================================
-
-ERL_NIF_TERM nif_cask_iterator(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
-    auto h = lock_cask_checked(env, argv[0]);
-    int maxage, maxputs;
-    if (!h || !h->cask ||
-        !enif_get_int(env, argv[1], &maxage) ||
-        !enif_get_int(env, argv[2], &maxputs)) {
-        return enif_make_badarg(env);
-    }
-    if (h->iter && h->iter->is_iterating()) {
-        return enif_make_tuple2(env, atoms().error, atoms().iteration_in_process);
-    }
-    auto it = h->cask->make_iter();
-    auto r = it->start(maxage, maxputs, /*now_sec*/ 0,
-                        /*see_tombstones*/ false);
-    if (!r) return fault_to_term(env, r.error());
-    if (*r == keydir::StartIterResult::kOutOfDate) {
-        return atoms().out_of_date;
-    }
-    h->iter = std::move(it);
-    return atoms().ok;
-}
-
-ERL_NIF_TERM nif_cask_iterator_next(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
-    auto h = lock_cask_checked(env, argv[0]);
-    if (!h) return enif_make_badarg(env);
-    if (!h->iter || !h->iter->is_iterating()) {
-        return make_error(env, atoms().iteration_not_started);
-    }
-    ERL_NIF_TERM out, key_bin, val_bin;
-    auto e = iter_next_common(env, h->iter.get(), atoms().not_found, out, key_bin, val_bin);
-    if (!e) return out;
-    ERL_NIF_TERM tup[7] = {
-        atoms().ok,
-        key_bin,
-        val_bin,
-        enif_make_uint(env, e->file_id),
-        enif_make_uint64(env, e->offset),
-        enif_make_uint(env, e->total_sz),
-        enif_make_uint64(env, e->tstamp),
-    };
-    return enif_make_tuple_from_array(env, tup, 7);
-}
-
-ERL_NIF_TERM nif_cask_iterator_release(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
-    auto* h = cask_handle(env, argv[0]);
-    if (!h) return enif_make_badarg(env);
-    std::shared_lock<std::shared_mutex> lk(h->mu);
-    release_iter(h->iter);
     return atoms().ok;
 }
 

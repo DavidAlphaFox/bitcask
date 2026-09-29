@@ -24,11 +24,10 @@ ERL_NIF_TERM nif_cask_open(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv
     CaskOptions opts = parse_options(env, argv[1]);
     auto* p = priv(env);
     auto c = Cask::open(dir, opts, &p->cask_registry);
-    // v6.0.0：open 走带 detail 的翻译。纪元门禁（meta v4 → v5 的
-    // `bitcask_migrate hintord` 提示、v1/v2/v3 的「须重建」提示）与选项校验
-    // 失败都只带消息，塌成裸 atom 等于把升级路径藏起来。其余故障形态不变
-    //（write_locked / mode_mismatch / read_only ... 仍是裸 atom）。
-    if (!c) return fault_to_term_detailed(env, c.error());
+    // 纪元门禁（meta v4 → v5 的 `bitcask_migrate hintord` 提示、v1/v2/v3 的
+    // 「须重建」提示）与选项校验失败都只带消息——fault_to_term 会把消息带上
+    //（6.7.0 起所有入口统一，见 nif_helpers.cpp）。
+    if (!c) return fault_to_term(env, c.error());
 
     auto term = make_resource<CaskHandle>(env, g_cask_resource_type,
                                            std::move(*c));
@@ -189,16 +188,12 @@ ERL_NIF_TERM nif_cask_close_write_file(ErlNifEnv* env, int /*argc*/,
                                          const ERL_NIF_TERM argv[]) {
     auto h = lock_cask_checked(env, argv[0]);
     if (!h) return enif_make_badarg(env);
-    if (h->iter && h->iter->is_iterating()) {
-        h->iter->release();
-        h->iter.reset();
-    }
     auto r = h->cask->close_write_file();
     if (!r) return fault_to_term(env, r.error());
     return atoms().ok;
 }
 
-// 以下 8 个搜索 NIF 都委托给 run_search 统一骨架（见 nif_helpers.hpp）：
+// 以下 7 个搜索 NIF 都委托给 run_search 统一骨架（见 nif_helpers.hpp）：
 // 各入口只负责解析自己的整型参数，再把「具体怎么搜」作为闭包传入。
 // argv 约定：3 参版 = {ref, query, k}；4 参版 = {ref, query, extra, k}。
 
@@ -216,12 +211,6 @@ ERL_NIF_TERM nif_cask_search_phrase(ErlNifEnv* env, int /*argc*/,
         [k](Cask& c, std::string_view q) { return c.search_phrase(q, k); });
 }
 
-ERL_NIF_TERM nif_cask_bool_search(ErlNifEnv* env, int /*argc*/,
-                                   const ERL_NIF_TERM argv[]) {
-    const auto k = static_cast<std::size_t>(get_topk(env, argv[2]));
-    return run_search(env, argv[0], argv[1],
-        [k](Cask& c, std::string_view q) { return c.bool_search(q, k); });
-}
 
 // S8.6：多字段搜索（field:term^boost）。
 ERL_NIF_TERM nif_cask_search_fields(ErlNifEnv* env, int /*argc*/,

@@ -21,8 +21,6 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     not_found             = a("not_found");
     already_exists        = a("already_exists");
     out_of_date           = a("out_of_date");
-    iteration_in_process  = a("iteration_in_process");
-    iteration_not_started = a("iteration_not_started");
     atom_true             = a("true");
     atom_false            = a("false");
     undefined             = a("undefined");
@@ -46,6 +44,8 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     mode_mismatch   = a("mode_mismatch");
     closed          = a("closed");
     invalid_option  = a("invalid_option");
+    analyzer_mismatch = a("analyzer_mismatch");
+    txn_committed   = a("txn_committed");
     io_error        = a("io_error");
 
     frag_merge_trigger       = a("frag_merge_trigger");
@@ -109,7 +109,6 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     sync_on_commit     = a("sync_on_commit");
     no_sync            = a("no_sync");
 
-    filter             = a("filter");
     key                = a("key");
     op                 = a("op");
     value              = a("value");
@@ -135,18 +134,6 @@ Atoms& atoms() noexcept { return g_atoms; }
 // file:read_file_info 等接口看到的 atom 完全一致。
 ERL_NIF_TERM errno_atom(ErlNifEnv* env, int errnum) noexcept {
     return enif_make_atom(env, ::erl_errno_id(errnum));
-}
-
-ERL_NIF_TERM errno_error_tuple(ErlNifEnv* env, int errnum) noexcept {
-    return enif_make_tuple2(env, g_atoms.error, errno_atom(env, errnum));
-}
-
-ERL_NIF_TERM tagged_errno_error_tuple(ErlNifEnv* env,
-                                      ERL_NIF_TERM tag,
-                                      int errnum) noexcept {
-    return enif_make_tuple2(
-        env, g_atoms.error,
-        enif_make_tuple2(env, tag, errno_atom(env, errnum)));
 }
 
 }  // namespace bitcask::nif

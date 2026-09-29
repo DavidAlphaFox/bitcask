@@ -24,6 +24,7 @@
 
 #include <erl_nif.h>
 
+#include "atoms.hpp"
 #include "bitcask/cask.hpp"
 
 namespace bitcask::nif {
@@ -36,10 +37,11 @@ extern ErlNifResourceType* g_txn_token_resource_type;
 // 包住 C++ Cask 对象的 NIF 资源。Cask 自己持有 KeyDir 和 active write/hint
 // file，析构会顺序释放它们。
 //
-// `iter` 是给 legacy `iterator/3` API 用的「单 Ref 单活跃迭代器」槽位；
-// fold/3 + fold/6 走另一条 CaskIterHandle 资源链路，跟这里互不影响。
+// 迭代一律走独立的 CaskIterHandle / CaskRangeIterHandle 资源（可多个并发）。
+// 以前这里还挂着 legacy `iterator/3` 用的「单 Ref 单活跃迭代器」槽位
+// （`iter` 字段，两个进程并发改它无同步），6.7.0 随那组没有调用者的 NIF 删除。
 //
-// === 生命周期与并发（6.6.1）===
+// === 生命周期与并发（6.7.0）===
 // cask.hpp 的两条契约：① `close()` 时刻不能有在途调用（并发是 UB）；
 // ② CaskIter 持裸 `Cask*`，**必须先于 Cask 对象析构**。以前 cask_close 直接
 // `cask.reset()` 删对象——普通调度器上的 get 能与 dirty 的 close 并发（违反
@@ -53,7 +55,6 @@ extern ErlNifResourceType* g_txn_token_resource_type;
 //     于是 Cask 对象一定晚于所有迭代器析构。
 struct CaskHandle {
     std::unique_ptr<Cask> cask;
-    std::unique_ptr<CaskIter> iter;
     mutable std::shared_mutex mu;
     std::atomic<bool> closed{false};
 
@@ -133,8 +134,7 @@ struct TxnTokenHandle {
     TxnTokenHandle& operator=(const TxnTokenHandle&) = delete;
     void fire(ErlNifEnv* caller_env) noexcept {
         if (!armed.load(std::memory_order_acquire)) return;
-        ERL_NIF_TERM msg = enif_make_tuple2(caller_env,
-                                            enif_make_atom(caller_env, "txn_committed"),
+        ERL_NIF_TERM msg = enif_make_tuple2(caller_env, atoms().txn_committed,
                                             enif_make_int64(caller_env, txn_id));
         enif_send(caller_env, &pid, nullptr, msg);
     }

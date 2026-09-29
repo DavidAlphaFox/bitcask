@@ -117,7 +117,7 @@ ERL_NIF_TERM nif_cask_put_batch_atomic(ErlNifEnv* env, int /*argc*/,
     }
 
     auto r = h->cask->put_batch_atomic(ops);
-    if (!r) return fault_to_term_detailed(env, r.error());
+    if (!r) return fault_to_term(env, r.error());
     return atoms().ok;
 }
 
@@ -125,7 +125,7 @@ ERL_NIF_TERM nif_cask_put_batch_atomic(ErlNifEnv* env, int /*argc*/,
 //   SyncPolicy :: sync_on_commit（默认，提交点显式 fsync）| no_sync
 //
 // 校验失败（空批 / 空 key / 重复 key / "_txn:" 前缀）由 TxnCask 判定，
-// 返回 kInvalidOption + 具体消息，经 fault_to_term_detailed 变成
+// 返回 kInvalidOption + 具体消息，经 fault_to_term 变成
 // {error, {invalid_option, <<"...">>}}——调用方能直接看到是哪一条规则。
 //
 // 4 元形态 cask_txn_commit(Ref, Ops, Sync, Token)：Token 是 txn_commit_token/2
@@ -168,7 +168,7 @@ ERL_NIF_TERM nif_cask_txn_commit(ErlNifEnv* env, int argc,
 
     TxnCask txn(h->cask.get(), sync);
     auto r = txn.commit(ops);
-    if (!r) return fault_to_term_detailed(env, r.error());
+    if (!r) return fault_to_term(env, r.error());
     return atoms().ok;
 }
 

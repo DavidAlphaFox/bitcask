@@ -75,22 +75,19 @@ bool parse_meta_value(ErlNifEnv* env, ERL_NIF_TERM term,
                       bitcask::meta::MetaValue& out,
                       bool other_atoms_as_null = false);
 
-// CaskFault → Erlang 错误 term。
-// kNotFound / kAlreadyExists 返回裸 atom（legacy 契约），其余返回 {error, Tag}。
+// CaskFault → Erlang 错误 term。所有 NIF 入口共用这一份（6.7.0 前还有个
+// fault_to_term_detailed，只在 open / range / batch 上用，于是同一种故障从
+// 不同 NIF 出来形态不同——invalid_option 从 merge / hybrid 出来就是
+// `{error, error}`，消息全丢）。形态：
+//   * 裸 atom（legacy 契约，**不要改**）：not_found、already_exists、no_index、
+//     mode_mismatch、closed；
+//   * `{error, write_locked}`（bitcask.erl 的 merge_locked 映射精确匹配它）；
+//   * 只有消息的两类带 detail：kInvalidOption → `{error, {invalid_option, Msg}}`，
+//     kIo(errnum == 0) → `{error, {io_error, Msg}}`；没有消息时退化为
+//     `{error, invalid_option}` / `{error, io_error}`（不再是 error / unknown）；
+//   * kAnalyzerMismatch → `{error, analyzer_mismatch}`；
+//   * 其余 `{error, Tag}`（kIo 的 Tag 是 errno atom）。
 ERL_NIF_TERM fault_to_term(ErlNifEnv* env, const CaskFault& f) noexcept;
-
-// v6.0.0：带 detail 的 CaskFault → Erlang 错误 term。
-//
-// 动机：libbitcask 有两类**只有消息、没有 errno/专用枚举**的故障——
-// `kIo(errnum == 0)` 与 `kInvalidOption`。它们经 fault_to_term 分别塌成
-// `{error, unknown}` 与 `{error, error}`，信息全丢。5.1.0 的 meta v4→v5
-// flag-day 正好走这条路：open 一个旧纪元目录，用户看到的应该是那句
-// 「run `bitcask_migrate hintord <src> <dst>`」，而不是 `{error, unknown}`。
-//
-// 本函数只对这两类附加 detail，形态 `{error, {Tag, DetailBinary}}`；
-// **其余全部原样委托 fault_to_term**（尤其 kWriteLocked 保持裸
-// `{error, write_locked}` —— bitcask.erl 的 merge_locked 映射精确匹配它）。
-ERL_NIF_TERM fault_to_term_detailed(ErlNifEnv* env, const CaskFault& f) noexcept;
 
 // 从 Erlang map 中提取 DocInput（text 和可选 meta 字段）。
 // map 必须包含 text 二进制字段，meta 二进制字段可选。

@@ -19,7 +19,6 @@
          cask_search_text/3,
          cask_search_text/4,
          cask_search_phrase/3,
-         cask_bool_search/3,
          cask_search_fields/3,
          cask_search_near/4,
          cask_search_fuzzy/4,
@@ -36,9 +35,6 @@
          cask_fold_next_batch/2,
          cask_fold_next_keys_batch/2,
          cask_fold_release/1,
-         cask_iterator/3,
-         cask_iterator_next/1,
-         cask_iterator_release/1,
          cask_is_empty/1,
          cask_is_frozen/1,
          cask_status/1,
@@ -46,7 +42,6 @@
          cask_merge/2,
          %% v5.1.0 S33-5：OKI 有序 range 迭代器
          cask_range_start/2,
-         cask_range_next/1,
          cask_range_next_batch/2,
          cask_range_release/1,
          %% v5.1.0 S34/S35：引擎原子批 + 多键事务
@@ -95,7 +90,6 @@ cask_search_text(_Ref, _Q, _K)   -> erlang:nif_error({error, not_loaded}).
 %% undefined 视为「无 filter」;其它 term 解析失败 → badarg。
 cask_search_text(_Ref, _Q, _K, _Filter)   -> erlang:nif_error({error, not_loaded}).
 cask_search_phrase(_Ref, _Q, _K) -> erlang:nif_error({error, not_loaded}).
-cask_bool_search(_Ref, _Q, _K)   -> erlang:nif_error({error, not_loaded}).
 cask_search_fields(_Ref, _Q, _K) -> erlang:nif_error({error, not_loaded}).
 cask_search_near(_Ref, _Q, _Slop, _K) -> erlang:nif_error({error, not_loaded}).
 cask_search_fuzzy(_Ref, _Q, _MaxEdit, _K) -> erlang:nif_error({error, not_loaded}).
@@ -127,9 +121,6 @@ cask_fold_next_batch(_IterRef, _BatchSize) -> erlang:nif_error({error, not_loade
            non_neg_integer(), boolean()}]} | done | {error, term()}.
 cask_fold_next_keys_batch(_IterRef, _BatchSize) -> erlang:nif_error({error, not_loaded}).
 cask_fold_release(_IterRef)   -> erlang:nif_error({error, not_loaded}).
-cask_iterator(_R, _MA, _MP)   -> erlang:nif_error({error, not_loaded}).
-cask_iterator_next(_R)        -> erlang:nif_error({error, not_loaded}).
-cask_iterator_release(_R)     -> erlang:nif_error({error, not_loaded}).
 cask_is_empty(_Ref)           -> erlang:nif_error({error, not_loaded}).
 cask_is_frozen(_Ref)          -> erlang:nif_error({error, not_loaded}).
 cask_status(_Ref)             -> erlang:nif_error({error, not_loaded}).
@@ -161,10 +152,6 @@ cask_merge(_Ref, _Files)      -> erlang:nif_error({error, not_loaded}).
 -spec cask_range_start(reference(), list()) ->
     {ok, reference()} | {error, term()} | atom().
 cask_range_start(_Ref, _Opts)  -> erlang:nif_error({error, not_loaded}).
--spec cask_range_next(reference()) ->
-    {ok, binary(), binary(), non_neg_integer(), non_neg_integer()}
-    | done | {error, term()} | atom().
-cask_range_next(_IterRef)      -> erlang:nif_error({error, not_loaded}).
 %% 批未满即到尾——返回列表比 BatchSize 短就该停。
 -spec cask_range_next_batch(reference(), pos_integer()) ->
     {ok, [{binary(), binary(), non_neg_integer(), non_neg_integer()}]}

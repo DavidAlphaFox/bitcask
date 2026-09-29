@@ -95,28 +95,6 @@ inline int get_nonneg_int(ErlNifEnv* env, ERL_NIF_TERM term,
     return v >= 0 ? v : default_val;
 }
 
-// 从 8 字节 native-endian binary term 里读 uint64。Erlang 那边写
-// <<X:64/unsigned-native>> 过来，这里 memcpy 反向解出来。
-// 注意：endianness 跟运行平台一致——legacy NIF 一直这么做，跨架构传
-// 数据本来也不能通过 native 二进制做，所以保留同样的契约。
-inline bool get_uint64_bin(ErlNifEnv* env, ERL_NIF_TERM term, std::uint64_t* out) {
-    ErlNifBinary bin;
-    if (!enif_inspect_binary(env, term, &bin)) return false;
-    if (bin.size != sizeof(std::uint64_t)) return false;
-    std::memcpy(out, bin.data, sizeof(std::uint64_t));
-    return true;
-}
-
-// uint64 → 8 字节 native-endian binary term。跟 get_uint64_bin/3 配对，
-// Erlang 侧拿 <<X:64/unsigned-native>> 模式匹配出来。
-// 分配失败返回 0（无效 term），调用方须检查。
-inline ERL_NIF_TERM make_uint64_bin(ErlNifEnv* env, std::uint64_t value) {
-    ErlNifBinary bin;
-    if (!enif_alloc_binary(sizeof(std::uint64_t), &bin)) return 0;
-    std::memcpy(bin.data, &value, sizeof(std::uint64_t));
-    return enif_make_binary(env, &bin);
-}
-
 // 从 NIF term 中提取二进制数据。成功返回 true 并填充 bin；失败返回 false。
 // 用于替代重复的 enif_inspect_binary + badarg 模式。
 inline bool ensure_binary(ErlNifEnv* env, ERL_NIF_TERM term, ErlNifBinary& bin) noexcept {
@@ -125,8 +103,7 @@ inline bool ensure_binary(ErlNifEnv* env, ERL_NIF_TERM term, ErlNifBinary& bin) 
 
 // V3.6:f32 LE 二进制 → float 向量(向量跨界格式,与 DocValue 存储一致)。
 // Erlang 侧用 << <<X:32/float-little>> || X <- List >> 构造。size 不是
-// 4 的倍数返回 false(调用方 badarg)。引擎仅支持 LE 平台(与
-// get_uint64_bin 的 native 契约同款),直接 memcpy。
+// 4 的倍数返回 false(调用方 badarg)。引擎仅支持 LE 平台,直接 memcpy。
 inline bool binary_to_f32vec(const ErlNifBinary& bin, std::vector<float>& out) {
     if (bin.size % sizeof(float) != 0) return false;
     out.resize(bin.size / sizeof(float));

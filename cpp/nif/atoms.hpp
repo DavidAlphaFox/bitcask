@@ -28,8 +28,6 @@ struct Atoms {
     ERL_NIF_TERM not_found;
     ERL_NIF_TERM already_exists;
     ERL_NIF_TERM out_of_date;
-    ERL_NIF_TERM iteration_in_process;
-    ERL_NIF_TERM iteration_not_started;
     ERL_NIF_TERM atom_true;
     ERL_NIF_TERM atom_false;
     ERL_NIF_TERM undefined;
@@ -54,7 +52,9 @@ struct Atoms {
     ERL_NIF_TERM index_rebuild_failed;
     ERL_NIF_TERM mode_mismatch;
     ERL_NIF_TERM closed;  // v3.1.0：CaskError::kClosed —— 对已 close 的 handle 调用
-    ERL_NIF_TERM invalid_option;  // v6.0.0：CaskError::kInvalidOption 的带 detail 形态
+    ERL_NIF_TERM invalid_option;
+    ERL_NIF_TERM analyzer_mismatch;  // CaskError::kAnalyzerMismatch（以前塌成 {error, error}）
+    ERL_NIF_TERM txn_committed;      // 提交令牌析构通知的消息标签  // v6.0.0：CaskError::kInvalidOption 的带 detail 形态
     ERL_NIF_TERM io_error;        // v6.0.0：kIo 但无 errno（纪元门禁等）的带 detail 形态
 
     // 合并策略阈值
@@ -141,14 +141,13 @@ struct Atoms {
     ERL_NIF_TERM no_sync;
 
     // V5:metadata filter 解析所需的 atom。
-    //   filter/conditions/children = 嵌套 MetaFilter 的 map 字段;
+    //   conditions/children = 嵌套 MetaFilter 的 map 字段;
     //   key/op/value/values = 单条 MetaCondition 的字段;
     //   logic + and_op/or_op = MetaFilter::Logic 取值;
     //   eq/neq/gt/gte/lt/lte/in_op/exists = MetaOp 取值。
     // in_op/and_op/or_op 加 _op 后缀以避开 Erlang `in`/`and`/`or` 是
     // 关键字/保留字在 atom 字面量里写起来不直观——但 NIF 侧用字符串
     // 走 enif_make_atom 不受限制,这里只是 C++ 端字段名要避开关键字。
-    ERL_NIF_TERM filter;
     ERL_NIF_TERM key;
     ERL_NIF_TERM op;
     ERL_NIF_TERM value;
@@ -179,16 +178,5 @@ Atoms& atoms() noexcept;
 // 直接复用 erts 提供的 erl_errno_id 表，与 Erlang 侧 file 模块的错误形态一致。
 // 线程安全: 是；不需任何锁。
 ERL_NIF_TERM errno_atom(ErlNifEnv* env, int errnum) noexcept;
-
-// 构造 {error, ErrnoAtom}，业务最常见的错误返回形态。
-// 线程安全: 是；不需任何锁。
-ERL_NIF_TERM errno_error_tuple(ErlNifEnv* env, int errnum) noexcept;
-
-// 构造 {error, {Tag, ErrnoAtom}}，给需要带上下文标签的错误用
-//（例如 {error, {pread_error, eio}}）。
-// 线程安全: 是；不需任何锁。
-ERL_NIF_TERM tagged_errno_error_tuple(ErlNifEnv* env,
-                                      ERL_NIF_TERM tag,
-                                      int errnum) noexcept;
 
 }  // namespace bitcask::nif
