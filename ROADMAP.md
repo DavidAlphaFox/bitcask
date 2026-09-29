@@ -6,6 +6,20 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 6.6.1 落地
+
+### 事务层：提交中途放锁修复 + 幂等键 ✅
+
+- **修复**：`txn_commit` 是 dirty NIF，调用方被 kill 时 DOWN 先于批落盘送达，
+  v1 按 DOWN 放锁 → 丢更新。现在带**提交令牌**（NIF 资源）进 NIF，令牌析构（只
+  发生在 NIF 返回后、或排队中被 kill 且 NIF 永不执行后）才通知 locker 放锁；
+  调用方死在提交途中的事务成为 orphan，锁留到通知到达。`no_sync` 吞吐与修复前
+  持平（中途试过的 committer 进程方案慢 25–30%，已替换）。
+- **幂等键** `{idem_key, K}`：同键至多提交一次，标记与数据同批原子提交；
+  `idem_lookup/2`、`idem_purge/2`。
+
+设计：`doc/txn-layer-design-zh.md` §4.5 / §4.5.1。
+
 ## 6.5.1 落地
 
 ### 事务协调层：2PL + 死锁检测 + 重跑（含前缀锁、分片、victim 启发式）✅

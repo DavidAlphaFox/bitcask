@@ -3,18 +3,23 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
-## [Unreleased]
+## [6.6.1] — 2026-09-29
+
+补丁版：事务层修一个并发 bug，外加幂等键。libbitcask 仍是 6.6.0，盘上格式与
+既有 API 不变；新增的只有 NIF 入口与 `bitcask_txn` 选项 / 函数。
 
 ### Fixed
 
 - **`bitcask_txn`：调用方在提交途中被 kill 时锁提前释放**。`txn_commit` 是 dirty
-  NIF，kill 的 DOWN 立即送达、批却要等 NIF 跑完才落盘（实测 DOWN 177µs，4MB 批约
-  10ms），locker 按 DOWN 放锁，别的事务就能在落盘前拿到这些 key，读到旧值再覆盖，
-  造成丢更新。现在由一个不与调用方 link 的 committer 进程执行提交，locker 在提交前
-  把 monitor 移交给它（新增 `bitcask_txn_locker:handoff/2`），锁一直持到批落盘或
-  失败。代价：每个写事务多一次 spawn 和一次归属分片 call；单 key + `no_sync` 的
-  最坏情况约慢 25–30%（8 vCPU：P=8 116k → 81–87k txn/s），`sync_on_commit` 下被
-  fsync 淹没。
+  NIF，kill 的 DOWN 立即送达、批却要等 NIF 跑完才落盘（实测 DOWN 约 100–177µs，
+  4MB 批约 10ms），locker 按 DOWN 放锁，别的事务就能在落盘前拿到这些 key，读到
+  旧值再覆盖，造成丢更新。现在提交时带一个**提交令牌**（NIF 资源）进 NIF：令牌
+  析构只会发生在 NIF 返回后、或调用方在 dirty 队列排队时被 kill（NIF 永不执行）
+  之后，析构时通知 locker。调用方死在提交途中，locker 只把事务标成孤儿、锁不放，
+  等到令牌通知再清理。兜底：30s 没等到就照常清理，记入 `status()` 新增的
+  `orphan_timeouts`（应恒为 0）。开销：每个写事务多两次轻量 NIF 调用和两次 ETS
+  写；单 key + `no_sync` 的吞吐与修复前在噪声内持平（8 vCPU：P=1 47–59k、
+  P=8 100–120k txn/s）。
 
 ### Added
 
@@ -24,9 +29,14 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
   `idem_purge/2`（按年龄清理标记）。`<<0, "bitcask_txn:idem:">>` 前缀保留，事务内
   写它 → `error({bitcask_txn, reserved_key, K})`。设计 `doc/txn-layer-design-zh.md`
   §4.5 / §4.5.1。
-- 测试：`bitcask_txn_tests` +6（幂等语义、中止不留标记、保留前缀、8 进程同键恰好
-  一次、purge，以及在提交中 kill 后重试，断言每轮恰好执行一次——去掉 committer 时
-  这一例稳定失败）。
+- NIF：`bitcask_cpp_nifs:cask_txn_commit/4`、`txn_commit_token/2`、
+  `txn_commit_token_disarm/1`；门面 `bitcask:txn_commit/4`（给 `bitcask_txn`
+  用，一般应用用不上）。
+- 测试：`bitcask_txn_tests` +7。覆盖幂等语义、中止不留标记、保留前缀、8 进程同键
+  恰好一次、purge；提交令牌的五种路径（disarm 不发、进程退出即发、坏参数、NIF 执行中
+  被 kill、排队中被 kill 且整批不落）；以及在 NIF 执行中 kill 后重试，断言每轮恰好执行
+  一次（让 DOWN 直接放锁时这一例稳定失败）。`commit_failed_test_` 改用引擎真实拒绝
+  （`_txn:` 保留前缀），不再 mock。
 
 ## [6.6.0] — 2026-09-23
 

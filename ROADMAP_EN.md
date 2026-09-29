@@ -6,6 +6,23 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 6.6.1 shipped
+
+### Transaction layer: mid-commit lock release fix + idempotency keys ✅
+
+- **Fix**: `txn_commit` is a dirty NIF, so a killed caller's DOWN arrives before
+  the batch lands; v1 released locks on DOWN → lost updates. Commit now carries
+  a **commit token** (NIF resource) into the NIF; the locker releases only when
+  the token's destructor notifies it (which happens only after the NIF returns,
+  or after a kill while still queued, when the NIF never runs). A transaction
+  whose caller dies mid-commit becomes an orphan and keeps its locks until
+  then. `no_sync` throughput is on par with pre-fix (the interim committer-
+  process approach cost 25–30% and was replaced).
+- **Idempotency keys** `{idem_key, K}`: a key commits at most once, the marker
+  commits atomically with the data; `idem_lookup/2`, `idem_purge/2`.
+
+Design: `doc/txn-layer-design-zh.md` §4.5 / §4.5.1.
+
 ## 6.5.1 shipped
 
 ### Transaction layer: 2PL + deadlock detection + restart (prefix locks, sharding, victim heuristic) ✅

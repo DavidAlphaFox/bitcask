@@ -3,21 +3,30 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [6.6.1] — 2026-09-29
+
+Patch release: a concurrency fix in the transaction layer, plus idempotency
+keys. libbitcask stays at 6.6.0; on-disk format and existing APIs are
+unchanged — the only additions are NIF entry points and `bitcask_txn`
+options / functions.
 
 ### Fixed
 
 - **`bitcask_txn`: locks released early when the caller is killed mid-commit.**
   `txn_commit` is a dirty NIF; a kill delivers DOWN immediately while the batch
-  only lands once the NIF returns (measured: DOWN at 177µs, a 4MB batch ~10ms
-  later). The locker released locks on DOWN, so another transaction could take
-  those keys before the batch landed, read the old value and overwrite it — a
-  lost update. Commit now runs in a committer process not linked to the caller,
-  and the locker hands the monitor over to it before commit (new
-  `bitcask_txn_locker:handoff/2`); locks are held until the batch lands or
-  fails. Cost: one extra spawn and one home-shard call per write transaction;
-  worst case (single key, `no_sync`) is ~25–30% slower (8 vCPU: P=8 116k →
-  81–87k txn/s), invisible under `sync_on_commit`.
+  only lands once the NIF returns (measured: DOWN at ~100–177µs, a 4MB batch
+  ~10ms later). The locker released locks on DOWN, so another transaction could
+  take those keys before the batch landed, read the old value and overwrite it
+  — a lost update. Commit now carries a **commit token** (a NIF resource) into
+  the NIF. The token can only be destroyed after the NIF returns, or after the
+  caller is killed while still queued for a dirty scheduler (the NIF then never
+  runs); its destructor notifies the locker. If the caller dies mid-commit the
+  locker marks the transaction orphaned and keeps its locks until that
+  notification arrives. Safety net: after 30s without it the locks are released
+  anyway and counted in the new `status()` key `orphan_timeouts` (expected to
+  stay 0). Cost: two lightweight NIF calls and two ETS writes per write
+  transaction; single-key `no_sync` throughput is within noise of the pre-fix
+  numbers (8 vCPU: P=1 47–59k, P=8 100–120k txn/s).
 
 ### Added
 
@@ -30,10 +39,17 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   `<<0, "bitcask_txn:idem:">>` prefix is reserved; writing it inside a
   transaction → `error({bitcask_txn, reserved_key, K})`. Design:
   `doc/txn-layer-design-zh.md` §4.5 / §4.5.1.
-- Tests: `bitcask_txn_tests` +6 (idempotency semantics, aborts leave no marker,
-  reserved prefix, 8 processes on one key commit exactly once, purge, and a
-  kill-mid-commit retry asserting exactly one execution per round — that case
-  fails reliably with the committer removed).
+- NIF: `bitcask_cpp_nifs:cask_txn_commit/4`, `txn_commit_token/2`,
+  `txn_commit_token_disarm/1`; facade `bitcask:txn_commit/4` (for `bitcask_txn`;
+  applications normally don't need it).
+- Tests: `bitcask_txn_tests` +7. Covers idempotency semantics, aborts leaving no
+  marker, the reserved prefix, 8 processes on one key committing exactly once,
+  and purge; the commit token's five paths (disarmed → silent, owner exit →
+  fires, bad argument, killed while the NIF runs, killed while queued with the
+  batch never landing); and a retry after a kill during the running NIF,
+  asserting exactly one execution per round (fails reliably when DOWN releases
+  locks directly). `commit_failed_test_` now uses a real engine rejection (the
+  `_txn:` reserved prefix) instead of a mock.
 
 ## [6.6.0] — 2026-09-23
 
