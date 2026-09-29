@@ -923,3 +923,167 @@ older_txn_never_restarts_test_() ->
             bitcask:close(R)
         end)
      end}}.
+
+%% ===================================================================
+%% 幂等键 + committer 移交（设计 §4.5 / §4.5.1）
+%% ===================================================================
+
+%% 计数器 +1，并向 Owner 报一次"Fun 跑过"（测试专用副作用）。
+bump(Tx, Owner, Tag) ->
+    Owner ! {ran, Tag},
+    V = case ?T:read(Tx, <<"ctr">>, write) of
+            {ok, B}   -> int(B);
+            not_found -> 0
+        end,
+    ok = ?T:write(Tx, <<"ctr">>, bin(V + 1)),
+    {Tag, V + 1}.
+
+ran_count(Tag) ->
+    receive {ran, Tag} -> 1 + ran_count(Tag) after 0 -> 0 end.
+
+idem_once_test_() ->
+    {"同一幂等键第二次调用不跑 Fun，原样返回首次结果；不同键各自执行",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open(D), Me = self(),
+            Opts = [{idem_key, <<"op-1">>} | ?FAST],
+            ?assertEqual({atomic, {a, 1}}, ?T:transaction(R, fun(Tx) -> bump(Tx, Me, a) end, Opts)),
+            ?assertEqual({atomic, {a, 1}}, ?T:transaction(R, fun(Tx) -> bump(Tx, Me, b) end, Opts)),
+            ?assertEqual(1, ran_count(a)),
+            ?assertEqual(0, ran_count(b)),
+            ?assertEqual({ok, <<"1">>}, bitcask:get(R, <<"ctr">>)),
+            ?assertEqual({ok, {a, 1}}, ?T:idem_lookup(R, <<"op-1">>)),
+            ?assertEqual(not_found, ?T:idem_lookup(R, <<"op-2">>)),
+            ?assertEqual({atomic, {c, 2}},
+                         ?T:transaction(R, fun(Tx) -> bump(Tx, Me, c) end,
+                                        [{idem_key, <<"op-2">>} | ?FAST])),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}.
+
+idem_abort_not_recorded_test_() ->
+    {"中止 / Fun 抛异常的事务不留标记，同键重来会执行；只读事务也记标记",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open(D), Me = self(),
+            Opts = [{idem_key, <<"k">>} | ?FAST],
+            ?assertEqual({aborted, nope},
+                         ?T:transaction(R, fun(Tx) -> bump(Tx, Me, a), ?T:abort(nope) end, Opts)),
+            ?assertEqual(not_found, ?T:idem_lookup(R, <<"k">>)),
+            ?assertEqual({atomic, {b, 1}}, ?T:transaction(R, fun(Tx) -> bump(Tx, Me, b) end, Opts)),
+            %% 只读 + 幂等键：标记照写，第二次返回首次读到的值
+            RO = [{idem_key, <<"ro">>} | ?FAST],
+            ?assertEqual({atomic, {ok, <<"1">>}}, ?T:transaction(R, fun(Tx) -> ?T:read(Tx, <<"ctr">>) end, RO)),
+            ok = bitcask:put(R, <<"ctr">>, <<"99">>),
+            ?assertEqual({atomic, {ok, <<"1">>}}, ?T:transaction(R, fun(Tx) -> ?T:read(Tx, <<"ctr">>) end, RO)),
+            bitcask:close(R)
+        end)
+     end}.
+
+idem_reserved_key_test_() ->
+    {"事务内 write/delete 标记前缀下的 key → reserved_key",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open(D),
+            K = <<0, "bitcask_txn:idem:x">>,
+            ?assertMatch({aborted, {{bitcask_txn, reserved_key, K}, _}},
+                         ?T:transaction(R, fun(Tx) -> ?T:write(Tx, K, <<"v">>) end, ?FAST)),
+            ?assertMatch({aborted, {{bitcask_txn, reserved_key, K}, _}},
+                         ?T:transaction(R, fun(Tx) -> ?T:delete(Tx, K) end, ?FAST)),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}.
+
+idem_concurrent_exactly_once_test_() ->
+    {"8 进程同时用同一幂等键：Fun 只提交一次，全部拿到同一结果",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open(D), Me = self(),
+            Pids = [spawn_link(fun() ->
+                        Res = ?T:transaction(R, fun(Tx) -> bump(Tx, Me, I) end,
+                                             [{idem_key, <<"same">>}, {retries, infinity} | ?FAST]),
+                        Me ! {self(), Res}
+                    end) || I <- lists:seq(1, 8)],
+            Rs = [receive {P, X} -> X end || P <- Pids],
+            ?assertMatch([{atomic, {_, 1}}], lists:usort(Rs)),
+            ?assertEqual({ok, <<"1">>}, bitcask:get(R, <<"ctr">>)),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}.
+
+idem_purge_test_() ->
+    {"idem_purge：按年龄删标记，删后同键重新执行；年龄未到的不动",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open(D), Me = self(),
+            [{atomic, _} = ?T:transaction(R, fun(Tx) -> bump(Tx, Me, x) end,
+                                          [{idem_key, bin(I)} | ?FAST]) || I <- lists:seq(1, 5)],
+            ?assertEqual({ok, 0}, ?T:idem_purge(R, 3600)),
+            ?assertEqual({ok, {x, 1}}, ?T:idem_lookup(R, <<"1">>)),
+            ?assertEqual({ok, 5}, ?T:idem_purge(R, 0)),
+            ?assertEqual(not_found, ?T:idem_lookup(R, <<"1">>)),
+            ?assertEqual({atomic, {y, 6}}, ?T:transaction(R, fun(Tx) -> bump(Tx, Me, y) end,
+                                                          [{idem_key, <<"1">>} | ?FAST])),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}.
+
+%% 调用进程在提交途中被 kill：锁必须等批落盘才放（committer 移交），否则
+%% 重试者可能在批落盘前查标记 → 看不到 → 再执行一次。每次执行写一个唯一
+%% 的 exec 键，断言每轮恰好一个（计数器 RMW 断言不够：两次执行若读到同一
+%% 个旧值，各写 V+1，重复执行被丢更新掩盖掉）。
+%% 大批（~4MB + sync）把 dirty NIF 的执行窗口撑宽；轮询 A 的调用栈，等它
+%% 进入提交阶段（Fun 已跑完）再 kill，前半轮直接 kill、后半轮再随机延迟
+%% [0, NIF 耗时]——确定性地打在"提交中"，也覆盖"刚提交完"。
+idem_killed_mid_commit_test_() ->
+    {"提交途中 kill 调用方 + 同幂等键重试：每轮恰好执行一次",
+     {timeout, 300, fun() ->
+        with_dir(fun(D) ->
+            R = open(D),
+            Big = binary:copy(<<"x">>, 4096),
+            Fun = fun(Round, Tag) -> fun(Tx) ->
+                      [ok = ?T:write(Tx, <<"big", (bin(I))/binary>>, Big) || I <- lists:seq(1, 1000)],
+                      ok = ?T:write(Tx, <<"exec-", Round/binary, "-", Tag>>, <<>>),
+                      Tag
+                  end end,
+            {Us, {atomic, _}} = timer:tc(fun() -> ?T:transaction(R, Fun(<<"warm">>, $w), []) end),
+            Rounds = 30,
+            Seen = [begin
+                        K = bin(N),
+                        A = spawn(fun() -> ?T:transaction(R, Fun(K, $a), [{idem_key, K}]) end),
+                        ok = wait_in_commit(A),
+                        N > Rounds div 2 andalso timer:sleep(rand:uniform(3) - 1),
+                        exit(A, kill),
+                        {atomic, Who} = ?T:transaction(R, Fun(K, $b),
+                                                       [{idem_key, K}, {retries, infinity}]),
+                        Execs = [T || T <- [$a, $b],
+                                      bitcask:get(R, <<"exec-", K/binary, "-", T>>) =/= not_found],
+                        {K, Who, Execs}
+                    end || N <- lists:seq(1, Rounds)],
+            ?debugFmt("txn ~pus, A 已提交 ~p / 重试者执行 ~p",
+                      [Us, length([x || {_, $a, _} <- Seen]),
+                       length([x || {_, $b, _} <- Seen])]),
+            ?assertEqual([], [X || {_, Who, Execs} = X <- Seen, Execs =/= [Who]]),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}}.
+
+%% 忙等 Pid 进入"提交中"：栈上是引擎 NIF（调用方自己提交的实现）或正在等
+%% committer（移交实现）。进程已死 → ok。
+wait_in_commit(Pid) ->
+    case erlang:process_info(Pid, current_stacktrace) of
+        undefined -> ok;
+        {current_stacktrace, St} ->
+            case lists:any(fun({bitcask_cpp_nifs, cask_txn_commit, 3, _}) -> true;
+                              ({bitcask_txn, commit_via_committer, 2, _}) -> true;
+                              (_) -> false
+                           end, St) of
+                true  -> ok;
+                false -> erlang:yield(), wait_in_commit(Pid)
+            end
+    end.

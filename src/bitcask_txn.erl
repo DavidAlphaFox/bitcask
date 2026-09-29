@@ -32,8 +32,10 @@
 %%   ⚠️ **Fun 必须无副作用**：可能执行多次。禁止在 Fun 内做 I/O、发消息、
 %%      改进程字典。Fun 在调用进程内执行，Tx 不能传给别的进程用（会
 %%      error({bitcask_txn, not_owner})）。
-%%   ⚠️ 不确定窗口：调用进程死于 txn_commit NIF 执行途中，批要么全成要么
-%%      全不成，但没人拿到结果。重试前应用需自查（§4.5）。
+%%   提交由一个内部 committer 进程执行，locker 在提交前把 monitor 移交给它：
+%%   调用进程在提交途中被 kill，锁也要等批落盘（或失败）后才放（§4.5）。
+%%   ⚠️ 不确定窗口：调用进程死于提交途中，批要么全成要么全不成，但没人拿到
+%%      结果。要安全重试就带 {idem_key, K}（见下）。
 %%   ⚠️ 不支持嵌套：Fun 内再调 transaction → {aborted, tx_nested}。
 %%
 %%   选项：
@@ -46,6 +48,15 @@
 %%                                    返回的额外 op 并入同一批原子提交。额外
 %%                                    op 的 key 在提交前补写锁；与缓冲里的
 %%                                    key 重合 → {aborted, {index_conflict, K}}。
+%%     {idem_key, binary()}           幂等键（§4.5.1）：同一个键的事务**至多提交
+%%                                    一次**。开跑前拿标记键的写锁并查它：已存在
+%%                                    → 不跑 Fun，直接 {atomic, 首次提交时的结果}；
+%%                                    否则照常跑，标记（含 Fun 的结果）与数据同批
+%%                                    原子提交——批在则标记在。只读事务带了键也写
+%%                                    标记。标记永不自动过期：idem_purge/2 清理。
+%%
+%%   ⚠️ 保留 key：以 <<0, "bitcask_txn:idem:">> 开头的 key 归幂等标记，事务内
+%%      write/delete 它们 → error({bitcask_txn, reserved_key, K})。
 %%
 %%   前缀锁（P2）：lock_prefix(Tx, Prefix, read|write) 锁住以 Prefix 开头的
 %%   全部 key（现有的和将来的）——事务内 range 扫描的幻读防护。
@@ -62,12 +73,15 @@
 -export([transaction/2, transaction/3,
          read/2, read/3, write/3, delete/2, abort/1,
          lock_prefix/3, prefix_range/2, prefix_range/3,
-         handle/1]).
+         handle/1,
+         idem_lookup/2, idem_purge/2]).
 
 -define(ACTIVE,  '$bitcask_txn_active').      % pdict：嵌套检测
 -define(ABORT,   bitcask_txn_abort).          % throw 标签：显式中止
 -define(RESTART, bitcask_txn_restart).        % throw 标签：死锁 → 重跑
 -define(TIMEOUT, bitcask_txn_timeout).        % throw 标签：过 deadline
+
+-define(IDEM_PREFIX, <<0, "bitcask_txn:idem:">>).
 
 -define(DEFAULT_RETRIES, 10).
 -define(DEFAULT_LOCK_WAIT_TIMEOUT, 5000).
@@ -77,14 +91,16 @@
                           handle    :: term(),
                           ref       :: reference(),
                           index_fun :: undefined | fun((binary(), term()) -> list()),
-                          sync      :: sync_on_commit | no_sync}).
+                          sync      :: sync_on_commit | no_sync,
+                          idem      :: undefined | binary()}).   % 标记键（已加前缀）
 
 -record(cfg, {retries   :: non_neg_integer() | infinity,
               age       :: pos_integer(),          % 一次 transaction 调用一个，重跑不变
               deadline  :: integer() | infinity,
               lock_wait :: timeout(),
               sync      :: sync_on_commit | no_sync,
-              index_fun :: undefined | fun()}).
+              index_fun :: undefined | fun(),
+              idem      :: undefined | binary()}).
 
 %% =========================================================================
 %% 门面
@@ -120,13 +136,18 @@ parse_opts(Opts) ->
     true = Sync =:= sync_on_commit orelse Sync =:= no_sync,
     IndexFun = proplists:get_value(index_fun, Opts, undefined),
     true = IndexFun =:= undefined orelse is_function(IndexFun, 2),
+    Idem = case proplists:get_value(idem_key, Opts, undefined) of
+               undefined -> undefined;
+               IK when is_binary(IK) -> idem_marker(IK)
+           end,
     #cfg{retries   = Retries,
          age       = erlang:unique_integer([positive, monotonic]),
          deadline  = Deadline,
          lock_wait = proplists:get_value(lock_wait_timeout, Opts,
                                          ?DEFAULT_LOCK_WAIT_TIMEOUT),
          sync      = Sync,
-         index_fun = IndexFun}.
+         index_fun = IndexFun,
+         idem      = Idem}.
 
 %% 重启循环。Attempt 是已重跑次数；Attempt < Retries 才准再来一次。
 run_loop(Handle, Fun, #cfg{retries = Retries} = Cfg, Attempt) ->
@@ -151,13 +172,19 @@ run_once(Handle, Fun, Cfg) ->
     Tx = #bitcask_txn_ctx{id = TxnId, handle = Handle,
                           ref = handle_ref(Handle),
                           index_fun = Cfg#cfg.index_fun,
-                          sync = Cfg#cfg.sync},
+                          sync = Cfg#cfg.sync,
+                          idem = Cfg#cfg.idem},
     BufKey = buf_key(TxnId),
     put(BufKey, #{}),
     put(locks_key(TxnId), {#{}, #{}}),        % {点锁 Key => Mode, 前缀锁 Prefix => Mode}
     try
-        Result = Fun(Tx),
-        commit(Tx, Result)
+        case idem_seen(Tx) of
+            {ok, Prev} ->
+                release(TxnId),
+                {atomic, Prev};
+            none ->
+                commit(Tx, Fun(Tx))
+        end
     catch
         throw:{?ABORT, Reason} ->
             release(TxnId), {aborted, Reason};
@@ -210,6 +237,7 @@ read(#bitcask_txn_ctx{handle = Handle} = Tx, Key, Lock)
 -spec write(term(), binary(), binary()) -> ok.
 write(#bitcask_txn_ctx{id = TxnId} = Tx, Key, Val) when is_binary(Key), is_binary(Val) ->
     Buf = buffer(Tx),
+    not_reserved(Key),
     lock(Tx, Key, write),
     put(buf_key(TxnId), Buf#{Key => {put, Val}}),
     ok.
@@ -217,6 +245,7 @@ write(#bitcask_txn_ctx{id = TxnId} = Tx, Key, Val) when is_binary(Key), is_binar
 -spec delete(term(), binary()) -> ok.
 delete(#bitcask_txn_ctx{id = TxnId} = Tx, Key) when is_binary(Key) ->
     Buf = buffer(Tx),
+    not_reserved(Key),
     lock(Tx, Key, write),
     put(buf_key(TxnId), Buf#{Key => delete}),
     ok.
@@ -334,33 +363,60 @@ acquire(TxnId, LockId, Mode) ->
 %% =========================================================================
 
 %% 仍在 try 里调用：这里抛出的 RESTART/TIMEOUT/ABORT 走同一套 catch。
-commit(#bitcask_txn_ctx{id = TxnId, handle = Handle, sync = Sync} = Tx, Result) ->
+commit(#bitcask_txn_ctx{id = TxnId, idem = Idem} = Tx, Result) ->
     Buf = buffer(Tx),
-    case map_size(Buf) of
-        0 ->
+    case map_size(Buf) =:= 0 andalso Idem =:= undefined of
+        true ->
             %% 只读：没什么好提交的，也不必打扰引擎（空批本来就被拒）。
             release(TxnId),
             {atomic, Result};
-        _ ->
+        false ->
             Sorted = lists:sort(maps:to_list(Buf)),
             Main = [case Op of
                         {put, V} -> {put, K, V};
                         delete   -> {remove, K}
                     end || {K, Op} <- Sorted],
             Extra = index_ops(Tx, Sorted, Buf),
-            case bitcask_txn_locker:check(TxnId) of
-                {error, timeout}     -> throw(?TIMEOUT);
-                {error, unknown_txn} -> throw({?ABORT, locker_restarted});
-                ok ->
-                    case bitcask:txn_commit(Handle, Main ++ Extra, Sync) of
-                        ok ->
-                            release(TxnId),
-                            {atomic, Result};
-                        {error, Reason} ->
-                            release(TxnId),
-                            {aborted, {commit_failed, Reason}}
-                    end
+            case commit_via_committer(Tx, Main ++ Extra ++ idem_ops(Tx, Result)) of
+                ok              -> {atomic, Result};
+                {error, Reason} -> {aborted, {commit_failed, Reason}}
             end
+    end.
+
+%% 提交交给一个不与调用方 link 的 committer 进程：它先向 locker 认领事务
+%% （handoff：校验 deadline + 把 monitor 换到自己身上），再 txn_commit，再
+%% release_all。调用方被 kill 也不影响——锁一直持有到批落盘或失败，不会在
+%% dirty NIF 还没跑完时就被 DOWN 清理放掉（见 bitcask_txn_locker:handoff/2）。
+%% 代价：每个写事务一次 spawn + 一次归属分片 call（替掉原来的直读 check）。
+commit_via_committer(#bitcask_txn_ctx{id = TxnId, handle = Handle, sync = Sync}, Ops) ->
+    Caller = self(),
+    {Pid, Mon} = spawn_monitor(fun() -> committer(Caller, TxnId, Handle, Ops, Sync) end),
+    receive
+        {?MODULE, committed, Pid, R} ->
+            erlang:demonitor(Mon, [flush]),
+            R;
+        {?MODULE, handoff_failed, Pid, Why} ->
+            erlang:demonitor(Mon, [flush]),
+            case Why of
+                timeout     -> throw(?TIMEOUT);
+                unknown_txn -> throw({?ABORT, locker_restarted})
+            end;
+        {'DOWN', Mon, process, Pid, Why} ->
+            %% 不该发生（committer 自己兜住了引擎异常）。结果不确定：若已
+            %% handoff，锁随它的 DOWN 由 locker 清；否则由 run_once 的 catch 放。
+            {error, {committer_down, Why}}
+    end.
+
+committer(Caller, TxnId, Handle, Ops, Sync) ->
+    case bitcask_txn_locker:handoff(TxnId, self()) of
+        ok ->
+            R = try bitcask:txn_commit(Handle, Ops, Sync)
+                catch Class:Reason -> {error, {Class, Reason}}
+                end,
+            ok = bitcask_txn_locker:release_all(TxnId),
+            Caller ! {?MODULE, committed, self(), R};
+        {error, Why} ->
+            Caller ! {?MODULE, handoff_failed, self(), Why}
     end.
 
 %% 二级索引展开。额外 op 的 key 在提交前补写锁（仍属 2PL 的增长段，
@@ -382,3 +438,72 @@ index_ops(#bitcask_txn_ctx{index_fun = F} = Tx, Sorted, Buf) ->
 extra_key({put, K, _V}) when is_binary(K) -> K;
 extra_key({remove, K})  when is_binary(K) -> K;
 extra_key(Bad) -> throw({?ABORT, {bad_index_op, Bad}}).
+
+%% =========================================================================
+%% 幂等键（§4.5.1）
+%% =========================================================================
+
+idem_marker(IdemKey) -> <<?IDEM_PREFIX/binary, IdemKey/binary>>.
+
+not_reserved(<<0, "bitcask_txn:idem:", _/binary>> = Key) ->
+    erlang:error({bitcask_txn, reserved_key, Key});
+not_reserved(_) ->
+    ok.
+
+%% 开跑前：拿标记键写锁并查。写锁持到事务结束——同一个幂等键的并发调用
+%% 在这里串行，后到者一定看得见先到者的标记（或先到者已中止、标记不存在）。
+%% 死锁重跑会重新走一遍，照样正确。
+idem_seen(#bitcask_txn_ctx{idem = undefined}) ->
+    none;
+idem_seen(#bitcask_txn_ctx{handle = Handle, idem = Marker} = Tx) ->
+    lock(Tx, Marker, write),
+    case bitcask:get(Handle, Marker) of
+        {ok, Bin}      -> {ok, idem_result(Bin)};
+        not_found      -> none;
+        {error, R}     -> throw({?ABORT, {idem_read_failed, R}})
+    end.
+
+idem_ops(#bitcask_txn_ctx{idem = undefined}, _Result) ->
+    [];
+idem_ops(#bitcask_txn_ctx{idem = Marker}, Result) ->
+    [{put, Marker, term_to_binary({idem, 1, os:system_time(second), Result})}].
+
+idem_result(Bin) ->
+    {idem, 1, _At, Result} = binary_to_term(Bin),
+    Result.
+
+%% 查某个幂等键是否已提交（不上锁的直读——应用自查用）。
+-spec idem_lookup(term(), binary()) -> {ok, term()} | not_found | {error, term()}.
+idem_lookup(Handle, IdemKey) when is_binary(IdemKey) ->
+    case bitcask:get(Handle, idem_marker(IdemKey)) of
+        {ok, Bin} -> {ok, idem_result(Bin)};
+        Other     -> Other
+    end.
+
+%% 删掉提交时间不晚于 MaxAgeSec 秒前的标记（0 = 全删），返回删掉的条数。一个事务里做：
+%% 标记前缀写锁（期间带幂等键的事务在各自标记上等）+ range + 同批删除。
+%% 删掉之后同一个键再来就会重新执行——MaxAgeSec 要大于应用的最长重试周期。
+-spec idem_purge(term(), non_neg_integer()) -> {ok, non_neg_integer()} | {error, term()}.
+idem_purge(Handle, MaxAgeSec) when is_integer(MaxAgeSec), MaxAgeSec >= 0 ->
+    Cutoff = os:system_time(second) - MaxAgeSec,
+    Res = transaction(
+            Handle,
+            fun(#bitcask_txn_ctx{id = TxnId} = Tx) ->
+                    case prefix_range(Tx, ?IDEM_PREFIX, [{lock, write}]) of
+                        {error, _} = E ->
+                            abort(E);
+                        Rows ->
+                            Old = [K || {K, V} <- Rows,
+                                        element(3, binary_to_term(V)) =< Cutoff],
+                            %% 绕过 delete/2 的保留 key 检查，直接进缓冲；
+                            %% 前缀写锁已罩住它们。
+                            BK = buf_key(TxnId),
+                            put(BK, maps:merge(get(BK), maps:from_list([{K, delete} || K <- Old]))),
+                            length(Old)
+                    end
+            end, [{sync, sync_on_commit}]),
+    case Res of
+        {atomic, N}             -> {ok, N};
+        {aborted, {error, _} = E} -> E;
+        {aborted, Why}          -> {error, Why}
+    end.

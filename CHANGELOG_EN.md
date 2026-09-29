@@ -3,6 +3,38 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`bitcask_txn`: locks released early when the caller is killed mid-commit.**
+  `txn_commit` is a dirty NIF; a kill delivers DOWN immediately while the batch
+  only lands once the NIF returns (measured: DOWN at 177µs, a 4MB batch ~10ms
+  later). The locker released locks on DOWN, so another transaction could take
+  those keys before the batch landed, read the old value and overwrite it — a
+  lost update. Commit now runs in a committer process not linked to the caller,
+  and the locker hands the monitor over to it before commit (new
+  `bitcask_txn_locker:handoff/2`); locks are held until the batch lands or
+  fails. Cost: one extra spawn and one home-shard call per write transaction;
+  worst case (single key, `no_sync`) is ~25–30% slower (8 vCPU: P=8 116k →
+  81–87k txn/s), invisible under `sync_on_commit`.
+
+### Added
+
+- **Idempotency keys**: `bitcask_txn:transaction/3` option `{idem_key, K}`. A
+  given K commits at most once; a repeat skips Fun and returns
+  `{atomic, FirstResult}`. The marker (holding the result) commits atomically
+  in the same batch as the data; the marker's write lock is taken before Fun
+  runs, so concurrent calls with the same key serialize. `idem_lookup/2`
+  (lock-free check), `idem_purge/2` (age-based cleanup). The
+  `<<0, "bitcask_txn:idem:">>` prefix is reserved; writing it inside a
+  transaction → `error({bitcask_txn, reserved_key, K})`. Design:
+  `doc/txn-layer-design-zh.md` §4.5 / §4.5.1.
+- Tests: `bitcask_txn_tests` +6 (idempotency semantics, aborts leave no marker,
+  reserved prefix, 8 processes on one key commit exactly once, purge, and a
+  kill-mid-commit retry asserting exactly one execution per round — that case
+  fails reliably with the committer removed).
+
 ## [6.6.0] — 2026-09-23
 
 **Follow-up upgrade libbitcask 6.5.0 → 6.6.0** (`f618e82` → `1a6d698`). Upstream C

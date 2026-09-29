@@ -175,6 +175,31 @@ single-node version of Mnesia's trio), zero engine changes, pure OTP:
 > edge's five keys (forward/reverse/et/deg/degi) commit in one locked batch, so
 > concurrent edge inserts keep exact counts.
 
+**Idempotency keys** (`{idem_key, K}`) — when the caller is killed mid-commit and
+never sees the result, retrying with the same key is safe: a given K commits at
+most once, and a repeat returns the first result without running Fun again:
+
+```erlang
+1> Pay = fun(Tx) -> {ok, A} = bitcask_txn:read(Tx, <<"a">>, write),
+                    New = binary_to_integer(A) - 30,
+                    ok = bitcask_txn:write(Tx, <<"a">>, integer_to_binary(New)),
+                    {paid, New} end.
+2> bitcask_txn:transaction(R, Pay, [{idem_key, <<"order-42">>}]).
+{atomic,{paid,70}}
+3> bitcask_txn:transaction(R, Pay, [{idem_key, <<"order-42">>}]).   % not charged again
+{atomic,{paid,70}}
+4> bitcask:get(R, <<"a">>).
+{ok,<<"70">>}
+5> bitcask_txn:idem_lookup(R, <<"order-42">>).
+{ok,{paid,70}}
+6> bitcask_txn:idem_purge(R, 7*86400).                               % drop markers older than 7 days
+{ok,0}
+```
+
+> The marker commits atomically in the same batch as the data; keys starting
+> with `<<0, "bitcask_txn:idem:">>` are reserved. Markers never expire on their
+> own — run `idem_purge` periodically.
+
 **BM25 full-text search** — open with `{analyzer, ...}` to enable. Each `put`
 indexes the value; results are `{ok, [{Key, Ord, Score}, ...]}` sorted by score:
 
@@ -325,6 +350,7 @@ ok
 | `range/2,3`, `range_fold/5` | Ordered range query over `[Lo, Hi)`, costs **O(range)**; per-key weak consistency (not a snapshot); `{prefetch, N}` fetches values concurrently |
 | `put_batch_atomic/2`, `txn_commit/2,3` | Crash-atomic batch / multi-key transaction; `Ops :: [{put,K,V} \| {remove,K}]`; ⚠️ the first call lazily upgrades the directory's meta to v6 |
 | `bitcask_txn:transaction/2,3`, `read/2,3`, `write/3`, `delete/2`, `abort/1` | **Isolated transactions** (6.5.1): pessimistic 2PL point locks + deadlock detection + automatic restart, Mnesia-style; `{atomic,R} \| {aborted,Why}`; options `retries`/`timeout`/`lock_wait_timeout`/`sync`/`index_fun`; `read/3` with `write` takes the write lock up front for read-modify-write; Fun must be side-effect free (may run more than once) |
+| `bitcask_txn:idem_lookup/2`, `idem_purge/2` | **Idempotency keys** (`transaction/3` option `{idem_key, K}`): a key commits at most once, repeats return the first result; `idem_lookup` is a lock-free check, `idem_purge(H, MaxAgeSec)` removes old markers |
 | `bitcask_txn:lock_prefix/3`, `prefix_range/2,3` | **Prefix locks**: cover every key starting with Prefix (existing and future); `prefix_range` = prefix lock + range + merge with the txn's own buffer — phantom-free scans inside a transaction |
 | `graphdb:transaction/2,3`, `put_edge_txn/4,5`, `del_edge_txn/4,5`, `edge_txn/4,5`, `degree_txn/2,3`, `put_vertex_txn/3`, `get_vertex_txn/2`, `out_edges_txn/2,3`, `in_edges_txn/2,3`, `del_vertex_txn/2` | Transactional graph reads/writes: an edge's five keys + degree counters commit in one locked batch (exact counts under concurrency); adjacency scans take a prefix lock (no phantoms); `del_vertex_txn` cascades in one batch; do not mix with direct `put_edge` on the same graph |
 | `stream/1`, `next/1`, `stop/1`, `with_stream/2` | Streaming iteration |

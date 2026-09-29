@@ -70,6 +70,8 @@
 %%     acquire(TxnId, LockId, Mode)    -> ok | {error, deadlock | lock_wait_timeout
 %%                                            | timeout | unknown_txn}
 %%     check(TxnId)                    -> ok | {error, timeout | unknown_txn}   （直读 ETS）
+%%     handoff(TxnId, Pid)             -> ok | {error, timeout | unknown_txn}
+%%                                        （提交前把 monitor 移交给 committer 进程）
 %%     release_all(TxnId)              -> ok          （幂等）
 %%     status()                        -> map()
 %%
@@ -85,7 +87,7 @@
 -endif.
 
 -export([start_link/1, shard_count/0, shard_of/1,
-         register/2, acquire/3, check/1, release_all/1,
+         register/2, acquire/3, check/1, handoff/2, release_all/1,
          status/0]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -212,6 +214,16 @@ check(TxnId) ->
                end
     end.
 
+%% 提交前的移交：校验同 check/1，并把事务的 monitor 从调用进程换到 Pid
+%% （committer）。之后调用进程死了 locker 不再放锁，锁跟着 committer 走——
+%% ⚠️ 为什么需要：txn_commit 是 dirty NIF，调用进程被 kill 时 DOWN **立即**
+%% 送达（NIF 还在 dirty 调度器上跑完），若按 DOWN 放锁，别的事务就能在批
+%% 落盘前拿到这些 key：读到提交前的值再覆盖 = 丢更新。committer 是门面
+%% 内部进程，没人会去 kill 它。归属分片一次 call，与 register 同价。
+-spec handoff(txn_id(), pid()) -> ok | {error, timeout | unknown_txn}.
+handoff(TxnId, Pid) when is_pid(Pid) ->
+    gen_server:call(shard(home_of(TxnId)), {handoff, TxnId, Pid}, infinity).
+
 %% 释放事务的全部锁并注销（幂等）。调用方就是事务进程，所以它此刻不在任何
 %% 分片上等；按 held 表分组向各分片 **cast** 放锁（同 mnesia_locker 的
 %% release_tid：异步），最后 call 归属分片 demonitor + 删记录。
@@ -288,6 +300,24 @@ handle_call({unregister, TxnId}, _From, S) ->
             true = ets:delete(?TXNS, TxnId)
     end,
     {reply, ok, S};
+
+%% 归属分片串行处理 DOWN 与 handoff：旧 monitor 的 DOWN 若已在信箱里，
+%% demonitor flush 掉它；若已处理过，记录已删 → unknown_txn，committer 放弃。
+handle_call({handoff, TxnId, Pid}, _From, S) ->
+    case ets:lookup(?TXNS, TxnId) of
+        [] ->
+            {reply, {error, unknown_txn}, S};
+        [T] ->
+            case expired(T) of
+                true ->
+                    {reply, {error, timeout}, S};
+                false ->
+                    Mon = erlang:monitor(process, Pid),
+                    erlang:demonitor(T#txn.mon, [flush]),
+                    true = ets:insert(?TXNS, T#txn{pid = Pid, mon = Mon}),
+                    {reply, ok, S}
+            end
+    end;
 
 handle_call({acquire, TxnId, LockId, Mode}, From, S) ->
     case ets:lookup(?TXNS, TxnId) of

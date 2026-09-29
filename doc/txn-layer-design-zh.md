@@ -155,20 +155,52 @@ all-or-nothing，但不提供隔离性：事务中间态对并发读者可见，
 
 ```
 commit(Tx):
-  1. locker: 状态/deadline 校验 → {commit_ok}          (仍持有全部锁)
-  2. Ops = index_fun 展开 + 缓冲展开
-  3. case bitcask:txn_commit(Handle, Ops, sync_on_commit) of
-       ok        -> locker:release_all(TxnId); {atomic, Fun结果}
-       {error,R} -> locker:release_all(TxnId); {aborted, {commit_failed,R}}
-     end
+  1. Ops = index_fun 展开 + 缓冲展开 (+ 幂等标记，§4.5.1)
+  2. spawn_monitor committer：                          (仍持有全部锁)
+       locker:handoff(TxnId, self())   —— deadline 校验 + monitor 移交
+       R = bitcask:txn_commit(Handle, Ops, Sync)
+       locker:release_all(TxnId)
+       Caller ! R
+  3. ok -> {atomic, Fun结果} ; {error,R} -> {aborted, {commit_failed,R}}
 ```
 
 - 提交期间锁不放（2PL 纪律）：引擎 `write_mu_` 串行提交期间，其他事务
   在这些 key 上等待——正确性优先，吞吐影响见 §8。
-- ⚠️ **不确定窗口**：调用方死于 `txn_commit` NIF 执行途中（被 kill），
-  NIF 在 dirty scheduler 上跑完，批要么全成要么全不成，但调用方拿不到
-  结果。重试前应用需自查（与 Mnesia `sync_transaction` 跨节点失败的
-  语义同档）。v2 可考虑幂等键，v1 文档化。
+- ⚠️ **为什么要 committer**（v1 的实现漏洞，2026-09-29 补上）：`txn_commit`
+  是 dirty NIF，调用进程被 kill 时 **DOWN 立即送达**，NIF 却在 dirty 调度器
+  上继续跑完（实测 DOWN 177µs、4MB 批约 10ms 后才落盘）。v1 由 locker 按
+  DOWN 放锁，别的事务就能在批落盘前拿到这些 key——读到提交前的值再覆盖，
+  丢更新。现在提交由不与调用方 link 的 committer 执行，locker 在提交前把
+  monitor 移交给它（`handoff/2`，归属分片一次 call，DOWN 与 handoff 在同一
+  分片串行：先处理了 DOWN → handoff 返回 unknown_txn、不提交；先 handoff →
+  旧 DOWN 被 demonitor flush）。锁因此一直持到批落盘或失败。
+  代价（8 vCPU，单 key 写事务 + `no_sync`，最坏情况）：P=1 55–69k → 41–49k
+  txn/s，P=8 116k → 81–87k，约 −25~30%；`sync_on_commit` 下被 fsync 淹没。
+- ⚠️ **不确定窗口**：调用方死于提交途中，批要么全成要么全不成，但调用方拿
+  不到结果。要能安全重试就用幂等键（§4.5.1）；不带键时重试前应用需自查。
+
+### 4.5.1 幂等键
+
+`transaction/3` 选项 `{idem_key, K}`：同一个 K 的事务**至多提交一次**。
+
+- 标记键 `<<0, "bitcask_txn:idem:", K/binary>>`，与用户数据同 cask。该前缀
+  保留：事务内 `write/delete` 它 → `error({bitcask_txn, reserved_key, Key})`。
+- 开跑前（每次重跑都做）拿标记键**写锁**再 `get`：存在 → 不跑 Fun，释放，
+  返回 `{atomic, 首次结果}`；不存在 → 照常跑。写锁持到事务结束，所以同一
+  个 K 的并发调用在这里串行，后到者必看见先到者的标记。
+- 提交：标记值 `term_to_binary({idem, 1, 提交时刻(秒), Fun结果})` 作为一条
+  `put` 并进**同一条** `txn_commit` 批——批在则标记在，二者不可能分离。
+  只读事务带了键也写标记（让"至多一次 + 原样返回首次结果"的语义统一）。
+- 中止 / 异常的事务不留标记，同 K 再来会执行。
+- 与 committer 的配合是正确性的关键：调用方在提交中被 kill，重试者要标记
+  键的写锁，必须等 committer 落盘后放锁，才读得到标记。去掉 committer 时
+  `idem_killed_mid_commit_test_` 稳定失败（同一轮两次执行都落盘）。
+- 清理：标记不会自动过期。`idem_purge(Handle, MaxAgeSec)` 在一个事务里
+  持标记前缀写锁 + range + 同批删除提交时间 ≤ now − MaxAgeSec 的标记，返回
+  条数；MaxAgeSec 要大于应用的最长重试周期。`idem_lookup(Handle, K)` 不上锁
+  直读，给应用自查用。
+- 不做：幂等键跨 cask（标记与数据同 cask 才能同批原子）；TTL 自动清理
+  （bitcask 无过期机制，交给应用定期 purge）。
 
 ### 4.6 死锁检测与重启
 
@@ -296,7 +328,8 @@ eunit（`rebar3 eunit`；并发用例用 spawn + 确定性同步，不引新框�
 - **单 locker 吞吐**：理论瓶颈与 Mnesia 同档；若 hit，P3 分片方案
   （key 哈希 → N 个 locker；waits 边进共享 ETS，检测由请求方 locker
   做全局 DFS——检测一致性依赖边插入的原子性，设计需单独评审）。
-- **不确定窗口**（§4.5）：kill 调用方场景；v1 文档化，必要时 v2 幂等键。
+- **不确定窗口**（§4.5）：kill 调用方场景。✅ 已补 committer 移交（修掉提交
+  中途放锁的漏洞）+ 幂等键（§4.5.1）。
 - **重启风暴**：对称死锁 + 无退避 = 活锁；抖动退避已入设计，预算耗尽
   有显式返回。
 - **与 merge 的关系**：无。事务提交走常规写路径，merge 锁模型不变。
@@ -318,6 +351,8 @@ eunit（`rebar3 eunit`；并发用例用 spawn + 确定性同步，不引新框�
 | `read/2` 只有读锁 | 加 `read/3`，`Lock = write` 直接拿写锁再读（Mnesia `wlock_read`） | 读-改-写模式两个事务都先读锁再升级 = 确定死锁，能跑对但白白重跑；graphdb 计数器全走它 |
 | `txns` 记录里放 `locks => [LockId]` | 持有锁单独一张 bag 表 `bitcask_txn_held` | ETS insert 整条拷贝，列表放记录里每拿一把新锁拷一遍已持有的——大事务 O(n²)。实测 100 边/事务从 12.8k → 25.6k edges/s |
 | 每个 read/write 一次 `gen_server:call` | 门面在 pdict 记已持有锁，重入（读后写、RMW）不再过 locker | 2PL 到事务结束才放锁，本地缓存永远准确；put_edge_txn 每边省 2~3 次往返 |
+| 提交前 `check` 直读 ETS、调用方自己跑 `txn_commit` | committer 进程 + `handoff/2`（§4.5） | 调用方在 dirty NIF 中被 kill 时 DOWN 先于落盘，按 DOWN 放锁 = 丢更新 |
+| 幂等键"v2 可考虑" | `{idem_key, K}` + `idem_lookup/2` + `idem_purge/2`（§4.5.1） | 不确定窗口下的安全重试 |
 | `handle(Tx)` 未列 | 加 `handle/1` | graphdb 计数键缺失时的按需扫描要句柄（不上锁，文档已声明） |
 
 实测（`concurrent_transfers_conserve_test_` 放大到 8 进程 × 400 次，10 账户，

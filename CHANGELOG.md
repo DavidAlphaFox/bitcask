@@ -3,6 +3,31 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [Unreleased]
+
+### Fixed
+
+- **`bitcask_txn`：调用方在提交途中被 kill 时锁提前释放**。`txn_commit` 是 dirty
+  NIF，kill 的 DOWN 立即送达、批却要等 NIF 跑完才落盘（实测 DOWN 177µs，4MB 批约
+  10ms），locker 按 DOWN 放锁，别的事务就能在落盘前拿到这些 key，读到旧值再覆盖，
+  造成丢更新。现在由一个不与调用方 link 的 committer 进程执行提交，locker 在提交前
+  把 monitor 移交给它（新增 `bitcask_txn_locker:handoff/2`），锁一直持到批落盘或
+  失败。代价：每个写事务多一次 spawn 和一次归属分片 call；单 key + `no_sync` 的
+  最坏情况约慢 25–30%（8 vCPU：P=8 116k → 81–87k txn/s），`sync_on_commit` 下被
+  fsync 淹没。
+
+### Added
+
+- **幂等键** `bitcask_txn:transaction/3` 选项 `{idem_key, K}`：同一个 K 至多提交
+  一次，重来不跑 Fun、直接返回 `{atomic, 首次结果}`。标记（含结果）与数据同批原子
+  提交；开跑前持标记写锁，同键并发调用串行。`idem_lookup/2`（不上锁自查）、
+  `idem_purge/2`（按年龄清理标记）。`<<0, "bitcask_txn:idem:">>` 前缀保留，事务内
+  写它 → `error({bitcask_txn, reserved_key, K})`。设计 `doc/txn-layer-design-zh.md`
+  §4.5 / §4.5.1。
+- 测试：`bitcask_txn_tests` +6（幂等语义、中止不留标记、保留前缀、8 进程同键恰好
+  一次、purge，以及在提交中 kill 后重试，断言每轮恰好执行一次——去掉 committer 时
+  这一例稳定失败）。
+
 ## [6.6.0] — 2026-09-23
 
 **跟随升级 libbitcask 6.5.0 → 6.6.0**（`f618e82` → `1a6d698`）。上游 C API 纯加法、

@@ -159,6 +159,29 @@ ok
 > 图层同款：`graphdb:transaction(R, fun(Tx) -> graphdb:put_edge_txn(Tx, 1, 7, 2) end)`
 > ——边的五个键（正向/反向/et/deg/degi）锁下同批提交，并发加边计数精确。
 
+**幂等键**（`{idem_key, K}`）— 调用方在提交途中被 kill 拿不到结果时，用同一个
+键重试是安全的：同一个 K 至多提交一次，重来直接返回首次结果、不再跑 Fun：
+
+```erlang
+1> Pay = fun(Tx) -> {ok, A} = bitcask_txn:read(Tx, <<"a">>, write),
+                    New = binary_to_integer(A) - 30,
+                    ok = bitcask_txn:write(Tx, <<"a">>, integer_to_binary(New)),
+                    {paid, New} end.
+2> bitcask_txn:transaction(R, Pay, [{idem_key, <<"order-42">>}]).
+{atomic,{paid,70}}
+3> bitcask_txn:transaction(R, Pay, [{idem_key, <<"order-42">>}]).   % 不再扣款
+{atomic,{paid,70}}
+4> bitcask:get(R, <<"a">>).
+{ok,<<"70">>}
+5> bitcask_txn:idem_lookup(R, <<"order-42">>).
+{ok,{paid,70}}
+6> bitcask_txn:idem_purge(R, 7*86400).                               % 删 7 天前的标记
+{ok,0}
+```
+
+> 标记与数据同批原子提交；以 `<<0, "bitcask_txn:idem:">>` 开头的 key 保留。
+> 标记不会自动过期，要定期 `idem_purge`。
+
 **BM25 全文检索** — 用 `{analyzer, ...}` 打开即可启用。每次 `put` 自动索引；
 返回 `{ok, [{Key, Ord, Score}, ...]}`，按分数降序：
 
@@ -286,6 +309,7 @@ ok
 | `range/2,3`, `range_fold/5` | 有序范围查询 `[Lo, Hi)`，代价 **O(range)**；per-key 弱一致（非快照）；`{prefetch, N}` 可批量并发取值 |
 | `put_batch_atomic/2`, `txn_commit/2,3` | 跨崩溃原子批 / 多键事务；`Ops :: [{put,K,V} \| {remove,K}]`；⚠️ 首次调用把目录 meta 懒升级为 v6 |
 | `bitcask_txn:transaction/2,3`, `read/2,3`, `write/3`, `delete/2`, `abort/1` | **隔离事务**：2PL 点锁 + 死锁检测 + 重跑；`{atomic,R} \| {aborted,Why}`；选项 `retries`/`timeout`/`lock_wait_timeout`/`sync`/`index_fun`；`read/3` 的 `write` 模式给读-改-写用 |
+| `bitcask_txn:idem_lookup/2`, `idem_purge/2` | **幂等键**（`transaction/3` 选项 `{idem_key, K}`）：同键至多提交一次，重来返回首次结果；`idem_lookup` 不上锁自查，`idem_purge(H, MaxAgeSec)` 清理旧标记 |
 | `bitcask_txn:lock_prefix/3`, `prefix_range/2,3` | **前缀锁**：罩住以 Prefix 开头的全部 key（含将来的）；`prefix_range` = 前缀锁 + range + 合并本事务缓冲，事务内扫描无幻读 |
 | `graphdb:transaction/2,3`, `put_edge_txn/4,5`, `del_edge_txn/4,5`, `edge_txn/4,5`, `degree_txn/2,3`, `put_vertex_txn/3`, `get_vertex_txn/2`, `out_edges_txn/2,3`, `in_edges_txn/2,3`, `del_vertex_txn/2` | 图层事务式读写：边五键 + 计数器锁下同批提交，并发计数精确；邻接扫描前缀锁无幻读；`del_vertex_txn` 级联一批提交；与直通 `put_edge` 不要混用于同一图 |
 | `stream/1`, `next/1`, `stop/1`, `with_stream/2` | 流式迭代 |
