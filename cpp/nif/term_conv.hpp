@@ -18,6 +18,8 @@
 
 #include <erl_nif.h>
 
+#include "atoms.hpp"
+
 namespace bitcask::nif {
 
 // 把 Erlang 的「latin1 字符列表」（即字符串 list-of-int）拷贝成 std::string。
@@ -76,6 +78,16 @@ inline int get_positive_int(ErlNifEnv* env, ERL_NIF_TERM term,
     return v > 0 ? v : default_val;
 }
 
+// 搜索 top-k / ef 的上限。引擎按 k 预分配（混合检索还要 ×4 过取），一个
+// INT_MAX 的 k 会直接 bad_alloc；再大也没有意义，超过就夹到这里。
+inline constexpr int kMaxTopK = 1'000'000;
+
+// top-k：正整数，缺省 10，上限 kMaxTopK。
+inline int get_topk(ErlNifEnv* env, ERL_NIF_TERM term) noexcept {
+    const int v = get_positive_int(env, term, 10);
+    return v > kMaxTopK ? kMaxTopK : v;
+}
+
 // 解析「必须非负」的整数参数（如 slop / max_edit_distance）：负数回落到 default_val。
 inline int get_nonneg_int(ErlNifEnv* env, ERL_NIF_TERM term,
                           int default_val) noexcept {
@@ -122,22 +134,26 @@ inline bool binary_to_f32vec(const ErlNifBinary& bin, std::vector<float>& out) {
     return true;
 }
 
-// 构造 {ok, Value} term。
+// 构造 {ok, Value} / {error, Reason} term。原子用 on_load 缓存的那份——
+// enif_make_atom 每次按字符串查原子表，get / search / fold 的热路径上白付。
 inline ERL_NIF_TERM make_ok(ErlNifEnv* env, ERL_NIF_TERM value) noexcept {
-    return enif_make_tuple2(env, enif_make_atom(env, "ok"), value);
+    return enif_make_tuple2(env, atoms().ok, value);
 }
 
-// 构造 {error, Reason} term。
 inline ERL_NIF_TERM make_error(ErlNifEnv* env, ERL_NIF_TERM reason) noexcept {
-    return enif_make_tuple2(env, enif_make_atom(env, "error"), reason);
+    return enif_make_tuple2(env, atoms().error, reason);
 }
 
-// 分配二进制并拷贝数据，失败时返回 0（无效 term）；调用方只需检查返回值是否为 0。
+// 拷贝成 binary term，失败时返回 0（无效 term）；调用方只需检查返回值是否为 0。
+// 用 enif_make_new_binary 而不是 alloc_binary + make_binary：后者对 ≤ 64 字节
+// 的数据先 malloc 一个 refc binary，再由 ERTS 拷进堆 binary、free 掉——每个
+// 短 key 白付一对 malloc/free。make_new_binary 自己按大小选堆 / refc。
 inline ERL_NIF_TERM make_binary_checked(ErlNifEnv* env, std::span<const std::byte> src) noexcept {
-    ErlNifBinary bin;
-    if (!enif_alloc_binary(src.size(), &bin)) return 0;
-    if (!src.empty()) std::memcpy(bin.data, src.data(), src.size());
-    return enif_make_binary(env, &bin);
+    ERL_NIF_TERM term;
+    unsigned char* p = enif_make_new_binary(env, src.size(), &term);
+    if (!p) return 0;
+    if (!src.empty()) std::memcpy(p, src.data(), src.size());
+    return term;
 }
 
 }  // namespace bitcask::nif

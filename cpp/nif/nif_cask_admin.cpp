@@ -20,14 +20,14 @@ using namespace detail;
 
 // O(1) 估算：keydir 是否为空。写过任何 key 即使后来全删，估算仍然 false。
 ERL_NIF_TERM nif_cask_is_empty(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
-    auto* h = checked_cask_handle(env, argv[0]);
+    auto h = lock_cask_checked(env, argv[0]);
     if (!h) return enif_make_badarg(env);
     return h->cask->is_empty_estimate() ? atoms().atom_true : atoms().atom_false;
 }
 
 // keydir 是否被 fold/iterator pin 住（影响 pending 表合并时机）。
 ERL_NIF_TERM nif_cask_is_frozen(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
-    auto* h = checked_cask_handle(env, argv[0]);
+    auto h = lock_cask_checked(env, argv[0]);
     if (!h) return enif_make_badarg(env);
     return h->cask->is_frozen() ? atoms().atom_true : atoms().atom_false;
 }
@@ -37,7 +37,7 @@ ERL_NIF_TERM nif_cask_is_frozen(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM
 // （IndexErrors 另由 facade index_errors/1 单独透出）。
 // v1.1.0：新增 IndexErrors（s.index_errors）——异步索引 worker 吞异常计数，非零 = 索引可能陈旧。
 ERL_NIF_TERM nif_cask_status(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
-    auto* h = checked_cask_handle(env, argv[0]);
+    auto h = lock_cask_checked(env, argv[0]);
     if (!h) return enif_make_badarg(env);
     auto s = h->cask->status();
     ERL_NIF_TERM files = enif_make_list(env, 0);
@@ -59,7 +59,7 @@ ERL_NIF_TERM nif_cask_status(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM ar
 
 // needs_merge(Ref) -> false | {true, [LiveFile,...], [ExpiredFile,...]}
 ERL_NIF_TERM nif_cask_needs_merge(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
-    auto* h = checked_cask_handle(env, argv[0]);
+    auto h = lock_cask_checked(env, argv[0]);
     if (!h) return enif_make_badarg(env);
     auto n = h->cask->needs_merge();
     if (!n.needs) return atoms().atom_false;
@@ -70,7 +70,7 @@ ERL_NIF_TERM nif_cask_needs_merge(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TE
 
 // merge(Ref, Files) -> {ok, {Seen, Kept, Stale, Tombs}} | {error, _}
 ERL_NIF_TERM nif_cask_merge(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
-    auto* h = cask_handle(env, argv[0]);
+    auto h = lock_cask_checked(env, argv[0]);
     if (!h || !h->cask || !enif_is_list(env, argv[1])) return enif_make_badarg(env);
 
     std::vector<std::string> files;

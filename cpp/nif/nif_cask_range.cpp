@@ -23,6 +23,7 @@
 //（BEAM 侧不保证串行化，C++ 侧 CaskRangeIter 自身非线程安全）——契约与
 // fold 迭代器一致：谁开的谁用。
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -37,6 +38,10 @@ namespace bitcask::nif {
 using namespace detail;
 
 namespace {
+
+constexpr ErlNifUInt64 kMaxPrefetch        = 1u << 16;   // 65536 个 key
+constexpr ErlNifUInt64 kMaxPrefetchThreads = 256;
+
 
 // range 选项 proplist → RangeOptions。
 //   {lo, Binary}              区间下界（含），缺省/空 = 从头
@@ -64,14 +69,18 @@ bool parse_range_options(ErlNifEnv* env, ERL_NIF_TERM list,
             if (!ensure_binary(env, val, hi_bin)) return false;
             out.hi = as_bytes(hi_bin);
         } else if (key == atoms().prefetch) {
+            // 上限：预取缓冲按 prefetch 预分配，线程按 prefetch_threads 起
+            // （std::thread 起不来抛 system_error）。超出就夹住，不让一个
+            // 调用方参数把节点打崩。
             ErlNifUInt64 v = 0;
             if (enif_get_uint64(env, val, &v)) {
-                out.prefetch = static_cast<std::size_t>(v);
+                out.prefetch = static_cast<std::size_t>(std::min<ErlNifUInt64>(v, kMaxPrefetch));
             }
         } else if (key == atoms().prefetch_threads) {
             ErlNifUInt64 v = 0;
             if (enif_get_uint64(env, val, &v)) {
-                out.prefetch_threads = static_cast<std::size_t>(v);
+                out.prefetch_threads =
+                    static_cast<std::size_t>(std::min<ErlNifUInt64>(v, kMaxPrefetchThreads));
             }
         }
     }
@@ -97,7 +106,8 @@ CaskRangeIterHandle* live_range_handle(ErlNifEnv* env, ERL_NIF_TERM term,
         out_err = enif_make_badarg(env);
         return nullptr;
     }
-    if (!ih->owner || !ih->owner->cask) {
+    if (!ih->owner || !ih->owner->cask ||
+        ih->owner->closed.load(std::memory_order_acquire)) {
         out_err = make_error(env, atoms().closed);
         return nullptr;
     }
@@ -112,7 +122,7 @@ CaskRangeIterHandle* live_range_handle(ErlNifEnv* env, ERL_NIF_TERM term,
 
 // cask_range_start(Ref, Opts) -> {ok, IterRef} | {error, Reason}
 ERL_NIF_TERM nif_cask_range_start(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
-    auto* h = checked_cask_handle(env, argv[0]);
+    auto h = lock_cask_checked(env, argv[0]);
     if (!h || !enif_is_list(env, argv[1])) return enif_make_badarg(env);
 
     RangeOptions opts;

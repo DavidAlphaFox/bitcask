@@ -349,3 +349,28 @@ filter_survives_reopen_test_() ->
             bitcask:close(R2)
         end)
     end}.
+
+%% ===================================================================
+%% 6.6.1 回归:encode_meta 的 true / false 曾被编成 null(判"其它 atom"的
+%% 分支排在布尔之前),eq true 的 filter 永远空集。
+%% ===================================================================
+
+encode_meta_bool_round_trip_test_() ->
+    {"encode_meta(#{flag => true/false}) → eq true 只命中 true 那条;undefined 仍是 null",
+     fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, ?IDX),
+            put_doc(R, <<"t">>, <<"alpha">>, m(#{<<"flag">> => true})),
+            put_doc(R, <<"f">>, <<"alpha">>, m(#{<<"flag">> => false})),
+            put_doc(R, <<"n">>, <<"alpha">>, m(#{<<"flag">> => undefined})),
+            put_doc(R, <<"o">>, <<"alpha">>, m(#{<<"flag">> => some_atom})),
+            Q = fun(V) ->
+                        {ok, Hits} = bitcask:search_text(R, <<"alpha">>, 10,
+                                        [#{key => <<"flag">>, op => eq, value => V}]),
+                        lists:sort([K || {K, _, _} <- Hits])
+                end,
+            ?assertEqual([<<"t">>], Q(true)),
+            ?assertEqual([<<"f">>], Q(false)),
+            bitcask:close(R)
+        end)
+    end}.

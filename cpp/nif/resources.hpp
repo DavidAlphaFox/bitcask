@@ -19,6 +19,7 @@
 #include <atomic>
 #include <memory>
 #include <new>
+#include <shared_mutex>
 #include <utility>
 
 #include <erl_nif.h>
@@ -37,15 +38,48 @@ extern ErlNifResourceType* g_txn_token_resource_type;
 //
 // `iter` 是给 legacy `iterator/3` API 用的「单 Ref 单活跃迭代器」槽位；
 // fold/3 + fold/6 走另一条 CaskIterHandle 资源链路，跟这里互不影响。
+//
+// === 生命周期与并发（6.6.1）===
+// cask.hpp 的两条契约：① `close()` 时刻不能有在途调用（并发是 UB）；
+// ② CaskIter 持裸 `Cask*`，**必须先于 Cask 对象析构**。以前 cask_close 直接
+// `cask.reset()` 删对象——普通调度器上的 get 能与 dirty 的 close 并发（违反
+// ①），close 后仍活着的 fold 迭代器下一次 next 就是 UAF（违反 ②）。现在：
+//   * `mu`：每个用到 cask 的 NIF 入口持 shared 锁（lock_cask_checked），
+//     close 持 unique 锁——close 排在所有在途调用之后，在途调用也进不来。
+//   * `closed`：close 只调 `Cask::close()`（释放 keydir / 文件），**不删对象**，
+//     对象活到资源析构。close 后的入口按 `closed` 标志 fail-fast（badarg，
+//     与以前 `cask` 为空时的行为一致）。
+//   * 迭代器句柄 keep 住本资源（见 CaskIterHandle / CaskRangeIterHandle），
+//     于是 Cask 对象一定晚于所有迭代器析构。
 struct CaskHandle {
     std::unique_ptr<Cask> cask;
     std::unique_ptr<CaskIter> iter;
+    mutable std::shared_mutex mu;
+    std::atomic<bool> closed{false};
+
+    explicit CaskHandle(std::unique_ptr<Cask> c) noexcept : cask(std::move(c)) {}
+    CaskHandle(const CaskHandle&)            = delete;
+    CaskHandle& operator=(const CaskHandle&) = delete;
 };
 
-// fold/3 + fold/6 用的独立迭代器资源；持有自己的 CaskIter，析构时由 iter
-// 对象自行收尾，不持有对父 cask 的引用（父 cask 的生命周期由 BEAM 管）。
+// fold/3 + fold/6 用的独立迭代器资源；持有自己的 CaskIter。keep 住父
+// CaskHandle（析构时 release）：CaskIter 的 `parent_` 是裸指针，父对象必须
+// 活得比它久。next 时持父的 shared 锁并检查 `closed`——close 后的 next 返回
+// {error, closed}，而不是读一个已经放掉 keydir 的 Cask。
 struct CaskIterHandle {
     std::unique_ptr<CaskIter> iter;
+    CaskHandle* owner = nullptr;   // keep 住的父资源，非拥有指针
+
+    CaskIterHandle(std::unique_ptr<CaskIter> it, CaskHandle* o) noexcept
+        : iter(std::move(it)), owner(o) {
+        if (owner) enif_keep_resource(owner);
+    }
+    CaskIterHandle(const CaskIterHandle&)            = delete;
+    CaskIterHandle& operator=(const CaskIterHandle&) = delete;
+    ~CaskIterHandle() {
+        iter.reset();  // 先放迭代器（它 pin 着 keydir），再放父资源
+        if (owner) enif_release_resource(owner);
+    }
 };
 
 // v5.1.0 S33-5：range 迭代器（OKI 有序范围查询）资源。

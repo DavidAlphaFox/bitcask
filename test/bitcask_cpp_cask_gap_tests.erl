@@ -763,3 +763,345 @@ fold_keys_populates_real_entry_fields_test_() ->
             end
         end)
     end}.
+
+%% ===================================================================
+%% fold 启动失败的裸 atom 归一（A5）
+%%   另一个 fold 在跑 + 期间有写入 → pending 表存在；再开一个带
+%%   MaxPut=0 的 fold，NIF 返回裸 out_of_date。以前 fold/6 / fold_keys/6
+%%   只匹配 {ok,_}/{error,_}，这里直接 case_clause。
+%% ===================================================================
+
+fold6_out_of_date_is_error_tuple_test_() ->
+    {"fold/6 + fold_keys/6 撞上 out_of_date 返回 {error, out_of_date}，不崩",
+     fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, ?CASK),
+            try
+                ok = bitcask:put(R, <<"k1">>, <<"v1">>),
+                {ok, S} = bitcask:stream(R),          % 挂一个 fold 在跑
+                ok = bitcask:put(R, <<"k2">>, <<"v2">>), % fold 期间写 → pending
+                Cnt = fun(_K, _V, A) -> A + 1 end,
+                ?assertEqual({error, out_of_date},
+                             bitcask:fold(R, Cnt, 0, -1, 0, false)),
+                ?assertEqual({error, out_of_date},
+                             bitcask:fold_keys(R, fun(_E, A) -> A + 1 end, 0, -1, 0, false)),
+                %% 不限就照常能开（复用现有 freeze）
+                ?assert(is_integer(bitcask:fold(R, Cnt, 0, -1, -1, false))),
+                ok = bitcask:stop(S)
+            after bitcask:close(R) end
+        end)
+     end}.
+
+%% ===================================================================
+%% stream 读完即释放迭代器；stop 之后 next 不挂（A6）
+%% ===================================================================
+
+stream_releases_iter_on_done_without_stop_test_() ->
+    {"读到 done 后迭代器立刻释放（is_frozen 回 false），不必等 stop",
+     fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, ?CASK),
+            try
+                ok = bitcask:put(R, <<"k">>, <<"v">>),
+                {ok, S} = bitcask:stream(R),
+                %% fold 期间写入 → pending 表建立 → is_frozen 为 true；
+                %% 最后一个迭代器 release 时 pending 合并回主表、frozen 归 false
+                ok = bitcask:put(R, <<"k2">>, <<"v2">>),
+                ?assertEqual(true, bitcask:is_frozen(R)),
+                {ok, <<"k">>, <<"v">>} = bitcask:next(S),
+                ?assertEqual(done, bitcask:next(S)),
+                %% 没调 stop——以前这里 producer 还在 drain_loop 里钉着迭代器
+                ?assertEqual(false, bitcask:is_frozen(R)),
+                ?assertEqual({ok, <<"v2">>}, bitcask:get(R, <<"k2">>)),
+                ?assertEqual(done, bitcask:next(S)),
+                ok = bitcask:stop(S)
+            after bitcask:close(R) end
+        end)
+     end}.
+
+stream_next_after_stop_returns_done_test_() ->
+    {"stop 之后再 next 返回 done（以前永久挂起：stop 已 flush 掉 monitor）",
+     {timeout, 10, fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, ?CASK),
+            try
+                ok = bitcask:put(R, <<"k">>, <<"v">>),
+                {ok, S} = bitcask:stream(R),
+                ok = bitcask:stop(S),
+                %% 等 producer 真退出，覆盖 noproc 路径
+                {bitcask_stream, Pid, _} = S,
+                Mon = erlang:monitor(process, Pid),
+                receive {'DOWN', Mon, process, Pid, _} -> ok
+                after 2000 -> error(producer_didnt_exit) end,
+                ?assertEqual(done, bitcask:next(S)),
+                ?assertEqual(done, bitcask:next(S)),
+                %% 信箱里不残留 DOWN
+                %% 只看 stream 自己的消息：eunit 同一进程跑整模块，信箱里可能有
+                %% 别的用例留下的 {'EXIT', _, normal}（trap_exit 打开过）。
+                {messages, Msgs} = process_info(self(), messages),
+                ?assertEqual([], [M || M <- Msgs, is_tuple(M), tuple_size(M) >= 1,
+                                        is_atom(element(1, M)),
+                                        lists:prefix("bitcask_stream", atom_to_list(element(1, M)))])
+            after bitcask:close(R) end
+        end)
+     end}}.
+
+%% ===================================================================
+%% merge 调度器（A4）：merge/1,2,3 经 bitcask_merge_worker 走一遍都不崩
+%%   以前 do_merge 的 [_,_,Args3] = Args 在 2 元形态上必 badmatch，worker
+%%   异常退出后 handle_info 又返回非法的 {stop, State}，调度器一起死。
+%% ===================================================================
+
+merge_worker_survives_all_arities_test_() ->
+    {"merge/1,2,3 经调度器执行，worker 与调度器都活着，队列清空",
+     {timeout, 30, fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, ?CASK),           % 顺带把 application 起来
+            ok = bitcask:put(R, <<"k">>, <<"v">>),
+            ok = bitcask:close(R),
+            Sched = whereis(bitcask_merge_worker),
+            ?assert(is_pid(Sched)),
+            application:set_env(bitcask, merge_window, always),
+            ok = bitcask_merge_worker:merge(D),
+            wait_idle(),
+            ok = bitcask_merge_worker:merge(D, [{frag_threshold, 1}]),
+            wait_idle(),
+            ok = bitcask_merge_worker:merge(D, [], []),          % 裸列表
+            wait_idle(),
+            ok = bitcask_merge_worker:merge(D, [], {[], []}),    % legacy 二元组
+            wait_idle(),
+            ?assertEqual(Sched, whereis(bitcask_merge_worker)),
+            ?assertEqual({0, undefined}, bitcask_merge_worker:status())
+        end)
+     end}}.
+
+merge_worker_dedupes_and_survives_worker_crash_test_() ->
+    {"同目录请求在队列里合并（2 元 + 3 元、列表 + 二元组）；worker 被 kill 后调度器继续出队",
+     {timeout, 30, fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, ?CASK),
+            ok = bitcask:close(R),
+            Sched = whereis(bitcask_merge_worker),
+            application:set_env(bitcask, merge_window, always),
+            Self = self(),
+            meck:new(bitcask, [passthrough]),
+            try
+                %% merge/2 卡住不返回 → worker 占着，后续请求只能排队
+                meck:expect(bitcask, merge, fun(_Dir, _Opts) ->
+                                                    receive release -> ok
+                                                    after 10000 -> ok end
+                                            end),
+                meck:expect(bitcask, merge, fun(Dir, Opts, Files) ->
+                                                    Self ! {merged3, Dir, Opts, Files},
+                                                    ok
+                                            end),
+                ok = bitcask_merge_worker:merge(D ++ "_busy"),
+                {0, W} = bitcask_merge_worker:status(),
+                ?assert(is_pid(W)),
+                %% 同 Dir 的 2 元、3 元裸列表、3 元二元组 → 合并成一条
+                ok = bitcask_merge_worker:merge(D, [{b, 2}, {a, 1}]),
+                ok = bitcask_merge_worker:merge(D, [{a, 1}], ["f1"]),
+                ok = bitcask_merge_worker:merge(D, [{c, 3}], {["f2"], ["f1"]}),
+                ?assertEqual({1, W}, bitcask_merge_worker:status()),
+                %% worker 崩溃（不是 normal）→ 调度器不能死，要接着出队
+                exit(W, kill),
+                receive
+                    {merged3, Dir3, Opts3, Files3} ->
+                        ?assertEqual(D, Dir3),
+                        ?assertEqual([{a, 1}, {b, 2}, {c, 3}], Opts3),
+                        %% f1 已 expired，从待合并列表里减掉
+                        ?assertEqual({["f2"], ["f1"]}, Files3)
+                after 5000 -> error(queued_merge_never_ran)
+                end,
+                wait_idle(),
+                ?assertEqual(Sched, whereis(bitcask_merge_worker)),
+                ?assertEqual({0, undefined}, bitcask_merge_worker:status())
+            after
+                meck:unload(bitcask)
+            end
+        end)
+     end}}.
+
+wait_idle() -> wait_idle(200).
+wait_idle(0) -> error({merge_worker_still_busy, bitcask_merge_worker:status()});
+wait_idle(N) ->
+    case bitcask_merge_worker:status() of
+        {0, undefined} -> ok;
+        _ -> timer:sleep(20), wait_idle(N - 1)
+    end.
+
+%% ===================================================================
+%% 6.6.1 回归:cask_close 与迭代器 / 在途调用的生命周期(NIF 层)
+%% ===================================================================
+
+%% 以前 cask_close 直接 delete 掉 Cask 对象,fold 迭代器持的是裸 parent 指针,
+%% close 之后 next 就是 use-after-free。现在对象活到资源析构,close 后的
+%% next → {error, closed},release 照常 ok。
+fold_iter_survives_close_test_() ->
+    {"close 之后 fold 迭代器 next → {error, closed},release → ok;stream 同",
+     fun() ->
+        with_dir(fun(D) ->
+            {Ref, _} = R = bitcask:open(D, ?CASK),
+            [ok = bitcask:put(R, <<"k", (integer_to_binary(I))/binary>>, <<"v">>)
+             || I <- lists:seq(1, 50)],
+            {ok, It} = bitcask_cpp_nifs:cask_fold_start(Ref, -1, -1, false),
+            ?assertMatch({ok, _, _}, bitcask_cpp_nifs:cask_fold_next(It)),
+            {ok, S} = bitcask:stream(R),
+            ?assertMatch({ok, _, _}, bitcask:next(S)),
+            ok = bitcask:close(R),
+            ?assertEqual({error, closed}, bitcask_cpp_nifs:cask_fold_next(It)),
+            ?assertEqual({error, closed}, bitcask_cpp_nifs:cask_fold_next_batch(It, 8)),
+            ?assertEqual(ok, bitcask_cpp_nifs:cask_fold_release(It)),
+            ?assertEqual({error, closed}, bitcask:next(S)),
+            ok = bitcask:stop(S),
+            %% 已 close 的句柄:普通调用照旧 badarg(与以前一致),close 幂等
+            ?assertError(badarg, bitcask:get(R, <<"k1">>)),
+            ?assertEqual(ok, bitcask:close(R)),
+            %% 迭代器句柄和 cask 句柄都丢掉后 GC 不崩(析构顺序:iter 先于 cask)
+            erlang:garbage_collect(),
+            ok
+        end)
+    end}.
+
+%% 一群进程在普通调度器上 get,同时 dirty 调度器上 close:以前是 UB(cask.hpp
+%% 契约要求 close 时无在途调用),现在 close 拿 unique 锁排在在途调用之后。
+%% 断言只能是"不崩 + 结果形态合法"。
+concurrent_get_vs_close_test_() ->
+    {"并发 get 与 close:节点不崩,每个结果都是 {ok,_} | not_found | badarg",
+     {timeout, 60, fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, ?CASK),
+            [ok = bitcask:put(R, <<I:32>>, <<"v">>) || I <- lists:seq(1, 200)],
+            Me = self(),
+            Readers = [spawn_link(fun() ->
+                          Bad = lists:foldl(
+                                  fun(I, Acc) ->
+                                          try bitcask:get(R, <<(I rem 200 + 1):32>>) of
+                                              {ok, _}   -> Acc;
+                                              not_found -> Acc;
+                                              Other     -> [Other | Acc]
+                                          catch error:badarg -> Acc
+                                          end
+                                  end, [], lists:seq(1, 20000)),
+                          Me ! {self(), Bad}
+                      end) || _ <- lists:seq(1, 8)],
+            timer:sleep(20),
+            ok = bitcask:close(R),
+            Bads = lists:append([receive {P, B} -> B end || P <- Readers]),
+            ?assertEqual([], Bads)
+        end)
+     end}}.
+
+%% 参数上限:以前一个 INT_MAX 的 k 会让引擎 bad_alloc → std::terminate 整个
+%% 节点;现在 k / ef 夹到 kMaxTopK,prefetch 夹到 65536 / 256。
+huge_search_and_prefetch_params_are_clamped_test_() ->
+    {"k = INT_MAX / prefetch = 2^40 → 正常返回而不是崩溃",
+     fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, [read_write, {analyzer, whitespace}, {vector_dim, 4}]),
+            Vec = << <<X:32/float-little>> || X <- [1.0, 0.0, 0.0, 0.0] >>,
+            ok = bitcask:put(R, <<"v1">>, #{text => <<"x">>, vector => Vec}),
+            ?assertMatch({ok, [_]}, bitcask:search_vector(R, Vec, 2147483647, 2147483647)),
+            ?assertMatch({ok, [_]}, bitcask:search_text(R, <<"x">>, 2147483647)),
+            [ok = bitcask:put(R, <<"k", I:8>>, <<"v">>) || I <- lists:seq(1, 20)],
+            Rows = bitcask:range(R, {<<"k">>, <<"l">>},
+                                 [{prefetch, 1 bsl 40}, {prefetch_threads, 1 bsl 40}]),
+            ?assertEqual(20, length(Rows)),
+            bitcask:close(R)
+        end)
+    end}.
+
+%% ===================================================================
+%% 6.6.1 B 档：fold 家族走批量 / 只要 key 的 NIF；put 按策略转 dirty
+%% ===================================================================
+
+%% list_keys / fold_keys/3 / fold_keys/6 改走 cask_fold_next_keys_batch，
+%% fold/3 改走 cask_fold_next_batch：与 fold/6（单条 next_full）逐项对账，
+%% 含批边界（300 > 2×128）与墓碑两种可见性。
+fold_family_agrees_with_fold6_test_() ->
+    {"list_keys / fold/3 / fold_keys/3,6 与 fold/6 结果一致（含墓碑、跨批）",
+     fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, ?CASK),
+            try
+                [ok = bitcask:put(R, <<"k", I:16>>, <<"v", I:16>>) || I <- lists:seq(1, 300)],
+                [ok = bitcask:delete(R, <<"k", I:16>>) || I <- lists:seq(1, 300, 7)],
+                Live6 = lists:sort(bitcask:fold(R, fun(K, V, A) when is_binary(K) -> [{K, V} | A];
+                                                    ({tombstone, _}, _, A) -> A
+                                                 end, [], -1, -1, false)),
+                ?assertEqual(257, length(Live6)),          % 300 - 43 个删除
+                ?assertEqual([K || {K, _} <- Live6], lists:sort(bitcask:list_keys(R))),
+                ?assertEqual(Live6, lists:sort(bitcask:fold(R, fun(K, V, A) -> [{K, V} | A] end, []))),
+                ?assertEqual([K || {K, _} <- Live6],
+                             lists:sort(bitcask:fold_keys(R, fun(E, A) -> [E#bitcask_entry.key | A] end, []))),
+                %% fold_keys/3 的 entry 字段与 fold_keys/6(false) 一致
+                Ent3 = lists:sort(bitcask:fold_keys(R, fun(E, A) -> [E | A] end, [])),
+                Ent6 = lists:sort(bitcask:fold_keys(R, fun(E, A) -> [E | A] end, [], -1, -1, false)),
+                ?assertEqual(Ent6, Ent3),
+                ?assertMatch(#bitcask_entry{file_id = F, total_sz = S} when F >= 0 andalso S > 0, hd(Ent3)),
+                %% 墓碑：fold_keys/6(true) 与 fold/6(true) 看到同一批 {tombstone, _}
+                Tomb6 = lists:sort(bitcask:fold(R, fun({tombstone, K}, _V, A) -> [K | A];
+                                                    (_, _, A) -> A
+                                                 end, [], -1, -1, true)),
+                TombK = lists:sort(bitcask:fold_keys(R, fun({tombstone, E}, A) -> [E#bitcask_entry.key | A];
+                                                        (_, A) -> A
+                                                     end, [], -1, -1, true)),
+                ?assertEqual(Tomb6, TombK),
+                LiveK = lists:sort(bitcask:fold_keys(R, fun(#bitcask_entry{key = K}, A) -> [K | A];
+                                                        (_, A) -> A
+                                                     end, [], -1, -1, true)),
+                ?assertEqual([K || {K, _} <- Live6], LiveK)
+            after bitcask:close(R) end
+        end)
+     end}.
+
+%% put / delete 在有 sync 策略、值是 map、值 > 64 KiB 时经 enif_schedule_nif 转到
+%% dirty IO 调度器再做；结果与直接跑完全一样，这里只验证每条路径都能走通。
+put_reschedule_paths_test_() ->
+    {"o_sync / {puts,N} / 100 KiB 值 / map 值：put 与 delete 照常工作",
+     fun() ->
+        with_dir(fun(D) ->
+            Big = binary:copy(<<"x">>, 100 * 1024),
+            R1 = bitcask:open(D, [{sync_strategy, o_sync} | ?CASK]),
+            ok = bitcask:put(R1, <<"a">>, <<"1">>),
+            ok = bitcask:put(R1, <<"big">>, Big),
+            ?assertEqual({ok, <<"1">>}, bitcask:get(R1, <<"a">>)),
+            ?assertEqual({ok, Big}, bitcask:get(R1, <<"big">>)),
+            ok = bitcask:delete(R1, <<"a">>),
+            ?assertEqual(not_found, bitcask:get(R1, <<"a">>)),
+            ?assertError(badarg, bitcask:put(R1, <<"b">>, not_a_binary)),
+            bitcask:close(R1),
+            R2 = bitcask:open(D, [{sync_strategy, {puts, 3}} | ?CASK]),
+            [ok = bitcask:put(R2, <<I:8>>, <<"v">>) || I <- lists:seq(1, 10)],
+            ok = bitcask:delete(R2, <<3:8>>),
+            ?assertEqual(not_found, bitcask:get(R2, <<3:8>>)),
+            ?assertEqual({ok, <<"v">>}, bitcask:get(R2, <<10:8>>)),
+            ?assertEqual({ok, Big}, bitcask:get(R2, <<"big">>)),      % o_sync 时写的
+            bitcask:close(R2),
+            %% 无策略 + 小值：inline 路径；100 KiB：dirty 路径。两者读回一致。
+            R3 = bitcask:open(D, ?CASK),
+            ok = bitcask:put(R3, <<"small">>, <<"s">>),
+            ok = bitcask:put(R3, <<"big2">>, Big),
+            ?assertEqual({ok, <<"s">>}, bitcask:get(R3, <<"small">>)),
+            ?assertEqual({ok, Big}, bitcask:get(R3, <<"big2">>)),
+            bitcask:close(R3)
+        end)
+     end}.
+
+%% map 值走 put_doc（索引模式），同样是 dirty 路径；顺带 k > 语料的搜索返回全部
+%% 命中（make_search_hits 分配失败现在是报错而不是悄悄丢 hit——这里只能验证
+%% 正常路径的完整性）。
+put_doc_reschedule_and_search_k_over_corpus_test_() ->
+    {"map 值 put（dirty 路径）+ search_text k=1000 返回全部 3 条",
+     fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, [read_write, {analyzer, whitespace}]),
+            ok = bitcask:put(R, <<"d1">>, #{text => <<"alpha beta">>}),
+            ok = bitcask:put(R, <<"d2">>, #{text => <<"alpha gamma">>}),
+            ok = bitcask:put(R, <<"d3">>, #{text => <<"alpha delta">>}),
+            {ok, Hits} = bitcask:search_text(R, <<"alpha">>, 1000),
+            ?assertEqual([<<"d1">>, <<"d2">>, <<"d3">>], lists:sort([K || {K, _, _} <- Hits])),
+            ?assertMatch({ok, #{text := <<"alpha beta">>}}, bitcask:get(R, <<"d1">>)),
+            bitcask:close(R)
+        end)
+     end}.

@@ -37,9 +37,12 @@ CaskHandle* cask_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept {
     return get_resource_handle<CaskHandle>(env, term, g_cask_resource_type);
 }
 
-CaskHandle* checked_cask_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept {
+CaskLock lock_cask_checked(ErlNifEnv* env, ERL_NIF_TERM term) {
     auto* h = cask_handle(env, term);
-    return (h && h->cask) ? h : nullptr;
+    if (!h) return {};
+    CaskLock l{h, std::shared_lock<std::shared_mutex>(h->mu)};
+    if (!h->cask || h->closed.load(std::memory_order_acquire)) return {};
+    return l;
 }
 
 CaskIterHandle* cask_iter_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept {
@@ -194,21 +197,23 @@ ERL_NIF_TERM fault_to_term_detailed(ErlNifEnv* env, const CaskFault& f) noexcept
 
 namespace {
 
-// Erlang term → MetaValue。
-// 支持 int(int64) / float(double) / binary(string) / true|false(bool) / undefined(monostate)。
-// 其他形态返回 false。
+}  // namespace
+
+// 声明见 nif_helpers.hpp（cask_encode_meta 与 filter 解析共用一份）。
 bool parse_meta_value(ErlNifEnv* env, ERL_NIF_TERM term,
-                      bitcask::meta::MetaValue& out) {
-    if (enif_is_identical(term, atoms().undefined)) {
-        out = std::monostate{};
-        return true;
-    }
+                      bitcask::meta::MetaValue& out,
+                      bool other_atoms_as_null) {
     if (enif_is_identical(term, atoms().atom_true)) {
         out = true;
         return true;
     }
     if (enif_is_identical(term, atoms().atom_false)) {
         out = false;
+        return true;
+    }
+    if (enif_is_identical(term, atoms().undefined) ||
+        (other_atoms_as_null && enif_is_atom(env, term))) {
+        out = std::monostate{};
         return true;
     }
     // 整数走 int64:enif_get_int64 在溢出时返回 false;大数用例罕见。
@@ -229,6 +234,8 @@ bool parse_meta_value(ErlNifEnv* env, ERL_NIF_TERM term,
     }
     return false;
 }
+
+namespace {
 
 // op atom → MetaOp。不识别返回 false。
 bool parse_meta_op(ErlNifEnv* /*env*/, ERL_NIF_TERM term,
@@ -392,8 +399,8 @@ parse_filter_term(ErlNifEnv* env, ERL_NIF_TERM term) {
 
 ERL_NIF_TERM run_search(ErlNifEnv* env, ERL_NIF_TERM ref_term,
                         ERL_NIF_TERM query_term, const SearchInvoker& invoke) {
-    // checked_cask_handle 已保证返回非空时 h->cask 也非空。
-    auto* h = checked_cask_handle(env, ref_term);
+    // lock_cask_checked 已保证返回非空时 h->cask 也非空、未 close。
+    auto h = lock_cask_checked(env, ref_term);
     ErlNifBinary query_bin{};
     if (!h || !enif_inspect_binary(env, query_term, &query_bin)) {
         return enif_make_badarg(env);
@@ -404,7 +411,9 @@ ERL_NIF_TERM run_search(ErlNifEnv* env, ERL_NIF_TERM ref_term,
     // 策略闭包负责具体怎么搜；query span 生命周期与 query_bin 同步，调用同步完成。
     auto r = invoke(*h->cask, as_string_view(query_bin));
     if (!r) return fault_to_term(env, r.error());
-    return make_ok(env, make_search_hits(env, r->hits));
+    ERL_NIF_TERM hits = make_search_hits(env, r->hits);
+    if (!hits) return make_error(env, atoms().allocation_error);
+    return make_ok(env, hits);
 }
 
 // ---------------------------------------------------------------------------
@@ -419,7 +428,7 @@ ERL_NIF_TERM fold_start_impl(ErlNifEnv* env, CaskHandle* h,
     if (!r) return fault_to_term(env, r.error());
     if (*r == keydir::StartIterResult::kOutOfDate) return atoms().out_of_date;
     auto term = make_resource<CaskIterHandle>(env, g_cask_iter_resource_type,
-                                               std::move(it));
+                                               std::move(it), h);
     if (!term) return make_error(env, atoms().allocation_error);
     return make_ok(env, term);
 }
@@ -442,18 +451,25 @@ ERL_NIF_TERM make_search_hits(ErlNifEnv* env,
                                const std::vector<bitcask::search::SearchHit>& hits) {
     ERL_NIF_TERM list = enif_make_list(env, 0);
     for (auto it = hits.rbegin(); it != hits.rend(); ++it) {
-        ErlNifBinary key_bin;
-        if (!enif_alloc_binary(it->key.size(), &key_bin)) continue;
-        if (!it->key.empty()) {
-            std::memcpy(key_bin.data, it->key.data(), it->key.size());
-        }
+        ERL_NIF_TERM key_bin = make_binary_checked(
+            env, std::as_bytes(std::span<const char>(it->key.data(), it->key.size())));
+        if (!key_bin) return 0;
         ERL_NIF_TERM tuple = enif_make_tuple3(env,
-            enif_make_binary(env, &key_bin),
+            key_bin,
             enif_make_uint64(env, it->ord),
             enif_make_double(env, it->score));
         list = enif_make_list_cell(env, tuple, list);
     }
     return list;
+}
+
+ERL_NIF_TERM exception_term(ErlNifEnv* env, const char* what) noexcept {
+    const std::size_t n = std::strlen(what);
+    ERL_NIF_TERM bin;
+    unsigned char* p = enif_make_new_binary(env, n, &bin);
+    if (p) std::memcpy(p, what, n);
+    return enif_make_tuple2(env, atoms().error,
+                            enif_make_tuple2(env, enif_make_atom(env, "exception"), bin));
 }
 
 }  // namespace detail

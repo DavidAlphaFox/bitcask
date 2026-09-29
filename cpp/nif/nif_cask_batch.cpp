@@ -101,7 +101,7 @@ bool parse_ops(ErlNifEnv* env, ERL_NIF_TERM list, std::vector<ParsedOp>& out) {
 // cask_put_batch_atomic(Ref, Ops) -> ok | {error, Reason}
 ERL_NIF_TERM nif_cask_put_batch_atomic(ErlNifEnv* env, int /*argc*/,
                                         const ERL_NIF_TERM argv[]) {
-    auto* h = checked_cask_handle(env, argv[0]);
+    auto h = lock_cask_checked(env, argv[0]);
     if (!h) return enif_make_badarg(env);
 
     std::vector<ParsedOp> parsed;
@@ -145,7 +145,7 @@ ERL_NIF_TERM nif_cask_txn_commit(ErlNifEnv* env, int argc,
         ~TokenPin() { if (t) enif_release_resource(t); }
     } pin{token};
 
-    auto* h = checked_cask_handle(env, argv[0]);
+    auto h = lock_cask_checked(env, argv[0]);
     if (!h) return enif_make_badarg(env);
 
     TxnSyncPolicy sync = TxnSyncPolicy::kSyncOnCommit;

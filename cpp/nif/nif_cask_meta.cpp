@@ -22,46 +22,13 @@ using namespace detail;
 
 namespace {
 
-bool term_to_meta_value(ErlNifEnv* env, ERL_NIF_TERM term,
-                        bitcask::meta::MetaValue& out) {
-    if (enif_is_identical(term, atoms().undefined) ||
-        enif_is_atom(env, term)) {
-        out = std::monostate{};
-        return true;
-    }
-    if (enif_is_identical(term, atoms().atom_true)) {
-        out = true;
-        return true;
-    }
-    if (enif_is_identical(term, atoms().atom_false)) {
-        out = false;
-        return true;
-    }
-    ErlNifSInt64 iv = 0;
-    if (enif_get_int64(env, term, &iv)) {
-        out = static_cast<std::int64_t>(iv);
-        return true;
-    }
-    double dv = 0.0;
-    if (enif_get_double(env, term, &dv)) {
-        out = dv;
-        return true;
-    }
-    ErlNifBinary bv{};
-    if (enif_inspect_binary(env, term, &bv)) {
-        out = std::string(reinterpret_cast<const char*>(bv.data), bv.size);
-        return true;
-    }
-    return false;
-}
-
 // 把一项 (key_term, value_term) 解析为 MetaEntry。失败返回 false。
 bool parse_meta_kv(ErlNifEnv* env, ERL_NIF_TERM key_term, ERL_NIF_TERM val_term,
                    bitcask::meta::MetaEntry& out) {
     ErlNifBinary kb{};
     if (!enif_inspect_binary(env, key_term, &kb)) return false;
     out.key.assign(reinterpret_cast<const char*>(kb.data), kb.size);
-    if (!term_to_meta_value(env, val_term, out.value)) return false;
+    if (!parse_meta_value(env, val_term, out.value, /*other_atoms_as_null=*/true)) return false;
     return true;
 }
 

@@ -10,23 +10,25 @@
 #pragma once
 
 #include <cstdint>
+#include <exception>
 #include <expected>
 #include <functional>
+#include <new>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include <erl_nif.h>
 
+#include "atoms.hpp"
 #include "bitcask/cask.hpp"
 #include "bitcask/meta_filter.hpp"
+#include "resources.hpp"
 
 namespace bitcask::nif {
-
-struct CaskHandle;
-struct CaskIterHandle;
-struct CaskRangeIterHandle;
 
 // 跨 .cpp 共享的内部辅助函数。
 namespace detail {
@@ -37,11 +39,22 @@ namespace detail {
 template <typename T>
 T* get_resource_handle(ErlNifEnv* env, ERL_NIF_TERM term, ErlNifResourceType* rt) noexcept;
 
-// 从 NIF term 取出 CaskHandle 指针；类型不对返回 nullptr。
+// 从 NIF term 取出 CaskHandle 指针；类型不对返回 nullptr。**不加锁**——只给
+// cask_close（它要拿 unique 锁）和不碰 cask 的路径用。
 CaskHandle* cask_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept;
 
-// 同上，额外验证 h->cask 非空（cask 未关闭）。
-CaskHandle* checked_cask_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept;
+// 持有 CaskHandle::mu 的 shared 锁的句柄。NIF 入口用它代替裸指针：锁在
+// 入口函数返回时释放，期间 cask_close 进不来（见 resources.hpp CaskHandle）。
+// 空句柄（类型不对 / 已 close）转成 nullptr，`if (!h)` 照旧。
+struct CaskLock {
+    CaskHandle* h = nullptr;
+    std::shared_lock<std::shared_mutex> lk;
+    CaskHandle* operator->() const noexcept { return h; }
+    operator CaskHandle*() const noexcept { return h; }
+};
+
+// 类型对 && 未 close → 锁住并返回；否则空句柄。**所有用 cask 的入口都走这个**。
+CaskLock lock_cask_checked(ErlNifEnv* env, ERL_NIF_TERM term);
 
 // 从 NIF term 取出 CaskIterHandle 指针；类型不对返回 nullptr。
 CaskIterHandle* cask_iter_handle(ErlNifEnv* env, ERL_NIF_TERM term) noexcept;
@@ -52,6 +65,15 @@ CaskRangeIterHandle* cask_range_iter_handle(ErlNifEnv* env, ERL_NIF_TERM term) n
 // 解析 [{Key, Value} | atom, ...] 形态的选项 proplist 到 CaskOptions。
 // 不识别的键静默跳过，与 legacy 语义一致。
 CaskOptions parse_options(ErlNifEnv* env, ERL_NIF_TERM list);
+
+// Erlang term → MetaValue：int(int64) / float(double) / binary(string) /
+// true|false(bool) / undefined(null)。其它 atom：other_atoms_as_null 为真时也当
+// null（cask_encode_meta 的宽松语义），否则返回 false（filter 表达式的严格语义）。
+// 其余形态返回 false。⚠️ true/false 必须先于"其它 atom"判断——以前
+// nif_cask_meta.cpp 里的一份拷贝把顺序弄反，布尔被编成 null。
+bool parse_meta_value(ErlNifEnv* env, ERL_NIF_TERM term,
+                      bitcask::meta::MetaValue& out,
+                      bool other_atoms_as_null = false);
 
 // CaskFault → Erlang 错误 term。
 // kNotFound / kAlreadyExists 返回裸 atom（legacy 契约），其余返回 {error, Tag}。
@@ -110,7 +132,34 @@ ERL_NIF_TERM make_string_list(ErlNifEnv* env,
 
 // 把搜索结果（vector<SearchHit>）转换为 Erlang 的 [{Key, Ord, Score}, ...] 列表。
 // 倒着遍历保持结果原始顺序（BM25 分数从高到低）。
+// 分配失败返回 0（无效 term）——以前是 continue 悄悄丢掉那条 hit，调用方拿到
+// 一个短了的列表却没有任何错误。
 ERL_NIF_TERM make_search_hits(ErlNifEnv* env, const std::vector<bitcask::search::SearchHit>& hits);
+
+// 异常屏障：C++ 异常穿过 NIF 边界就是 std::terminate——整个节点没了。上游
+// 索引路径文档化了 bad_alloc（cask.hpp），本层也到处 std::vector / std::string，
+// 调用方一个夸张的参数（大 k、大 prefetch）就能触发。函数表里每个入口都套
+// 一层，enif_schedule_nif 转到 dirty 调度器的那份 impl 也要套：
+//   bad_alloc      → {error, allocation_error}
+//   std::exception → {error, {exception, What}}
+//   其它           → {error, {exception, <<"unknown">>}}
+// 参数校验用的 enif_make_badarg 是返回值不是异常，不受影响。
+using NifFn = ERL_NIF_TERM (*)(ErlNifEnv*, int, const ERL_NIF_TERM[]);
+
+ERL_NIF_TERM exception_term(ErlNifEnv* env, const char* what) noexcept;
+
+template <NifFn F>
+ERL_NIF_TERM guarded(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) noexcept {
+    try {
+        return F(env, argc, argv);
+    } catch (const std::bad_alloc&) {
+        return enif_make_tuple2(env, atoms().error, atoms().allocation_error);
+    } catch (const std::exception& e) {
+        return exception_term(env, e.what());
+    } catch (...) {
+        return exception_term(env, "unknown");
+    }
+}
 
 }  // namespace detail
 }  // namespace bitcask::nif
