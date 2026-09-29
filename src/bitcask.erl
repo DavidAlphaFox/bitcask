@@ -62,6 +62,11 @@
 
 -include("bitcask.hrl").
 
+%% 批量迭代的每批条数（NIF 上限 1024）。fold 一批 128：一次往返摊薄跨界成本，
+%% 又不至于一批把 128 个 value 全堆进一个 term 才回调；range 一批 256（老值）。
+-define(FOLD_BATCH, 128).
+-define(RANGE_BATCH, 256).
+
 %% cask_cpp NIF 能识别的选项白名单。Opts 里其它键会被静默丢弃
 %% （legacy 时代就是这个语义，新代码沿用以免破坏现有调用方）。
 -define(CASK_PASSTHROUGH_OPTS, [
@@ -440,19 +445,23 @@ sync(Handle) ->
 %% =========================================================================
 %% 折叠 / 列举
 %%
-%% 这一族函数全部建立在单条 cask_fold_* 迭代器之上：
-%%   cask_fold_start    — 开始迭代（拿快照）
-%%   cask_fold_next     — 取下一项（K, V）
-%%   cask_fold_next_full— 取下一项（K, V, FileId, Offset, Sz, Tstamp, IsTomb）
-%%   cask_fold_release  — 释放迭代器
+%% 这一族函数全部建立在 cask_fold_* 迭代器之上：
+%%   cask_fold_start           — 开始迭代（拿快照）
+%%   cask_fold_next_batch      — 批量取 [{K, V}]（fold/3、list_keys、stream_fold）
+%%   cask_fold_next_keys_batch — 批量取 [{K, FileId, Offset, Sz, Tstamp, IsTomb}]，
+%%                               不拷 value（fold_keys/3,6）
+%%   cask_fold_next_full       — 单条 {K, V, FileId, Offset, Sz, Tstamp, IsTomb}（fold/6）
+%%   cask_fold_release         — 释放迭代器
+%% 批量入口每次 NIF 往返带回 ?FOLD_BATCH 条——逐条 next 在百万 key 上是
+%% 百万次跨界往返 + dirty 线程切换。
 %%
 %% 迭代是基于 keydir 的快照，不会看见迭代开始之后的写入；底层用 epoch
 %% 实现，参见 cpp/src/keydir/keydir.cpp。
 %% =========================================================================
 
-%% 列出全部活跃 key，顺序未定义。墓碑被过滤。
+%% 列出全部活跃 key，顺序未定义。墓碑被过滤。只要 key，走不拷 value 的批。
 list_keys(Handle) ->
-    cask_fold_collect(ref(Handle), fun(K, _V, Acc) -> [K | Acc] end, []).
+    cask_fold_keys_collect(ref(Handle), fun(#bitcask_entry{key = K}, Acc) -> [K | Acc] end, []).
 
 %% fold_keys/3：回调签名 fun(#bitcask_entry{}, Acc) -> Acc'
 fold_keys(Handle, Fun, Acc0) ->
@@ -467,9 +476,9 @@ fold_keys(Handle, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
                             cask_max_age(MaxAge), cask_max_put(MaxPut),
                             SeeTombstonesP).
 
-%% fold/3：回调签名 fun(K, V, Acc) -> Acc'
+%% fold/3：回调签名 fun(K, V, Acc) -> Acc'。与 stream_fold/3 同一条批量路径。
 fold(Handle, Fun, Acc0) ->
-    cask_fold_collect(ref(Handle), Fun, Acc0).
+    stream_fold(Handle, Fun, Acc0, ?FOLD_BATCH).
 
 %% fold/6：MaxAge / MaxPut 含义同 fold_keys/6；SeeTombstones=true 时墓碑
 %% 以 {tombstone, K} 的 key 形态上交，V 是墓碑值（通常是空 binary）。
@@ -538,7 +547,7 @@ range(Handle, {Lo, Hi}, Opts) ->
 
 %% 流式版本：Fun 是 fun(Key, Value, Tstamp, Ord, Acc) -> Acc'。
 %% 迭代器一定会被释放（after 兜底），NIF 错误原样返回、不抛异常——与
-%% cask_fold_collect 的契约一致。
+%% with_fold_iter 的契约一致。
 range_fold(Handle, {Lo, Hi}, Opts, Fun, Acc0) ->
     RangeOpts = range_opts(Lo, Hi, Opts),
     case bitcask_cpp_nifs:cask_range_start(ref(Handle), RangeOpts) of
@@ -567,15 +576,21 @@ range_opts(Lo, Hi, Opts) ->
                         (V = proplists:get_value(K, Opts)) =/= undefined],
     Bounds ++ Tuning.
 
-%% 批量拉 —— 每次 NIF 往返最多带回 256 条，长范围下比逐条 next 少两个数量级
-%% 的往返。批未满即到尾（NIF 契约），所以短列表也要继续走到 done。
+%% 批量拉 —— 每次 NIF 往返最多带回 ?RANGE_BATCH 条，长范围下比逐条 next 少两个
+%% 数量级的往返。**批未满即到尾**（NIF 契约：C++ 侧只在 next() 没值时提前
+%% break），所以短批之后不必再打一次拿 done——graphdb 的小度数邻居 range
+%% 正是"一批 + 一次白打的 done"，那一次是 dirty 调度器上的往返。
 range_loop(IterRef, Fun, Acc) ->
-    case bitcask_cpp_nifs:cask_range_next_batch(IterRef, 256) of
+    case bitcask_cpp_nifs:cask_range_next_batch(IterRef, ?RANGE_BATCH) of
         done -> Acc;
         {ok, Entries} ->
-            Acc1 = lists:foldl(fun({K, V, T, O}, A) -> Fun(K, V, T, O, A) end,
-                               Acc, Entries),
-            range_loop(IterRef, Fun, Acc1);
+            {Acc1, N} = lists:foldl(fun({K, V, T, O}, {A, C}) ->
+                                            {Fun(K, V, T, O, A), C + 1}
+                                    end, {Acc, 0}, Entries),
+            case N < ?RANGE_BATCH of
+                true  -> Acc1;
+                false -> range_loop(IterRef, Fun, Acc1)
+            end;
         Other -> normalize_error(Other)
     end.
 
@@ -666,8 +681,8 @@ cask_merge_dir(Dirname, Opts, FilesArg) ->
             {error, {merge_locked,
                      "another merger is already running on this dir",
                      Dirname}};
-        {error, _} = E ->
-            E
+        Other ->
+            normalize_error(Other)    % 裸 atom（mode_mismatch 等）也归一
     end.
 
 %% all：让 cask_needs_merge 决定该并哪些文件
@@ -687,8 +702,8 @@ cask_merge_run(R, Files) when is_list(Files) ->
 cask_merge_call(_R, []) -> ok;
 cask_merge_call(R, Files) ->
     case bitcask_cpp_nifs:cask_merge(R, Files) of
-        {ok, _Stats}   -> ok;
-        {error, _} = E -> E
+        {ok, _Stats} -> ok;
+        Other        -> normalize_error(Other)
     end.
 
 %% 给「临时 merge open」用的选项构造：强制 read_write，再带上调用方给的
@@ -761,74 +776,55 @@ thread_limits() ->
 %% 内部：cask 迭代器收集器 + 单位换算
 %% =========================================================================
 
-%% 通用「打开迭代器 → 循环收集 → 兜底释放」骨架。Fun 是
-%% fun(K, V, Acc) -> Acc'。任何 NIF 错误会原样返回（不抛异常）。
-cask_fold_collect(Ref, Fun, Acc0) ->
-    case bitcask_cpp_nifs:cask_fold_start(Ref, -1, -1) of
-        {ok, IterRef} ->
-            try cask_fold_loop(IterRef, Fun, Acc0)
-            after bitcask_cpp_nifs:cask_fold_release(IterRef)
-            end;
-        {error, _} = E -> E
-    end.
-
-cask_fold_loop(IterRef, Fun, Acc) ->
-    case bitcask_cpp_nifs:cask_fold_next(IterRef) of
-        done            -> Acc;
-        {ok, K, V}      -> cask_fold_loop(IterRef, Fun, Fun(K, V, Acc));
-        {error, _} = E  -> E
-    end.
-
-%% fold_keys/3 用：每条记录都重新组装一个 #bitcask_entry，把 file_id /
-%% offset / total_sz / tstamp 全部填上真实值（不像有些后端会塞 0 占位）。
-%% 因为是 fold_keys/3，see_tombstones 默认 false，墓碑在 NIF 那边就过滤掉了，
-%% 所以这里收到的 IsTomb 一定是 false，匹配时把它丢弃。
-cask_fold_keys_collect(Ref, Fun, Acc0) ->
-    case bitcask_cpp_nifs:cask_fold_start(Ref, -1, -1) of
-        {ok, IterRef} ->
-            try cask_fold_keys_loop(IterRef, Fun, Acc0)
-            after bitcask_cpp_nifs:cask_fold_release(IterRef)
-            end;
-        {error, _} = E -> E
-    end.
-
-cask_fold_keys_loop(IterRef, Fun, Acc) ->
-    case bitcask_cpp_nifs:cask_fold_next_full(IterRef) of
-        done -> Acc;
-        {ok, K, _V, FileId, Offset, TotalSz, Tstamp, _IsTomb} ->
-            E = #bitcask_entry{key = K, file_id = FileId,
-                               total_sz = TotalSz, offset = Offset,
-                               tstamp = Tstamp},
-            cask_fold_keys_loop(IterRef, Fun, Fun(E, Acc));
-        {error, _} = Err -> Err
-    end.
-
-%% fold_keys/6 走完整 cask_fold_start/4——把 see_tombstones 标志传给 NIF，
-%% 这样遍历时 NIF 也会把墓碑送上来。SeeTombstonesP=true 时墓碑包成
-%% {tombstone, BCEntry} 给回调；false 时理论上这一支不会走到，留空兜底。
-cask_fold_keys6_collect(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
+%% 通用「打开迭代器 → 循环收集 → 兜底释放」骨架：全部 fold 变体都从这里
+%% 走。Loop 是 fun(IterRef) -> Acc' | {error, _}。
+%% ⚠️ 启动失败不只有 {error, _}：NIF 对 out_of_date（另一个 fold 在跑且
+%% pending 表比 MaxAge/MaxPut 允许的旧）、closed、mode_mismatch 返回的是
+%% **裸 atom**——以前每个收集器各自只匹配 {ok,_}/{error,_}，撞上就
+%% case_clause。app 默认 max_fold_puts = 0 恰好是最容易撞上 out_of_date 的
+%% 配置。统一归一成 {error, Reason} 返回给调用方，不抛异常。
+with_fold_iter(Ref, MaxAge, MaxPut, SeeTombstonesP, Loop) ->
     case bitcask_cpp_nifs:cask_fold_start(Ref, MaxAge, MaxPut, SeeTombstonesP) of
         {ok, IterRef} ->
-            try cask_fold_keys6_loop(IterRef, Fun, Acc0, SeeTombstonesP)
+            try Loop(IterRef)
             after bitcask_cpp_nifs:cask_fold_release(IterRef)
             end;
-        {error, _} = E -> E
+        Other ->
+            normalize_error(Other)
     end.
 
+%% fold_keys/3、list_keys/1 用：see_tombstones=false，墓碑在 NIF 那边就过滤
+%% 掉了。走只要 key 的批（value 不跨界拷贝）。
+cask_fold_keys_collect(Ref, Fun, Acc0) ->
+    cask_fold_keys6_collect(Ref, Fun, Acc0, -1, -1, false).
+
+%% fold_keys/6：把 see_tombstones 标志传给 NIF，遍历时 NIF 也会把墓碑送上来。
+%% 每条记录组装一个 #bitcask_entry，file_id / offset / total_sz / tstamp 全部
+%% 是真实值。SeeTombstonesP=true 时墓碑包成 {tombstone, BCEntry} 给回调；
+%% false 时 NIF 已过滤，IsTomb 恒 false，留空兜底。
+cask_fold_keys6_collect(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
+    with_fold_iter(Ref, MaxAge, MaxPut, SeeTombstonesP,
+                   fun(IterRef) ->
+                           cask_fold_keys6_loop(IterRef, Fun, Acc0, SeeTombstonesP)
+                   end).
+
 cask_fold_keys6_loop(IterRef, Fun, Acc, SeeTombstonesP) ->
-    case bitcask_cpp_nifs:cask_fold_next_full(IterRef) of
+    case bitcask_cpp_nifs:cask_fold_next_keys_batch(IterRef, ?FOLD_BATCH) of
         done -> Acc;
-        {ok, K, _V, FileId, Offset, TotalSz, Tstamp, IsTomb} ->
-            E = #bitcask_entry{key = K, file_id = FileId,
-                               total_sz = TotalSz, offset = Offset,
-                               tstamp = Tstamp},
-            Acc2 = case IsTomb of
-                       true when SeeTombstonesP -> Fun({tombstone, E}, Acc);
-                       true                     -> Acc;
-                       false                    -> Fun(E, Acc)
-                   end,
+        {ok, Items} ->
+            Acc2 = lists:foldl(
+                     fun({K, FileId, Offset, TotalSz, Tstamp, IsTomb}, A) ->
+                             E = #bitcask_entry{key = K, file_id = FileId,
+                                                total_sz = TotalSz, offset = Offset,
+                                                tstamp = Tstamp},
+                             case IsTomb of
+                                 true when SeeTombstonesP -> Fun({tombstone, E}, A);
+                                 true                     -> A;
+                                 false                    -> Fun(E, A)
+                             end
+                     end, Acc, Items),
             cask_fold_keys6_loop(IterRef, Fun, Acc2, SeeTombstonesP);
-        {error, _} = Err -> Err
+        Other -> normalize_error(Other)
     end.
 
 %% fold/6 的回调形态有点特殊：
@@ -836,13 +832,10 @@ cask_fold_keys6_loop(IterRef, Fun, Acc, SeeTombstonesP) ->
 %%   墓碑（仅当 SeeTombstones=true）：Fun({tombstone, K}, V, Acc)
 %% 这是 legacy 留下来的契约，不要改——下游可能在模式匹配 {tombstone, _}。
 cask_fold6_collect(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
-    case bitcask_cpp_nifs:cask_fold_start(Ref, MaxAge, MaxPut, SeeTombstonesP) of
-        {ok, IterRef} ->
-            try cask_fold6_loop(IterRef, Fun, Acc0, SeeTombstonesP)
-            after bitcask_cpp_nifs:cask_fold_release(IterRef)
-            end;
-        {error, _} = E -> E
-    end.
+    with_fold_iter(Ref, MaxAge, MaxPut, SeeTombstonesP,
+                   fun(IterRef) ->
+                           cask_fold6_loop(IterRef, Fun, Acc0, SeeTombstonesP)
+                   end).
 
 cask_fold6_loop(IterRef, Fun, Acc, SeeTombstonesP) ->
     case bitcask_cpp_nifs:cask_fold_next_full(IterRef) of
@@ -854,22 +847,17 @@ cask_fold6_loop(IterRef, Fun, Acc, SeeTombstonesP) ->
                        false                    -> Fun(K, V, Acc)
                    end,
             cask_fold6_loop(IterRef, Fun, Acc2, SeeTombstonesP);
-        {error, _} = Err -> Err
+        Other -> normalize_error(Other)
     end.
 
 %% stream_fold/3,4 — 批量迭代版 fold，每批 N 条减少 NIF 调用开销。
-%% 默认批量大小=32。回调签名 fun(K, V, Acc) -> Acc'。
+%% 默认批量大小 = ?FOLD_BATCH。回调签名 fun(K, V, Acc) -> Acc'。fold/3 就是它。
 stream_fold(Handle, Fun, Acc0) ->
-    stream_fold(Handle, Fun, Acc0, 32).
+    stream_fold(Handle, Fun, Acc0, ?FOLD_BATCH).
 
 stream_fold(Handle, Fun, Acc0, BatchSize) when is_integer(BatchSize), BatchSize > 0 ->
-    case bitcask_cpp_nifs:cask_fold_start(ref(Handle), -1, -1) of
-        {ok, IterRef} ->
-            try stream_fold_loop(IterRef, Fun, Acc0, BatchSize)
-            after bitcask_cpp_nifs:cask_fold_release(IterRef)
-            end;
-        {error, _} = E -> E
-    end.
+    with_fold_iter(ref(Handle), -1, -1, false,
+                   fun(IterRef) -> stream_fold_loop(IterRef, Fun, Acc0, BatchSize) end).
 
 stream_fold_loop(IterRef, Fun, Acc, BatchSize) ->
     case bitcask_cpp_nifs:cask_fold_next_batch(IterRef, BatchSize) of
@@ -877,7 +865,7 @@ stream_fold_loop(IterRef, Fun, Acc, BatchSize) ->
         {ok, Pairs} ->
             Acc2 = lists:foldl(fun({K, V}, A) -> Fun(K, V, A) end, Acc, Pairs),
             stream_fold_loop(IterRef, Fun, Acc2, BatchSize);
-        {error, _} = E -> E
+        Other -> normalize_error(Other)
     end.
 
 %% 单位换算：legacy fold/6 接收的 MaxAge 是「微秒」（来自 bitcask.app.src

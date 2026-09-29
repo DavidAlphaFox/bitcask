@@ -378,3 +378,28 @@ keydir_cache_entries_test_() ->
             bitcask:close(R2)
         end)
     end}.
+
+%% ===================================================================
+%% 6.6.1 B 档：range_loop 短批即到尾，不再多打一次 done
+%% ===================================================================
+
+range_batch_boundary_test_() ->
+    {"range 恰好 255 / 256 / 257 / 512 / 513 条：批边界上不多不少",
+     fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, ?KV),
+            lists:foldl(
+              fun(N, Prev) ->
+                      %% 增量补到 N 条：key 单调，range ["r", "s") 全覆盖
+                      [ok = bitcask:put(R, <<"r", I:16>>, <<"v">>) || I <- lists:seq(Prev + 1, N)],
+                      Rows = bitcask:range(R, {<<"r">>, <<"s">>}),
+                      ?assertEqual(N, length(Rows)),
+                      ?assertEqual([<<"r", I:16>> || I <- lists:seq(1, N)], keys_of(Rows)),
+                      %% range_fold 同一条循环
+                      ?assertEqual(N, bitcask:range_fold(R, {<<"r">>, <<"s">>}, [],
+                                                         fun(_, _, _, _, A) -> A + 1 end, 0)),
+                      N
+              end, 0, [255, 256, 257, 512, 513]),
+            bitcask:close(R)
+        end)
+     end}.
