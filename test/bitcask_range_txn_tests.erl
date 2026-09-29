@@ -192,15 +192,18 @@ range_rebuild_failed_test_() ->
     end}.
 
 range_after_close_test_() ->
-    {"父 cask 已 close 后再 next → {error, closed}（而不是段错误）",
+    {"父 cask 已 close 后再 next_batch → {error, closed}（而不是段错误）",
      fun() ->
         with_dir(fun(D) ->
             R = open_seeded(D),
             {ok, It} = bitcask_cpp_nifs:cask_range_start(element(1, R), []),
+            %% close 前能拿到一批，close 后同一个迭代器 → closed
+            ?assertMatch({ok, [_ | _]}, bitcask_cpp_nifs:cask_range_next_batch(It, 1)),
             bitcask:close(R),
-            ?assertEqual({error, closed}, bitcask_cpp_nifs:cask_range_next(It)),
             ?assertEqual({error, closed},
                          bitcask_cpp_nifs:cask_range_next_batch(It, 10)),
+            ?assertEqual({error, closed},
+                         bitcask_cpp_nifs:cask_range_next_batch(It, 1)),
             %% release 幂等
             ?assertEqual(ok, bitcask_cpp_nifs:cask_range_release(It)),
             ?assertEqual(ok, bitcask_cpp_nifs:cask_range_release(It))
@@ -374,7 +377,7 @@ keydir_cache_entries_test_() ->
     end}.
 
 %% ===================================================================
-%% 6.6.1 B 档：range_loop 短批即到尾，不再多打一次 done
+%% 6.7.0 B 档：range_loop 短批即到尾，不再多打一次 done
 %% ===================================================================
 
 range_batch_boundary_test_() ->

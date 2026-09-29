@@ -359,7 +359,7 @@ readonly_and_abort_test_() ->
             ?assertMatch({aborted, {badarith, _}},
                          ?T:transaction(R, fun(Tx) ->
                              ok = ?T:write(Tx, <<"a">>, <<"9">>),
-                             1 / 0
+                             erlang:error(badarith)      %% 即 1/0，但不招编译告警
                          end)),
             ?assertEqual({aborted, {throw, oops}},
                          ?T:transaction(R, fun(_Tx) -> throw(oops) end)),
@@ -1214,7 +1214,7 @@ nif_commit_notify_test_() ->
      end}}.
 
 %% ===================================================================
-%% 6.6.1:坏选项在门面就挡住,不进 locker
+%% 6.7.0:坏选项在门面就挡住,不进 locker
 %% ===================================================================
 
 bad_options_do_not_reach_locker_test_() ->
@@ -1243,7 +1243,7 @@ bad_options_do_not_reach_locker_test_() ->
      end}.
 
 %% ===================================================================
-%% 6.6.1 B 档：held 表按 {TxnId, Shard} 建键；重跑不越过 deadline
+%% 6.7.0 B 档：held 表按 {TxnId, Shard} 建键；重跑不越过 deadline
 %% ===================================================================
 
 held_table_keyed_by_shard_test_() ->

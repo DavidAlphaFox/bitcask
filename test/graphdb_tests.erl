@@ -314,9 +314,9 @@ edges_by_type_test_() ->
             R = seeded(D),
             {ok, E7} = graphdb:edges_by_type(R, 7),
             ?assertEqual([{1, 2}, {1, 3}, {2, 3}, {3, 4}],
-                         [{S, D} || #{src := S, dst := D} <- E7]),
+                         [{S, Dv} || #{src := S, dst := Dv} <- E7]),
             {ok, E8} = graphdb:edges_by_type(R, 8),
-            ?assertEqual([{1, 3}], [{S, D} || #{src := S, dst := D} <- E8]),
+            ?assertEqual([{1, 3}], [{S, Dv} || #{src := S, dst := Dv} <- E8]),
             ?assertEqual({ok, []}, graphdb:edges_by_type(R, 99)),
             graphdb:close(R)
         end)
@@ -357,7 +357,7 @@ read_your_writes_test_() ->
             R = seeded(D),
             ok = graphdb:put_edge(R, 1, 42, 777, #{props => <<"fresh">>}),
             {ok, Fresh} = graphdb:out_edges(R, 1, #{etype => 42}),
-            ?assertEqual([777], [D || #{dst := D} <- Fresh]),
+            ?assertEqual([777], [Dv || #{dst := Dv} <- Fresh]),
             graphdb:close(R)
         end)
     end}.
@@ -387,12 +387,12 @@ scan_insert_during_iteration_test_() ->
                     end || K <- lists:reverse(RawKeys)],
             %% 不变量：严格升序、定义域合法、999 看到与否均合法
             ?assertEqual(lists:usort(Dsts), Dsts),
-            ?assert(lists:all(fun(D) -> (D >= 100 andalso D =< 199) orelse D =:= 999 end, Dsts)),
+            ?assert(lists:all(fun(Dv) -> (Dv >= 100 andalso Dv =< 199) orelse Dv =:= 999 end, Dsts)),
             ?assert(length(Dsts) >= 100),                     %% 原有边绝不丢
             ?assert(lists:member(999, Dsts) orelse not lists:member(999, Dsts)),
             %% 提交已完成 → 新扫描必见
             {ok, FreshEdges} = graphdb:out_edges(R, 1),
-            ?assert(lists:member(999, [D || #{dst := D} <- FreshEdges])),
+            ?assert(lists:member(999, [Dv || #{dst := Dv} <- FreshEdges])),
             graphdb:close(R)
         end)
     end}.
@@ -423,10 +423,10 @@ scan_delete_during_iteration_test_() ->
             ?assertEqual(lists:usort(Dsts), Dsts),
             ?assert(length(Dsts) =< 100),
             %% 350 除外的 99 条必然还在
-            ?assertEqual(99, length([D || D <- Dsts, D =/= 350])),
+            ?assertEqual(99, length([Dv || Dv <- Dsts, Dv =/= 350])),
             %% 删除已提交 → 新扫描不可见
             {ok, FreshEdges2} = graphdb:out_edges(R, 2),
-            ?assertNot(lists:member(350, [D || #{dst := D} <- FreshEdges2])),
+            ?assertNot(lists:member(350, [Dv || #{dst := Dv} <- FreshEdges2])),
             graphdb:close(R)
         end)
     end}.
@@ -569,7 +569,7 @@ register_etype_concurrent_test_() ->
      end}}.
 
 %% ===================================================================
-%% 6.6.1 B 档：hub 去重不再二次方、expand 分片 + 失败清理、
+%% 6.7.0 B 档：hub 去重不再二次方、expand 分片 + 失败清理、
 %% range_take 计数、strict 计数（$i 开头的 vid）
 %% ===================================================================
 

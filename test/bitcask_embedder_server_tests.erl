@@ -655,7 +655,7 @@ worker_cfgs(Sup) ->
      end || Id <- Ids].
 
 %% ===================================================================
-%% 6.6.1：bitcask:put_docs/2 —— 自动 embed 走一次 embed_batch
+%% 6.7.0：bitcask:put_docs/2 —— 自动 embed 走一次 embed_batch
 %% ===================================================================
 
 put_docs_batches_embed_test_() ->
@@ -780,6 +780,9 @@ scatter_retries_segment_of_dead_worker_test_() ->
                      P -> exit(P, kill)
                  end,
                  ?assertEqual({ok, Expect}, bitcask_embedder:embed_batch(C, Texts))
-             end || _ <- lists:seq(1, 20)]
+                 %% ⚠️ 轮数必须低于池的重启强度（{one_for_one, 5, 10}）：第 6 次
+                 %%    kill 会让 supervisor 放弃、整池关掉，另一个 worker 也没了，
+                 %%    重试无处可去——那是测试自己把池打死，不是 scatter 的问题。
+             end || _ <- lists:seq(1, 4)]
         end)
     end}.

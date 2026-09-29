@@ -28,16 +28,7 @@
 
 -behaviour(gen_server).
 
--ifdef(PULSE).
--compile({parse_transform, pulse_instrument}).
--include_lib("pulse_otp/include/pulse_otp.hrl").
--endif.
-
 -ifdef(TEST).
--ifdef(EQC).
--include_lib("eqc/include/eqc.hrl").
--export([prop_in_window/0]).
--endif.
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
@@ -289,22 +280,23 @@ in_merge_window(NowHour, {Start, End}) when Start > End ->
 
 
 %% =========================================================================
-%% 单元测试（仅 EQC 构建可见）
+%% 单元测试
 %% =========================================================================
 
--ifdef(EQC).
+-ifdef(TEST).
 
-prop_in_window() ->
-    ?FORALL({NowHour, WindowLen, StartTime}, {choose(0, 23), choose(0, 23), choose(0, 23)},
-            begin
-                EndTime = (StartTime + WindowLen) rem 24,
+%% 原来是 EQC 的 prop_in_window（仓库早就没有 eqc 依赖，从没跑过）。输入空间
+%% 只有 24³ = 13824 种，直接穷举：窗口覆盖的小时集合与 in_merge_window/2 的
+%% 判断逐一比对（含跨午夜的窗口）。
+in_window_exhaustive_test() ->
+    [begin
+         EndTime = (StartTime + WindowLen) rem 24,
+         WindowHours = [H rem 24 || H <- lists:seq(StartTime, StartTime + WindowLen)],
+         ?assertEqual({NowHour, StartTime, EndTime, lists:member(NowHour, WindowHours)},
+                      {NowHour, StartTime, EndTime,
+                       in_merge_window(NowHour, {StartTime, EndTime})})
+     end || NowHour <- lists:seq(0, 23), WindowLen <- lists:seq(0, 23),
+            StartTime <- lists:seq(0, 23)],
+    ok.
 
-                %% 生成窗口覆盖的全部小时集合，然后跟 in_merge_window/2 的
-                %% 判断做一致性比对。
-                WindowHours = [H rem 24 || H <- lists:seq(StartTime, StartTime + WindowLen)],
-
-                ExpInWindow = lists:member(NowHour, WindowHours),
-                ?assertEqual(ExpInWindow, in_merge_window(NowHour, {StartTime, EndTime})),
-                true
-            end).
 -endif.

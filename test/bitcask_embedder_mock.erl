@@ -18,7 +18,7 @@
 %% New context-based API
 -export([init/1, embed/2]).
 
-%% Legacy API (backward compat for existing tests)
+%% 测试辅助（不是 behaviour 回调——旧式 embed/1 + dim/0 回调已删除）
 -export([embed/1, dim/0, vec_bin/1]).
 
 %% ===================================================================
