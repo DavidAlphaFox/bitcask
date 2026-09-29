@@ -911,17 +911,30 @@ collect_slices(Workers, Ref, Deadline, Acc) ->
             collect_slices(Rest, Ref, Deadline, Acc#{Idx => Lists});
         {{Ref, 'DOWN'}, _MRef, process, _Pid, Reason} ->
             %% 结果消息总先于同一发送者的 DOWN 到达，所以走到这里一定是异常退出
-            kill_workers(Workers),
+            kill_workers(Workers, Ref),
             erlang:error({graphdb_expand, Reason})
     after Wait ->
-            kill_workers(Workers),
+            kill_workers(Workers, Ref),
             erlang:error(graphdb_expand_timeout)
     end.
 
-kill_workers(Workers) ->
-    [begin exit(Pid, kill), erlang:demonitor(MRef, [flush]) end
-     || {_, {Pid, MRef}} <- Workers],
-    ok.
+%% 杀掉剩下的 worker，并保证调用方信箱里不留它们的任何消息。
+%% ⚠️ 不能 kill 完直接 demonitor(flush)：已经把结果发出来的 worker，它的
+%%    {Ref, Idx, Lists} 可能还没到或刚到，demonitor 只清 DOWN 不清它。要**等
+%%    每个 worker 的 DOWN**——同一发送者的信号有序，DOWN 到了，它之前发的结果
+%%    一定已经在信箱里——再把 {Ref, _, _} 全部清掉。（6.7.0 发版检查时整模块
+%%    跑偶发撞上：别的片 worker 刚好在失败那一刻交了结果。）
+kill_workers(Workers, Ref) ->
+    [exit(Pid, kill) || {_, {Pid, _MRef}} <- Workers],
+    [receive {{Ref, 'DOWN'}, MRef, process, _, _} -> ok
+     after 5000 -> erlang:demonitor(MRef, [flush])
+     end || {_, {_Pid, MRef}} <- Workers],
+    flush_results(Ref).
+
+flush_results(Ref) ->
+    receive {Ref, _Idx, _Lists} -> flush_results(Ref)
+    after 0 -> ok
+    end.
 
 %% 按 N 个一片连续切（保序）。调用方保证 L 非空（空 frontier 不会走到 expand）。
 slice(L, N) -> slice(L, N, N, [], []).
