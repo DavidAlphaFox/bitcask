@@ -30,6 +30,7 @@
          close_write_file/1,
          get/2,
          put/3,
+         put_docs/2,
          delete/2,
          sync/1,
          list_keys/1,
@@ -365,6 +366,66 @@ put({Ref, Ctx}, Key, #{text := Text} = Doc) when is_binary(Text) ->
     end;
 put(Handle, Key, Value) ->
     bitcask_cpp_nifs:cask_put(ref(Handle), Key, Value).
+
+%% 批量写文档：[{Key, Value}]，Value 与 put/3 相同（binary / #{text,...} /
+%% tombstone）。与逐条 put/3 的唯一区别是**自动 embed 走一次 embed_batch**：
+%% 所有"有 text 无 vector"的文档收成一批，一次 bitcask_embedder:embed_batch/2
+%% （llama 后端一次 decode 喂多条、HTTP 档一个数组一次往返、池化时拆到各卡）——
+%% 这是索引侧的吞吐杠杆（设计稿 §3.5，短文本实测 7×），此前公开 API 里没有
+%% 任何入口用到它。
+%%
+%% 语义：
+%%   * embed 失败（整批 {error, R}，或任一条 {error, R}）→ **一条都不写**，返回
+%%     {error, {embed_failed, R}} / {error, {embed_failed, [{Key, R}, ...]}}。
+%%   * embed 都成功后按列表顺序逐条 put；某条 put 失败 → 停下，返回
+%%     {error, {Key, Reason}}。⚠️ **不原子**：前面已写入的保留（要原子用
+%%     put_batch_atomic，但它只收 binary 值、不做 embed）。
+%%   * 无 embedder（open 时没配）或文档已带 vector / 不是 #{text := _} → 原样
+%%     逐条 put，不碰 embedder。
+%%   * 空列表 → ok。
+put_docs(_Handle, []) ->
+    ok;
+put_docs({_Ref, Ctx} = Handle, Docs) when is_list(Docs) ->
+    Need = case Ctx of
+               undefined -> [];
+               _ -> [{K, T} || {K, #{text := T} = D} <- Docs,
+                               is_binary(T), not is_map_key(vector, D)]
+           end,
+    case Need of
+        [] ->
+            put_docs_seq(Handle, Docs);
+        _ ->
+            case bitcask_embedder:embed_batch(Ctx, [T || {_, T} <- Need]) of
+                {error, R} ->
+                    {error, {embed_failed, R}};
+                {ok, Results} ->
+                    Paired = lists:zip([K || {K, _} <- Need], Results),
+                    case [{K, R} || {K, {error, R}} <- Paired] of
+                        [] ->
+                            Vecs = maps:from_list([{K, V} || {K, {ok, V}} <- Paired]),
+                            Filled = [case D of
+                                          #{text := T} when is_binary(T),
+                                                            not is_map_key(vector, D) ->
+                                              {K, D#{vector => maps:get(K, Vecs)}};
+                                          _ -> {K, D}
+                                      end || {K, D} <- Docs],
+                            put_docs_seq(Handle, Filled);
+                        Failed ->
+                            {error, {embed_failed, Failed}}
+                    end
+            end
+    end.
+
+%% 逐条 put；到这里的 #{text} 文档要么已带 vector、要么没有 embedder，put/3
+%% 都不会再去 embed。
+put_docs_seq(_Handle, []) ->
+    ok;
+put_docs_seq(Handle, [{K, V} | Rest]) ->
+    case put(Handle, K, V) of
+        ok             -> put_docs_seq(Handle, Rest);
+        {error, R}     -> {error, {K, R}};
+        Other          -> {error, {K, Other}}
+    end.
 
 %% 软删除：写一个墓碑 entry。空间在下一次 merge 时回收。
 delete(Handle, Key) ->
