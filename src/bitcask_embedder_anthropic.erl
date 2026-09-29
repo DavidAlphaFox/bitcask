@@ -28,86 +28,28 @@
 %% Provider behaviour API
 -export([init/1, embed/2, embed_batch/2]).
 
-%% 可选项默认值（均为正整数；可在 new/2 的 Opts 里覆盖，缺省用这些）：
-%%   max_input_bytes    — embed 前输入的字节级保守上限，约对应 32K token
-%%                        （UTF-8 下字节数 ≤ N ⟹ token 数 ≤ N）。
-%%   timeout_ms         — 单次 embedding 请求的总超时（毫秒）。
-%%   connect_timeout_ms — 建连超时（毫秒）。
--define(DEFAULT_MAX_INPUT_BYTES, 32768).
--define(DEFAULT_TIMEOUT_MS, 30000).
--define(DEFAULT_CONNECT_TIMEOUT_MS, 5000).
 %% 模型原生维度默认值（dim）。MRL 落库维度 vector_dim 缺省 = dim。
+%% 其余可选项的默认值与校验见 bitcask_embedder_util:http_init/4（与 openai
+%% 共用；本模块只剩默认维度与认证 header 两处差异）。
 -define(DEFAULT_DIM, 4096).
 
 %% ===================================================================
-%% Provider behaviour: init/1
+%% Provider behaviour: init/1 / embed/2 / embed_batch/2
 %% ===================================================================
 
 -spec init(map()) -> {ok, bitcask_embedder:ctx()} | {error, term()}.
 init(Opts) ->
-    case {maps:get(url, Opts, undefined), maps:get(model, Opts, undefined)} of
-        {undefined, _} -> {error, {missing_opt, url}};
-        {_, undefined} -> {error, {missing_opt, model}};
-        {Url, Model} ->
-            case bitcask_embedder_util:validate_dims(Opts, ?DEFAULT_DIM) of
-                {ok, Dim, VDim} ->
-                    case validate_limits(Opts) of
-                        {ok, Limits} ->
-                            Base = #{
-                                url        => Url,
-                                model      => to_bin(Model),
-                                api_key    => maps:get(api_key, Opts, undefined),
-                                dim        => Dim,
-                                vector_dim => VDim
-                            },
-                            {ok, #{
-                                module     => ?MODULE,
-                                dim        => Dim,
-                                vector_dim => VDim,
-                                config     => maps:merge(Base, Limits)
-                            }};
-                        {error, _} = E ->
-                            E
-                    end;
-                {error, _} = E ->
-                    E
-            end
-    end.
-
-%% 校验三个正整数可选项，返回 {ok, #{Key => Val}}（缺省填默认值）或
-%% {error, {bad_opt, Key}}。
-validate_limits(Opts) ->
-    bitcask_embedder_util:validate_limits(
-      Opts, [{max_input_bytes,    ?DEFAULT_MAX_INPUT_BYTES},
-             {timeout_ms,         ?DEFAULT_TIMEOUT_MS},
-             {connect_timeout_ms, ?DEFAULT_CONNECT_TIMEOUT_MS}]).
-
-%% ===================================================================
-%% Provider behaviour: embed/2
-%% ===================================================================
+    bitcask_embedder_util:http_init(?MODULE, Opts, ?DEFAULT_DIM, fun build_headers/1).
 
 -spec embed(map(), binary()) -> {ok, binary()} | {error, term()}.
 embed(#{url := _, model := _} = Cfg, Text) when is_binary(Text) ->
-    bitcask_embedder_util:http_embed(
-      Cfg, Text, build_headers(maps:get(api_key, Cfg, undefined)),
-      ?DEFAULT_MAX_INPUT_BYTES).
+    bitcask_embedder_util:http_embed(Cfg, Text).
 
-%% ===================================================================
-%% embed_batch/2（bitcask_embedder 的可选回调）—— 一次请求带一个数组
-%%
-%% ⚠️ 逐条结果，顺序与输入一一对应。响应按 `index` 字段归位，**不按返回顺序
-%%    zip** —— 详见 bitcask_embedder_util:parse_embedding_batch/3 的注释：
-%%    按顺序 zip 的后果是把向量配到别的文档上，不报错、维度也对。
-%%
-%% 可选项 max_batch（默认 64）：一次请求最多几条。端点对数组长度与总 token
-%% 都有上限，超了是**整个请求**失败，所以按它切块。
-%% ===================================================================
 -spec embed_batch(map(), [binary()]) ->
           {ok, [{ok, binary()} | {error, term()}]} | {error, term()}.
 embed_batch(#{url := _, model := _} = Cfg, Texts) when is_list(Texts) ->
-    bitcask_embedder_util:http_embed_batch(
-      Cfg, Texts, build_headers(maps:get(api_key, Cfg, undefined)),
-      ?DEFAULT_MAX_INPUT_BYTES).
+    bitcask_embedder_util:http_embed_batch(Cfg, Texts).
+
 %% ===================================================================
 %% Internal
 %% ===================================================================
@@ -123,8 +65,4 @@ build_headers(ApiKey) when is_list(ApiKey) ->
     [{"x-api-key", ApiKey},
      {"anthropic-version", "2023-06-01"}].
 
-
-
-to_bin(B) when is_binary(B) -> B;
-to_bin(L) when is_list(L)   -> list_to_binary(L).
 

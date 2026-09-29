@@ -91,6 +91,7 @@
 -export([start_link/2, child_spec/3, workers/1, worker_name/2, is_pool/1,
          status/1]).
 -export([start_worker_lenient/3]).
+-export([worker_threads/2]).                % 纯函数，测试用
 -export([init/1]).
 
 %% supervisor 的启动超时：N 次模型加载都在这里面。给足。
@@ -316,18 +317,19 @@ init({Name, Groups, Mode, Opts}) ->
     %% start_link 之后会把它收窄成**实际起来**的那些。
     persistent_term:put(pt_key(Name), Names),
     persistent_term:put(pt_key({all, Name}), Names),
-    Children = [worker_spec(Name, I, G, Base, Mode)
+    N = length(Groups),
+    Children = [worker_spec(Name, I, G, Base, Mode, N)
                 || {I, G} <- lists:zip(Idxs, Groups)],
     %% one_for_one：一个 worker 挂了只重启它自己。其余卡上那些 context 没理由
     %% 跟着重建——每次重建都是一次模型加载。
     {ok, {{one_for_one, 5, 10}, Children}}.
 
-worker_spec(Pool, Idx, Group, Base, Mode) ->
+worker_spec(Pool, Idx, Group, Base, Mode, NumWorkers) ->
     WName = worker_name(Pool, Idx),
     Cfg0 = maps:get(config, Base, #{}),
-    %% Group = none 表示"不绑卡"（auto 在没有可用 GPU 时的退化）。
+    %% Group = none 表示"不绑卡"（auto 在没有可用 GPU 时的退化，或 slots）。
     Cfg = case Group of
-              none -> Cfg0;
+              none -> cpu_threads(Cfg0, NumWorkers);
               _    -> Cfg0#{gpu_index => Group}
           end,
     Opts = Base#{config => Cfg},
@@ -347,6 +349,39 @@ worker_spec(Pool, Idx, Group, Base, Mode) ->
     %% 并还原顺序。
     {{bc_emb_worker, Idx, WName}, Start,
      permanent, ?WORKER_SHUTDOWN, worker, [bitcask_embedder_server]}.
+
+%% 不绑卡的 worker 且没显式给 n_threads：把默认线程数**按 worker 数均分**。
+%%
+%% ⚠️ 不分的话每个 worker 各拿 provider 的默认值（可用核数 - 2），slots => 4
+%%    在 8 vCPU 上就是 4 × 6 = 24 个 ggml 线程抢 8 个核。ggml 线程池自旋 +
+%%    调度抢在一起，超订是断崖不是渐变（bitcask_llama_nifs 里那张表：12 线程
+%%    比 6 线程慢 5 倍，且没有任何报错）。K 路并发的本意是 K 个 forward 同时
+%%    跑，那每个只能分到 1/K 的核。
+%% 显式配了 backend => cuda | vulkan 或 gpu_index 的按 GPU 绑定看待，不动：
+%% GPU 前向里 CPU 线程数无关紧要，留给 provider 自己的默认。
+cpu_threads(Cfg, NumWorkers) ->
+    GpuBound = maps:is_key(gpu_index, Cfg)
+        orelse lists:member(maps:get(backend, Cfg, auto), [cuda, vulkan]),
+    case maps:is_key(n_threads, Cfg) orelse GpuBound of
+        true  -> Cfg;
+        false -> Cfg#{n_threads => worker_threads(available_cpus(), NumWorkers)}
+    end.
+
+%% 每个 worker 的线程数：留 2 核（同 provider 默认），剩下的按 worker 数均分，
+%% 至少 1。纯函数，方便测。
+-spec worker_threads(pos_integer(), pos_integer()) -> pos_integer().
+worker_threads(Avail, NumWorkers) when is_integer(Avail), is_integer(NumWorkers),
+                                       NumWorkers >= 1 ->
+    max(1, (Avail - 2) div NumWorkers).
+
+%% ⚠️ 只认亲和性掩码内的核数（logical_processors_available），拿不到就退到
+%%    schedulers_online——**绝不**退到 logical_processors：容器里它报的是宿主机
+%%    的核数（本机 8 vCPU 报 128）。
+available_cpus() ->
+    case erlang:system_info(logical_processors_available) of
+        N when is_integer(N), N > 0 -> N;
+        _ -> erlang:system_info(schedulers_online)
+    end.
 
 %% auto 模式的 child start：起不来返回 ignore（supervisor 把它记成 undefined
 %% 并继续），而不是 {error,_}（那会让整个 supervisor 起不来）。

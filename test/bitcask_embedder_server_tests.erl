@@ -425,9 +425,9 @@ pool_dispatch_avoids_busy_worker_test_() ->
     {timeout, 60, fun() ->
         with_pool([0, 1], fun(Pool) ->
             {ok, [W0, W1]} = bitcask_embedder_pool:workers(Pool),
-            %% 空闲时是确定性的：取第一个最小。
+            %% 空闲时平局随机：两个都可能，但一定是其中之一。
             {PickedIdle, _} = pick_probe([W0, W1]),
-            ?assertEqual(W0, PickedIdle),
+            ?assert(lists:member(PickedIdle, [W0, W1])),
             %% 把 W0 灌忙，派发必须换到 W1。
             Parent = self(),
             Pids = [spawn(fun() ->
@@ -448,8 +448,8 @@ pool_dispatch_avoids_busy_worker_test_() ->
             %% W0），本条自动不作数——与上面 Wait 的「没堆起来就不作数」
             %% 同一意图，但不再有「guard 采样 >0、pick 再采样已排空」的
             %% 竞态窗口（全量套件并行负载下偶发假红的根因）。
-            {Picked, Qlens} = pick_probe([W0, W1]),
-            case maps:get(W0, Qlens) of
+            {Picked, Loads} = pick_probe([W0, W1]),
+            case maps:get(W0, Loads) of
                 L when L > 0 -> ?assertEqual(W1, Picked);
                 0 -> ok      %% mock 在 pick 采样前排空，这条不作数
             end,
@@ -514,143 +514,205 @@ open_with_pool_test_() ->
 %% 与 proxy 的 pick/1 同语义的探针（proxy 那个是私有函数）。
 %% 返回 {胜者, 各 worker 采样到的邮箱长度映射}——判定与依据出自同一份
 %% 快照，调用方能分辨「真选了忙的那个」和「采样后平局回退首元素」。
+%% 采样合一：pick 的判定和它依据的负载快照来自同一组 process_info。
 pick_probe(Ws) ->
-    Probes = [{qlen_probe(X), X} || X <- Ws],
-    {{_, _Qlen}, W} = lists:min(Probes),
-    {W, maps:from_list([{X, Q} || {{_, Q}, X} <- Probes])}.
+    Probes = [{bitcask_embedder_proxy:load(X), rand:uniform(), X} || X <- Ws],
+    {_, _, W} = lists:min(Probes),
+    {W, maps:from_list([{X, L} || {{_, L}, _, X} <- Probes])}.
 
-qlen_probe(W) ->
-    case whereis(W) of
-        undefined -> {1, 0};
-        Pid -> case process_info(Pid, message_queue_len) of
-                   {message_queue_len, N} -> {0, N};
-                   undefined -> {1, 0}
-               end
+qlen_probe(W) -> bitcask_embedder_proxy:load(W).
+
+%% ===================================================================
+%% 派发必须看得见"正在算"的 worker（不只是邮箱长度）
+%%
+%% ⚠️ gen_server 先把请求从邮箱取走再跑 handle_call：一个正在做前向的 worker
+%%    邮箱长度是 0，跟闲着的一样。旧实现只看队列长度，平局按名字取 `_0`——
+%%    第二个请求排到正在忙的 `_0` 后面，旁边的 `_1` 空着。mock 是瞬时的，
+%%    这里用一个会 sleep 的 provider（在本文件里现编现载）把 worker 卡在
+%%    handle_call 里。
+%% ===================================================================
+
+%% 慢 provider：embed 睡 config 里的 delay 毫秒再返回 mock 的向量。
+%% 现编现载，不给 test/ 多加一个模块。
+slow_mock_module() ->
+    Mod = bc_slow_mock_embedder,
+    case code:is_loaded(Mod) of
+        {file, _} -> Mod;
+        false ->
+            Src = [
+              "-module(bc_slow_mock_embedder).",
+              "-export([init/1, embed/2]).",
+              "init(#{delay := D}) -> {ok, #{module => bc_slow_mock_embedder, dim => 4, config => #{delay => D}}}.",
+              "embed(#{delay := D}, Text) -> timer:sleep(D), bitcask_embedder_mock:embed(Text)."
+            ],
+            Forms = [begin
+                         {ok, Ts, _} = erl_scan:string(L),
+                         {ok, F} = erl_parse:parse_form(Ts),
+                         F
+                     end || L <- Src],
+            {ok, Mod, Bin} = compile:forms(Forms, []),
+            {module, Mod} = code:load_binary(Mod, "bc_slow_mock_embedder.erl", Bin),
+            Mod
     end.
 
-%% ===================================================================
-%% 批量 embed
-%%
-%% ⚠️ 用 mock provider：批量的**契约**（逐条结果、顺序、一条坏不影响其它条、
-%%    池化时拆分并行）与 provider 无关。llama 的原生批量由 bitcask_llama_tests 管。
-%% ===================================================================
-
-%% mock 没实现 embed_batch/2 —— 框架必须自动退化成逐条，结果形状完全一致。
-%% ⚠️ 这条钉住"调用方不必知道 provider 支不支持批量"。
-framework_falls_back_to_sequential_test() ->
-    {ok, Ctx} = bitcask_embedder:new({custom, bitcask_embedder_mock}, #{}),
-    ?assertNot(erlang:function_exported(bitcask_embedder_mock, embed_batch, 2)),
-    {ok, Rs} = bitcask_embedder:embed_batch(Ctx, [<<"x x x">>, <<"z z z">>]),
-    ?assertEqual([{ok, bitcask_embedder_mock:vec_bin([0.6, 0.8, 0.0, 0.0])},
-                  {ok, bitcask_embedder_mock:vec_bin([0.0, 0.0, 0.0, 1.0])}], Rs).
-
-framework_batch_empty_test() ->
-    {ok, Ctx} = bitcask_embedder:new({custom, bitcask_embedder_mock}, #{}),
-    ?assertEqual({ok, []}, bitcask_embedder:embed_batch(Ctx, [])).
-
-server_batch_test() ->
-    with_server(?MOCK, fun(Pid) ->
-        {ok, Rs} = bitcask_embedder_server:embed_batch(Pid, [<<"x x x">>, <<"x">>]),
-        ?assertEqual(2, length(Rs)),
-        [?assertMatch({ok, _}, R) || R <- Rs]
-    end).
-
-%% ⚠️ **顺序必须与输入一一对应** —— 调用方靠下标对回自己的 key。池化时批被拆
-%%    到多个 worker 上并行跑，拼回来的顺序错了就是把向量配错文档，而且不报错。
-proxy_batch_preserves_order_test_() ->
+pool_dispatch_sees_running_worker_test_() ->
     {timeout, 60, fun() ->
-        Texts = [<<"x x x">>, <<"x x y">>, <<"x y y">>, <<"z z z">>, <<"x">>],
-        Expect = [begin {ok, V} = bitcask_embedder_mock:embed(T), {ok, V} end || T <- Texts],
-        %% 单进程
-        with_server(?MOCK, fun(Pid) ->
-            {ok, C} = bitcask_embedder:new({custom, bitcask_embedder_proxy}, #{server => Pid}),
-            ?assertEqual({ok, Expect}, bitcask_embedder:embed_batch(C, Texts))
-        end),
-        %% 池化（3 个 worker，5 条会被拆成多段并行）
-        with_pool([0, 1, 2], fun(Pool) ->
-            {ok, C} = bitcask_embedder:new({custom, bitcask_embedder_proxy}, #{server => Pool}),
-            ?assertEqual({ok, Expect}, bitcask_embedder:embed_batch(C, Texts)),
-            ?assertEqual({ok, []}, bitcask_embedder:embed_batch(C, [])),
-            %% 条数少于 worker 数：不该崩，也不该丢条目
-            {ok, R1} = bitcask_embedder:embed_batch(C, [<<"x">>]),
-            ?assertEqual(1, length(R1))
-        end)
-    end}.
-
-%% 池里某个 worker 死了：那一段记成错，其余段照常返回——不是整批失败。
-proxy_batch_partial_failure_test_() ->
-    {timeout, 60, fun() ->
-        with_pool([0, 1], fun(Pool) ->
-            {ok, C} = bitcask_embedder:new({custom, bitcask_embedder_proxy}, #{server => Pool}),
-            {ok, [W0, _]} = bitcask_embedder_pool:workers(Pool),
-            %% 让 supervisor 别把它拉起来：直接 stop 掉整棵子树里的那一个是不行的，
-            %% 所以改用"注册名被占走"的等效场景——kill 之后立刻发批，
-            %% 重启窗口内那一段会失败。
-            exit(whereis(W0), kill),
-            {ok, Rs} = bitcask_embedder:embed_batch(C, [<<"x">>, <<"x x x">>, <<"z z z">>, <<"x y y">>]),
-            ?assertEqual(4, length(Rs)),
-            %% 不论 worker 是否已重启，条数与顺序必须完整；至少不能整批 {error,_}
-            [?assert(element(1, R) =:= ok orelse element(1, R) =:= error) || R <- Rs]
-        end)
-    end}.
-
-%% ===================================================================
-%% instances => auto / per_gpu / 不对称失败策略
-%% ===================================================================
-
-%% mock provider 没实现 auto_instances/1 —— auto 必须被明确拒绝，
-%% ⚠️ 不能悄悄退化成"起一个"，那会让 `instances => auto` 在不支持的 provider 上
-%%    看起来生效了。
-auto_unsupported_provider_test() ->
-    process_flag(trap_exit, true),
-    N = list_to_atom("bc_auto_" ++ integer_to_list(erlang:unique_integer([positive]))),
-    ?assertMatch({error, {instances_auto_unsupported, _}},
-                 bitcask_embedder_pool:start_link({local, N}, pool_opts(auto))),
-    process_flag(trap_exit, false),
-    ok.
-
-%% per_gpu：同一张卡开 K 个 instance。
-%% ⚠️ 显式列表里重复写同一张卡会被拒（配置错），但 per_gpu 是**明确要求**的复制，
-%%    两者必须区分开。
-per_gpu_expands_instances_test_() ->
-    {timeout, 60, fun() ->
-        Name = list_to_atom("bc_pg_" ++ integer_to_list(erlang:unique_integer([positive]))),
-        Opts = (pool_opts([0, 1]))#{per_gpu => 3},
-        {ok, Pid} = bitcask_embedder_pool:start_link({local, Name}, Opts),
+        Mod = slow_mock_module(),
+        Delay = 400,
+        Name = list_to_atom("bc_slowpool_" ++ integer_to_list(erlang:unique_integer([positive]))),
+        {ok, Pid} = bitcask_embedder_pool:start_link(
+                      {local, Name},
+                      #{provider => {custom, Mod}, slots => 2,
+                        config => #{delay => Delay}}),
         try
-            {ok, Ws} = bitcask_embedder_pool:workers(Name),
-            ?assertEqual(6, length(Ws)),          %% 2 卡 × 3
-            {ok, St} = bitcask_embedder_pool:status(Name),
-            ?assertMatch(#{requested := 6, started := 6, missing := []}, St)
+            {ok, [W0, W1] = Ws} = bitcask_embedder_pool:workers(Name),
+            {ok, Ctx} = bitcask_embedder:new({custom, bitcask_embedder_proxy},
+                                             #{server => Name}),
+            %% 第一个请求：随便落到谁身上，把它卡在 handle_call 里。
+            Parent = self(),
+            spawn_link(fun() -> Parent ! {first, bitcask_embedder:embed(Ctx, <<"x">>)} end),
+            %% 等到恰好一个 worker 报"在算"（邮箱仍是 0）。
+            Busy = (fun Wait(0) -> error(no_worker_became_busy);
+                        Wait(N) ->
+                            case [W || W <- Ws, bitcask_embedder_proxy:load(W) =:= {0, 1}] of
+                                [B] -> B;
+                                _   -> timer:sleep(5), Wait(N - 1)
+                            end
+                    end)(200),
+            Idle = hd(Ws -- [Busy]),
+            ?assertEqual({0, 0}, bitcask_embedder_proxy:load(Idle)),
+            %% 核心断言：邮箱都是 0，但 pick 必须避开正在算的那个。
+            ?assertEqual(Idle, bitcask_embedder_proxy:pick(Ws)),
+            ?assertEqual(Idle, bitcask_embedder_proxy:pick([W1, W0])),   %% 与顺序无关
+            %% 佐证：第二个请求经 proxy 走，耗时 ≈ 1 × Delay 而不是排在第一个后面的 2 ×。
+            {Us, R2} = timer:tc(fun() -> bitcask_embedder:embed(Ctx, <<"x">>) end),
+            ?assertMatch({ok, _}, R2),
+            ?assert(Us < Delay * 1500),   %% < 1.5 × Delay（排队的话 ≥ ~1.9 ×）
+            receive {first, R1} -> ?assertMatch({ok, _}, R1) after 5000 -> error(first_timeout) end
         after
-            unlink(Pid), exit(Pid, shutdown),
-            (fun W(0) -> ok; W(K) ->
-                case whereis(Name) of undefined -> ok; _ -> timer:sleep(10), W(K-1) end
-             end)(100)
+            unlink(Pid),
+            exit(Pid, shutdown)
         end
     end}.
 
-%% status/1 是"尽力而为"的必要配套 —— 少了几个必须问得出来。
-pool_status_test_() ->
-    {timeout, 60, fun() ->
-        with_pool([0, 1, 2], fun(Pool) ->
-            {ok, St} = bitcask_embedder_pool:status(Pool),
-            ?assertMatch(#{requested := 3, started := 3, missing := []}, St),
-            ?assertEqual({error, not_a_pool},
-                         bitcask_embedder_pool:status(no_such_pool_xyz))
+%% ===================================================================
+%% slots 下 n_threads 按 worker 数均分
+%% ===================================================================
+
+worker_threads_split_test() ->
+    %% 8 核留 2：4 个 worker 各 1；2 个各 3；1 个拿满 6。
+    ?assertEqual(1, bitcask_embedder_pool:worker_threads(8, 4)),
+    ?assertEqual(3, bitcask_embedder_pool:worker_threads(8, 2)),
+    ?assertEqual(6, bitcask_embedder_pool:worker_threads(8, 1)),
+    %% 核比 worker 少也至少 1，绝不为 0。
+    ?assertEqual(1, bitcask_embedder_pool:worker_threads(2, 4)),
+    ?assertEqual(1, bitcask_embedder_pool:worker_threads(1, 1)),
+    ?assertEqual(15, bitcask_embedder_pool:worker_threads(128, 8)).
+
+%% 注入只发生在"不绑卡 + 没显式给"的 worker 上：从 child spec 里的 start 参数看。
+worker_threads_injection_test_() ->
+    {timeout, 30, fun() ->
+        Avail = case erlang:system_info(logical_processors_available) of
+                    N when is_integer(N), N > 0 -> N;
+                    _ -> erlang:system_info(schedulers_online)
+                end,
+        Expect = bitcask_embedder_pool:worker_threads(Avail, 3),
+        %% 不绑卡、没显式给 → 注入均分值
+        with_slots_pool(3, #{}, fun(Sup) ->
+            Cfgs = worker_cfgs(Sup),
+            ?assertEqual(3, length(Cfgs)),
+            ?assert(lists:all(fun(C) -> maps:get(n_threads, C) =:= Expect end, Cfgs))
+        end),
+        %% 显式 n_threads 原样保留
+        with_slots_pool(2, #{n_threads => 7}, fun(Sup) ->
+            ?assertEqual([7, 7], [maps:get(n_threads, C) || C <- worker_cfgs(Sup)])
+        end),
+        %% GPU 绑定（backend / gpu_index）不注入
+        with_slots_pool(2, #{backend => cuda}, fun(Sup) ->
+            ?assertNot(lists:any(fun(C) -> maps:is_key(n_threads, C) end, worker_cfgs(Sup)))
+        end),
+        with_slots_pool(2, #{gpu_index => 1}, fun(Sup) ->
+            ?assertNot(lists:any(fun(C) -> maps:is_key(n_threads, C) end, worker_cfgs(Sup)))
         end)
     end}.
 
-%% ⚠️ 显式列表 = 全都必须起来。这里用一个必然起不来的 provider 配置验证：
-%%    supervisor 起不来 → start_link 报错（而不是少一个照跑）。
-explicit_instances_fail_hard_test_() ->
-    {timeout, 60, fun() ->
-        process_flag(trap_exit, true),
-        N = list_to_atom("bc_hard_" ++ integer_to_list(erlang:unique_integer([positive]))),
-        %% 缺 url 的 openai：每个 worker 的 init 都会失败
-        Opts = #{provider => openai, config => #{model => <<"m">>}, instances => [0, 1]},
-        ?assertMatch({error, _}, bitcask_embedder_pool:start_link({local, N}, Opts)),
-        ?assertEqual(undefined, whereis(N)),
-        process_flag(trap_exit, false),
-        ok
-    end}.
+with_slots_pool(K, Cfg, Fun) ->
+    Name = list_to_atom("bc_thrpool_" ++ integer_to_list(erlang:unique_integer([positive]))),
+    {ok, Pid} = bitcask_embedder_pool:start_link(
+                  {local, Name},
+                  #{provider => {custom, bitcask_embedder_mock}, slots => K, config => Cfg}),
+    try Fun(Pid)
+    after unlink(Pid), exit(Pid, shutdown)
+    end.
+
+%% 每个 worker child 的 start 参数里的 config（按 index 顺序）。
+worker_cfgs(Sup) ->
+    Ids = lists:sort([Id || {{bc_emb_worker, _, _} = Id, _, _, _} <- supervisor:which_children(Sup)]),
+    [begin
+         {ok, #{start := {_, _, [_Reg, Opts]}}} = supervisor:get_childspec(Sup, Id),
+         maps:get(config, Opts)
+     end || Id <- Ids].
+
+%% ===================================================================
+%% 6.6.1：bitcask:put_docs/2 —— 自动 embed 走一次 embed_batch
+%% ===================================================================
+
+put_docs_batches_embed_test_() ->
+    {"put_docs：5 篇里 3 篇要 embed → 恰好一次 embed_batch、零次 embed；向量写进去了",
+     fun() ->
+        with_dir(fun(D) ->
+            H = bitcask:open(D, ?VOPTS ++ [{embedder, {{custom, bitcask_embedder_mock}, #{}}}]),
+            V = bitcask_embedder_mock:vec_bin([0.0, 1.0, 0.0, 0.0]),
+            Docs = [{<<"a">>, #{text => <<"x x x">>}},
+                    {<<"b">>, #{text => <<"x x y">>, vector => V}},   %% 已带向量，不 embed
+                    {<<"c">>, #{text => <<"x y y">>}},
+                    {<<"d">>, <<"plain binary">>},                     %% 不是文档
+                    {<<"e">>, #{text => <<"z z z">>}}],
+            meck:new(bitcask_embedder, [passthrough]),
+            try
+                ?assertEqual(ok, bitcask:put_docs(H, Docs)),
+                ?assertEqual(1, meck:num_calls(bitcask_embedder, embed_batch, '_')),
+                ?assertEqual(0, meck:num_calls(bitcask_embedder, embed, '_')),
+                %% 批里只有真正需要的三条，顺序同输入
+                ?assert(meck:called(bitcask_embedder, embed_batch,
+                                    ['_', [<<"x x x">>, <<"x y y">>, <<"z z z">>]]))
+            after
+                meck:unload(bitcask_embedder)
+            end,
+            [?assertMatch({ok, _}, bitcask:get(H, K)) || K <- [<<"a">>, <<"b">>, <<"c">>, <<"d">>, <<"e">>]],
+            %% 向量确实按各自文本生成：查 "z z z" 的向量应命中 e
+            {ok, Hits} = bitcask:search_vector(H, bitcask_embedder_mock:vec_bin([0.0, 0.0, 0.0, 1.0]), 1),
+            ?assertEqual([<<"e">>], [K || {K, _, _} <- Hits]),
+            ?assertEqual(ok, bitcask:put_docs(H, [])),
+            bitcask:close(H)
+        end)
+     end}.
+
+put_docs_embed_failure_writes_nothing_test_() ->
+    {"put_docs：embed 整批失败 / 单条失败 → 一条都不写，报 embed_failed",
+     fun() ->
+        with_dir(fun(D) ->
+            H = bitcask:open(D, ?VOPTS ++ [{embedder, {{custom, bitcask_embedder_mock}, #{}}}]),
+            Docs = [{<<"a">>, #{text => <<"x">>}}, {<<"b">>, <<"bin">>}, {<<"c">>, #{text => <<"y">>}}],
+            meck:new(bitcask_embedder, [passthrough]),
+            try
+                meck:expect(bitcask_embedder, embed_batch, fun(_, _) -> {error, boom} end),
+                ?assertEqual({error, {embed_failed, boom}}, bitcask:put_docs(H, Docs)),
+                meck:expect(bitcask_embedder, embed_batch,
+                            fun(_, Ts) -> {ok, [case T of
+                                                    <<"y">> -> {error, too_long};
+                                                    _ -> {ok, bitcask_embedder_mock:vec_bin([1.0, 0.0, 0.0, 0.0])}
+                                                end || T <- Ts]} end),
+                ?assertEqual({error, {embed_failed, [{<<"c">>, too_long}]}}, bitcask:put_docs(H, Docs))
+            after
+                meck:unload(bitcask_embedder)
+            end,
+            [?assertEqual(not_found, bitcask:get(H, K)) || K <- [<<"a">>, <<"b">>, <<"c">>]],
+            %% 没配 embedder 的句柄：文档原样逐条写，不碰 embedder
+            bitcask:close(H),
+            H2 = bitcask:open(D ++ "/kv", [read_write]),      %% 新目录：索引模式的目录 KV 模式打不开
+            ?assertEqual(ok, bitcask:put_docs(H2, [{<<"p">>, <<"1">>}, {<<"q">>, <<"2">>}])),
+            ?assertEqual({ok, <<"2">>}, bitcask:get(H2, <<"q">>)),
+            bitcask:close(H2)
+        end)
+     end}.

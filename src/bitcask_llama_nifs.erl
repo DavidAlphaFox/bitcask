@@ -283,19 +283,23 @@ model_load(Path, Opts) when is_binary(Path), is_map(Opts) ->
 %%    自旋与调度抢在一起，超订之后是断崖不是渐变。
 %%
 %% ⚠️ 亲和性覆盖不到 cgroup 的 CPU **配额**（cpu.max 那种按时间片限流的）：那种
-%%    环境下三个 system_info 都会报宿主机核数。真跑在配额容器里就显式配
+%%    环境下 system_info 会报宿主机核数。真跑在配额容器里就显式配
 %%    n_threads，别指望这里猜对。
+%% ⚠️ 退路是 schedulers_online，**不是** logical_processors：后者就是那个报
+%%    宿主机核数的，拿它兜底等于把上面防的坑又挖回来。
+%% ⚠️ 池里多个不绑卡的 worker 时不该各拿一份这个默认值——
+%%    bitcask_embedder_pool 会按 worker 数均分后显式注入 n_threads。
 -spec default_threads() -> pos_integer().
 default_threads() ->
     Ncpu = first_int([erlang:system_info(logical_processors_available),
                       erlang:system_info(logical_processors_online),
-                      erlang:system_info(logical_processors)]),
+                      erlang:system_info(schedulers_online)]),
     case Ncpu of
         N when is_integer(N), N > 2 -> N - 2;
         _                           -> 1
     end.
 
-%% system_info 的这三个都可能返回 unknown。
+%% 前两个可能返回 unknown；schedulers_online 恒为整数，是最终退路。
 first_int([N | _]) when is_integer(N), N > 0 -> N;
 first_int([_ | T])                           -> first_int(T);
 first_int([])                                -> 1.

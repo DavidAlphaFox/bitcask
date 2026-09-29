@@ -26,9 +26,11 @@
 %%   ⚠️ 缓存的是**注册名**不是 pid：worker 重启后 pid 变而名字不变，缓存名字
 %%      不会失效。
 %%
-%%   选谁：取消息队列最短的那个。N 很小（就是卡数），一次 O(N) 的
-%%   process_info 比任何集中式调度都便宜，而且天然反映"谁在忙"——
-%%   worker 是串行的，队列长度就是它欠的活。
+%%   选谁：负载最轻的那个（正在算的那一次 + 邮箱里排队的）。N 很小（就是
+%%   卡数），一次 O(N) 的 process_info 比任何集中式调度都便宜，而且天然反映
+%%   "谁在忙"——worker 是串行的，手上那一次加队列长度就是它欠的活。
+%%   ⚠️ 只看队列长度不够：gen_server 先把请求从邮箱取走再跑 handle_call，
+%%      正在做前向的 worker 队列也是 0，跟闲着的分不开。见 pick/1。
 %%
 %%   ⚠️ **维度是 open 时快照的。** server 在运行中被换成另一个模型的话，
 %%      已经打开的 cask 仍按旧维度写——但那本来就是不该做的事（换模型 =
@@ -44,6 +46,10 @@
 
 -export([init/1, embed/2, embed_batch/2]).
 -export([info/1, workers/1]).
+-export([pick/1, load/1]).                  % 测试 / 排错用
+
+%% scatter 的总 deadline 在最长那段的 worker 超时之上再留的余量。
+-define(SCATTER_MARGIN_MS, 5000).
 
 %% ===================================================================
 %% Provider behaviour: init/1
@@ -106,7 +112,7 @@ embed_batch(#{workers := Ws, timeout := T}, Texts) when is_list(Texts) ->
     case chunk(Texts, length(Ws)) of
         []      -> {ok, []};
         [Only]  -> bitcask_embedder_server:embed_batch(pick(Ws), Only, T * length(Only));
-        Chunks  -> scatter(lists:zip(lists:sublist(Ws, length(Chunks)), Chunks), T)
+        Chunks  -> scatter(Chunks, Ws, T)
     end;
 embed_batch(#{server := Ref, timeout := T}, Texts) when is_list(Texts) ->
     bitcask_embedder_server:embed_batch(Ref, Texts, T * max(1, length(Texts))).
@@ -128,52 +134,103 @@ split(L, Per) ->
             [H | split(Tl, Per)]
     end.
 
-scatter(Pairs, T) ->
-    Parent = self(),
-    Tag = make_ref(),
-    Pids = [spawn(fun() ->
-                Parent ! {Tag, self(), bitcask_embedder_server:embed_batch(W, C, T * length(C))}
-            end) || {W, C} <- Pairs],
-    Collect = fun(Pid) ->
-        receive {Tag, Pid, R} -> R
-        %% ⚠️ 兜底超时要比 worker 自己的超时更长，否则我们会先放弃、把一段
-        %%    本来会回来的结果丢掉。
-        after T * 4 + 60000 -> {error, {embedder_timeout, T}}
-        end
-    end,
-    Results = [Collect(P) || P <- Pids],
-    %% 任一段整体失败 → 该段的每一条都记成那个错，其余段照常返回。
-    Merged = lists:append(
-        [case R of
-             {ok, Rs}       -> Rs;
-             {error, _} = E -> lists:duplicate(length(C), E)
-         end || {R, {_W, C}} <- lists:zip(Results, Pairs)]),
-    {ok, Merged}.
-
-%% 取消息队列最短的 worker。
+%% 多段并发：每段交给一个 worker，结果按原顺序拼回。
 %%
-%% worker 是串行的（一个 llama_context 同时只服务一次前向），所以队列长度就是
+%% 并发骨架用 bitcask_embedder_util:run_chunks/4（spawn_monitor + 单一总
+%% deadline + 到点 kill + 收尾 flush）。以前这里自己 spawn + 逐段 receive，有
+%% 四个问题：
+%%   * 收集端兜底 T*4+60000 比 worker 自己的超时 T*length(C) 还短（一段 > 5 条
+%%     就反了）——先放弃、把本来会回来的结果丢掉；
+%%   * 逐段各等一个完整超时，最坏 K 倍；
+%%   * 放弃后辅助进程迟早还会发结果，带着整段向量永远留在调用方信箱里；
+%%     辅助进程是裸 spawn，崩了只能干等到超时；
+%%   * 固定取前 K 个 worker，不看负载也不管死活，挂掉的照样分到一段。
+%% 现在：worker 按负载排序（没起来的排最后），总 deadline = 最长那段的超时 +
+%% 余量；某段因为 worker 没起来而失败，换一个活着的 worker 重试一次。
+scatter(Chunks, Ws, T) ->
+    Ranked = [W || {_, _, W} <- lists:sort([{load(W), rand:uniform(), W} || W <- Ws])],
+    Pairs = lists:zip(lists:sublist(Ranked, length(Chunks)), Chunks),
+    Results0 = run_pairs(Pairs, T),
+    Results = retry_not_running(Results0, Pairs, Ranked, T),
+    %% 任一段整体失败 → 该段的每一条都记成那个错，其余段照常返回。
+    {ok, lists:append([per_item(R, C, T) || {R, {_W, C}} <- lists:zip(Results, Pairs)])}.
+
+run_pairs(Pairs, T) ->
+    Deadline = lists:max([chunk_timeout(C, T) || {_, C} <- Pairs]) + ?SCATTER_MARGIN_MS,
+    bitcask_embedder_util:run_chunks(
+      Pairs, length(Pairs), Deadline,
+      fun({W, C}) -> bitcask_embedder_server:embed_batch(W, C, chunk_timeout(C, T)) end).
+
+chunk_timeout(C, T) -> T * length(C).
+
+%% worker 没起来（重启中）的那几段，换活着的 worker 再来一次；没有活着的
+%% 就保留原错误。只重试一次——再失败说明不是瞬时问题。
+retry_not_running(Results, Pairs, Ranked, T) ->
+    Failed = [{I, W, C} || {I, {{ok, {error, {embedder_not_running, _}}}, {W, C}}}
+                               <- lists:zip(lists:seq(1, length(Pairs)),
+                                            lists:zip(Results, Pairs))],
+    Dead = [W || {_, W, _} <- Failed],
+    Alive = [W || W <- Ranked, not lists:member(W, Dead), element(1, load(W)) =:= 0],
+    case {Failed, Alive} of
+        {[], _} -> Results;
+        {_, []} -> Results;
+        _ ->
+            N = length(Alive),
+            Again = [{lists:nth((K rem N) + 1, Alive), C}
+                     || {K, {_, _, C}} <- lists:zip(lists:seq(0, length(Failed) - 1), Failed)],
+            Patch = maps:from_list(lists:zip([I || {I, _, _} <- Failed], run_pairs(Again, T))),
+            [maps:get(I, Patch, R) || {I, R} <- lists:zip(lists:seq(1, length(Results)), Results)]
+    end.
+
+per_item({ok, {ok, Rs}}, _C, _T)             -> Rs;
+per_item({ok, {error, _} = E}, C, _T)        -> lists:duplicate(length(C), E);
+per_item({error, {chunk_timeout, _}}, C, T)  -> lists:duplicate(length(C), {error, {embedder_timeout, T}});
+per_item({error, _} = E, C, _T)              -> lists:duplicate(length(C), E).
+
+%% 取负载最轻的 worker：负载 = 正在算的那一次（0/1）+ 邮箱里排队的条数。
+%%
+%% worker 是串行的（一个 llama_context 同时只服务一次前向），所以这个数就是
 %% 它欠的活 —— 这比轮询更贴近"谁真的闲着"，尤其在请求耗时不均时（查询 35 ms
 %% 与长文档 890 ms 差一个数量级）。
 %%
+%% ⚠️ **必须算上"正在算的那一次"**：gen_server 先把请求从邮箱取出再跑
+%%    handle_call，一个正在做 890 ms 前向的 worker 邮箱长度是 0，跟闲着的一样。
+%%    只看队列长度时两个 worker 平局，lists:min 再按名字排序，`_0` 永远赢——
+%%    两路并发的池实际只有一路在干活。"在算"由 current_function 判定：闲着的
+%%    gen_server 停在 gen_server 模块自己的 receive 循环里，跑 handle_call 时
+%%    当前函数是 provider 的（llama 是 NIF 存根、mock 是它自己的 embed）。
+%%    gen_server 模块内的分发只有微秒级，漏判窗口可以忽略。
+%% ⚠️ 平局随机打破，不按名字：否则同时到达的一批请求全砸在同一个上。
 %% ⚠️ 没起来的 worker（whereis 返回 undefined）要排到最后而不是被直接选中：
 %%    选中它只会拿到 {error, {embedder_not_running, _}}，而此刻别的 worker
 %%    明明是好的。重启中的那一个不该拖垮整池。
+-spec pick([atom(), ...]) -> atom().
 pick([W]) -> W;
 pick(Ws) ->
-    Scored = [{qlen(W), W} || W <- Ws],
-    {_, Best} = lists:min(Scored),
+    Scored = [{load(W), rand:uniform(), W} || W <- Ws],
+    {_, _, Best} = lists:min(Scored),
     Best.
 
-qlen(W) ->
+%% {Down, Load}：Down = 1 表示没起来（排最后）；Load = 在算(0/1) + 队列长度。
+-spec load(atom()) -> {0 | 1, non_neg_integer()}.
+load(W) ->
     case whereis(W) of
         undefined -> {1, 0};                    %% 没起来：排最后
         Pid ->
-            case process_info(Pid, message_queue_len) of
-                {message_queue_len, N} -> {0, N};
-                undefined              -> {1, 0}  %% 刚好死在这一刻
+            case process_info(Pid, [message_queue_len, current_function]) of
+                [{message_queue_len, N}, {current_function, CF}] ->
+                    {0, N + busy(CF)};
+                undefined ->
+                    {1, 0}                      %% 刚好死在这一刻
             end
     end.
+
+%% 闲着的 gen_server 当前函数在 gen_server 模块里（loop / receive）；
+%% 其它任何模块都意味着它正在跑 handle_call。hibernate 过的进程当前函数是
+%% {erlang, hibernate, 3}，也算闲。
+busy({gen_server, _, _}) -> 0;
+busy({erlang, hibernate, _}) -> 0;
+busy(_) -> 1.
 
 %% 透传到 server 的 provider info（llama 是模型参数）。排错用。
 -spec info(bitcask_embedder:ctx() | map()) -> {ok, map()} | {error, term()}.

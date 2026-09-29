@@ -137,3 +137,82 @@ validate_dims_test() ->
     ?assertEqual({error, {vector_dim_exceeds_dim, 200, 100}},
                  ?U:validate_dims(#{vector_dim => 200}, 100)),
     ?assertEqual({error, {bad_opt, dim}}, ?U:validate_dims(#{dim => 0}, 100)).
+
+%% ===================================================================
+%% 6.6.1：批量请求的并发骨架 run_chunks/4、切块 chunks/2、init 的上限校验
+%% ===================================================================
+
+%% 5 块、并发上限 2：同时在飞的从不超过 2，结果按块序返回。
+run_chunks_bounded_and_ordered_test() ->
+    Cnt = counters:new(2, [atomics]),          %% 1 = 当前在飞, 2 = 峰值
+    Fun = fun(I) ->
+                  Now = counters:add(Cnt, 1, 1),
+                  _ = Now,
+                  Cur = counters:get(Cnt, 1),
+                  bump_max(Cnt, Cur),
+                  timer:sleep(60),
+                  counters:sub(Cnt, 1, 1),
+                  I * 10
+          end,
+    T0 = erlang:monotonic_time(millisecond),
+    Res = ?U:run_chunks([1, 2, 3, 4, 5], 2, 10000, Fun),
+    Elapsed = erlang:monotonic_time(millisecond) - T0,
+    ?assertEqual([{ok, 10}, {ok, 20}, {ok, 30}, {ok, 40}, {ok, 50}], Res),
+    ?assert(counters:get(Cnt, 2) =< 2),
+    ?assert(counters:get(Cnt, 2) >= 2),        %% 确实并发了，不是串行
+    ?assert(Elapsed >= 3 * 60),                %% 3 轮
+    ?assert(Elapsed < 5 * 60),                 %% 而不是 5 轮串行
+    ?assertEqual({messages, []}, process_info(self(), messages)).
+
+bump_max(Cnt, Cur) ->
+    case counters:get(Cnt, 2) of
+        M when M >= Cur -> ok;
+        _ -> counters:put(Cnt, 2, Cur)
+    end.
+
+%% 一块崩了只影响那一块；其它块照常。
+run_chunks_crash_isolated_test() ->
+    Fun = fun(2) -> exit(boom); (I) -> I end,
+    ?assertEqual([{ok, 1}, {error, {chunk_crashed, boom}}, {ok, 3}],
+                 ?U:run_chunks([1, 2, 3], 4, 10000, Fun)).
+
+%% 总 deadline 到：在飞的杀掉、没发的不发，都记 chunk_timeout；不留孤儿进程、
+%% 不留迟到消息。
+run_chunks_deadline_kills_stragglers_test() ->
+    Parent = self(),
+    Fun = fun(I) -> Parent ! {worker, self(), I}, timer:sleep(5000), I end,
+    Res = ?U:run_chunks([1, 2, 3], 2, 100, Fun),
+    ?assertEqual([{error, {chunk_timeout, 100}}, {error, {chunk_timeout, 100}},
+                  {error, {chunk_timeout, 100}}], Res),
+    Pids = [P || {worker, P, _} <- drain()],
+    ?assertEqual(2, length(Pids)),             %% 第 3 块从未发出
+    timer:sleep(20),
+    ?assertEqual([], [P || P <- Pids, is_process_alive(P)]).
+
+drain() ->
+    receive M -> [M | drain()] after 0 -> [] end.
+
+chunks_test() ->
+    ?assertEqual([], ?U:chunks([], 10)),
+    ?assertEqual([[1, 2, 3]], ?U:chunks([1, 2, 3], 10)),
+    ?assertEqual([10, 10, 5], [length(C) || C <- ?U:chunks(lists:seq(1, 25), 10)]),
+    ?assertEqual(lists:seq(1, 25), lists:append(?U:chunks(lists:seq(1, 25), 10))).
+
+%% max_batch 以前文档写了却没进 config（util 永远用 64）；0 会让切块死循环，
+%% init 必须拒绝。headers 在 init 时拼好一次进 config。
+http_init_limits_test() ->
+    Base = #{url => "http://127.0.0.1:1/v1/embeddings", model => "m", api_key => <<"k">>},
+    {ok, #{config := Cfg}} = bitcask_embedder_openai:init(Base#{max_batch => 10, max_inflight => 2}),
+    ?assertMatch(#{max_batch := 10, max_inflight := 2, max_input_bytes := 32768,
+                   timeout_ms := 30000, connect_timeout_ms := 5000,
+                   headers := [{"Authorization", "Bearer k"}], model := <<"m">>}, Cfg),
+    {ok, #{config := Cfg2}} = bitcask_embedder_openai:init(Base),
+    ?assertMatch(#{max_batch := 64, max_inflight := 4}, Cfg2),
+    ?assertEqual({error, {bad_opt, max_batch}}, bitcask_embedder_openai:init(Base#{max_batch => 0})),
+    ?assertEqual({error, {bad_opt, max_inflight}}, bitcask_embedder_openai:init(Base#{max_inflight => 0})),
+    ?assertEqual({error, {bad_opt, max_batch}}, bitcask_embedder_anthropic:init(Base#{max_batch => -1})),
+    {ok, #{config := Cfg3}} = bitcask_embedder_anthropic:init(Base),
+    ?assertMatch(#{headers := [{"x-api-key", "k"}, {"anthropic-version", _}]}, Cfg3),
+    %% 专用 httpc profile 起来了，且重复 init 幂等
+    ?assert(is_pid(whereis(httpc_bitcask_embedder))),
+    ?assertEqual(ok, ?U:ensure_httpc()).
