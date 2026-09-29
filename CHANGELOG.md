@@ -16,23 +16,27 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
   旧值再覆盖，造成丢更新。现在提交时带一个**提交令牌**（NIF 资源）进 NIF：令牌
   析构只会发生在 NIF 返回后、或调用方在 dirty 队列排队时被 kill（NIF 永不执行）
   之后，析构时通知 locker。调用方死在提交途中，locker 只把事务标成孤儿、锁不放，
-  等到令牌通知再清理。兜底：30s 没等到就照常清理，记入 `status()` 新增的
-  `orphan_timeouts`（应恒为 0）。开销：每个写事务多两次轻量 NIF 调用和两次 ETS
-  写；单 key + `no_sync` 的吞吐与修复前在噪声内持平（8 vCPU：P=1 47–59k、
-  P=8 100–120k txn/s）。
+  等到令牌通知再清理。兜底：等不到通知就照常清理，记入 `status()` 新增的
+  `orphan_timeouts`（应恒为 0）；等待上限是新 app env `{txn_orphan_timeout, Ms}`
+  （默认 300000——到点放锁会重新打开丢更新窗口，只防锁永久泄漏，别调小）。
+  开销：每个写事务多两次轻量 NIF 调用和一次 ETS 写；单 key + `no_sync` 的吞吐
+  与修复前在噪声内持平（8 vCPU：P=1 47–59k、P=8 100–120k txn/s）。
 
 ### Added
 
 - **幂等键** `bitcask_txn:transaction/3` 选项 `{idem_key, K}`：同一个 K 至多提交
   一次，重来不跑 Fun、直接返回 `{atomic, 首次结果}`。标记（含结果）与数据同批原子
   提交；开跑前持标记写锁，同键并发调用串行。`idem_lookup/2`（不上锁自查）、
-  `idem_purge/2`（按年龄清理标记）。`<<0, "bitcask_txn:idem:">>` 前缀保留，事务内
-  写它 → `error({bitcask_txn, reserved_key, K})`。设计 `doc/txn-layer-design-zh.md`
-  §4.5 / §4.5.1。
-- NIF：`bitcask_cpp_nifs:cask_txn_commit/4`、`txn_commit_token/2`、
-  `txn_commit_token_disarm/1`；门面 `bitcask:txn_commit/4`（给 `bitcask_txn`
-  用，一般应用用不上）。
-- 测试：`bitcask_txn_tests` +7。覆盖幂等语义、中止不留标记、保留前缀、8 进程同键
+  `idem_purge/2,3`（按年龄清理标记：不上锁流式扫描只收过期 key，再按块
+  `{chunk, N}` 加前缀锁核对删除，不整体装内存、不长时间挡住带键事务）。
+  `{idem_result, false}` 不存 Fun 结果，重来返回 `{atomic, idem_replayed}`（结果大的
+  事务用）。标记值定长头 `<<Ver:8, At:64, Result/binary>>`。`<<0, "bitcask_txn:idem:">>`
+  前缀保留，事务内写它 → `error({bitcask_txn, reserved_key, K})`。设计
+  `doc/txn-layer-design-zh.md` §4.5 / §4.5.1。
+- NIF：`bitcask_cpp_nifs:cask_txn_commit/4`、`txn_commit_token/2`（令牌只存
+  `{Pid, TxnId}`，析构时发 `{txn_committed, TxnId}`）、`txn_commit_token_disarm/1`；
+  门面 `bitcask:txn_commit/4`（给 `bitcask_txn` 用，一般应用用不上）。
+- 测试：`bitcask_txn_tests` +8（含 `{idem_result, false}`、按块 purge）。覆盖幂等语义、中止不留标记、保留前缀、8 进程同键
   恰好一次、purge；提交令牌的五种路径（disarm 不发、进程退出即发、坏参数、NIF 执行中
   被 kill、排队中被 kill 且整批不落）；以及在 NIF 执行中 kill 后重试，断言每轮恰好执行
   一次（让 DOWN 直接放锁时这一例稳定失败）。`commit_failed_test_` 改用引擎真实拒绝

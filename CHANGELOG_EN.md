@@ -22,11 +22,14 @@ options / functions.
   caller is killed while still queued for a dirty scheduler (the NIF then never
   runs); its destructor notifies the locker. If the caller dies mid-commit the
   locker marks the transaction orphaned and keeps its locks until that
-  notification arrives. Safety net: after 30s without it the locks are released
+  notification arrives. Safety net: if it never comes the locks are released
   anyway and counted in the new `status()` key `orphan_timeouts` (expected to
-  stay 0). Cost: two lightweight NIF calls and two ETS writes per write
-  transaction; single-key `no_sync` throughput is within noise of the pre-fix
-  numbers (8 vCPU: P=1 47–59k, P=8 100–120k txn/s).
+  stay 0); the wait is the new app env `{txn_orphan_timeout, Ms}` (default
+  300000 — firing it reopens the lost-update window, it only guards against a
+  permanently leaked lock, don't lower it). Cost: two lightweight NIF calls and
+  one ETS write per write transaction; single-key `no_sync` throughput is
+  within noise of the pre-fix numbers (8 vCPU: P=1 47–59k, P=8 100–120k
+  txn/s).
 
 ### Added
 
@@ -35,14 +38,21 @@ options / functions.
   `{atomic, FirstResult}`. The marker (holding the result) commits atomically
   in the same batch as the data; the marker's write lock is taken before Fun
   runs, so concurrent calls with the same key serialize. `idem_lookup/2`
-  (lock-free check), `idem_purge/2` (age-based cleanup). The
-  `<<0, "bitcask_txn:idem:">>` prefix is reserved; writing it inside a
-  transaction → `error({bitcask_txn, reserved_key, K})`. Design:
+  (lock-free check), `idem_purge/2,3` (age-based cleanup: a lock-free
+  streaming scan collects only the expired keys, then chunks of `{chunk, N}`
+  are re-checked and deleted under the prefix lock — nothing is loaded whole,
+  keyed transactions are only blocked per chunk). `{idem_result, false}`
+  skips storing Fun's result; a repeat then returns `{atomic, idem_replayed}`
+  (for transactions with large results). Marker value has a fixed header
+  `<<Ver:8, At:64, Result/binary>>`. The `<<0, "bitcask_txn:idem:">>` prefix
+  is reserved; writing it inside a transaction →
+  `error({bitcask_txn, reserved_key, K})`. Design:
   `doc/txn-layer-design-zh.md` §4.5 / §4.5.1.
-- NIF: `bitcask_cpp_nifs:cask_txn_commit/4`, `txn_commit_token/2`,
-  `txn_commit_token_disarm/1`; facade `bitcask:txn_commit/4` (for `bitcask_txn`;
-  applications normally don't need it).
-- Tests: `bitcask_txn_tests` +7. Covers idempotency semantics, aborts leaving no
+- NIF: `bitcask_cpp_nifs:cask_txn_commit/4`, `txn_commit_token/2` (the token
+  holds only `{Pid, TxnId}` and sends `{txn_committed, TxnId}` on destruction),
+  `txn_commit_token_disarm/1`; facade `bitcask:txn_commit/4` (for
+  `bitcask_txn`; applications normally don't need it).
+- Tests: `bitcask_txn_tests` +8 (incl. `{idem_result, false}` and chunked purge). Covers idempotency semantics, aborts leaving no
   marker, the reserved prefix, 8 processes on one key committing exactly once,
   and purge; the commit token's five paths (disarmed → silent, owner exit →
   fires, bad argument, killed while the NIF runs, killed while queued with the

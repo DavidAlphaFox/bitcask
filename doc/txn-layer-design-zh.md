@@ -156,12 +156,11 @@ all-or-nothing，但不提供隔离性：事务中间态对并发读者可见，
 ```
 commit(Tx):
   1. Ops = index_fun 展开 + 缓冲展开 (+ 幂等标记，§4.5.1)
-  2. locker:begin_commit(TxnId)        —— deadline 校验 + 标 inflight（直写 ETS）
-  3. Token = txn_commit_token(HomeShard, {committed, TxnId})
-     R = bitcask:txn_commit(Handle, Ops, Sync, Token)      (仍持有全部锁)
-  4. locker:end_commit(TxnId)          —— 标 done（直写 ETS）
-     txn_commit_token_disarm(Token)    —— 顺序不能反
-     locker:release_all(TxnId)
+  2. Token = txn_commit_token(HomeShard, TxnId)   —— 先建令牌
+     locker:begin_commit(TxnId)        —— deadline 校验 + 标 inflight（直写 ETS）
+  3. R = bitcask:txn_commit(Handle, Ops, Sync, Token)      (仍持有全部锁)
+  4. locker:release_all(TxnId)         —— 删记录
+     txn_commit_token_disarm(Token)    —— 再撤令牌，顺序不能反
   5. ok -> {atomic, Fun结果} ; {error,R} -> {aborted, {commit_failed,R}}
 ```
 
@@ -172,14 +171,21 @@ commit(Tx):
   上继续跑完（实测 DOWN ~100–177µs、4MB 批约 10ms 后才落盘）。v1 由 locker
   按 DOWN 放锁，别的事务就能在批落盘前拿到这些 key——读到提交前的值再覆盖，
   丢更新。
-- **提交令牌**：一个 NIF 资源，析构时若仍 armed 就把 `{committed, TxnId}`
-  发给归属分片。它当参数传进 `txn_commit/4`，NIF 执行期间再额外 keep 一份，
-  所以析构只可能发生在 (a) NIF 已返回之后，或 (b) 调用方还在 dirty 队列里排队、
-  NIF 真正开始前就被 kill——ERTS 不会再执行它——之后。两种都是"这批不会再
-  动盘"。locker 侧：inflight 的事务 DOWN 了只标 `orphan`、锁不放；收到令牌
-  通知再清理。正常路径调用方先 `end_commit`（标 done）再 disarm，两步之间被
-  kill 时 DOWN 看到 done 照常清理，残留通知被忽略。兜底：orphan 30s 等不到
-  通知就照常清理并记 `status()` 的 `orphan_timeouts`（应恒为 0）。
+- **提交令牌**：一个 NIF 资源，只存 `{Pid, TxnId}` 两个标量，析构时若仍 armed
+  就在回调 env 里现构造 `{txn_committed, TxnId}` 发给归属分片。它当参数传进
+  `txn_commit/4`，NIF 执行期间再额外 keep 一份，所以析构只可能发生在 (a) NIF
+  已返回之后，或 (b) 调用方还在 dirty 队列里排队、NIF 真正开始前就被 kill——
+  ERTS 不会再执行它——之后。两种都是"这批不会再动盘"。locker 侧：inflight 的
+  事务 DOWN 了只标 `orphan`、锁不放；收到令牌通知再清理。
+- **两处顺序**是状态机只需三态（none / inflight / orphan）的原因：
+  ① 先建令牌再标 inflight——只要记录是 inflight，令牌就一定存在，DOWN 后
+  必有通知；② NIF 返回后先 `release_all`（删记录）再 disarm——release 之前
+  被 kill，DOWN 看到 inflight → orphan，令牌仍 armed，随进程退出析构 → 通知 →
+  清理；release 之后被 kill，记录已删，通知被忽略。不需要 "done" 状态。
+- 兜底：orphan 等不到通知（比如 NIF 卡死在 I/O 上）就照常清理并记 `status()`
+  的 `orphan_timeouts`（应恒为 0）。等待上限 app env `txn_orphan_timeout`，
+  默认 5 分钟——⚠️ 到点放锁等于把"批还在写、锁已经放了"的窗口重新打开，它只
+  防锁永久泄漏，不要为了快点回收而调小。
 - **放弃过的两个方案**（都实现并测过）：
   1. committer 进程 + `handoff/2`（`c0ca0e3`）：正确，但每个写事务多一次
      spawn + 一次归属分片 call，单 key `no_sync` 最坏 −25~30%。
@@ -190,7 +196,7 @@ commit(Tx):
   令牌方案用析构回调的 callback env 发消息，是文档内用法，两种情况都覆盖。
 - 代价（8 vCPU，单 key 写事务 + `no_sync`，同时段对比）：committer 版 P=1
   42–47k / P=8 70–89k txn/s → 令牌版 47–59k / 100–120k，与修复前基线在噪声
-  内持平。每个写事务多两次轻量 NIF（建令牌 / disarm）+ 两次 ETS 写。
+  内持平。每个写事务多两次轻量 NIF（建令牌 / disarm）+ 一次 ETS 写。
 - ⚠️ **不确定窗口**：调用方死于提交途中，批要么全成要么全不成，但调用方拿
   不到结果。要能安全重试就用幂等键（§4.5.1）；不带键时重试前应用需自查。
 
@@ -203,17 +209,25 @@ commit(Tx):
 - 开跑前（每次重跑都做）拿标记键**写锁**再 `get`：存在 → 不跑 Fun，释放，
   返回 `{atomic, 首次结果}`；不存在 → 照常跑。写锁持到事务结束，所以同一
   个 K 的并发调用在这里串行，后到者必看见先到者的标记。
-- 提交：标记值 `term_to_binary({idem, 1, 提交时刻(秒), Fun结果})` 作为一条
-  `put` 并进**同一条** `txn_commit` 批——批在则标记在，二者不可能分离。
+- 提交：标记值 `<<Ver:8, At:64/big, Result/binary>>`（`Result` =
+  `term_to_binary(Fun结果)`）作为一条 `put` 并进**同一条** `txn_commit` 批——
+  批在则标记在，二者不可能分离。定长头让 purge 不解码结果就能读时间戳。
   只读事务带了键也写标记（让"至多一次 + 原样返回首次结果"的语义统一）。
+- `{idem_result, false}`：不存结果（`Result` 为空），重来返回
+  `{atomic, idem_replayed}`。结果大的事务（比如返回整个文档）应关掉——标记
+  会一直留到 purge。
 - 中止 / 异常的事务不留标记，同 K 再来会执行。
 - 与提交令牌的配合是正确性的关键：调用方在提交中被 kill，重试者要标记
   键的写锁，必须等批落盘、令牌通知到了才放锁，才读得到标记。让 DOWN 直接
   放锁时 `idem_killed_mid_commit_test_` 稳定失败（同一轮两次执行都落盘）。
-- 清理：标记不会自动过期。`idem_purge(Handle, MaxAgeSec)` 在一个事务里
-  持标记前缀写锁 + range + 同批删除提交时间 ≤ now − MaxAgeSec 的标记，返回
-  条数；MaxAgeSec 要大于应用的最长重试周期。`idem_lookup(Handle, K)` 不上锁
-  直读，给应用自查用。
+- 清理：标记不会自动过期。`idem_purge(Handle, MaxAgeSec [, Opts])` 删提交
+  时间 ≤ now − MaxAgeSec 的标记，返回条数；MaxAgeSec 要大于应用的最长重试
+  周期。两段式，为了规模：① 不上锁 `range_fold` 扫标记前缀，只解定长头、只
+  收过期的 key（不把所有标记的值装进内存）；② 按块删（`{chunk, N}`，默认
+  1000）：每块一个事务，持标记前缀写锁 → 逐 key 重读核对仍过期（扫描与加锁
+  之间可能被别的 purge 删掉又被同键新事务重写）→ 同批删除。块之间不持锁，
+  带幂等键的事务只在每块提交那一小会儿被挡；块间新写的标记必然比 cutoff
+  新，不会被误删。`idem_lookup(Handle, K)` 不上锁直读，给应用自查用。
 - 不做：幂等键跨 cask（标记与数据同 cask 才能同批原子）；TTL 自动清理
   （bitcask 无过期机制，交给应用定期 purge）。
 
@@ -366,7 +380,7 @@ eunit（`rebar3 eunit`；并发用例用 spawn + 确定性同步，不引新框�
 | `read/2` 只有读锁 | 加 `read/3`，`Lock = write` 直接拿写锁再读（Mnesia `wlock_read`） | 读-改-写模式两个事务都先读锁再升级 = 确定死锁，能跑对但白白重跑；graphdb 计数器全走它 |
 | `txns` 记录里放 `locks => [LockId]` | 持有锁单独一张 bag 表 `bitcask_txn_held` | ETS insert 整条拷贝，列表放记录里每拿一把新锁拷一遍已持有的——大事务 O(n²)。实测 100 边/事务从 12.8k → 25.6k edges/s |
 | 每个 read/write 一次 `gen_server:call` | 门面在 pdict 记已持有锁，重入（读后写、RMW）不再过 locker | 2PL 到事务结束才放锁，本地缓存永远准确；put_edge_txn 每边省 2~3 次往返 |
-| 提交前 `check` 直读 ETS、调用方自己跑 `txn_commit` | `begin_commit/1` + 提交令牌（`txn_commit/4`）+ `end_commit/1`；DOWN 时 inflight → orphan（§4.5） | 调用方在 dirty NIF 中被 kill 时 DOWN 先于落盘，按 DOWN 放锁 = 丢更新 |
+| 提交前 `check` 直读 ETS、调用方自己跑 `txn_commit` | 先建提交令牌再 `begin_commit/1`（标 inflight）→ `txn_commit/4` → `release_all` → disarm；DOWN 时 inflight → orphan，等令牌通知（§4.5） | 调用方在 dirty NIF 中被 kill 时 DOWN 先于落盘，按 DOWN 放锁 = 丢更新 |
 | 幂等键"v2 可考虑" | `{idem_key, K}` + `idem_lookup/2` + `idem_purge/2`（§4.5.1） | 不确定窗口下的安全重试 |
 | `handle(Tx)` 未列 | 加 `handle/1` | graphdb 计数键缺失时的按需扫描要句柄（不上锁，文档已声明） |
 
