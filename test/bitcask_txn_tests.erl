@@ -1153,3 +1153,81 @@ nif_commit_notify_test_() ->
             bitcask:close(R)
         end)
      end}}.
+
+%% ===================================================================
+%% 6.6.1:坏选项在门面就挡住,不进 locker
+%% ===================================================================
+
+bad_options_do_not_reach_locker_test_() ->
+    {"lock_wait_timeout / timeout 坏值 → badarg,locker 分片不重启;{timeout,0} → {aborted,timeout}",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open(D),
+            Shards = [whereis(bitcask_txn_locker_1), whereis(bitcask_txn_locker_2)],
+            F = fun(Tx) -> ?T:write(Tx, <<"k">>, <<"v">>) end,
+            ?assertError({badarg, {lock_wait_timeout, -1}},
+                         ?T:transaction(R, F, [{lock_wait_timeout, -1}])),
+            ?assertError({badarg, {lock_wait_timeout, foo}},
+                         ?T:transaction(R, F, [{lock_wait_timeout, foo}])),
+            ?assertError({badarg, {timeout, -5}}, ?T:transaction(R, F, [{timeout, -5}])),
+            ?assertError({badarg, {timeout, bar}}, ?T:transaction(R, F, [{timeout, bar}])),
+            ?assertEqual({aborted, timeout}, ?T:transaction(R, F, [{timeout, 0} | ?FAST])),
+            ?assertEqual({atomic, ok}, ?T:transaction(R, F, [{lock_wait_timeout, infinity} | ?FAST])),
+            ?assertEqual(Shards, [whereis(bitcask_txn_locker_1), whereis(bitcask_txn_locker_2)]),
+            %% 直接对 locker 塞坏值(绕过门面):用默认值注册,不崩
+            {ok, TxnId} = ?L:register(self(), #{lock_wait_timeout => nope, deadline => nope}),
+            ?assertEqual(ok, ?L:release_all(TxnId)),
+            ?assertEqual(Shards, [whereis(bitcask_txn_locker_1), whereis(bitcask_txn_locker_2)]),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}.
+
+%% ===================================================================
+%% 6.6.1 B 档：held 表按 {TxnId, Shard} 建键；重跑不越过 deadline
+%% ===================================================================
+
+held_table_keyed_by_shard_test_() ->
+    {"20 把点锁 + 1 把前缀锁：held 行数 = 20 + 分片数，status 一致；放锁后清零",
+     fun() ->
+        setup(),
+        Ref = make_ref(),
+        N = ?L:shard_count(),
+        A = agent_start(),
+        Points = [{Ref, <<"k", (bin(I))/binary>>, point} || I <- lists:seq(1, 20)],
+        [begin acq(A, K, write), ok = expect(A, K, 500) end || K <- Points],
+        P = {Ref, <<"pre">>, prefix},
+        acq(A, P, read), ok = expect(A, P, 500),
+        %% 重入不加行
+        acq(A, hd(Points), read), ok = expect(A, hd(Points), 500),
+        ?assertEqual(20 + N, ets:info(bitcask_txn_held, size)),
+        ?assertMatch(#{locks := L, prefix_locks := N} when L =:= 20 + N, ?L:status()),
+        %% 键形态：{TxnId, Shard}，每个分片至少有前缀锁那一行
+        Keys = lists:usort([Sh || {{_, Sh}, _} <- ets:tab2list(bitcask_txn_held)]),
+        ?assertEqual(lists:seq(1, N), Keys),
+        rel(A),
+        ?assertMatch(#{locks := 0, prefix_locks := 0}, wait_clean()),
+        ?assertEqual(0, ets:info(bitcask_txn_held, size)),
+        stop(A)
+     end}.
+
+restart_stops_at_deadline_test_() ->
+    {"{timeout,50} + {retries,infinity} 在别人持锁下：{aborted,timeout}，不再越过预算重跑",
+     fun() ->
+        with_dir(fun(D) ->
+            {Ref, _} = R = open(D),
+            A = agent_start(),
+            K = {Ref, <<"k">>, point},
+            acq(A, K, write), ok = expect(A, K, 500),
+            {Us, Res} = timer:tc(fun() ->
+                            ?T:transaction(R, fun(Tx) -> ?T:write(Tx, <<"k">>, <<"v">>) end,
+                                           [{timeout, 50}, {retries, infinity},
+                                            {lock_wait_timeout, 10} | ?FAST])
+                        end),
+            ?assertEqual({aborted, timeout}, Res),
+            ?assert(Us < 1000000),
+            rel(A), stop(A),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}.

@@ -55,7 +55,8 @@
 %%   ETS：
 %%     共享（tables 进程持有，public）：
 %%       bitcask_txn_txns    #txn{}                 按 TxnId；waiting = {Shard, LockId}
-%%       bitcask_txn_held    {TxnId, Shard, LockId} bag：事务持有的锁（释放时按分片分组）
+%%       bitcask_txn_held    {{TxnId, Shard}, LockId} duplicate_bag：事务持有的锁
+%%                           （键带分片：分片放锁一次 take，释放时 member 探分片）
 %%       bitcask_txn_stats   {Key, Count}
 %%     每分片（分片进程持有，protected；名字带下标）：
 %%       bitcask_txn_locks_I #lock{}                ordered_set 按 LockId（前缀扫描要序）
@@ -63,7 +64,13 @@
 %%   ⚠️ held 单独成表而不是 #txn{} 里的列表：ETS insert 是整条拷贝，列表
 %%      放记录里意味着每拿一把新锁都把已持有的全部拷一遍——大事务
 %%      （几百个 key）O(n²)，实测 100 边/事务比 1 边/事务还慢。
-%%   无前缀锁时（plens 空）点锁路径的开销与纯点锁实现相同：只查自身一条。
+%%   ⚠️ 键是 {TxnId, Shard} 而不是 TxnId：bag 按键挂链，insert 要查重、
+%%      delete_object 要扫链，都是 O(该键条数)——按 TxnId 建键仍是 O(L²)。
+%%      duplicate_bag 不查重（grant 只在首次持有时 insert，本就没有重复），
+%%      分片放锁 ets:take 一次拿走自己那份。
+%%   无前缀锁时（plens 空）点锁路径的开销与纯点锁实现相同：只查自身一条
+%%   （overlapping 先 ets:first 探 plens 是否为空），无人等待时 release 不做
+%%   唤醒扫描（wake_around 先看本分片 waiting 是否为空）。
 %%
 %%   API（全部由 bitcask_txn 门面调用，不面向用户）：
 %%     register(Pid, Opts)             -> {ok, TxnId}
@@ -82,6 +89,8 @@
 -module(bitcask_txn_locker).
 
 -behaviour(gen_server).
+
+-include_lib("stdlib/include/ms_transform.hrl").
 
 -ifdef(PULSE).
 -compile({parse_transform, pulse_instrument}).
@@ -146,7 +155,11 @@
 -record(tabs, {idx :: pos_integer(), locks :: atom(), plens :: atom()}).
 
 -record(state, {tabs    :: #tabs{},
-                waiting = #{} :: #{txn_id() => lock_id()}}).   % 在本分片等的事务
+                waiting = #{} :: #{txn_id() => lock_id()},    % 在本分片等的事务
+                %% 归属分片：monitor ref → TxnId。DOWN 到了按 ref 直查，不在
+                %% 共享表上按非键字段 match_object 全扫。
+                mons    = #{} :: #{reference() => txn_id()}}).
+
 
 %% =========================================================================
 %% 启动
@@ -265,7 +278,7 @@ begin_commit(TxnId) ->
 %% 每个触及的分片一次 call，多 key 事务里比拿锁本身还贵。
 -spec release_all(txn_id()) -> ok.
 release_all(TxnId) ->
-    Shards = lists:usort([S || {_, S, _} <- ets:match_object(?HELD, {TxnId, '_', '_'})]),
+    Shards = [S || S <- lists:seq(1, shard_count()), ets:member(?HELD, {TxnId, S})],
     [gen_server:cast(shard(S), {release, TxnId}) || S <- Shards],
     gen_server:call(shard(home_of(TxnId)), {unregister, TxnId}, infinity).
 
@@ -277,8 +290,7 @@ release_all(TxnId) ->
                     orphan_timeouts => non_neg_integer(), shards => pos_integer()}.
 status() ->
     N = shard_count(),
-    Waiting = ets:select_count(?TXNS, [{#txn{waiting = '$1', _ = '_'},
-                                        [{'=/=', '$1', undefined}], [true]}]),
+    Waiting = ets:select_count(?TXNS, ets:fun2ms(fun(#txn{waiting = W}) when W =/= undefined -> true end)),
     Locks  = lists:sum([ets:info((tabs(I))#tabs.locks, size) || I <- lists:seq(1, N)]),
     Prefix = lists:sum([C || I <- lists:seq(1, N),
                              {_Len, C} <- ets:tab2list((tabs(I))#tabs.plens)]),
@@ -300,7 +312,7 @@ status() ->
 init({tables, N}) ->
     _ = ets:new(?TXNS,  [named_table, set, public, {keypos, #txn.id},
                          {read_concurrency, true}, {write_concurrency, true}]),
-    _ = ets:new(?HELD,  [named_table, bag, public,
+    _ = ets:new(?HELD,  [named_table, duplicate_bag, public,
                          {read_concurrency, true}, {write_concurrency, true}]),
     _ = ets:new(?STATS, [named_table, set, public, {write_concurrency, true}]),
     Names = list_to_tuple([shard_name(I) || I <- lists:seq(1, N)]),
@@ -317,24 +329,35 @@ init({shard, I}) ->
 handle_call(_Req, _From, tables) ->
     {reply, {error, bad_request}, tables};
 
+%% 门面已校验选项；这里再兜一层——分片是共享的，一个调用方的坏值不能把
+%% 整组 locker 打崩（start_timer badarg → one_for_all 重启）。不合法就用默认。
 handle_call({register, TxnId, Pid, Opts}, _From, S) ->
     Mon = erlang:monitor(process, Pid),
+    LW = case maps:get(lock_wait_timeout, Opts, ?DEFAULT_LOCK_WAIT_TIMEOUT) of
+             infinity -> infinity;
+             V when is_integer(V), V >= 0 -> V;
+             _ -> ?DEFAULT_LOCK_WAIT_TIMEOUT
+         end,
+    DL = case maps:get(deadline, Opts, infinity) of
+             infinity -> infinity;
+             D when is_integer(D) -> D;
+             _ -> infinity
+         end,
     T = #txn{id = TxnId, pid = Pid, mon = Mon,
              age = maps:get(age, Opts, erlang:unique_integer([positive, monotonic])),
-             deadline = maps:get(deadline, Opts, infinity),
-             lock_wait_timeout = maps:get(lock_wait_timeout, Opts,
-                                          ?DEFAULT_LOCK_WAIT_TIMEOUT)},
+             deadline = DL,
+             lock_wait_timeout = LW},
     true = ets:insert(?TXNS, T),
-    {reply, {ok, TxnId}, S};
+    {reply, {ok, TxnId}, S#state{mons = (S#state.mons)#{Mon => TxnId}}};
 
-handle_call({unregister, TxnId}, _From, S) ->
+handle_call({unregister, TxnId}, _From, #state{mons = Mons} = S) ->
     case ets:lookup(?TXNS, TxnId) of
-        [] -> ok;
+        [] -> {reply, ok, S};
         [T] ->
             erlang:demonitor(T#txn.mon, [flush]),
-            true = ets:delete(?TXNS, TxnId)
-    end,
-    {reply, ok, S};
+            true = ets:delete(?TXNS, TxnId),
+            {reply, ok, S#state{mons = maps:remove(T#txn.mon, Mons)}}
+    end;
 
 handle_call({acquire, TxnId, LockId, Mode}, From, S) ->
     case ets:lookup(?TXNS, TxnId) of
@@ -371,17 +394,23 @@ handle_cast(_Msg, S) ->
 
 %% 调用进程死了（只有归属分片会收到）：通知全部分片各自清理，再删记录。
 %% 例外：死在提交途中（inflight）→ 标 orphan，锁留着等完成通知。
-handle_info({'DOWN', Mon, process, _Pid, _Reason}, #state{} = S) ->
-    case ets:match_object(?TXNS, #txn{mon = Mon, _ = '_'}) of
-        [#txn{id = TxnId, commit = inflight}] ->
-            true = ets:update_element(?TXNS, TxnId, {#txn.commit, orphan}),
-            Ms = application:get_env(bitcask, txn_orphan_timeout, ?DEFAULT_ORPHAN_TIMEOUT),
-            _ = erlang:send_after(Ms, self(), {orphan_timeout, TxnId}),
+handle_info({'DOWN', Mon, process, _Pid, _Reason}, #state{mons = Mons} = S) ->
+    case maps:take(Mon, Mons) of
+        error ->
             {noreply, S};
-        [#txn{id = TxnId}] ->
-            {noreply, drop_txn(TxnId, S)};
-        [] ->
-            {noreply, S}
+        {TxnId, Mons1} ->
+            S1 = S#state{mons = Mons1},
+            case ets:lookup(?TXNS, TxnId) of
+                [#txn{commit = inflight}] ->
+                    true = ets:update_element(?TXNS, TxnId, {#txn.commit, orphan}),
+                    Ms = application:get_env(bitcask, txn_orphan_timeout, ?DEFAULT_ORPHAN_TIMEOUT),
+                    _ = erlang:send_after(Ms, self(), {orphan_timeout, TxnId}),
+                    {noreply, S1};
+                [_] ->
+                    {noreply, drop_txn(TxnId, S1)};
+                [] ->
+                    {noreply, S1}
+            end
     end;
 
 %% 提交令牌的析构通知：只有 orphan 才需要它（正常路径令牌已 disarm）。
@@ -405,8 +434,11 @@ handle_info({orphan_timeout, TxnId}, #state{} = S) ->
 handle_info({timeout, TRef, {lock_wait, TxnId, LockId}}, #state{tabs = Tabs} = S) ->
     case maps:find(TxnId, S#state.waiting) of
         {ok, LockId} ->
-            case take_waiter(Tabs, LockId, TxnId) of
-                {ok, #waiter{timer = TRef, from = From}} ->
+            %% 先看不拿：引用不符是过期消息（waiting 与队列条目同步维护，
+            %% 理论上不会发生），别为它把条目取出来再塞回去。
+            case find_waiter(Tabs, LockId, TxnId) of
+                #waiter{timer = TRef} ->
+                    {ok, #waiter{from = From}} = take_waiter(Tabs, LockId, TxnId),
                     Reply = case ets:lookup(?TXNS, TxnId) of
                                 [T] -> case expired(T) of
                                            true  -> {error, timeout};
@@ -421,12 +453,7 @@ handle_info({timeout, TRef, {lock_wait, TxnId, LockId}}, #state{tabs = Tabs} = S
                             end,
                     gen_server:reply(From, Reply),
                     {noreply, wake_around(LockId, set_waiting(TxnId, undefined, S))};
-                {ok, W} ->
-                    %% 引用不符：把它放回去（take 已经拿走了）。理论上不会发生——
-                    %% waiting 与队列条目总是同步维护——防御而已。
-                    requeue(Tabs, LockId, W),
-                    {noreply, S};
-                error ->
+                _ ->
                     {noreply, S}
             end;
         _ ->
@@ -455,11 +482,11 @@ do_acquire(#txn{id = TxnId} = T, LockId, Mode, From, #state{tabs = Tabs} = S) ->
             {reply, ok, S};
         false ->
             Seq = erlang:unique_integer([positive, monotonic]),
-            case blockers(TxnId, Mode, Seq, Recs) of
-                [] ->
+            case blocked(TxnId, Mode, Seq, Recs) of
+                false ->
                     grant(Tabs, TxnId, LockId, Mode),
                     {reply, ok, S};
-                _ ->
+                true ->
                     Timer = start_wait_timer(T, LockId),
                     W = #waiter{txn = TxnId, mode = Mode, from = From,
                                 timer = Timer, seq = Seq},
@@ -518,6 +545,29 @@ covered(TxnId, Mode, Recs) ->
                       end
               end, Recs).
 
+%% 授予判定只要"有没有人挡"：短路，不建列表、不 usort。blockers/4 那份完整
+%% 列表只给死锁 DFS 用。
+blocked(TxnId, Mode, Seq, Recs) ->
+    IsHolder = lists:any(fun(#lock{holders = H}) -> maps:is_key(TxnId, H) end, Recs),
+    lists:any(fun(#lock{holders = H, queue = Q}) ->
+                      holder_conflicts(TxnId, Mode, H)
+                          orelse (not IsHolder andalso
+                                  lists:any(fun(#waiter{txn = X, mode = XM, seq = XS}) ->
+                                                    X =/= TxnId andalso XS < Seq
+                                                        andalso conflicts(Mode, XM)
+                                            end, Q))
+              end, Recs).
+
+%% 写请求：除自己外有任何 holder 即冲突；读请求：除自己外有写 holder 即冲突。
+holder_conflicts(TxnId, write, H) ->
+    map_size(H) > (case maps:is_key(TxnId, H) of true -> 1; false -> 0 end);
+holder_conflicts(TxnId, read, H) ->
+    any_other_writer(TxnId, maps:next(maps:iterator(H))).
+
+any_other_writer(_TxnId, none)                      -> false;
+any_other_writer(TxnId, {X, write, _}) when X =/= TxnId -> true;
+any_other_writer(TxnId, {_, _, It})                 -> any_other_writer(TxnId, maps:next(It)).
+
 %% 挡住 (TxnId, Mode, Seq) 的事务：重叠记录上冲突的 holder ∪（自己不是任一
 %% 重叠记录的 holder 时）比自己早到且冲突的等待者。空 = 可授予。
 blockers(TxnId, Mode, Seq, Recs) ->
@@ -547,7 +597,7 @@ grant(#tabs{idx = I} = Tabs, TxnId, LockId, Mode) ->
         end,
     put_lock(Tabs, L#lock{holders = H#{TxnId => NewMode}}),
     case First of
-        true  -> true = ets:insert(?HELD, {TxnId, I, LockId});
+        true  -> true = ets:insert(?HELD, {{TxnId, I}, LockId});
         false -> ok
     end.
 
@@ -557,8 +607,12 @@ grant(#tabs{idx = I} = Tabs, TxnId, LockId, Mode) ->
 
 overlapping(#tabs{locks = Locks, plens = Plens}, {Ref, Bin, Kind} = LockId) ->
     Size = byte_size(Bin),
-    Lens = [Len || {Len, _} <- ets:tab2list(Plens),
-                   Len < Size orelse (Len =:= Size andalso Kind =:= point)],
+    %% 没有任何前缀锁时（绝大多数负载）不 tab2list：一次 ets:first 探空。
+    Lens = case ets:first(Plens) of
+               '$end_of_table' -> [];
+               _ -> [Len || {Len, _} <- ets:tab2list(Plens),
+                            Len < Size orelse (Len =:= Size andalso Kind =:= point)]
+           end,
     Covering = lists:append([ets:lookup(Locks, {Ref, binary_part(Bin, 0, Len), prefix})
                              || Len <- Lens]),
     Under = case Kind of
@@ -686,11 +740,8 @@ drop_local(TxnId, #state{tabs = Tabs, waiting = W} = S) ->
 
 %% 放掉 TxnId 在本分片持有的全部锁。
 release_held(TxnId, #state{tabs = #tabs{idx = I}} = S) ->
-    Held = ets:match_object(?HELD, {TxnId, I, '_'}),
-    lists:foldl(fun({_, _, LockId} = Obj, Acc) ->
-                        true = ets:delete_object(?HELD, Obj),
-                        release_one(LockId, TxnId, Acc)
-                end, S, Held).
+    Held = ets:take(?HELD, {TxnId, I}),
+    lists:foldl(fun({_, LockId}, Acc) -> release_one(LockId, TxnId, Acc) end, S, Held).
 
 release_one(LockId, TxnId, #state{tabs = #tabs{locks = Locks} = Tabs} = S) ->
     case ets:lookup(Locks, LockId) of
@@ -702,6 +753,10 @@ release_one(LockId, TxnId, #state{tabs = #tabs{locks = Locks} = Tabs} = S) ->
 
 %% LockId 附近的状态变了：把重叠范围内的全部等待者按 seq 依次重判。
 %% 每授予一个都会改变后面人的判定，所以逐个重算（等待者通常个位数）。
+%% 本分片没人在等（waiting 与队列条目同步维护）→ 没有可唤醒的人，跳过
+%% 重叠扫描：release/drop/abort/timeout 在无争用时都走到这里。
+wake_around(_LockId, #state{waiting = W} = S) when map_size(W) =:= 0 ->
+    S;
 wake_around(LockId, #state{tabs = Tabs} = S) ->
     Ws = lists:sort(fun(#waiter{seq = A}, #waiter{seq = B}) -> A =< B end,
                     lists:append([Q || #lock{queue = Q} <- overlapping(Tabs, LockId)])),
@@ -716,16 +771,21 @@ try_wake(#waiter{txn = TxnId, mode = Mode, seq = Seq, timer = Timer, from = From
                     {ok, _} = take_waiter(Tabs, LockId, TxnId),
                     cancel_timer(Timer),
                     gen_server:reply(From, {error, timeout}),
-                    set_waiting(TxnId, undefined, S);
+                    %% 它出队了，排在它后面、被它（更早的冲突等待者）挡着的
+                    %% 人要重判——尤其是它等的是前缀锁、挡的是别的 key 时，
+                    %% 外层 wake_around 的重叠集罩不到那些 key。不补这一下
+                    %% 那些人要等到 lock_wait_timeout 才醒。递归有界：每步
+                    %% 少一个等待者。
+                    wake_around(LockId, set_waiting(TxnId, undefined, S));
                 false ->
-                    case blockers(TxnId, Mode, Seq, overlapping(Tabs, LockId)) of
-                        [] ->
+                    case blocked(TxnId, Mode, Seq, overlapping(Tabs, LockId)) of
+                        false ->
                             {ok, _} = take_waiter(Tabs, LockId, TxnId),
                             cancel_timer(Timer),
                             grant(Tabs, TxnId, LockId, Mode),
                             gen_server:reply(From, ok),
                             set_waiting(TxnId, undefined, S);
-                        _ ->
+                        true ->
                             S
                     end
             end;
@@ -781,12 +841,11 @@ take_waiter(#tabs{locks = Locks} = Tabs, LockId, TxnId) ->
             end
     end.
 
-%% 入队（队列按 seq 升序）。
+%% 入队（队列按 seq 升序）。只有新等待者才入队，它的 seq 是刚取的单调整数、
+%% 必定最大，直接追加就是有序的——不用整队重排。
 requeue(Tabs, LockId, W) ->
     L = get_lock(Tabs, LockId),
-    Q = lists:sort(fun(#waiter{seq = A}, #waiter{seq = B}) -> A =< B end,
-                   [W | L#lock.queue]),
-    put_lock(Tabs, L#lock{queue = Q}).
+    put_lock(Tabs, L#lock{queue = L#lock.queue ++ [W]}).
 
 %% =========================================================================
 %% 小工具

@@ -133,11 +133,21 @@ transaction(Handle, Fun, Opts) when is_function(Fun, 1), is_list(Opts) ->
             {aborted, tx_nested}
     end.
 
+%% 选项一律在门面校验，坏值当场 badarg——别把它们送进 locker：一个坏的
+%% lock_wait_timeout 到了分片里 start_timer 就 badarg，分片崩、one_for_all 全组
+%% 重启，所有在途事务 locker_restarted；10 秒内几次就超过重启强度，supervisor
+%% 自己也没了。
 parse_opts(Opts) ->
     Deadline = case proplists:get_value(timeout, Opts, infinity) of
                    infinity -> infinity;
-                   Ms when is_integer(Ms), Ms > 0 ->
-                       erlang:monotonic_time(millisecond) + Ms
+                   Ms when is_integer(Ms), Ms >= 0 ->
+                       erlang:monotonic_time(millisecond) + Ms;
+                   BadT -> erlang:error({badarg, {timeout, BadT}})
+               end,
+    LockWait = case proplists:get_value(lock_wait_timeout, Opts, ?DEFAULT_LOCK_WAIT_TIMEOUT) of
+                   infinity -> infinity;
+                   LW when is_integer(LW), LW >= 0 -> LW;
+                   BadLW -> erlang:error({badarg, {lock_wait_timeout, BadLW}})
                end,
     Retries = proplists:get_value(retries, Opts, ?DEFAULT_RETRIES),
     true = Retries =:= infinity orelse (is_integer(Retries) andalso Retries >= 0),
@@ -154,24 +164,34 @@ parse_opts(Opts) ->
     #cfg{retries   = Retries,
          age       = erlang:unique_integer([positive, monotonic]),
          deadline  = Deadline,
-         lock_wait = proplists:get_value(lock_wait_timeout, Opts,
-                                         ?DEFAULT_LOCK_WAIT_TIMEOUT),
+         lock_wait = LockWait,
          sync      = Sync,
          index_fun = IndexFun,
          idem      = Idem,
          idem_result = IdemResult}.
 
 %% 重启循环。Attempt 是已重跑次数；Attempt < Retries 才准再来一次。
-run_loop(Handle, Fun, #cfg{retries = Retries} = Cfg, Attempt) ->
+run_loop(Handle, Fun, #cfg{retries = Retries, deadline = Deadline} = Cfg, Attempt) ->
     case run_once(Handle, Fun, Cfg) of
         {restart, _Why} when Retries =:= infinity; Attempt < Retries ->
-            timer:sleep(rand:uniform(10)),
-            run_loop(Handle, Fun, Cfg, Attempt + 1);
+            case past_deadline(Deadline) of
+                true ->
+                    %% 预算已耗尽：别再睡、再注册、再拿锁只为拿回一个 timeout。
+                    {aborted, timeout};
+                false ->
+                    %% 退避带上限的指数抖动：热点 key 上一群事务同步重跑，
+                    %% 平抖动 1~10ms 打不散，越退越开才能错开。
+                    timer:sleep(rand:uniform(min(10 bsl Attempt, 200))),
+                    run_loop(Handle, Fun, Cfg, Attempt + 1)
+            end;
         {restart, _Why} ->
             {aborted, {retry_limit, Retries}};
         Result ->
             Result
     end.
+
+past_deadline(infinity) -> false;
+past_deadline(D)        -> erlang:monotonic_time(millisecond) >= D.
 
 %% 单次尝试：注册 → 跑 Fun → 提交。所有出口都 release_all（幂等）。
 run_once(Handle, Fun, Cfg) ->
@@ -354,6 +374,8 @@ covers({ok, read}, read)  -> true;
 covers(_, _)              -> false.
 
 %% 已持有的前缀锁里有没有一把罩住 Bin（含相等）且模式够用的。
+prefix_covers(_Bin, _Mode, Prefixes) when map_size(Prefixes) =:= 0 ->
+    false;                                   % 没持前缀锁（绝大多数事务）：不建列表
 prefix_covers(Bin, Mode, Prefixes) ->
     Size = byte_size(Bin),
     lists:any(fun({P, PM}) ->
