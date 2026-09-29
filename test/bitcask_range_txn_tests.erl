@@ -16,13 +16,7 @@
 
 -define(KV, [read_write]).
 
-with_dir(Fun) ->
-    Dir = "/tmp/bitcask_range_txn_" ++ os:getpid() ++ "_" ++
-          integer_to_list(erlang:unique_integer([positive])),
-    ok = filelib:ensure_path(Dir),
-    try Fun(Dir)
-    after os:cmd("rm -rf " ++ Dir)
-    end.
+with_dir(Fun) -> bitcask_test_util:with_dir("bitcask_range_txn_", Fun).
 
 key(N) -> list_to_binary(io_lib:format("k~3..0b", [N])).
 

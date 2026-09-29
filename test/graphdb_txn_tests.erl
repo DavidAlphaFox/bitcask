@@ -17,18 +17,23 @@
 with_dir(Fun) ->
     catch application:load(bitcask),
     {ok, _} = application:ensure_all_started(bitcask),
-    Dir = "/tmp/graphdb_txn_tests_" ++ os:getpid() ++ "_" ++
-          integer_to_list(erlang:unique_integer([positive])),
-    ok = filelib:ensure_path(Dir),
-    try Fun(Dir)
-    after os:cmd("rm -rf " ++ Dir)
-    end.
+    bitcask_test_util:with_dir("graphdb_txn_tests_", Fun).
 
 -define(FAST, [{sync, no_sync}]).
 
 dsts({ok, Edges}) -> [D || #{dst := D} <- Edges].
 
 %% 锁的释放是异步的（cast），断言"锁表清零"要等一下。
+%% 只等锁表清空（locks / prefix_locks / waiting 归零），不管 txns——agent 还活着
+%% 时它们的事务仍注册着，txns 不会归零，用 wait_clean/0 会白白轮询满 1 s。
+wait_locks_clean() -> wait_locks_clean(50).
+wait_locks_clean(0) -> bitcask_txn_locker:status();
+wait_locks_clean(N) ->
+    case bitcask_txn_locker:status() of
+        #{locks := 0, prefix_locks := 0, waiting := 0} = S -> S;
+        _ -> timer:sleep(20), wait_locks_clean(N - 1)
+    end.
+
 wait_clean() -> wait_clean(50).
 wait_clean(0) -> bitcask_txn_locker:status();
 wait_clean(N) ->
@@ -208,7 +213,7 @@ out_edges_txn_merges_buffer_test_() ->
             ?assertEqual({atomic, {[3, 9, 4], [3, 9], 2, [1], [], 3}}, Res),
             %% 直通视图与提交一致
             ?assertEqual([3, 9, 4], dsts(?G:out_edges(R, 1))),
-            ?assertMatch(#{locks := 0, prefix_locks := 0}, wait_clean()),
+            ?assertMatch(#{locks := 0, prefix_locks := 0}, wait_locks_clean()),
             ?G:close(R)
         end)
      end}.
@@ -240,7 +245,7 @@ del_vertex_txn_test_() ->
             %% 自身计数键全没了（不是归零，是删除）
             ?assertEqual([], bitcask:range(R, {<<"deg", 1:64/big>>, <<"deg", 2:64/big>>})),
             ?assertEqual([], bitcask:range(R, {<<"degi", 1:64/big>>, <<"degi", 2:64/big>>})),
-            ?assertMatch(#{locks := 0, prefix_locks := 0}, wait_clean()),
+            ?assertMatch(#{locks := 0, prefix_locks := 0}, wait_locks_clean()),
             ?G:close(R)
         end)
      end}.

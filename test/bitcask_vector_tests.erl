@@ -16,13 +16,7 @@
 -define(VOPTS, [read_write, {analyzer, whitespace}, {vector_dim, 4}]).
 -define(IDX,   [read_write, {analyzer, whitespace}]).
 
-with_dir(Fun) ->
-    Dir = "/tmp/bitcask_vector_" ++ os:getpid() ++ "_" ++
-          integer_to_list(erlang:unique_integer([positive])),
-    ok = filelib:ensure_path(Dir),
-    try Fun(Dir)
-    after os:cmd("rm -rf " ++ Dir)
-    end.
+with_dir(Fun) -> bitcask_test_util:with_dir("bitcask_vector_", Fun).
 
 %% 语料（与 C++ V36HybridRrfFusion 一致；向量出自 mock embedder）：
 %%   key  text(BM25 rank)  vec               (vec rank, cos vs (1,0,0,0))

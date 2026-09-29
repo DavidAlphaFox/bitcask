@@ -7,13 +7,7 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
-with_dir(Fun) ->
-    Dir = "/tmp/graphdb_analytics_tests_" ++ os:getpid() ++ "_" ++
-          integer_to_list(erlang:unique_integer([positive])),
-    ok = filelib:ensure_path(Dir),
-    try Fun(Dir)
-    after os:cmd("rm -rf " ++ Dir)
-    end.
+with_dir(Fun) -> bitcask_test_util:with_dir("graphdb_analytics_tests_", Fun).
 
 %% 顶点 1..4；边（etype 7）：1→2, 2→3, 3→4, 1→3；边（etype 8）：1→3。
 seeded(D) ->

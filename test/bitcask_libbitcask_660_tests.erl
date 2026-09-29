@@ -12,13 +12,7 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
-with_dir(Fun) ->
-    Dir = "/tmp/bitcask_660_" ++ os:getpid() ++ "_" ++
-          integer_to_list(erlang:unique_integer([positive])),
-    ok = filelib:ensure_path(Dir),
-    try Fun(Dir)
-    after os:cmd("rm -rf " ++ Dir)
-    end.
+with_dir(Fun) -> bitcask_test_util:with_dir("bitcask_660_", Fun).
 
 hits(R, Q) ->
     {ok, Hits} = bitcask:search_text(R, Q),

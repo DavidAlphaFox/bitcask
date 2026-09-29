@@ -30,12 +30,7 @@ setup() ->
 
 with_dir(Fun) ->
     setup(),
-    Dir = "/tmp/bitcask_txn_" ++ os:getpid() ++ "_" ++
-          integer_to_list(erlang:unique_integer([positive])),
-    ok = filelib:ensure_path(Dir),
-    try Fun(Dir)
-    after os:cmd("rm -rf " ++ Dir)
-    end.
+    bitcask_test_util:with_dir("bitcask_txn_", Fun).
 
 open(D) -> bitcask:open(D, [read_write]).
 
@@ -88,6 +83,16 @@ agent_loop(Parent, TxnId) ->
     end.
 
 %% 锁的释放是异步的（cast），断言"锁表清零"要等一下：最多 1s，返回末次 status。
+%% 只等锁表清空（locks / prefix_locks / waiting 归零），不管 txns——agent 还活着
+%% 时它们的事务仍注册着，txns 不会归零，用 wait_clean/0 会白白轮询满 1 s。
+wait_locks_clean() -> wait_locks_clean(50).
+wait_locks_clean(0) -> ?L:status();
+wait_locks_clean(N) ->
+    case ?L:status() of
+        #{locks := 0, prefix_locks := 0, waiting := 0} = S -> S;
+        _ -> timer:sleep(20), wait_locks_clean(N - 1)
+    end.
+
 wait_clean() -> wait_clean(50).
 wait_clean(0) -> ?L:status();
 wait_clean(N) ->
@@ -105,11 +110,45 @@ expect({Pid, _}, LockId, Ms) ->
     after Ms -> timeout
     end.
 
-%% 期望 Ms 内**没有**结果（仍阻塞）。
+%% 期望 agent 在 LockId 上**排队等着**（没拿到、也没失败）。
+%%
+%% 以前是"150 ms 内没收到结果就算阻塞"——既慢（29 处调用），又是反向断言：
+%% 负载高时晚于 150 ms 才授予的锁也会被当成阻塞。现在正向确认：轮询共享表
+%% bitcask_txn_txns，直到 agent 的事务记录 waiting = {_, LockId}。locker 在
+%% handle_call 里先入队 + 写 waiting、**之后**才 noreply（立即可授予的请求直接
+%% reply，根本不写 waiting），所以看到 waiting 就说明请求确实排上了队。
+%% 期间收到结果 → {unexpected, R}；2 s 内既没排队也没结果 → {not_queued, W}。
+%% 最后再 after 0 看一眼信箱，防"排上队后立刻被授予"。
 blocked({Pid, _}, LockId) ->
+    blocked(Pid, LockId, 1000).
+
+blocked(Pid, LockId, 0) ->
     receive {Pid, {acquired, LockId, R}} -> {unexpected, R}
-    after 150 -> blocked
+    after 0 -> {not_queued, txn_waiting(Pid)}
+    end;
+blocked(Pid, LockId, N) ->
+    receive {Pid, {acquired, LockId, R}} -> {unexpected, R}
+    after 0 ->
+        case lists:any(fun({_Shard, L}) -> L =:= LockId end, txn_waiting(Pid)) of
+            true ->
+                receive {Pid, {acquired, LockId, R}} -> {unexpected, R}
+                after 0 -> blocked
+                end;
+            false ->
+                timer:sleep(2),
+                blocked(Pid, LockId, N - 1)
+        end
     end.
+
+%% Pid 名下事务的 waiting 字段（非 undefined 的）。#txn{} 是 locker 私有记录，
+%% 这里按位置读：{txn, Id, Pid, Mon, Age, Deadline, LockWaitTimeout, Waiting, Commit}。
+txn_waiting(Pid) ->
+    [element(8, T) || T <- ets:tab2list(bitcask_txn_txns),
+                      element(3, T) =:= Pid, element(8, T) =/= undefined].
+
+%% 等到 Pid 名下有事务在排队（门面事务用：不知道具体 LockId）。
+wait_queued(Pid) ->
+    ok = wait_for(fun() -> txn_waiting(Pid) =/= [] end).
 
 rel(A) -> rel(A, #{}).
 
@@ -150,7 +189,7 @@ lock_matrix_test_() ->
         acq(B, K, write), ?assertEqual(blocked, blocked(B, K)),
         rel(A),           ?assertEqual(ok, expect(B, K, 500)),
         rel(B),
-        ?assertMatch(#{locks := 0}, wait_clean()),
+        ?assertMatch(#{locks := 0}, wait_locks_clean()),
         stop(A), stop(B)
      end}.
 
@@ -175,7 +214,7 @@ fifo_no_writer_starvation_test_() ->
         ?assertEqual(ok, expect(R2, K, 500)),                         % 读段合并
         ?assertEqual(ok, expect(R3, K, 500)),
         rel(R2), rel(R3),
-        ?assertMatch(#{locks := 0}, wait_clean()),
+        ?assertMatch(#{locks := 0}, wait_locks_clean()),
         [stop(X) || X <- [R1, W, R2, R3]]
      end}.
 
@@ -201,7 +240,7 @@ deadlock_detected_at_locker_test_() ->
         rel(B),
         ?assertEqual(ok, expect(A, K2, 500)),
         rel(A),
-        ?assertMatch(#{locks := 0, waiting := 0}, wait_clean()),
+        ?assertMatch(#{locks := 0, waiting := 0}, wait_locks_clean()),
         stop(A), stop(B)
      end}.
 
@@ -223,7 +262,7 @@ three_way_cycle_test_() ->
         rel(B),
         ok = expect(A, K2, 500),
         rel(A),
-        ?assertMatch(#{locks := 0}, wait_clean()),
+        ?assertMatch(#{locks := 0}, wait_locks_clean()),
         [stop(X) || X <- [A, B, C]]
      end}.
 
@@ -251,7 +290,7 @@ holder_death_releases_test_() ->
         ?assertEqual(ok, expect(C, K, 500)),
         rel(C),
         process_flag(trap_exit, false),
-        ?assertMatch(#{locks := 0, waiting := 0}, wait_clean()),
+        ?assertMatch(#{locks := 0, waiting := 0}, wait_locks_clean()),
         stop(C)
      end}.
 
@@ -534,7 +573,8 @@ txn_process_death_test_() ->
                                         ?T:write(Tx, <<"k">>, <<"p2">>)
                                     end, ?FAST)}
             end),
-            receive {P2, _} -> ?assert(false) after 150 -> ok end,   % 确实在等
+            ok = wait_queued(P2),                                     % 确实在等
+            receive {P2, _} -> ?assert(false) after 0 -> ok end,
             exit(P1, kill),
             ?assertEqual({atomic, ok}, receive {P2, Res} -> Res after 2000 -> timeout end),
             ?assertEqual({ok, <<"p2">>}, bitcask:get(R, <<"k">>)),
@@ -660,7 +700,7 @@ prefix_lock_matrix_test_() ->
         acq(B, P, read),   ?assertEqual(blocked, blocked(B, P)),
         rel(A),            ok = expect(B, P, 500),
         rel(B),
-        ?assertMatch(#{locks := 0, prefix_locks := 0, waiting := 0}, wait_clean()),
+        ?assertMatch(#{locks := 0, prefix_locks := 0, waiting := 0}, wait_locks_clean()),
         stop(A), stop(B), stop(C)
      end}.
 
@@ -691,7 +731,7 @@ prefix_writer_fairness_test_() ->
         rel(W),
         ok = expect(L, K2, 500),
         rel(L),
-        ?assertMatch(#{locks := 0, prefix_locks := 0}, wait_clean()),
+        ?assertMatch(#{locks := 0, prefix_locks := 0}, wait_locks_clean()),
         [stop(X) || X <- [H, W, L]]
      end}.
 
@@ -717,7 +757,7 @@ prefix_covered_is_free_test_() ->
         rel(B),                                        % B 重跑前放锁 → A 拿到 q
         ?assertEqual(ok, expect(A, {Ref, <<"q">>, point}, 500)),
         rel(A),
-        ?assertMatch(#{locks := 0, prefix_locks := 0}, wait_clean()),
+        ?assertMatch(#{locks := 0, prefix_locks := 0}, wait_locks_clean()),
         stop(A), stop(B)
      end}.
 
@@ -743,12 +783,13 @@ prefix_range_phantom_test_() ->
             end),
             receive {Scanner, scanned, 5} -> ok end,
             %% 并发写者想插 u:9：前缀读锁在手，必须等
-            spawn_link(fun() ->
+            Writer = spawn_link(fun() ->
                 Parent ! {writer, ?T:transaction(R, fun(Tx) ->
                                        ?T:write(Tx, <<"u:", 9>>, <<"phantom">>)
                                    end, ?FAST)}
             end),
-            receive {writer, _} -> ?assert(false) after 150 -> ok end,
+            ok = wait_queued(Writer),
+            receive {writer, _} -> ?assert(false) after 0 -> ok end,
             Scanner ! go,
             {atomic, {5, Second}} = receive {Scanner, Res} -> Res end,
             %% 缓冲合并：u:1 没了、u:7 有了、u:9 不可见
@@ -783,7 +824,7 @@ cross_shard_deadlock_test_() ->
         acq(B, K1, write), ?assertEqual({error, deadlock}, expect(B, K1, 500)),
         rel(B), ok = expect(A, K2, 500),
         rel(A),
-        ?assertMatch(#{locks := 0, waiting := 0}, wait_clean()),
+        ?assertMatch(#{locks := 0, waiting := 0}, wait_locks_clean()),
         stop(A), stop(B)
      end}.
 
@@ -839,12 +880,13 @@ shard_crash_aborts_txn_test_() ->
         end)
      end}}.
 
-wait_for(Pred) -> wait_for(Pred, 100).
+%% 轮询 Pred 直到为真：5 ms 一次，最多 2 s。
+wait_for(Pred) -> wait_for(Pred, 400).
 wait_for(_Pred, 0) -> timeout;
 wait_for(Pred, N) ->
     case catch Pred() of
         true -> ok;
-        _    -> timer:sleep(20), wait_for(Pred, N - 1)
+        _    -> timer:sleep(5), wait_for(Pred, N - 1)
     end.
 
 %% ===================================================================
@@ -872,7 +914,7 @@ younger_is_victim_across_shards_test_() ->
         ?assertEqual(ok, expect(A, K2, 500)),
         ?assertMatch(#{victims_other := V1} when V1 =:= V0 + 1, ?L:status()),
         rel(A),
-        ?assertMatch(#{locks := 0, waiting := 0}, wait_clean()),
+        ?assertMatch(#{locks := 0, waiting := 0}, wait_locks_clean()),
         stop(A), stop(B)
      end}.
 
@@ -908,7 +950,7 @@ older_txn_never_restarts_test_() ->
                 Parent ! {self(), Res}
             end),
             receive {PYoung, has_k2} -> ok end,
-            timer:sleep(100),                              % 让 young 真的挂在 k1 上
+            ok = wait_queued(PYoung),                      % young 真的挂在 k1 上
             POld ! go,
             ?assertEqual({atomic, ok}, receive {POld, R1} -> R1 after 5000 -> timeout end),
             ?assertEqual({atomic, ok}, receive {PYoung, R2} -> R2 after 5000 -> timeout end),
@@ -1075,7 +1117,12 @@ idem_killed_mid_commit_test_() ->
                                                     || I <- lists:seq(1, 2000)], sync_on_commit)
                     end)) div 1000)),
             #{orphan_timeouts := Orph0} = ?L:status(),
-            Rounds = 30,
+            %% 默认 10 轮（每轮一次 ~8 MB 同步提交）；BITCASK_STRESS_ROUNDS=30 跑压测。
+            %% 每轮都打在 NIF 执行中，错误实现一轮就会露馅，10 轮足够区分。
+            Rounds = case os:getenv("BITCASK_STRESS_ROUNDS") of
+                         false -> 10;
+                         RS    -> list_to_integer(RS)
+                     end,
             Seen = [begin
                         K = bin(N),
                         A = spawn(fun() -> ?T:transaction(R, Fun(K, $a), [{idem_key, K}]) end),
@@ -1138,8 +1185,13 @@ nif_commit_notify_test_() ->
             %% 排队中被 kill：先占满全部 dirty IO 调度器，A 只能排队；kill 后
             %% NIF 永不执行——通知照样到（令牌随进程退出析构），整批不落
             NDio = erlang:system_info(dirty_io_schedulers),
-            Hogs = [spawn(fun() -> erts_debug:dirty_io(wait, 1500) end) || _ <- lists:seq(1, NDio)],
-            timer:sleep(100),
+            Hogs = [spawn_monitor(fun() -> erts_debug:dirty_io(wait, 600) end)
+                    || _ <- lists:seq(1, NDio)],
+            %% 等每个 hog 真的进了 dirty NIF（占住调度器），不靠 sleep 猜
+            [ok = wait_for(fun() ->
+                               process_info(H, current_function)
+                                   =:= {current_function, {erts_debug, dirty_io, 2}}
+                           end) || {H, _} <- Hogs],
             {A2, M2} = spawn_monitor(fun() ->
                            bitcask:txn_commit(R, Ops(<<"queued">>), sync_on_commit, Tok(200))
                        end),
@@ -1147,8 +1199,15 @@ nif_commit_notify_test_() ->
             exit(A2, kill),
             receive {'DOWN', M2, _, _, _} -> ok end,
             ?assertEqual(ok, Recv(200, 5000)),
-            [exit(H, kill) || H <- Hogs],
-            timer:sleep(1600),
+            [exit(H, kill) || {H, _} <- Hogs],
+            [receive {'DOWN', HM, _, _, _} -> ok after 5000 -> error(hog_not_down) end
+             || {_, HM} <- Hogs],
+            %% hog 的 DOWN 在 kill 时就到了，dirty 调度器要等 NIF 自己返回才空出来。
+            %% 以前在这里 sleep(1600) 等。现在：dirty 队列先进先出，排一个探针
+            %% dirty 调用，它跑起来时排在前面的 A2（若还在队里）必已被派发；再做
+            %% 一次小提交——它要拿引擎写锁，A2 的批若真在写，一定先写完。
+            erts_debug:dirty_io(wait, 0),
+            ok = bitcask:txn_commit(R, [{put, <<"probe">>, <<"1">>}], no_sync),
             ?assertEqual(not_found, bitcask:get(R, <<"queued1">>)),
             bitcask:close(R)
         end)
@@ -1206,7 +1265,7 @@ held_table_keyed_by_shard_test_() ->
         Keys = lists:usort([Sh || {{_, Sh}, _} <- ets:tab2list(bitcask_txn_held)]),
         ?assertEqual(lists:seq(1, N), Keys),
         rel(A),
-        ?assertMatch(#{locks := 0, prefix_locks := 0}, wait_clean()),
+        ?assertMatch(#{locks := 0, prefix_locks := 0}, wait_locks_clean()),
         ?assertEqual(0, ets:info(bitcask_txn_held, size)),
         stop(A)
      end}.

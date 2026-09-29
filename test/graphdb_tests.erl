@@ -12,13 +12,7 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
-with_dir(Fun) ->
-    Dir = "/tmp/graphdb_tests_" ++ os:getpid() ++ "_" ++
-          integer_to_list(erlang:unique_integer([positive])),
-    ok = filelib:ensure_path(Dir),
-    try Fun(Dir)
-    after os:cmd("rm -rf " ++ Dir)
-    end.
+with_dir(Fun) -> bitcask_test_util:with_dir("graphdb_tests_", Fun).
 
 %% 顶点 1..4；边（etype 7）：1→2, 2→3, 3→4, 1→3；边（etype 8）：1→3。
 seeded(D) ->
@@ -667,3 +661,67 @@ degree_strict_parse_i_vid_test_() ->
             graphdb:close(R)
         end)
      end}.
+
+%% ===================================================================
+%% shortest_path：大 frontier 并行展开、失败清理
+%% ===================================================================
+
+%% 0 →(7) 1..50 →(7) 101..150 →(7) 200。第二轮起两侧 frontier 都是 50 个顶点，
+%% 走并行分片展开；路径必须与逐点串行语义一致（frontier 序、邻居序）。
+wide_graph(D) ->
+    R = graphdb:open(D, [read_write]),
+    [begin
+         ok = graphdb:put_edge(R, 0, 7, I),
+         ok = graphdb:put_edge(R, I, 7, 100 + I),
+         ok = graphdb:put_edge(R, 100 + I, 7, 200)
+     end || I <- lists:seq(1, 50)],
+    R.
+
+shortest_path_wide_frontier_test_() ->
+    {"两侧 frontier 各 50 个顶点：并行展开，路径 = 串行语义下的第一条",
+     {timeout, 60, fun() ->
+        with_dir(fun(D) ->
+            R = wide_graph(D),
+            ?assertEqual({ok, [0, 1, 101, 200]}, graphdb:shortest_path(R, 0, 200)),
+            ?assertEqual({ok, [7, 107, 200]}, graphdb:shortest_path(R, 7, 200)),
+            ?assertEqual({error, no_path}, graphdb:shortest_path(R, 200, 0)),
+            graphdb:close(R)
+        end)
+     end}}.
+
+%% 展开途中引擎报错：串行路径（frontier ≤ 4）与并行路径都返回 {error, _}，
+%% 调用方信箱里不留 worker 的结果 / DOWN。
+shortest_path_expand_failure_test_() ->
+    {"展开失败：串行 / 并行两条路径都返回 {error,{graphdb_expand,_}}，信箱干净",
+     {timeout, 60, fun() ->
+        with_dir(fun(D) ->
+            R = wide_graph(D),
+            Boom = <<"e", 7:64/big>>,               %% 顶点 7 的出边范围
+            meck:new(bitcask, [passthrough]),
+            meck:expect(bitcask, range_fold,
+                        fun(H, {Lo, Hi}, O, F, A) ->
+                                case binary:longest_common_prefix([Lo, Boom]) =:= byte_size(Boom) of
+                                    true  -> {error, boom};
+                                    false -> meck:passthrough([H, {Lo, Hi}, O, F, A])
+                                end
+                        end),
+            try
+                %% 串行：起点就是 7，第一层 frontier = [7]
+                ?assertMatch({error, {graphdb_expand, _}}, graphdb:shortest_path(R, 7, 200)),
+                %% 并行：第二层 frontier = [1..50]，7 那片失败、其余片被 kill
+                ?assertMatch({error, {graphdb_expand, _}}, graphdb:shortest_path(R, 0, 200))
+            after
+                meck:unload(bitcask)
+            end,
+            timer:sleep(50),
+            {messages, Msgs} = process_info(self(), messages),
+            Leaked = [M || M <- Msgs,
+                           (is_tuple(M) andalso tuple_size(M) =:= 5
+                            andalso element(3, M) =:= process)
+                           orelse (is_tuple(M) andalso tuple_size(M) =:= 3
+                                   andalso is_reference(element(1, M)))],
+            ?assertEqual([], Leaked),
+            ?assertEqual({ok, [0, 1, 101, 200]}, graphdb:shortest_path(R, 0, 200)),
+            graphdb:close(R)
+        end)
+     end}}.

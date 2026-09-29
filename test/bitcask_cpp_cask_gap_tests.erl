@@ -10,13 +10,7 @@
 
 -define(CASK, [read_write]).
 
-with_dir(Fun) ->
-    Dir = "/tmp/bitcask_cpp_gap_" ++ os:getpid() ++ "_" ++
-          integer_to_list(erlang:unique_integer([positive])),
-    ok = filelib:ensure_path(Dir),
-    try Fun(Dir)
-    after os:cmd("rm -rf " ++ Dir)
-    end.
+with_dir(Fun) -> bitcask_test_util:with_dir("bitcask_cpp_gap_", Fun).
 
 %% ===================================================================
 %% expiry_secs (mirrors legacy expire_test2)

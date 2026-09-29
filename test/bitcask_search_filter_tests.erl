@@ -23,13 +23,7 @@
 -define(IDX, [read_write, {analyzer, whitespace}]).
 -define(VOPTS, [read_write, {analyzer, whitespace}, {vector_dim, 4}]).
 
-with_dir(Fun) ->
-    Dir = "/tmp/bitcask_filter_" ++ os:getpid() ++ "_" ++
-          integer_to_list(erlang:unique_integer([positive])),
-    ok = filelib:ensure_path(Dir),
-    try Fun(Dir)
-    after os:cmd("rm -rf " ++ Dir)
-    end.
+with_dir(Fun) -> bitcask_test_util:with_dir("bitcask_filter_", Fun).
 
 %% 给一份 doc 写入带 meta 的索引模式数据。Meta 必须是 NIF 编码过的 binary。
 put_doc(R, Key, Text, Meta) ->

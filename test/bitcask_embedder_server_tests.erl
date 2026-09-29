@@ -13,13 +13,7 @@
 -define(MOCK, #{provider => {custom, bitcask_embedder_mock}, config => #{}}).
 -define(VOPTS, [read_write, {analyzer, whitespace}]).
 
-with_dir(Fun) ->
-    Dir = "/tmp/bitcask_embsrv_" ++ os:getpid() ++ "_" ++
-          integer_to_list(erlang:unique_integer([positive])),
-    ok = filelib:ensure_path(Dir),
-    try Fun(Dir)
-    after os:cmd("rm -rf " ++ Dir)
-    end.
+with_dir(Fun) -> bitcask_test_util:with_dir("bitcask_embsrv_", Fun).
 
 with_server(Opts, Fun) ->
     {ok, Pid} = bitcask_embedder_server:start_link(Opts),
@@ -421,6 +415,19 @@ proxy_single_has_no_workers_test() ->
 %% ⚠️ 这条钉的是"协调者不在热路径上"的可观察后果：把 0 号 worker 灌忙之后，
 %%    下一次派发必须换到别人身上。转发式实现（所有请求先进协调者）在这里
 %%    体现不出差别，但它的真正代价由下一条 independent 用例钉住。
+%% 等一批 spawn_monitor 起的进程全部退出，共用一个总 deadline；超时就失败。
+%% 以前是 [receive done -> ok after 5000 -> ok end || ...]——超时被吞掉，
+%% 消息丢了测试照样绿，最坏还能卡 N × 5 s。
+await_all_down(Pids, TimeoutMs) ->
+    Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
+    lists:foreach(
+      fun({_Pid, MRef}) ->
+              Left = max(0, Deadline - erlang:monotonic_time(millisecond)),
+              receive {'DOWN', MRef, process, _, _} -> ok
+              after Left -> erlang:error({not_all_down, TimeoutMs})
+              end
+      end, Pids).
+
 pool_dispatch_avoids_busy_worker_test_() ->
     {timeout, 60, fun() ->
         with_pool([0, 1], fun(Pool) ->
@@ -429,10 +436,8 @@ pool_dispatch_avoids_busy_worker_test_() ->
             {PickedIdle, _} = pick_probe([W0, W1]),
             ?assert(lists:member(PickedIdle, [W0, W1])),
             %% 把 W0 灌忙，派发必须换到 W1。
-            Parent = self(),
-            Pids = [spawn(fun() ->
-                        _ = bitcask_embedder_server:embed(W0, <<"x x x">>),
-                        Parent ! done
+            Pids = [spawn_monitor(fun() ->
+                        _ = bitcask_embedder_server:embed(W0, <<"x x x">>)
                     end) || _ <- lists:seq(1, 200)],
             %% 等消息真的堆进 W0 的邮箱
             (fun Wait(0) -> ok;
@@ -453,8 +458,7 @@ pool_dispatch_avoids_busy_worker_test_() ->
                 L when L > 0 -> ?assertEqual(W1, Picked);
                 0 -> ok      %% mock 在 pick 采样前排空，这条不作数
             end,
-            [receive done -> ok after 5000 -> ok end || _ <- Pids],
-            ok
+            ok = await_all_down(Pids, 10000)
         end)
     end}.
 
@@ -468,16 +472,13 @@ pool_workers_are_independent_test_() ->
         with_pool([0, 1], fun(Pool) ->
             {ok, [W0, W1]} = bitcask_embedder_pool:workers(Pool),
             %% 把 W0 的邮箱堆满（这些 embed 会排队）
-            Parent = self(),
-            [spawn(fun() ->
-                 _ = bitcask_embedder_server:embed(W0, <<"x x x">>),
-                 Parent ! done
-             end) || _ <- lists:seq(1, 50)],
+            Pids = [spawn_monitor(fun() ->
+                        _ = bitcask_embedder_server:embed(W0, <<"x x x">>)
+                    end) || _ <- lists:seq(1, 50)],
             %% W1 完全不受影响，立刻可服务
             ?assertMatch({ok, _}, bitcask_embedder_server:embed(W1, <<"x">>, 5000)),
             %% 收尾
-            [receive done -> ok after 5000 -> ok end || _ <- lists:seq(1, 50)],
-            ok
+            ok = await_all_down(Pids, 10000)
         end)
     end}.
 
@@ -716,3 +717,69 @@ put_docs_embed_failure_writes_nothing_test_() ->
             bitcask:close(H2)
         end)
      end}.
+
+%% ===================================================================
+%% scatter：总 deadline、并发等待、残留消息、worker 没起来时重试
+%% ===================================================================
+
+%% 慢 provider 的 2-worker 池；Timeout 是 proxy ctx 的每条超时。
+with_slow_pool(Delay, Timeout, Fun) ->
+    Mod = slow_mock_module(),
+    Name = list_to_atom("bc_slowpool_" ++ integer_to_list(erlang:unique_integer([positive]))),
+    {ok, Pid} = bitcask_embedder_pool:start_link(
+                  {local, Name},
+                  #{provider => {custom, Mod}, slots => 2, config => #{delay => Delay}}),
+    try
+        {ok, Ctx} = bitcask_embedder:new({custom, bitcask_embedder_proxy},
+                                         #{server => Name, timeout => Timeout}),
+        Fun(Name, Ctx)
+    after
+        unlink(Pid),
+        exit(Pid, shutdown),
+        (fun W(0) -> ok; W(N) ->
+            case whereis(Name) of undefined -> ok; _ -> timer:sleep(10), W(N-1) end
+         end)(100)
+    end.
+
+%% 各段并发等、一个总 deadline：两段都超时，总耗时≈一段的超时，迟到的结果
+%% 不落进调用方信箱。⚠️ 这是回归测试，不区分新旧实现——这里 worker 自己的
+%% 调用超时先到，旧收集端从没等满过；旧实现真正的问题（收集端兜底
+%% T*4+60000 比单段 > 5 条时的 worker 超时还短、先放弃后残留消息）要等 60 s
+%% 以上才能复现，不适合放进单测。
+scatter_segments_time_out_together_test_() ->
+    {timeout, 60, fun() ->
+        %% 每条睡 300 ms，超时 100 ms/条 → 每段 2 条、段超时 200 ms，必超时
+        with_slow_pool(300, 100, fun(_Pool, Ctx) ->
+            T0 = erlang:monotonic_time(millisecond),
+            {ok, Rs} = bitcask_embedder:embed_batch(Ctx, [<<"a">>, <<"b">>, <<"c">>, <<"d">>]),
+            Elapsed = erlang:monotonic_time(millisecond) - T0,
+            ?assertEqual(4, length(Rs)),
+            ?assertEqual([], [R || R <- Rs, element(1, R) =/= error]),
+            %% 两段并发：≈200 ms；串行等会 ≥ 400 ms
+            ?assert(Elapsed < 380),
+            %% 等慢 worker 真的跑完，确认迟到的结果没有落进调用方信箱
+            timer:sleep(700),
+            {messages, Msgs} = process_info(self(), messages),
+            ?assertEqual([], [M || M <- Msgs, is_tuple(M), tuple_size(M) >= 2,
+                                   is_reference(element(1, M))])
+        end)
+    end}.
+
+%% 某个 worker 没起来（被 kill、supervisor 还没拉起）：它分到的那段换活着的
+%% worker 重试一次——整批全部成功，而不是那一段全是 embedder_not_running。
+scatter_retries_segment_of_dead_worker_test_() ->
+    {timeout, 60, fun() ->
+        Texts = [<<"x">>, <<"x x x">>, <<"z z z">>, <<"x y y">>],
+        Expect = [begin {ok, V} = bitcask_embedder_mock:embed(T), {ok, V} end || T <- Texts],
+        with_pool([0, 1], fun(Pool) ->
+            {ok, C} = bitcask_embedder:new({custom, bitcask_embedder_proxy}, #{server => Pool}),
+            {ok, [W0, _]} = bitcask_embedder_pool:workers(Pool),
+            [begin
+                 case whereis(W0) of
+                     undefined -> ok;
+                     P -> exit(P, kill)
+                 end,
+                 ?assertEqual({ok, Expect}, bitcask_embedder:embed_batch(C, Texts))
+             end || _ <- lists:seq(1, 20)]
+        end)
+    end}.

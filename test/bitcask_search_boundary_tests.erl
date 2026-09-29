@@ -14,13 +14,7 @@
 -define(IDX, [read_write, {analyzer, whitespace}]).
 -define(KV,  [read_write]).
 
-with_dir(Fun) ->
-    Dir = "/tmp/bitcask_search_bnd_" ++ os:getpid() ++ "_" ++
-          integer_to_list(erlang:unique_integer([positive])),
-    ok = filelib:ensure_path(Dir),
-    try Fun(Dir)
-    after os:cmd("rm -rf " ++ Dir)
-    end.
+with_dir(Fun) -> bitcask_test_util:with_dir("bitcask_search_bnd_", Fun).
 
 %% 在索引模式下写两篇都含 "brown" 的文档，返回 Ref。
 open_indexed(D) ->
