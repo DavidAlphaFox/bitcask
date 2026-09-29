@@ -383,21 +383,26 @@ commit(#bitcask_txn_ctx{id = TxnId, idem = Idem} = Tx, Result) ->
             end
     end.
 
-%% 进 NIF 前把事务标成 inflight，并带一个提交令牌进 NIF：调用方死在提交
-%% 途中，locker 不按 DOWN 放锁，而是等令牌析构的通知——锁一直持到这批不会
-%% 再动盘（见 bitcask_txn_locker:begin_commit/1）。正常路径：end_commit 标
-%% done，再 disarm 令牌（顺序不能反），最后 release。
+%% 带一个提交令牌进 NIF：调用方死在提交途中，locker 不按 DOWN 放锁，而是
+%% 等令牌析构的通知——锁一直持到这批不会再动盘（见 bitcask_txn_locker:
+%% begin_commit/1）。顺序有讲究：**先建令牌再标 inflight**（inflight 的记录
+%% 必有令牌兜着），NIF 返回后**先 release 再 disarm**（release 之前被 kill，
+%% 令牌还 armed，通知照来）。
 commit_notified(#bitcask_txn_ctx{id = TxnId, handle = Handle, sync = Sync}, Ops) ->
-    case bitcask_txn_locker:begin_commit(TxnId) of
-        {ok, {Pid, Msg}} ->
-            Token = bitcask_cpp_nifs:txn_commit_token(Pid, Msg),
-            R = bitcask:txn_commit(Handle, Ops, Sync, Token),
-            ok = bitcask_txn_locker:end_commit(TxnId),
-            ok = bitcask_cpp_nifs:txn_commit_token_disarm(Token),
-            release(TxnId),
-            R;
-        {error, timeout}     -> throw(?TIMEOUT);
-        {error, unknown_txn} -> throw({?ABORT, locker_restarted})
+    case bitcask_txn_locker:notify_target(TxnId) of
+        {ok, Shard} ->
+            Token = bitcask_cpp_nifs:txn_commit_token(Shard, TxnId),
+            case bitcask_txn_locker:begin_commit(TxnId) of
+                ok ->
+                    R = bitcask:txn_commit(Handle, Ops, Sync, Token),
+                    release(TxnId),
+                    ok = bitcask_cpp_nifs:txn_commit_token_disarm(Token),
+                    R;
+                {error, timeout}     -> throw(?TIMEOUT);
+                {error, unknown_txn} -> throw({?ABORT, locker_restarted})
+            end;
+        {error, unknown_txn} ->
+            throw({?ABORT, locker_restarted})
     end.
 
 %% 二级索引展开。额外 op 的 key 在提交前补写锁（仍属 2PL 的增长段，

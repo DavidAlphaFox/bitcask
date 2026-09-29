@@ -81,29 +81,28 @@ struct CaskRangeIterHandle {
 //   (a) NIF 已返回，且调用方已丢掉令牌；或
 //   (b) 调用方在排进 dirty 队列后、NIF 真正开始前被 kill——NIF 永远不会跑，
 //       进程退出清理时放掉令牌。
-// 两种都是"这批不会再动盘"的时刻，析构时若仍 armed 就把 msg 发给 pid。
-// 正常路径调用方提交完 disarm（txn_commit_token_disarm/1），析构不发。
+// 两种都是"这批不会再动盘"的时刻，析构时若仍 armed 就把
+// {txn_committed, TxnId} 发给 pid。正常路径调用方提交完 disarm
+// （txn_commit_token_disarm/1），析构不发。
+// 只存两个标量，消息在析构回调的 env 里现构造（msg_env = NULL 走拷贝），
+// 不用为每个令牌再分配 / 释放一个 ErlNifEnv。
 // ⚠️ 为什么不在 NIF 返回前直接 enif_send：(b) 里 NIF 根本不执行，发不出来；
 //    且调用方已死时用它的 env 发会被 ERTS 按文档丢弃（发送者不存活）。
 //    析构回调的 callback env 发消息是文档内用法，两种情况都覆盖。
 struct TxnTokenHandle {
     ErlNifPid pid{};
-    ErlNifEnv* menv = nullptr;       // 进程无关 env，msg 的归属
-    ERL_NIF_TERM msg = 0;
+    ErlNifSInt64 txn_id = 0;
     std::atomic<bool> armed{true};
 
-    TxnTokenHandle(const ErlNifPid& p, ErlNifEnv* /*src*/, ERL_NIF_TERM m) noexcept
-        : pid(p), menv(enif_alloc_env()) {
-        msg = enif_make_copy(menv, m);
-    }
+    TxnTokenHandle(const ErlNifPid& p, ErlNifSInt64 id) noexcept : pid(p), txn_id(id) {}
     TxnTokenHandle(const TxnTokenHandle&)            = delete;
     TxnTokenHandle& operator=(const TxnTokenHandle&) = delete;
     void fire(ErlNifEnv* caller_env) noexcept {
-        if (armed.load(std::memory_order_acquire)) {
-            enif_send(caller_env, &pid, menv, msg);   // 成功后 menv 失效，只能 free
-        }
-        enif_free_env(menv);
-        menv = nullptr;
+        if (!armed.load(std::memory_order_acquire)) return;
+        ERL_NIF_TERM msg = enif_make_tuple2(caller_env,
+                                            enif_make_atom(caller_env, "txn_committed"),
+                                            enif_make_int64(caller_env, txn_id));
+        enif_send(caller_env, &pid, nullptr, msg);
     }
 };
 

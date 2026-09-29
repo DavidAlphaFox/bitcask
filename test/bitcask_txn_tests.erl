@@ -1091,8 +1091,8 @@ nif_commit_notify_test_() ->
      {timeout, 120, fun() ->
         with_dir(fun(D) ->
             R = open(D), Me = self(),
-            Recv = fun(Tag, Ms) -> receive {note, Tag} -> ok after Ms -> no_notify end end,
-            Tok = fun(Tag) -> bitcask_cpp_nifs:txn_commit_token(Me, {note, Tag}) end,
+            Recv = fun(Id, Ms) -> receive {txn_committed, Id} -> ok after Ms -> no_notify end end,
+            Tok = fun(Id) -> bitcask_cpp_nifs:txn_commit_token(Me, Id) end,
             %% 正常 + disarm：不发
             spawn(fun() -> T = Tok(1),
                            ok = bitcask:txn_commit(R, [{put, <<"a">>, <<"1">>}], no_sync, T),
@@ -1102,17 +1102,18 @@ nif_commit_notify_test_() ->
             spawn(fun() -> {error, _} = bitcask:txn_commit(R, [], no_sync, Tok(2)) end),
             ?assertEqual(ok, Recv(2, 5000)),
             ?assertError(badarg, bitcask:txn_commit(R, [{put, <<"b">>, <<"1">>}], no_sync, make_ref())),
+            ?assertError(badarg, bitcask_cpp_nifs:txn_commit_token(Me, not_an_int)),
             Big = binary:copy(<<"x">>, 4096),
             Ops = fun(P) -> [{put, <<P/binary, (bin(I))/binary>>, Big} || I <- lists:seq(1, 1000)] end,
             %% NIF 执行中被 kill：通知在批落盘之后
             [begin
                  {A, M} = spawn_monitor(fun() ->
-                              bitcask:txn_commit(R, Ops(<<"run">>), sync_on_commit, Tok({run, N}))
+                              bitcask:txn_commit(R, Ops(<<"run">>), sync_on_commit, Tok(100 + N))
                           end),
                  ok = wait_in_commit(A),
                  exit(A, kill),
                  receive {'DOWN', M, _, _, _} -> ok end,
-                 ?assertEqual(ok, Recv({run, N}, 5000)),
+                 ?assertEqual(ok, Recv(100 + N, 5000)),
                  ?assertMatch({ok, _}, bitcask:get(R, <<"run1000">>))
              end || N <- lists:seq(1, 3)],
             %% 排队中被 kill：先占满全部 dirty IO 调度器，A 只能排队；kill 后
@@ -1121,12 +1122,12 @@ nif_commit_notify_test_() ->
             Hogs = [spawn(fun() -> erts_debug:dirty_io(wait, 1500) end) || _ <- lists:seq(1, NDio)],
             timer:sleep(100),
             {A2, M2} = spawn_monitor(fun() ->
-                           bitcask:txn_commit(R, Ops(<<"queued">>), sync_on_commit, Tok(queued))
+                           bitcask:txn_commit(R, Ops(<<"queued">>), sync_on_commit, Tok(200))
                        end),
             ok = wait_in_commit(A2),
             exit(A2, kill),
             receive {'DOWN', M2, _, _, _} -> ok end,
-            ?assertEqual(ok, Recv(queued, 5000)),
+            ?assertEqual(ok, Recv(200, 5000)),
             [exit(H, kill) || H <- Hogs],
             timer:sleep(1600),
             ?assertEqual(not_found, bitcask:get(R, <<"queued1">>)),

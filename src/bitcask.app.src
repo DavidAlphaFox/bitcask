@@ -42,6 +42,15 @@
          %% is the next ceiling on an 8-vCPU box.
          {txn_locker_shards, 8},
 
+         %% How long the lock manager keeps the locks of a transaction whose
+         %% caller died in the middle of txn_commit, waiting for the commit
+         %% token's "batch can no longer touch disk" notification. It is a
+         %% last resort against a leaked lock (e.g. the NIF wedged on I/O):
+         %% firing it while the batch is still being written reopens the
+         %% lost-update window, so keep it generous. Timeouts are counted in
+         %% bitcask_txn_locker:status() as orphan_timeouts (should stay 0).
+         {txn_orphan_timeout, 300000},
+
          %% libbitcask 6.6.0 process-wide thread caps, applied when the
          %% application starts (i.e. before the first search-enabled open):
          %%   {thread_limits, {IndexWorkers, SearchSlots}}

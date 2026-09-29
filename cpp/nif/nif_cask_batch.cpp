@@ -10,7 +10,8 @@
 //                                        fsync 策略。
 //   cask_txn_commit(Ref, Ops, Sync, Token)
 //                                        同上，执行期间 pin 住提交令牌。
-//   txn_commit_token(Pid, Msg)           建令牌：析构时若仍 armed 发 Msg 给 Pid。
+//   txn_commit_token(Pid, TxnId)         建令牌：析构时若仍 armed 发
+//                                        {txn_committed, TxnId} 给 Pid。
 //   txn_commit_token_disarm(Token)       撤销通知（正常提交完成后调）。
 //
 // 语义（doc/atomic-batch-design-zh.md）：崩溃/掉电后**整批要么全可见要么全
@@ -171,13 +172,17 @@ ERL_NIF_TERM nif_cask_txn_commit(ErlNifEnv* env, int argc,
     return atoms().ok;
 }
 
-// txn_commit_token(Pid, Msg) -> Token
+// txn_commit_token(Pid, TxnId) -> Token
 ERL_NIF_TERM nif_txn_commit_token(ErlNifEnv* env, int /*argc*/,
                                    const ERL_NIF_TERM argv[]) {
     ErlNifPid pid{};
-    if (!enif_get_local_pid(env, argv[0], &pid)) return enif_make_badarg(env);
+    ErlNifSInt64 txn_id = 0;
+    if (!enif_get_local_pid(env, argv[0], &pid) ||
+        !enif_get_int64(env, argv[1], &txn_id)) {
+        return enif_make_badarg(env);
+    }
     ERL_NIF_TERM t = make_resource<TxnTokenHandle>(env, g_txn_token_resource_type,
-                                                   pid, env, argv[1]);
+                                                   pid, txn_id);
     return t ? t : enif_make_badarg(env);
 }
 
