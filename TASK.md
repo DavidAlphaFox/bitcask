@@ -536,6 +536,22 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 | **R2-7** | **graphdb_analytics**：PageRank 沿反向 CSR 拉取（O(N+M)/轮，测试里对照一份 map 版 scatter 参考实现，逐顶点 < 1e-9）；`sssp` 单 map；`materialize` 一次 usort，正向数组不再重排（index 对 vid 单调）。 | ✅ |
 | **R2-8** | **embedder**：新 API `bitcask:put_docs/2`（一次 `embed_batch`）；HTTP 分块并发（`max_inflight` 默认 4）；httpc 独立 profile、init 起一次；`max_batch` 生效；openai / anthropic 并进 `http_init/4`。 | ✅ |
 | **R2-9** | 回归：全量 eunit **274/274**、xref 干净、dialyzer **0**（审查前 8 条）。 | ✅ |
+| **R2-10** | **审查遗留两处**（代码随 `c3e3f82` / `d5206df` 提交，测试后补）。① `bitcask_embedder_proxy:scatter` 改用 `run_chunks/4`：worker 按负载排序、总 deadline = 最长段超时 + 5 s、`embedder_not_running` 的段换活 worker 重试一次（kill worker 后立刻发批 20 轮全部成功；旧实现下失败）。② `graphdb:shortest_path` 的 `expand_layer` 走 `expand_grouped/4`（按 frontier 同序返回 `[[邻居]]`，父指针不变），frontier ≤ 4 串行；`bidir` 带长度走；展开失败 `{error,_}`。⚠️ scatter 超时那例只是回归：旧收集端真正的问题要等 60 s 以上才复现，不放单测。全量 eunit **278/278**、dialyzer 0、xref 干净。 | ✅ |
+
+---
+
+## R3 — 全项目审查：C 档构建与测试（6.6.1）
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **R3-1** | **submodule pre-hook**：`test -d .git` → `test -e .git`（worktree / 被当子模块引用时 `.git` 是文件，以前 compile 直接失败）；只在 `third_party/libbitcask` 为空时 init，不再每次编译把子模块重置回 pin 住的提交。⚠️ 改了 pin 之后要自己 `git submodule update`。llama hook 同改。 | ✅ |
+| **R3-2** | **CMake 构建**：`--parallel $(nproc)`（原来裸 `-j` = 无限并行）；新建 `_build/cmake` 时有 ninja 就用 Ninja、有 ccache 就挂 launcher（已有的 Makefiles 目录不强切）；`BITCASK_LTO=OFF rebar3 compile` 关 LTO 给开发循环用（默认仍 ON）；换 OTP（`$ERLANG_ROOT_DIR` 与缓存的 `Erlang_INCLUDE_DIR` 不符）只删 CMakeCache 重配，不重编目标文件。 | ✅ |
+| **R3-3** | **clean**：`rebar3 clean` 不再删 `_build/cmake`；新增 `make distclean`。Makefile 的 `REBAR` 默认改为 PATH 上的 `rebar3`。 | ✅ |
+| **R3-4** | **死配置**：删 `namespaced_types` / `dirty_file_nif` platform_define 与 `gha` profile；meck 钉 1.2.0。删根目录遮住 libbitcask 新版的 `cmake/BitcaskSanitizers.cmake` 与无人用的 `tsan.supp`。修 `nif_options.cpp` 的 `-Wshadow`（本仓库 NIF 零警告）。 | ✅ |
+| **R3-5** | **CI**：ccache、dialyzer PLT 缓存、cpp 作业 OTP 矩阵改 27/28。⚠️ **没开 `BITCASK_WERROR`**：它会连 libbitcask 源码一起 `-Werror`，GCC 14 在上游 `keydir.cpp` 报 `-Wmaybe-uninitialized`（误报），本地试编即挂。 | ✅ |
+| **R3-6** | **测试提速 38 s → 12–15 s**：`blocked/2` 固定等 150 ms 改为轮询 `bitcask_txn_txns` 里该 agent 的 `waiting` 字段（`do_acquire` 在回复前写 waiting，正向断言、无竞态）；锁矩阵类测试原来每个多耗 1 s——`wait_clean/0` 要等 `txns := 0`，而 agent 活着时事务一直注册着，每次轮询满 50×20 ms，只断言锁表的调用点改用 `wait_locks_clean/0`；`nif_commit_notify_test_` 用 DOWN 取代 `sleep(1600)`。 | ✅ |
+| **R3-7** | **测试基础设施**：`test/bitcask_test_util:with_dir/2`（认 `TMPDIR`、`file:del_dir_r`）取代 11 份拷贝；`idem_killed_mid_commit_test_` 轮数读 `BITCASK_STRESS_ROUNDS`（默认 10）；embedder 测试的收集循环超时不再被吞；eunit surefire 报告写 `_build/test/logs`。不做 `inparallel`：全量只有十几秒，引入不稳定不值。 | ✅ |
+| **R3-8** | 回归：全量 eunit 278/278 连跑 3 遍（12–15 s），dialyzer 0，xref 干净。 | ✅ |
 
 ---
 
