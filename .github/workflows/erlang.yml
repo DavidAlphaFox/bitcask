@@ -9,37 +9,39 @@ on:
 jobs:
 
   # -------------------------------------------------------------------------
-  # Legacy Erlang path: eunit + xref + dialyzer across the supported OTP
-  # range. This is the long-standing pre-cask test gate.
+  # Erlang path: compile + xref + dialyzer + eunit across the supported OTP
+  # range. Floor is OTP 27: bitcask_embedder_util uses the stdlib `json`
+  # module (27+), and the NIF is C++23 — the erlang:<ver> docker images for
+  # 22–25 ship gcc 8–10 and can't build it, so we use setup-beam on
+  # ubuntu-24.04 (gcc 13) instead. rebar3 comes from setup-beam; the repo
+  # no longer vendors ./rebar3.
   # -------------------------------------------------------------------------
   eunit:
     name: eunit (OTP ${{ matrix.otp }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        otp:
-          - "25.1"
-          - "24.3"
-          - "22.3"
-    container:
-      image: erlang:${{ matrix.otp }}
+        otp: ["27", "28"]
     steps:
-      - uses: lukka/get-cmake@latest
       - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp }}
+          rebar3-version: "3.24.0"
       # libbitcask 6.3+ 新增 ICU 依赖：BITCASK_ICU_PROVIDER=auto 走系统 ICU
       # 开发包；vendored 回落（380 MB，update=none 被 --recursive 跳过）在 CI
       # 不可行，系统包是唯一路。
-      - name: Install ICU (libbitcask 6.3+)
+      - name: Install build deps
         run: |
-          apt-get update
-          apt-get install -y libicu-dev
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libicu-dev
       - name: Compile
-        run: ./rebar3 compile
+        run: rebar3 compile
       - name: Run xref and dialyzer
-        run: ./rebar3 do xref, dialyzer
+        run: rebar3 do xref, dialyzer
       - name: Run eunit
-        run: ./rebar3 as gha do eunit
+        run: rebar3 eunit
 
   # -------------------------------------------------------------------------
   # C++ NIF: Release build + ctest. Matrix exercises GCC and Clang against
