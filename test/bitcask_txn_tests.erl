@@ -1012,6 +1012,24 @@ idem_concurrent_exactly_once_test_() ->
         end)
      end}.
 
+idem_result_off_test_() ->
+    {"{idem_result, false}：标记不存结果，重来返回 idem_replayed；lookup 同样",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open(D), Me = self(),
+            Opts = [{idem_key, <<"k">>}, {idem_result, false} | ?FAST],
+            %% tag 别与前面用例重名：eunit 同一进程跑整模块，信箱里有别人的 {ran, _}
+            ?assertEqual({atomic, {off_a, 1}}, ?T:transaction(R, fun(Tx) -> bump(Tx, Me, off_a) end, Opts)),
+            ?assertEqual({atomic, idem_replayed}, ?T:transaction(R, fun(Tx) -> bump(Tx, Me, off_b) end, Opts)),
+            ?assertEqual(0, ran_count(off_b)),
+            ?assertEqual({ok, idem_replayed}, ?T:idem_lookup(R, <<"k">>)),
+            %% 标记值只有 9 字节头
+            {ok, Raw} = bitcask:get(R, <<0, "bitcask_txn:idem:k">>),
+            ?assertEqual(9, byte_size(Raw)),
+            bitcask:close(R)
+        end)
+     end}.
+
 idem_purge_test_() ->
     {"idem_purge：按年龄删标记，删后同键重新执行；年龄未到的不动",
      fun() ->
@@ -1021,7 +1039,8 @@ idem_purge_test_() ->
                                           [{idem_key, bin(I)} | ?FAST]) || I <- lists:seq(1, 5)],
             ?assertEqual({ok, 0}, ?T:idem_purge(R, 3600)),
             ?assertEqual({ok, {x, 1}}, ?T:idem_lookup(R, <<"1">>)),
-            ?assertEqual({ok, 5}, ?T:idem_purge(R, 0)),
+            %% 按块删：5 条、块大小 2 → 3 个事务，总数仍 5
+            ?assertEqual({ok, 5}, ?T:idem_purge(R, 0, [{chunk, 2}])),
             ?assertEqual(not_found, ?T:idem_lookup(R, <<"1">>)),
             ?assertEqual({atomic, {y, 6}}, ?T:transaction(R, fun(Tx) -> bump(Tx, Me, y) end,
                                                           [{idem_key, <<"1">>} | ?FAST])),

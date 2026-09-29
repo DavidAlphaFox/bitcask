@@ -53,7 +53,10 @@
 %%                                    → 不跑 Fun，直接 {atomic, 首次提交时的结果}；
 %%                                    否则照常跑，标记（含 Fun 的结果）与数据同批
 %%                                    原子提交——批在则标记在。只读事务带了键也写
-%%                                    标记。标记永不自动过期：idem_purge/2 清理。
+%%                                    标记。标记永不自动过期：idem_purge/2,3 清理。
+%%     {idem_result, boolean()}       默认 true：标记里存 Fun 的结果（term_to_binary，
+%%                                    一直留到 purge——结果大的事务请关掉）。false
+%%                                    → 不存，重来返回 {atomic, idem_replayed}。
 %%
 %%   ⚠️ 保留 key：以 <<0, "bitcask_txn:idem:">> 开头的 key 归幂等标记，事务内
 %%      write/delete 它们 → error({bitcask_txn, reserved_key, K})。
@@ -74,7 +77,7 @@
          read/2, read/3, write/3, delete/2, abort/1,
          lock_prefix/3, prefix_range/2, prefix_range/3,
          handle/1,
-         idem_lookup/2, idem_purge/2]).
+         idem_lookup/2, idem_purge/2, idem_purge/3]).
 
 -define(ACTIVE,  '$bitcask_txn_active').      % pdict：嵌套检测
 -define(ABORT,   bitcask_txn_abort).          % throw 标签：显式中止
@@ -82,6 +85,10 @@
 -define(TIMEOUT, bitcask_txn_timeout).        % throw 标签：过 deadline
 
 -define(IDEM_PREFIX, <<0, "bitcask_txn:idem:">>).
+%% 标记值：<<Ver:8, At:64/big, Result/binary>>。定长头让 purge 不用解码结果
+%% 就能读时间戳；Result 为空 = 没存结果（{idem_result, false}）。
+-define(IDEM_VER, 1).
+-define(IDEM_PURGE_CHUNK, 1000).
 
 -define(DEFAULT_RETRIES, 10).
 -define(DEFAULT_LOCK_WAIT_TIMEOUT, 5000).
@@ -92,7 +99,8 @@
                           ref       :: reference(),
                           index_fun :: undefined | fun((binary(), term()) -> list()),
                           sync      :: sync_on_commit | no_sync,
-                          idem      :: undefined | binary()}).   % 标记键（已加前缀）
+                          idem      :: undefined | binary(),    % 标记键（已加前缀）
+                          idem_result :: boolean()}).
 
 -record(cfg, {retries   :: non_neg_integer() | infinity,
               age       :: pos_integer(),          % 一次 transaction 调用一个，重跑不变
@@ -100,7 +108,8 @@
               lock_wait :: timeout(),
               sync      :: sync_on_commit | no_sync,
               index_fun :: undefined | fun(),
-              idem      :: undefined | binary()}).
+              idem      :: undefined | binary(),
+              idem_result :: boolean()}).
 
 %% =========================================================================
 %% 门面
@@ -140,6 +149,8 @@ parse_opts(Opts) ->
                undefined -> undefined;
                IK when is_binary(IK) -> idem_marker(IK)
            end,
+    IdemResult = proplists:get_value(idem_result, Opts, true),
+    true = is_boolean(IdemResult),
     #cfg{retries   = Retries,
          age       = erlang:unique_integer([positive, monotonic]),
          deadline  = Deadline,
@@ -147,7 +158,8 @@ parse_opts(Opts) ->
                                          ?DEFAULT_LOCK_WAIT_TIMEOUT),
          sync      = Sync,
          index_fun = IndexFun,
-         idem      = Idem}.
+         idem      = Idem,
+         idem_result = IdemResult}.
 
 %% 重启循环。Attempt 是已重跑次数；Attempt < Retries 才准再来一次。
 run_loop(Handle, Fun, #cfg{retries = Retries} = Cfg, Attempt) ->
@@ -173,7 +185,8 @@ run_once(Handle, Fun, Cfg) ->
                           ref = handle_ref(Handle),
                           index_fun = Cfg#cfg.index_fun,
                           sync = Cfg#cfg.sync,
-                          idem = Cfg#cfg.idem},
+                          idem = Cfg#cfg.idem,
+                          idem_result = Cfg#cfg.idem_result},
     BufKey = buf_key(TxnId),
     put(BufKey, #{}),
     put(locks_key(TxnId), {#{}, #{}}),        % {点锁 Key => Mode, 前缀锁 Prefix => Mode}
@@ -451,12 +464,17 @@ idem_seen(#bitcask_txn_ctx{handle = Handle, idem = Marker} = Tx) ->
 
 idem_ops(#bitcask_txn_ctx{idem = undefined}, _Result) ->
     [];
-idem_ops(#bitcask_txn_ctx{idem = Marker}, Result) ->
-    [{put, Marker, term_to_binary({idem, 1, os:system_time(second), Result})}].
+idem_ops(#bitcask_txn_ctx{idem = Marker, idem_result = Store}, Result) ->
+    Payload = case Store of
+                  true  -> term_to_binary(Result);
+                  false -> <<>>
+              end,
+    [{put, Marker, <<?IDEM_VER:8, (os:system_time(second)):64, Payload/binary>>}].
 
-idem_result(Bin) ->
-    {idem, 1, _At, Result} = binary_to_term(Bin),
-    Result.
+idem_result(<<?IDEM_VER:8, _At:64>>)                 -> idem_replayed;
+idem_result(<<?IDEM_VER:8, _At:64, Payload/binary>>) -> binary_to_term(Payload).
+
+idem_at(<<?IDEM_VER:8, At:64, _/binary>>) -> At.
 
 %% 查某个幂等键是否已提交（不上锁的直读——应用自查用）。
 -spec idem_lookup(term(), binary()) -> {ok, term()} | not_found | {error, term()}.
@@ -466,30 +484,62 @@ idem_lookup(Handle, IdemKey) when is_binary(IdemKey) ->
         Other     -> Other
     end.
 
-%% 删掉提交时间不晚于 MaxAgeSec 秒前的标记（0 = 全删），返回删掉的条数。一个事务里做：
-%% 标记前缀写锁（期间带幂等键的事务在各自标记上等）+ range + 同批删除。
-%% 删掉之后同一个键再来就会重新执行——MaxAgeSec 要大于应用的最长重试周期。
+%% 删掉提交时间不晚于 MaxAgeSec 秒前的标记（0 = 全删），返回删掉的条数。
+%% MaxAgeSec 要大于应用的最长重试周期——删掉之后同一个键再来就会重新执行。
+%%
+%% 两段式，为了规模：
+%%   1. 不上锁 range_fold 扫标记前缀，只解定长头、只收过期的 **key**——不把
+%%      所有标记的值（里面是 Fun 结果）装进内存。
+%%   2. 按块删（{chunk, N}，默认 1000）：每块一个事务，持标记前缀写锁 → 逐 key
+%%      重读核对时间戳仍过期（扫描与加锁之间可能被别的 purge 删掉又被同键的新
+%%      事务重写）→ 同批删除。块之间不持锁，带幂等键的事务只在每块提交那一小
+%%      会儿被挡；块间新写的标记必然比 cutoff 新，不会被误删。
 -spec idem_purge(term(), non_neg_integer()) -> {ok, non_neg_integer()} | {error, term()}.
-idem_purge(Handle, MaxAgeSec) when is_integer(MaxAgeSec), MaxAgeSec >= 0 ->
+idem_purge(Handle, MaxAgeSec) ->
+    idem_purge(Handle, MaxAgeSec, []).
+
+-spec idem_purge(term(), non_neg_integer(), list()) -> {ok, non_neg_integer()} | {error, term()}.
+idem_purge(Handle, MaxAgeSec, Opts) when is_integer(MaxAgeSec), MaxAgeSec >= 0, is_list(Opts) ->
     Cutoff = os:system_time(second) - MaxAgeSec,
+    Chunk = proplists:get_value(chunk, Opts, ?IDEM_PURGE_CHUNK),
+    true = is_integer(Chunk) andalso Chunk > 0,
+    Range = {?IDEM_PREFIX, succ(?IDEM_PREFIX)},
+    case bitcask:range_fold(Handle, Range, [],
+                            fun(K, V, _T, _O, Acc) ->
+                                    case idem_at(V) =< Cutoff of
+                                        true  -> [K | Acc];
+                                        false -> Acc
+                                    end
+                            end, []) of
+        {error, _} = E -> E;
+        Old            -> idem_purge_chunks(Handle, Cutoff, chunks(Old, Chunk), 0)
+    end.
+
+idem_purge_chunks(_Handle, _Cutoff, [], N) ->
+    {ok, N};
+idem_purge_chunks(Handle, Cutoff, [Keys | Rest], N) ->
     Res = transaction(
             Handle,
             fun(#bitcask_txn_ctx{id = TxnId} = Tx) ->
-                    case prefix_range(Tx, ?IDEM_PREFIX, [{lock, write}]) of
-                        {error, _} = E ->
-                            abort(E);
-                        Rows ->
-                            Old = [K || {K, V} <- Rows,
-                                        element(3, binary_to_term(V)) =< Cutoff],
-                            %% 绕过 delete/2 的保留 key 检查，直接进缓冲；
-                            %% 前缀写锁已罩住它们。
-                            BK = buf_key(TxnId),
-                            put(BK, maps:merge(get(BK), maps:from_list([{K, delete} || K <- Old]))),
-                            length(Old)
-                    end
+                    ok = lock_prefix_(Tx, ?IDEM_PREFIX, write),
+                    Dead = [K || K <- Keys,
+                                 case bitcask:get(Handle, K) of
+                                     {ok, V} -> idem_at(V) =< Cutoff;
+                                     _       -> false
+                                 end],
+                    %% 绕过 delete/2 的保留 key 检查，直接进缓冲；前缀写锁已罩住。
+                    BK = buf_key(TxnId),
+                    put(BK, maps:merge(get(BK), maps:from_list([{K, delete} || K <- Dead]))),
+                    length(Dead)
             end, [{sync, sync_on_commit}]),
     case Res of
-        {atomic, N}             -> {ok, N};
-        {aborted, {error, _} = E} -> E;
-        {aborted, Why}          -> {error, Why}
+        {atomic, M}    -> idem_purge_chunks(Handle, Cutoff, Rest, N + M);
+        {aborted, Why} -> {error, Why}
     end.
+
+chunks([], _N) -> [];
+chunks(L, N)  -> chunks(L, N, N, [], []).
+
+chunks([], _N, _Left, Cur, Acc)   -> lists:reverse([lists:reverse(Cur) | Acc]);
+chunks(L, N, 0, Cur, Acc)         -> chunks(L, N, N, [], [lists:reverse(Cur) | Acc]);
+chunks([X | T], N, Left, Cur, Acc) -> chunks(T, N, Left - 1, [X | Cur], Acc).
