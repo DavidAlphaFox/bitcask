@@ -6,7 +6,7 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
-## 6.6.1 落地
+## 6.7.0 落地
 
 ### 事务层：提交中途放锁修复 + 幂等键 ✅
 
@@ -19,6 +19,27 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
   `idem_lookup/2`、`idem_purge/2`。
 
 设计：`doc/txn-layer-design-zh.md` §4.5 / §4.5.1。
+
+### 全项目审查：正确性 / 性能 / 构建测试 / 清理 ✅
+
+六路并行审查（KV 门面、graphdb、锁管理器、embedder、C++ NIF、构建测试）约 70 条，
+分四档全部落地（`TASK.md` R1–R4）：
+
+- **正确性 12 条**：NIF `cask_close` 与在途调用 / 迭代器的 use-after-free（改为
+  shared_mutex + 迭代器 keep 父资源）、NIF 无异常屏障（`bad_alloc` 直接
+  `std::terminate` 节点）、`encode_meta` 布尔编成 null、merge 调度器一用就崩、fold
+  家族撞裸原子 `case_clause`、stream 读完不释放迭代器、`del_vertex` 跨批计数器
+  不收敛、计数器读错误被当 0、`register_etype` 并发合并两种边类型、坏选项打崩整个
+  locker 组、embedder 池永远选 `_0` 且线程超订、CI 跑不过。
+- **性能**：range 少一次 dirty NIF / 跳、fold 批量化、NIF 调度分类修正、locker
+  多 key 事务 +35%、PageRank O(N+M)、新 API `bitcask:put_docs/2` 走一次
+  `embed_batch`、HTTP 分块并发。
+- **构建 / 测试**：子模块钩子不再重置本地提交、`rebar3 clean` 不再全量重编 C++、
+  可关 LTO、换 OTP 自动重配；全量 eunit 38 s → 约 13 s。
+- **清理**：删无调用者的 NIF 与旧 embedder API、rebar2 / Basho 遗留；NIF 错误形态
+  统一（⚠️ 两处形态变化见 CHANGELOG）。
+
+⚠️ 最低 OTP 提到 **27**（stdlib `json`）。
 
 ## 6.5.1 落地
 

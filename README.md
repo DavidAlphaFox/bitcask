@@ -223,6 +223,8 @@ embedder 的 `vector_dim`——无需外部 `new`、也无需单独写 `{vector_
 ```erlang
 %% 1) open 直接配 embedder（Provider = openai | anthropic | {custom,Mod}）。
 %%    OpenAI 兼容端点，如 llama.cpp server / vLLM。
+%%    ⚠️ anthropic 是占位：Anthropic 目前没有公开的 embedding 端点，模块按预期
+%%    协议写好但无法对真实服务使用（见 bitcask_embedder_anthropic 模块头）。
 1> H = bitcask:open("/tmp/vec", [read_write, {analyzer, whitespace},
 1>     {embedder, {openai, #{
 1>         url => "http://localhost:8080/v1/embeddings",
@@ -344,7 +346,7 @@ ok
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
 | `doc/unified-architecture-plan-zh.md` | 统一架构计划（已实施） |
 | `doc/libcask-extraction-zh.md` | **libcask 独立库拆分可行性评估**（2.2.0 规划） |
-| `ROADMAP.md` / `ROADMAP_EN.md` | **路线图**：6.6.1 / 6.6.0 / 6.5.1 / 6.5.0 / 6.4.0 / 6.3.2 / 6.3.1 / 6.2.2 / 6.2.1 / 6.1.0 / 6.0.0 / 5.1.0 / 5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 落地 + 2.1.1 已落地（P5–P15）+ 2.2.0 规划（libcask 独立 / V7+ 向量优化）（中/英） |
+| `ROADMAP.md` / `ROADMAP_EN.md` | **路线图**：6.7.0 / 6.6.0 / 6.5.1 / 6.5.0 / 6.4.0 / 6.3.2 / 6.3.1 / 6.2.2 / 6.2.1 / 6.1.0 / 6.0.0 / 5.1.0 / 5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 落地 + 2.1.1 已落地（P5–P15）+ 2.2.0 规划（libcask 独立 / V7+ 向量优化）（中/英） |
 | `TASK.md` | 详细任务拆分与历史 |
 
 ## 项目状态
@@ -363,7 +365,7 @@ ok
 - **3.1.0**（2026-07-01）— 升级 libbitcask v3.1.0（ABI 不破坏）：`{max_read_handles, unlimited}` / `{auto_compact_dead_ratio, R}` 选项、错误原子 `closed`；随库引入 read 句柄默认上限（按 `RLIMIT_NOFILE` 自动推导）、`bitcask.meta` v3 加 CRC32、field.schema FSCH v1 头 + CRC
 - **4.0.0**（2026-07-13）— 升级 libbitcask v4.0.0（ABI 破坏，`SOVERSION` 3→4，源码级兼容）：`{vector_engine, hnsw|ivfrq|diskann}` 向量双引擎 + 调优选项、`{auto_checkpoint_min_docs, N}` 崩溃恢复重放有界；随库引入 IVF-RaBitQ-lite 引擎、DiskANN 引擎（实验性）、AVX2 int8 内核、HNSW `.qc8` mmap 化；`examples/` Wikipedia 检索库示例
 - **4.1.0**（2026-07-15）— 升级 libbitcask v4.1.0（ABI 不破坏，`SOVERSION` 保持 4，盘上格式不变）：对 Erlang 调用方**无 API 变更**，重编即得；随库引入 Phase 5/6 深度审计成果——修复 `close/1` 拆卸路径的进程级永久挂死（`IndexPool` 计数泄漏 + `unregister_lib` 无界 `flush`）、hnsw 三处原子写 rename 前补 `fdatasync`（此前崩溃即半截文件）、`RowChunks`/`MmapSegment` 资源泄漏；`file_util` 归并使 fsync 纪律 4 套收敛为 1 套
-- **6.6.1**（2026-09-29，当前版本）— 事务层补丁：**修复调用方在提交途中被 kill 时锁提前释放**（`txn_commit` 是 dirty NIF，DOWN 先于落盘送达，按 DOWN 放锁会丢更新；现在带提交令牌进 NIF，令牌析构才通知 locker 放锁，`status()` 新增 `orphan_timeouts`）；**幂等键** `{idem_key, K}` + `idem_lookup/2` / `idem_purge/2`（同键至多提交一次，重来返回首次结果，提交中途被 kill 也能安全重试）。libbitcask 仍 6.6.0，盘上格式与既有 API 不变
+- **6.7.0**（2026-09-29，当前版本）— 事务层：**修复调用方在提交途中被 kill 时锁提前释放**（`txn_commit` 是 dirty NIF，DOWN 先于落盘送达，按 DOWN 放锁会丢更新；现在带提交令牌进 NIF，令牌析构才通知 locker 放锁，`status()` 新增 `orphan_timeouts`）；**幂等键** `{idem_key, K}` + `idem_lookup/2` / `idem_purge/2`（同键至多提交一次，重来返回首次结果，提交中途被 kill 也能安全重试）；**全项目审查**修掉 12 处正确性问题（NIF `cask_close` 的 use-after-free 与异常屏障、`encode_meta` 布尔、merge 调度器、fold 错误形态、graphdb 计数器、embedder 池调度等），一轮性能优化（locker 多 key 事务 +35%、PageRank O(N+M)、新 API `bitcask:put_docs/2`），构建 / 测试提速与遗留清理。libbitcask 仍 6.6.0，盘上格式不变。⚠️ **最低 OTP 27**；NIF 错误形态有两处变化（`{error, error}` → `{error, invalid_option}`、`{error, unknown}` → `{error, io_error}`），删除了几个无调用者的 NIF 与 openai embedder 旧 API，详见 CHANGELOG
 - **6.6.0**（2026-09-23）— 升级 libbitcask 6.5.0 → **6.6.0**（C API 纯加法、`SOVERSION` 保持 6，盘上仅 `bitcask.meta` 可选尾段向后兼容追加）：新 open 选项 **`{segment_verify_crc, B}`**（索引模式开库 BM25 段 CRC 开关，`false` 省开库整读段 I/O）；新 API **`bitcask:set_thread_limits/2` / `thread_limits/0`** + application env **`{thread_limits, {IW, SS}}`**（进程级索引池 worker / 检索槽数上限，首个索引模式库 open 即冻结，异值返回 `{error, {thread_limits_frozen, _}}`）。随库带入：索引模式开库常驻内存下降（段分块校验、ckpt 逐段读、检索 key 四份 → 两份，上游实测 −19.5%）、核心句柄 `O_CLOEXEC`、analyzer 配置指纹重开告警、`ord_to_ext` 对已删 ord 返回空；`rebar3 eunit` 238/238
 - **6.5.1**（2026-09-21）— **事务协调层落地**：`bitcask_txn`（原子批之上的隔离性：悲观 2PL 点锁 + wait-for 图死锁检测 + 自动重跑，写进 pdict 缓冲、提交为一条 `txn_commit` 批；`{retries,N}`/`{timeout,Ms}`/`index_fun`）；**前缀锁** `lock_prefix/3` + `prefix_range/2,3`（事务内范围扫描无幻读）；**锁管理器分片**（`txn_locker_shards` 默认 8，前缀锁每分片各拿一份，跨分片死锁检测不漏报，locker 微基准 26k 平线 → P=16 50k+）；**受害者 = 环上最年轻**（年龄跨重跑不变，长事务不被短事务反复打断）。`graphdb` 事务式 API（`transaction` + `put_edge_txn`/`del_edge_txn`/`del_vertex_txn`/`out_edges_txn`/`degree_txn` …）：边五键 + 计数器锁下同批提交，并发加边计数精确。引擎零改动、零新依赖、无 ABI / 盘上格式变更；设计 `doc/txn-layer-design-zh.md`；`rebar3 eunit` 235/235
 - **6.5.0**（2026-09-18）— **图处理层落地**：`graphdb`（KV per-key：k=顶点、边为定宽大端 key 经原子批双向双写、邻接走 OKI 前缀 range、BFS/k-hop/双向最短路、deg/et 索引、`neighbors_where` 过滤遍历）+ `graphdb_analytics`（内存 CSR 物化 + PageRank/连通分量/SSSP）；设计文档 `doc/graph-layer-design-zh.md`。随库升级 libbitcask 6.3.2 → **6.5.0**：OKI memdelta 排序视图缓存拔掉「装载后 range 静默变慢 4200×」悬崖（图基准实测一跳 110ms → 0.078ms），`status()` 新增 `oki_delta_rows`/`oki_delta_bytes`；embedder 池派发测试采样合一消假红。C API 纯加法、SOVERSION 6 不变、无盘上格式变更

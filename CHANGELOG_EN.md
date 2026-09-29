@@ -3,14 +3,21 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [6.6.1] — 2026-09-29
+## [6.7.0] — 2026-09-29
 
-Patch release: a concurrency fix in the transaction layer, plus idempotency
+A concurrency fix in the transaction layer, plus idempotency
 keys, followed by a project-wide review that fixed 12 correctness issues (NIF
 lifetimes / exception barrier, merge scheduler, fold error shapes, graphdb
-counters, embedder pool dispatch, CI). libbitcask stays at 6.6.0; on-disk format
-and existing APIs are unchanged — the only additions are NIF entry points and
-`bitcask_txn` options / functions. ⚠️ Minimum OTP is now **27** (stdlib `json`).
+counters, embedder pool dispatch, CI), plus a performance and cleanup pass.
+libbitcask stays at 6.6.0; the on-disk format is unchanged.
+
+**Why a minor rather than a patch release** — three kinds of change can affect
+callers:
+- ⚠️ minimum OTP is now **27** (stdlib `json`);
+- ⚠️ two NIF error shapes changed (`{error, error}` → `{error, invalid_option}`,
+  `{error, unknown}` → `{error, io_error}`), see Removed / behaviour changes;
+- ⚠️ a few NIFs with no callers and the legacy `bitcask_embedder_openai` API
+  were removed.
 
 ### Fixed
 
@@ -159,6 +166,26 @@ and existing APIs are unchanged — the only additions are NIF entry points and
   (documented but ignored before — always 64); the duplicated openai /
   anthropic code moved into `bitcask_embedder_util:http_init/4`, with headers
   built once at init.
+
+### Removed / behaviour changes
+
+- **Unified NIF error shapes** (`fault_to_term_detailed` merged into
+  `fault_to_term`): a given fault now has the same shape from every NIF.
+  ⚠️ Changes: `invalid_option` without a message goes from `{error, error}` to
+  `{error, invalid_option}`; I/O faults without an errno go from
+  `{error, unknown}` to `{error, io_error}`; analyzer mismatch gets
+  `{error, analyzer_mismatch}`. Bare atoms (`not_found`, `closed`, …) and
+  `{error, write_locked}` are unchanged.
+- **Removed NIFs with no callers**: `bitcask_cpp_nifs:cask_iterator/3`,
+  `cask_iterator_next/1`, `cask_iterator_release/1` (superseded long ago by
+  `stream/1` and the fold family), `cask_bool_search/3`, `cask_range_next/1`
+  (use `cask_range_next_batch/2`).
+- **Removed the legacy `bitcask_embedder_openai` API** `embed/1,3`, `dim/0` and
+  the `embedder_url` / `embedder_model` / `embedder_dim` app env it read; the
+  `bitcask_embedder` behaviour drops the legacy `embed/1`, `dim/0` callbacks.
+  Use `bitcask_embedder:new/2` and a ctx.
+- Removed rebar2 / Basho-era leftovers: `package/`, `.travis.yml`, PULSE / EQC
+  helpers and Makefile targets, `test/bcfold_*`.
 
 ### Added
 

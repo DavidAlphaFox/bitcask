@@ -6,7 +6,7 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
-## 6.6.1 shipped
+## 6.7.0 shipped
 
 ### Transaction layer: mid-commit lock release fix + idempotency keys ✅
 
@@ -22,6 +22,35 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
   commits atomically with the data; `idem_lookup/2`, `idem_purge/2`.
 
 Design: `doc/txn-layer-design-zh.md` §4.5 / §4.5.1.
+
+### Project-wide review: correctness / performance / build & test / cleanup ✅
+
+A six-way parallel review (KV facade, graphdb, lock manager, embedder, C++ NIF,
+build & test) produced about 70 findings in four tiers, all landed
+(`TASK.md` R1–R4):
+
+- **12 correctness fixes**: NIF `cask_close` use-after-free against in-flight
+  calls and live iterators (now a shared_mutex plus iterators keeping the
+  parent resource), no exception barrier in the NIF (`bad_alloc` meant
+  `std::terminate` for the node), `encode_meta` encoding booleans as null, the
+  merge scheduler crashing on first use, the fold family hitting `case_clause`
+  on bare atoms, streams keeping the iterator after `done`, `del_vertex`
+  counters not converging across batches, counter read errors treated as 0,
+  concurrent `register_etype` merging two edge types, a bad option taking down
+  the whole locker group, the embedder pool always picking `_0` and
+  oversubscribing threads, and a CI that could not pass.
+- **Performance**: one dirty NIF call fewer per range / hop, batched folds,
+  corrected NIF scheduler classes, +35% for multi-key transactions in the
+  locker, O(N+M) PageRank, a new `bitcask:put_docs/2` using one `embed_batch`,
+  concurrent HTTP chunks.
+- **Build / test**: the submodule hook no longer resets local commits,
+  `rebar3 clean` no longer forces a full C++ rebuild, LTO can be turned off,
+  switching OTP reconfigures automatically; full eunit 38 s → about 13 s.
+- **Cleanup**: removed NIFs and legacy embedder API with no callers and the
+  rebar2 / Basho leftovers; unified NIF error shapes (⚠️ two shape changes, see
+  CHANGELOG).
+
+⚠️ Minimum OTP is now **27** (stdlib `json`).
 
 ## 6.5.1 shipped
 

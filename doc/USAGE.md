@@ -496,7 +496,6 @@ ok = bitcask_cpp_nifs:cask_close(R).
 | `cask_fold_next_batch/2` | 批量取下一组 `[{K,V}]`（少 BEAM↔NIF 往返） |
 | `cask_fold_release/1` | 释放迭代器 |
 | `cask_range_start/2` | **6.0.0**：开 range 迭代器；`Opts = [{lo,Bin},{hi,Bin},{prefetch,N},{prefetch_threads,N}]` |
-| `cask_range_next/1` | 下一条 `{ok, K, V, Tstamp, Ord}` \| `done` |
 | `cask_range_next_batch/2` | 批量版；**返回列表短于 BatchSize 即到尾** |
 | `cask_range_release/1` | 释放 range 迭代器（幂等） |
 | `cask_put_batch_atomic/2` | **6.0.0**：裸原子批 |

@@ -3,12 +3,17 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
-## [6.6.1] — 2026-09-29
+## [6.7.0] — 2026-09-29
 
-补丁版：事务层修一个并发 bug，外加幂等键；随后一轮全项目审查修掉 12 处正确性
+事务层修一个并发 bug，外加幂等键；随后一轮全项目审查修掉 12 处正确性
 问题（NIF 生命周期 / 异常屏障、merge 调度器、fold 错误形态、graphdb 计数器、
-embedder 池调度、CI）。libbitcask 仍是 6.6.0，盘上格式与既有 API 不变；新增的只有
-NIF 入口与 `bitcask_txn` 选项 / 函数。⚠️ 最低 OTP 提到 **27**（stdlib `json`）。
+embedder 池调度、CI），外加一轮性能优化与清理。libbitcask 仍是 6.6.0，盘上格式不变。
+
+**为什么是 minor 而不是补丁版**——有三类可能影响调用方的变化：
+- ⚠️ 最低 OTP 提到 **27**（stdlib `json`）；
+- ⚠️ NIF 错误形态两处变化（`{error, error}` → `{error, invalid_option}`、
+  `{error, unknown}` → `{error, io_error}`），见 Removed / 行为变化；
+- ⚠️ 删除了几个无调用者的 NIF 与 `bitcask_embedder_openai` 的旧 API。
 
 ### Fixed
 
@@ -115,6 +120,23 @@ NIF 入口与 `bitcask_txn` 选项 / 函数。⚠️ 最低 OTP 提到 **27**（
   `inets` / httpc 在 init 起一次，用独立 profile `bitcask_embedder`；`max_batch` 选项
   真正生效（以前文档有、代码忽略，恒为 64）；openai / anthropic 的重复代码并进
   `bitcask_embedder_util:http_init/4`，headers 在 init 构造一次。
+
+### Removed / 行为变化
+
+- **NIF 错误形态统一**（`fault_to_term_detailed` 并入 `fault_to_term`）：同一种故障
+  从任何 NIF 出来形态都一样。⚠️ 变化：没有消息的 `invalid_option` 由
+  `{error, error}` 变为 `{error, invalid_option}`；没有 errno 的 IO 故障由
+  `{error, unknown}` 变为 `{error, io_error}`；analyzer 不匹配新增
+  `{error, analyzer_mismatch}`。裸原子（`not_found`、`closed` 等）与
+  `{error, write_locked}` 不变。
+- **删除无调用者的 NIF**：`bitcask_cpp_nifs:cask_iterator/3`、`cask_iterator_next/1`、
+  `cask_iterator_release/1`（早被 `stream/1` 与 fold 家族取代）、`cask_bool_search/3`、
+  `cask_range_next/1`（用 `cask_range_next_batch/2`）。
+- **删除 `bitcask_embedder_openai` 的旧 API** `embed/1,3`、`dim/0` 及其读的
+  `embedder_url` / `embedder_model` / `embedder_dim` app env；`bitcask_embedder`
+  behaviour 去掉旧回调 `embed/1`、`dim/0`。用 `bitcask_embedder:new/2` + ctx。
+- 删除 rebar2 / Basho 时代遗留：`package/`、`.travis.yml`、PULSE / EQC 助手与
+  Makefile 目标、`test/bcfold_*`。
 
 ### Added
 

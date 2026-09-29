@@ -492,12 +492,12 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 | **X1-6** | **前缀锁**（txn P2，设计 §12）：`LockId = {Ref, Bin, point\|prefix}`，锁表改 ordered_set；请求与**重叠记录集**（自身 + 罩住它的前缀记录〔按现存前缀长度集合 `plens` 逐长度查〕+ 自己是前缀时其下全部记录〔一段顺序扫〕）上的 holder / 早到等待者比——跨记录 FIFO 天然防前缀写饿死；持覆盖锁的事务再要其下的锁免费（不建记录）。无前缀锁时点锁路径只查自身一条，与 P1 同价（bench 比值无回退）。门面 `lock_prefix/3`、`prefix_range/2,3`（前缀锁 + range + 合并缓冲）。graphdb：`out_edges_txn`/`in_edges_txn`/`degree_txn/2`/`del_vertex_txn`。测试 +4（locker 矩阵、跨记录公平、覆盖免费 + 经前缀锁的死锁、幻读）+3（缓冲合并、级联含自环、**加边 vs 删点随机交错的全图不变式**，放大 10× 跑 3 轮）。⚠️ 测试 harness 又两个坑：一个 agent 同一时刻只能挂一个 acquire（被阻塞时发第二个请求会 timeout）；测试数据里"abx"不在前缀"abc"下——先写清 key 再断言。全量 eunit **230/230**。 | ✅ |
 | **X1-7** | **locker 分片**（txn P3，设计 §13）。先 profiling 再动手：locker-only 微基准单 locker **26k txn/s 且 P=1..16 一条平线**，引擎 P=8 能 44–55k → 单点确证。拓扑：`bitcask_txn_locker_sup`（one_for_all）= 共享表进程 + N 分片（env `txn_locker_shards`，默认 8，⚠️ 不按 schedulers_online 推）；点锁 `phash2({Ref,Key})` 落分片，**前缀锁每分片各拿一份**（分片间零锁语义交互）；事务归属分片管 monitor/DOWN；共享 public `txns`/`held`/`stats`。跨分片 DFS 直读别的分片的 protected 表，"先写边再检"保证不漏报只误报；`status()` 加 `lock_wait_timeouts`（漏检探针，压测断言不变）。释放改 **cast**（同 mnesia_locker）、`check` 直读 ETS——多 key 事务的同步逐分片 release 比拿锁还贵。**分片间只 cast 不 call**。实测 locker-only P=16 26k → 50k+；端到端 put_edge_txn 插入 P=8 22k → 28k（+28%，再上去是引擎 commit）。⚠️ 基准坑：同一 cask 重复灌同一批边走的是 upsert 路径（1 锁 1 写），曾误读成 60k "引擎天花板"——每轮要开新库。语义变化：跨分片 FIFO 只对前缀写已到达的分片成立（有进展保证）。测试 +3（跨分片死锁、跨分片死亡清理、分片崩溃 → 全组重启 → `{aborted, locker_restarted}`）。**victim 启发式**（设计 §13.7）：受害者 = 环上最年轻（age 最大），age 由门面按 `transaction/3` 调用取、重跑不变（同 Mnesia 重启保 Tid）——最老的永远不被牺牲，长事务不再被短事务反复打断；DFS 改带路径栈返回环；非请求者受害者在本分片就地中止、在别的分片 cast `abort_waiter`（核对仍在等同一把锁）。压测 131 次死锁 85 次选非请求者、`lock_wait_timeouts` 仍 0，transfers 3200 事务 0.27–0.5s → 0.2s。测试 +2。环境式 API 不做（显式 Tx 更清楚）。全量 eunit **235/235**。 | ✅ |
 | **X1-8** | **提交不确定窗口：committer 移交 + 幂等键**（设计 §4.5 / §4.5.1）。⚠️ 先查出一个 v1 实现漏洞：`txn_commit` 是 dirty NIF，调用方被 kill 时 **DOWN 立即送达**，NIF 却还在跑（实测 DOWN 177µs，4MB 批约 10ms 后才落盘）；locker 按 DOWN 放锁 → 别的事务在落盘前读到旧值再覆盖，造成丢更新。修法：提交交给一个不与调用方 link 的 committer，`bitcask_txn_locker:handoff/2` 把 monitor 移交过去（归属分片串行处理 DOWN 与 handoff，两种先后顺序都有定义），锁持到批落盘。幂等键 `{idem_key, K}`：开跑前持标记写锁并查，有标记就返回首次结果；标记（含结果）与数据同批提交。另加 `idem_lookup/2`、`idem_purge/2`，并保留前缀 `<<0,"bitcask_txn:idem:">>`。测试 +6。⚠️ 测试坑：① 用计数器 RMW 断言会掩盖重复执行（两次执行读到同一个旧值、各写 V+1），改成每次执行写唯一的 exec 键；② 随机延迟 kill 大多打在 Fun 缓冲阶段，改成轮询调用栈，等进入 NIF（或在等 committer）再 kill。反向验证：去掉移交时该例 2/2 失败，有移交时 3/3 通过。代价：单 key + `no_sync` 最坏约 −25~30%（P=8 116k → 81–87k txn/s），`sync_on_commit` 下看不出。全量 eunit **244/244**。 | ✅ |
-| **X1-9** | **提交令牌替换 committer 进程**（6.6.1，设计 §4.5）。X1-8 的 committer 正确但每个写事务多一次 spawn 和一次分片 call，`no_sync` 最坏 −25~30%。新方案：提交带一个 NIF 资源（令牌）进 `cask_txn_commit/4`，NIF 执行期间额外 keep 一份，析构时若仍 armed 就通知归属分片；locker 侧 `begin_commit/1` 标 inflight、`end_commit/1` 标 done（都直写 ETS），inflight 时 DOWN → orphan，锁留到令牌通知，30s 兜底并计 `orphan_timeouts`。同时段对比 `no_sync` 单 key：committer 版 P=1 42–47k / P=8 70–89k → 令牌版 47–59k / 100–120k，回到修复前水平。⚠️ 踩坑：① 先试的"NIF 返回前 `enif_send`"有两处漏：调用方已死时用它的 env 发会被 ERTS 按文档丢弃（erl_nif.c：dirty 上 `ERTS_PROC_IS_EXITING → return 0`）；更致命的是 kill 落在 **dirty 队列排队期**时 NIF 根本不执行，通知永远不来——整模块跑、dirty 调度器有负载时稳定复现，孤儿锁挂 30s。令牌靠析构回调的 callback env 发，两种都覆盖。② **`rebar3 eunit --test=M:F` 对 `_test_` 生成器不执行里面的用例**（0.005s 就报 ok），前面好几次"单独跑通过"都不作数，定向跑要用 `--generator`。③ `current_function` 显示在 NIF 里时，进程多半还在 dirty 队列排队——kill 测试若直接 kill，覆盖的是"永不执行"而不是"执行中"，让 DOWN 直接放锁的错误实现也能通过。现在先测 NIF 耗时，进入后再睡 1/4–3/4 个耗时再 kill：错误实现 3/3 失败，令牌实现 3/3 通过；"排队中被 kill"改用 `erts_debug:dirty_io/2` 占满 dirty IO 调度器，确定性覆盖。`commit_failed_test_` 从 mock `txn_commit/3` 改成引擎真实拒绝（`_txn:` 前缀），同时覆盖错误路径上的令牌。 | ✅ |
-| **X1-10** | **X1-9 的收尾优化**（6.6.1 发版前自审）。① 窗口：原来先标 inflight 再建令牌，中间被 kill 就没令牌兜着，得等兜底还误计 `orphan_timeouts`——改成先建令牌再 `begin_commit`（`notify_target/1` 拆成纯函数，分片不在 → `locker_restarted`）。② 删掉 `end_commit` 和 `done` 态：NIF 返回后先 `release_all` 再 disarm，两步之间被 kill 由"令牌仍 armed"兜住，之后被 kill 记录已删、通知被忽略；每个写事务少一次 ETS 写。③ 令牌不再带 `ErlNifEnv`：只存 `{Pid, TxnId}`，析构时在回调 env 现构造 `{txn_committed, TxnId}`、`msg_env = NULL`。④ 30s 兜底改 app env `txn_orphan_timeout`，默认 5 分钟——到点放锁等于重开丢更新窗口，文档写明别调小。⑤ `idem_purge` 规模化：标记值改定长头 `<<Ver:8, At:64, Result/binary>>`，purge 不解码结果；不上锁 `range_fold` 只收过期 key；按块（`{chunk, N}` 默认 1000）加前缀锁重读核对后删，块间不持锁。⑥ `{idem_result, false}` 不存 Fun 结果，重来返回 `idem_replayed`。⚠️ 测试坑：eunit 同一进程跑整模块，用例之间信箱不清——新用例复用 `{ran, b}` 这种 tag 会数到上一个用例漏下的消息。全量 eunit **246/246**。 | ✅ |
+| **X1-9** | **提交令牌替换 committer 进程**（6.7.0，设计 §4.5）。X1-8 的 committer 正确但每个写事务多一次 spawn 和一次分片 call，`no_sync` 最坏 −25~30%。新方案：提交带一个 NIF 资源（令牌）进 `cask_txn_commit/4`，NIF 执行期间额外 keep 一份，析构时若仍 armed 就通知归属分片；locker 侧 `begin_commit/1` 标 inflight、`end_commit/1` 标 done（都直写 ETS），inflight 时 DOWN → orphan，锁留到令牌通知，30s 兜底并计 `orphan_timeouts`。同时段对比 `no_sync` 单 key：committer 版 P=1 42–47k / P=8 70–89k → 令牌版 47–59k / 100–120k，回到修复前水平。⚠️ 踩坑：① 先试的"NIF 返回前 `enif_send`"有两处漏：调用方已死时用它的 env 发会被 ERTS 按文档丢弃（erl_nif.c：dirty 上 `ERTS_PROC_IS_EXITING → return 0`）；更致命的是 kill 落在 **dirty 队列排队期**时 NIF 根本不执行，通知永远不来——整模块跑、dirty 调度器有负载时稳定复现，孤儿锁挂 30s。令牌靠析构回调的 callback env 发，两种都覆盖。② **`rebar3 eunit --test=M:F` 对 `_test_` 生成器不执行里面的用例**（0.005s 就报 ok），前面好几次"单独跑通过"都不作数，定向跑要用 `--generator`。③ `current_function` 显示在 NIF 里时，进程多半还在 dirty 队列排队——kill 测试若直接 kill，覆盖的是"永不执行"而不是"执行中"，让 DOWN 直接放锁的错误实现也能通过。现在先测 NIF 耗时，进入后再睡 1/4–3/4 个耗时再 kill：错误实现 3/3 失败，令牌实现 3/3 通过；"排队中被 kill"改用 `erts_debug:dirty_io/2` 占满 dirty IO 调度器，确定性覆盖。`commit_failed_test_` 从 mock `txn_commit/3` 改成引擎真实拒绝（`_txn:` 前缀），同时覆盖错误路径上的令牌。 | ✅ |
+| **X1-10** | **X1-9 的收尾优化**（6.7.0 发版前自审）。① 窗口：原来先标 inflight 再建令牌，中间被 kill 就没令牌兜着，得等兜底还误计 `orphan_timeouts`——改成先建令牌再 `begin_commit`（`notify_target/1` 拆成纯函数，分片不在 → `locker_restarted`）。② 删掉 `end_commit` 和 `done` 态：NIF 返回后先 `release_all` 再 disarm，两步之间被 kill 由"令牌仍 armed"兜住，之后被 kill 记录已删、通知被忽略；每个写事务少一次 ETS 写。③ 令牌不再带 `ErlNifEnv`：只存 `{Pid, TxnId}`，析构时在回调 env 现构造 `{txn_committed, TxnId}`、`msg_env = NULL`。④ 30s 兜底改 app env `txn_orphan_timeout`，默认 5 分钟——到点放锁等于重开丢更新窗口，文档写明别调小。⑤ `idem_purge` 规模化：标记值改定长头 `<<Ver:8, At:64, Result/binary>>`，purge 不解码结果；不上锁 `range_fold` 只收过期 key；按块（`{chunk, N}` 默认 1000）加前缀锁重读核对后删，块间不持锁。⑥ `{idem_result, false}` 不存 Fun 结果，重来返回 `idem_replayed`。⚠️ 测试坑：eunit 同一进程跑整模块，用例之间信箱不清——新用例复用 `{ran, b}` 这种 tag 会数到上一个用例漏下的消息。全量 eunit **246/246**。 | ✅ |
 
 ---
 
-## R1 — 全项目审查：A 档正确性修复（6.6.1）
+## R1 — 全项目审查：A 档正确性修复（6.7.0）
 
 > 六路并行审查（KV 门面 / graphdb / locker / embedder / C++ NIF / 构建测试）约 70 条
 > 发现，按"先修什么"分四档；本节是 A 档 12 条，全部有回归测试。B（性能）、C（构建
@@ -521,7 +521,7 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
-## R2 — 全项目审查：B 档性能（6.6.1）
+## R2 — 全项目审查：B 档性能（6.7.0）
 
 > 审查里的 B 档 18 条，四路并行（NIF + fold 家族 / locker / graphdb / embedder）。
 
@@ -540,7 +540,7 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
-## R3 — 全项目审查：C 档构建与测试（6.6.1）
+## R3 — 全项目审查：C 档构建与测试（6.7.0）
 
 | 步骤 | 内容 | 状态 |
 |------|------|------|
@@ -552,6 +552,20 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 | **R3-6** | **测试提速 38 s → 12–15 s**：`blocked/2` 固定等 150 ms 改为轮询 `bitcask_txn_txns` 里该 agent 的 `waiting` 字段（`do_acquire` 在回复前写 waiting，正向断言、无竞态）；锁矩阵类测试原来每个多耗 1 s——`wait_clean/0` 要等 `txns := 0`，而 agent 活着时事务一直注册着，每次轮询满 50×20 ms，只断言锁表的调用点改用 `wait_locks_clean/0`；`nif_commit_notify_test_` 用 DOWN 取代 `sleep(1600)`。 | ✅ |
 | **R3-7** | **测试基础设施**：`test/bitcask_test_util:with_dir/2`（认 `TMPDIR`、`file:del_dir_r`）取代 11 份拷贝；`idem_killed_mid_commit_test_` 轮数读 `BITCASK_STRESS_ROUNDS`（默认 10）；embedder 测试的收集循环超时不再被吞；eunit surefire 报告写 `_build/test/logs`。不做 `inparallel`：全量只有十几秒，引入不稳定不值。 | ✅ |
 | **R3-8** | 回归：全量 eunit 278/278 连跑 3 遍（12–15 s），dialyzer 0，xref 干净。 | ✅ |
+
+---
+
+## R4 — 全项目审查：D 档清理（6.7.0）
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **R4-1** | **死 NIF**：删 `cask_iterator/3` 三件套、`cask_bool_search/3`（零调用者）、`CaskHandle::iter` 字段与两个相关原子；删 `cask_range_next/1`（只有一个测试在用，且 prefetch > 1 时会在普通调度器上跑 N 键归并 + 起线程），该测试改用 `cask_range_next_batch`。删无用辅助 `get/make_uint64_bin`、`errno_error_tuple`、`Atoms::filter`。删完 `bitcask_cpp_nifs` 的 export 与 `kNifFuncs` 逐一对齐。 | ✅ |
+| **R4-2** | **错误形态统一**：`fault_to_term_detailed` 并入 `fault_to_term`，所有 NIF 同一故障同一形态。⚠️ 两处形态变化：无消息的 `kInvalidOption` `{error, error}` → `{error, invalid_option}`；无 errno 的 `kIo` `{error, unknown}` → `{error, io_error}`；新增 `{error, analyzer_mismatch}`。裸原子与 `{error, write_locked}` 不变。grep 过 src/test/doc：没有代码匹配旧形态。 | ✅ |
+| **R4-3** | **rebar2 / Basho 遗留**：删 `package/`、`.travis.yml`、`test/Run-eunit-loop.expect`、PULSE 助手（`handle_errors` / `mute` / `token` / `utils`）、`test/bcfold_*`（调的 `bitcask_fileops` / `bitcask_io` 早已不存在）、Makefile 的 eqc / pulse 目标、src 里的 PULSE `-ifdef`。`merge_worker` 从没跑过的 EQC 属性改成穷举 24³ 的普通 eunit。 | ✅ |
+| **R4-4** | **Erlang 去重**：`succ/1` 只留 `bitcask:prefix_succ/1`（`graphdb:succ/1` 是公开 codec 函数，保留名字改为委托）；graphdb 键只构一次；删 `bitcask_embedder_openai` 的旧 API（`embed/1,3`、`dim/0`，B 档重构后其实已经不能用）与 behaviour 的旧回调。`bitcask_embedder_anthropic` 没删（公开 API），README 加了 ⚠️：Anthropic 没有公开 embedding 端点。 | ✅ |
+| **R4-5** | 过时注释（模块头 / stream / app）、`open/2` 多余的 `application:load`、test 里 8 条编译告警。 | ✅ |
+| **R4-6** | 回归：全量 eunit **279/279** 连跑 2 遍，dialyzer 0，xref 干净，NIF 零警告。 | ✅ |
+| **R4-7** | **6.7.0 发版检查**：6.6.1 → **6.7.0**（最低 OTP 27、NIF 错误形态变化、删公开函数，按语义化版本升 minor）。全量连跑时抓到两处偶发：① `graphdb:expand_grouped` 失败清理有真 bug——`kill_workers` kill 完直接 `demonitor(flush)`，已经交了结果的片 worker 的 `{Ref, Idx, Lists}` 会留在调用方信箱；改成等每个 worker 的 DOWN（同一发送者信号有序）再清 `{Ref,_,_}`。单独跑 15 遍复现不出，只在整模块有负载时出现，没法做确定性反向验证。② `scatter_retries_segment_of_dead_worker_test_` 是测试 bug：连 kill 20 次超过池的重启强度 `{one_for_one, 5, 10}`，整池被 supervisor 关掉；压到 4 轮（旧实现下仍 3/3 失败）。修后全量连跑 3 遍 279/279，`prod` 编译零警告，dialyzer 0，xref 干净。 | ✅ |
 
 ---
 
