@@ -10,6 +10,10 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
+# 根 cmake/ 只放本仓库自己的模块（FindErlang）。⚠️ 别在这里放与 libbitcask
+# 同名的模块：本行先 APPEND，libbitcask 后 APPEND 自己的 cmake/，同名时根的
+# 这份先被找到——以前根目录留着一份旧的 BitcaskSanitizers.cmake（没有 MSVC
+# 分支），libbitcask 的 include(BitcaskSanitizers) 实际加载的是它。已删除。
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 find_package(Erlang REQUIRED)
 
