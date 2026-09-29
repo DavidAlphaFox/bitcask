@@ -36,6 +36,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build libicu-dev
+      # rebar.config 的 configure hook 见到 PATH 上的 ccache 就设成 launcher。
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: eunit-otp${{ matrix.otp }}
+      # dialyzer 的 PLT 冷建要几分钟；按 OTP 版本 + 依赖锁定缓存。
+      - name: Cache dialyzer PLT
+        uses: actions/cache@v4
+        with:
+          path: _build/default/*_plt
+          key: plt-otp${{ matrix.otp }}-${{ hashFiles('rebar.lock', 'rebar.config') }}
+          restore-keys: plt-otp${{ matrix.otp }}-
       - name: Compile
         run: rebar3 compile
       - name: Run xref and dialyzer
@@ -53,7 +64,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        otp: ["25.3", "26.2"]
+        otp: ["27", "28"]
         compiler: ["gcc", "clang"]
     steps:
       - uses: actions/checkout@v4
@@ -74,10 +85,19 @@ jobs:
             echo "CC=gcc"  >> "$GITHUB_ENV"
             echo "CXX=g++" >> "$GITHUB_ENV"
           fi
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: cpp-${{ matrix.compiler }}-otp${{ matrix.otp }}
+      # ⚠️ 不开 -DBITCASK_WERROR=ON：它是 libbitcask 的选项，会连上游源码一起
+      #    -Werror，GCC 14 在 libbitcask 的 keydir.cpp 上报 -Wmaybe-uninitialized
+      #    （误报），CI 必挂。上游代码不归本仓库管；本仓库 NIF 的警告靠本地
+      #    构建输出盯着（当前为 0）。
       - name: Configure
-        run: cmake -S . -B _build/cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+        run: |
+          cmake -S . -B _build/cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
       - name: Build
-        run: cmake --build _build/cmake -j
+        run: cmake --build _build/cmake --parallel "$(nproc)"
       - name: Run ctest
         working-directory: _build/cmake
         run: ctest --output-on-failure -j
@@ -108,7 +128,7 @@ jobs:
             -DBUILD_TESTING=ON \
             -DBITCASK_SANITIZE=address,undefined
       - name: Build
-        run: cmake --build _build/asan -j
+        run: cmake --build _build/asan --parallel "$(nproc)"
       - name: Run ctest
         working-directory: _build/asan
         env:
@@ -136,7 +156,7 @@ jobs:
             -DBUILD_TESTING=ON \
             -DBITCASK_SANITIZE=thread
       - name: Build
-        run: cmake --build _build/tsan -j
+        run: cmake --build _build/tsan --parallel "$(nproc)"
       - name: Run ctest
         working-directory: _build/tsan
         env:
@@ -169,7 +189,7 @@ jobs:
             -DCMAKE_EXE_LINKER_FLAGS="--coverage" \
             -DCMAKE_SHARED_LINKER_FLAGS="--coverage"
       - name: Build
-        run: cmake --build _build/cov -j
+        run: cmake --build _build/cov --parallel "$(nproc)"
       - name: Run ctest
         working-directory: _build/cov
         run: ctest --output-on-failure -j
