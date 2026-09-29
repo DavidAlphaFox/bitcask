@@ -8,6 +8,10 @@
 //                                        （非空 / key 非空 / key 互不重复 /
 //                                        不占用 "_txn:" 保留前缀）与提交点
 //                                        fsync 策略。
+//   cask_txn_commit(Ref, Ops, Sync, Token)
+//                                        同上，执行期间 pin 住提交令牌。
+//   txn_commit_token(Pid, Msg)           建令牌：析构时若仍 armed 发 Msg 给 Pid。
+//   txn_commit_token_disarm(Token)       撤销通知（正常提交完成后调）。
 //
 // 语义（doc/atomic-batch-design-zh.md）：崩溃/掉电后**整批要么全可见要么全
 // 不可见**——盘上批头声明区间，恢复时区间不完整即整批截断。原子性与持久性
@@ -122,8 +126,24 @@ ERL_NIF_TERM nif_cask_put_batch_atomic(ErlNifEnv* env, int /*argc*/,
 // 校验失败（空批 / 空 key / 重复 key / "_txn:" 前缀）由 TxnCask 判定，
 // 返回 kInvalidOption + 具体消息，经 fault_to_term_detailed 变成
 // {error, {invalid_option, <<"...">>}}——调用方能直接看到是哪一条规则。
-ERL_NIF_TERM nif_cask_txn_commit(ErlNifEnv* env, int /*argc*/,
+//
+// 4 元形态 cask_txn_commit(Ref, Ops, Sync, Token)：Token 是 txn_commit_token/2
+// 建的提交令牌（见 resources.hpp TxnTokenHandle）。本 NIF 执行期间 keep 住它，
+// 保证"析构即批不会再动盘"。
+ERL_NIF_TERM nif_cask_txn_commit(ErlNifEnv* env, int argc,
                                   const ERL_NIF_TERM argv[]) {
+    TxnTokenHandle* token = nullptr;
+    if (argc == 4 &&
+        !enif_get_resource(env, argv[3], g_txn_token_resource_type,
+                           reinterpret_cast<void**>(&token))) {
+        return enif_make_badarg(env);
+    }
+    struct TokenPin {
+        TxnTokenHandle* t;
+        explicit TokenPin(TxnTokenHandle* x) noexcept : t(x) { if (t) enif_keep_resource(t); }
+        ~TokenPin() { if (t) enif_release_resource(t); }
+    } pin{token};
+
     auto* h = checked_cask_handle(env, argv[0]);
     if (!h) return enif_make_badarg(env);
 
@@ -148,6 +168,28 @@ ERL_NIF_TERM nif_cask_txn_commit(ErlNifEnv* env, int /*argc*/,
     TxnCask txn(h->cask.get(), sync);
     auto r = txn.commit(ops);
     if (!r) return fault_to_term_detailed(env, r.error());
+    return atoms().ok;
+}
+
+// txn_commit_token(Pid, Msg) -> Token
+ERL_NIF_TERM nif_txn_commit_token(ErlNifEnv* env, int /*argc*/,
+                                   const ERL_NIF_TERM argv[]) {
+    ErlNifPid pid{};
+    if (!enif_get_local_pid(env, argv[0], &pid)) return enif_make_badarg(env);
+    ERL_NIF_TERM t = make_resource<TxnTokenHandle>(env, g_txn_token_resource_type,
+                                                   pid, env, argv[1]);
+    return t ? t : enif_make_badarg(env);
+}
+
+// txn_commit_token_disarm(Token) -> ok
+ERL_NIF_TERM nif_txn_commit_token_disarm(ErlNifEnv* env, int /*argc*/,
+                                          const ERL_NIF_TERM argv[]) {
+    TxnTokenHandle* token = nullptr;
+    if (!enif_get_resource(env, argv[0], g_txn_token_resource_type,
+                           reinterpret_cast<void**>(&token))) {
+        return enif_make_badarg(env);
+    }
+    token->armed.store(false, std::memory_order_release);
     return atoms().ok;
 }
 

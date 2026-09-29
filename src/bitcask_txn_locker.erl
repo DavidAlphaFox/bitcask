@@ -70,8 +70,9 @@
 %%     acquire(TxnId, LockId, Mode)    -> ok | {error, deadlock | lock_wait_timeout
 %%                                            | timeout | unknown_txn}
 %%     check(TxnId)                    -> ok | {error, timeout | unknown_txn}   （直读 ETS）
-%%     handoff(TxnId, Pid)             -> ok | {error, timeout | unknown_txn}
-%%                                        （提交前把 monitor 移交给 committer 进程）
+%%     begin_commit(TxnId)             -> {ok, {Pid, Msg}} | {error, timeout | unknown_txn}
+%%                                        （直读写 ETS；返回提交令牌的通知目标）
+%%     end_commit(TxnId)               -> ok  （NIF 返回后，直写 ETS）
 %%     release_all(TxnId)              -> ok          （幂等）
 %%     status()                        -> map()
 %%
@@ -87,7 +88,7 @@
 -endif.
 
 -export([start_link/1, shard_count/0, shard_of/1,
-         register/2, acquire/3, check/1, handoff/2, release_all/1,
+         register/2, acquire/3, check/1, begin_commit/1, end_commit/1, release_all/1,
          status/0]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -100,6 +101,11 @@
 
 %% 单锁等待兜底上限（ms）。正常路径死锁检测必达，这只是防御。
 -define(DEFAULT_LOCK_WAIT_TIMEOUT, 5000).
+
+%% 孤儿提交（调用方死于 txn_commit 途中）等完成通知的兜底上限（ms）。正常
+%% 情况下通知在 NIF 返回时必到；到点还没来就照常清理并记 orphan_timeouts——
+%% 宁可冒一次提前放锁的险，也不让锁永远挂着。
+-define(ORPHAN_TIMEOUT, 30000).
 
 -type txn_id() :: pos_integer().
 -type lock_id() :: {reference(), binary(), point | prefix}.
@@ -127,7 +133,11 @@
               age      :: pos_integer(),             % 越小越老；重跑不变
               deadline :: integer() | infinity,      % erlang:monotonic_time(ms)
               lock_wait_timeout :: timeout(),
-              waiting  = undefined :: undefined | {pos_integer(), lock_id()}}).
+              waiting  = undefined :: undefined | {pos_integer(), lock_id()},
+              %% 提交状态（见 begin_commit/1）：none → inflight（调用方进 NIF 前
+              %% 标）→ done（NIF 返回后调用方标）；inflight 时调用方 DOWN →
+              %% orphan（锁不放，等提交令牌的析构通知）。
+              commit   = none :: none | inflight | done | orphan}).
 
 %% 一个分片的表句柄；persistent_term 里按下标存一份，跨分片 DFS 用。
 -record(tabs, {idx :: pos_integer(), locks :: atom(), plens :: atom()}).
@@ -214,15 +224,35 @@ check(TxnId) ->
                end
     end.
 
-%% 提交前的移交：校验同 check/1，并把事务的 monitor 从调用进程换到 Pid
-%% （committer）。之后调用进程死了 locker 不再放锁，锁跟着 committer 走——
+%% 进 txn_commit NIF 之前：校验同 check/1，并把事务标成 inflight（调用方
+%% 直写共享表，不过分片——分片只用 update_element 改别的字段，不会覆盖它）。
+%% 返回通知目标 {Pid, Msg}，调用方拿它建提交令牌（bitcask_cpp_nifs:
+%% txn_commit_token/2）传给 txn_commit/4。
 %% ⚠️ 为什么需要：txn_commit 是 dirty NIF，调用进程被 kill 时 DOWN **立即**
-%% 送达（NIF 还在 dirty 调度器上跑完），若按 DOWN 放锁，别的事务就能在批
-%% 落盘前拿到这些 key：读到提交前的值再覆盖 = 丢更新。committer 是门面
-%% 内部进程，没人会去 kill 它。归属分片一次 call，与 register 同价。
--spec handoff(txn_id(), pid()) -> ok | {error, timeout | unknown_txn}.
-handoff(TxnId, Pid) when is_pid(Pid) ->
-    gen_server:call(shard(home_of(TxnId)), {handoff, TxnId, Pid}, infinity).
+%% 送达，NIF 却在 dirty 调度器上跑完才落盘（实测 DOWN ~100µs，4MB 批 ~10ms
+%% 后才落盘）。若按 DOWN 放锁，别的事务会在批落盘前拿到这些 key：读到提交
+%% 前的值再覆盖 = 丢更新。inflight 的事务 DOWN 了只标 orphan、锁不放，等
+%% 令牌析构发来的通知再清理——析构只发生在 NIF 返回后，或进程在 NIF 真正
+%% 开始前（还在 dirty 队列里）就被 kill、NIF 永不执行时。
+%% ⚠️ 不能用"NIF 返回前发消息"代替令牌：后一种情况 NIF 根本不跑（整模块
+%%    跑测试、dirty 调度器有负载时稳定复现），孤儿永远等不到通知。
+-spec begin_commit(txn_id()) -> {ok, {pid(), term()}} | {error, timeout | unknown_txn}.
+begin_commit(TxnId) ->
+    case check(TxnId) of
+        ok ->
+            true = ets:update_element(?TXNS, TxnId, {#txn.commit, inflight}),
+            {ok, {whereis(shard(home_of(TxnId))), {?MODULE, committed, TxnId}}};
+        Error ->
+            Error
+    end.
+
+%% NIF 已返回：inflight → done。此后调用方再死就是普通 DOWN（批已落定）。
+%% 必须在 disarm 令牌**之前**调：两步之间被 kill，DOWN 看到 done 照常清理，
+%% 残留的令牌通知找不到 orphan 记录，被忽略。
+-spec end_commit(txn_id()) -> ok.
+end_commit(TxnId) ->
+    _ = ets:update_element(?TXNS, TxnId, {#txn.commit, done}),
+    ok.
 
 %% 释放事务的全部锁并注销（幂等）。调用方就是事务进程，所以它此刻不在任何
 %% 分片上等；按 held 表分组向各分片 **cast** 放锁（同 mnesia_locker 的
@@ -240,7 +270,8 @@ release_all(TxnId) ->
 -spec status() -> #{txns => non_neg_integer(), waiting => non_neg_integer(),
                     locks => non_neg_integer(), prefix_locks => non_neg_integer(),
                     deadlocks_total => non_neg_integer(), victims_other => non_neg_integer(),
-                    lock_wait_timeouts => non_neg_integer(), shards => pos_integer()}.
+                    lock_wait_timeouts => non_neg_integer(),
+                    orphan_timeouts => non_neg_integer(), shards => pos_integer()}.
 status() ->
     N = shard_count(),
     Waiting = ets:select_count(?TXNS, [{#txn{waiting = '$1', _ = '_'},
@@ -256,6 +287,7 @@ status() ->
       deadlocks_total     => Stat(deadlocks),
       victims_other       => Stat(victims_other),   % 受害者不是请求者的次数
       lock_wait_timeouts  => Stat(lock_wait_timeouts),
+      orphan_timeouts     => Stat(orphan_timeouts),  % 孤儿提交等通知超时（应恒为 0）
       shards              => N}.
 
 %% =========================================================================
@@ -301,24 +333,6 @@ handle_call({unregister, TxnId}, _From, S) ->
     end,
     {reply, ok, S};
 
-%% 归属分片串行处理 DOWN 与 handoff：旧 monitor 的 DOWN 若已在信箱里，
-%% demonitor flush 掉它；若已处理过，记录已删 → unknown_txn，committer 放弃。
-handle_call({handoff, TxnId, Pid}, _From, S) ->
-    case ets:lookup(?TXNS, TxnId) of
-        [] ->
-            {reply, {error, unknown_txn}, S};
-        [T] ->
-            case expired(T) of
-                true ->
-                    {reply, {error, timeout}, S};
-                false ->
-                    Mon = erlang:monitor(process, Pid),
-                    erlang:demonitor(T#txn.mon, [flush]),
-                    true = ets:insert(?TXNS, T#txn{pid = Pid, mon = Mon}),
-                    {reply, ok, S}
-            end
-    end;
-
 handle_call({acquire, TxnId, LockId, Mode}, From, S) ->
     case ets:lookup(?TXNS, TxnId) of
         [] ->
@@ -353,16 +367,32 @@ handle_cast(_Msg, S) ->
     {noreply, S}.
 
 %% 调用进程死了（只有归属分片会收到）：通知全部分片各自清理，再删记录。
+%% 例外：死在提交途中（inflight）→ 标 orphan，锁留着等完成通知。
 handle_info({'DOWN', Mon, process, _Pid, _Reason}, #state{} = S) ->
     case ets:match_object(?TXNS, #txn{mon = Mon, _ = '_'}) of
+        [#txn{id = TxnId, commit = inflight}] ->
+            true = ets:update_element(?TXNS, TxnId, {#txn.commit, orphan}),
+            _ = erlang:send_after(?ORPHAN_TIMEOUT, self(), {orphan_timeout, TxnId}),
+            {noreply, S};
         [#txn{id = TxnId}] ->
-            N = shard_count(),
-            Me = (S#state.tabs)#tabs.idx,
-            [gen_server:cast(shard(I), {drop, TxnId}) || I <- lists:seq(1, N), I =/= Me],
-            S1 = drop_local(TxnId, S),
-            true = ets:delete(?TXNS, TxnId),
-            {noreply, S1};
+            {noreply, drop_txn(TxnId, S)};
         [] ->
+            {noreply, S}
+    end;
+
+%% 提交令牌的析构通知：只有 orphan 才需要它（正常路径令牌已 disarm）。
+handle_info({?MODULE, committed, TxnId}, #state{} = S) ->
+    case ets:lookup(?TXNS, TxnId) of
+        [#txn{commit = orphan}] -> {noreply, drop_txn(TxnId, S)};
+        _                       -> {noreply, S}
+    end;
+
+handle_info({orphan_timeout, TxnId}, #state{} = S) ->
+    case ets:lookup(?TXNS, TxnId) of
+        [#txn{commit = orphan}] ->
+            _ = ets:update_counter(?STATS, orphan_timeouts, 1, {orphan_timeouts, 0}),
+            {noreply, drop_txn(TxnId, S)};
+        _ ->
             {noreply, S}
     end;
 
@@ -459,6 +489,14 @@ do_acquire(#txn{id = TxnId} = T, LockId, Mode, From, #state{tabs = Tabs} = S) ->
     end.
 
 %% 本分片的 waiting 映射 + 共享表里的 waiting 字段一起维护。
+%% 事务死亡的完整清理（只在归属分片上调）：通知全部分片各自放锁，再删记录。
+drop_txn(TxnId, S) ->
+    Me = (S#state.tabs)#tabs.idx,
+    [gen_server:cast(shard(I), {drop, TxnId}) || I <- lists:seq(1, shard_count()), I =/= Me],
+    S1 = drop_local(TxnId, S),
+    true = ets:delete(?TXNS, TxnId),
+    S1.
+
 set_waiting(TxnId, undefined, #state{waiting = W} = S) ->
     _ = ets:update_element(?TXNS, TxnId, {#txn.waiting, undefined}),
     S#state{waiting = maps:remove(TxnId, W)};

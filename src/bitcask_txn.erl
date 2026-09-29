@@ -32,8 +32,8 @@
 %%   ⚠️ **Fun 必须无副作用**：可能执行多次。禁止在 Fun 内做 I/O、发消息、
 %%      改进程字典。Fun 在调用进程内执行，Tx 不能传给别的进程用（会
 %%      error({bitcask_txn, not_owner})）。
-%%   提交由一个内部 committer 进程执行，locker 在提交前把 monitor 移交给它：
-%%   调用进程在提交途中被 kill，锁也要等批落盘（或失败）后才放（§4.5）。
+%%   提交带一个提交令牌进 NIF（txn_commit/4）：调用进程在提交途中被 kill，
+%%   locker 等令牌析构的通知再放锁——锁持到这批不会再动盘（§4.5）。
 %%   ⚠️ 不确定窗口：调用进程死于提交途中，批要么全成要么全不成，但没人拿到
 %%      结果。要安全重试就带 {idem_key, K}（见下）。
 %%   ⚠️ 不支持嵌套：Fun 内再调 transaction → {aborted, tx_nested}。
@@ -377,46 +377,27 @@ commit(#bitcask_txn_ctx{id = TxnId, idem = Idem} = Tx, Result) ->
                         delete   -> {remove, K}
                     end || {K, Op} <- Sorted],
             Extra = index_ops(Tx, Sorted, Buf),
-            case commit_via_committer(Tx, Main ++ Extra ++ idem_ops(Tx, Result)) of
+            case commit_notified(Tx, Main ++ Extra ++ idem_ops(Tx, Result)) of
                 ok              -> {atomic, Result};
                 {error, Reason} -> {aborted, {commit_failed, Reason}}
             end
     end.
 
-%% 提交交给一个不与调用方 link 的 committer 进程：它先向 locker 认领事务
-%% （handoff：校验 deadline + 把 monitor 换到自己身上），再 txn_commit，再
-%% release_all。调用方被 kill 也不影响——锁一直持有到批落盘或失败，不会在
-%% dirty NIF 还没跑完时就被 DOWN 清理放掉（见 bitcask_txn_locker:handoff/2）。
-%% 代价：每个写事务一次 spawn + 一次归属分片 call（替掉原来的直读 check）。
-commit_via_committer(#bitcask_txn_ctx{id = TxnId, handle = Handle, sync = Sync}, Ops) ->
-    Caller = self(),
-    {Pid, Mon} = spawn_monitor(fun() -> committer(Caller, TxnId, Handle, Ops, Sync) end),
-    receive
-        {?MODULE, committed, Pid, R} ->
-            erlang:demonitor(Mon, [flush]),
+%% 进 NIF 前把事务标成 inflight，并带一个提交令牌进 NIF：调用方死在提交
+%% 途中，locker 不按 DOWN 放锁，而是等令牌析构的通知——锁一直持到这批不会
+%% 再动盘（见 bitcask_txn_locker:begin_commit/1）。正常路径：end_commit 标
+%% done，再 disarm 令牌（顺序不能反），最后 release。
+commit_notified(#bitcask_txn_ctx{id = TxnId, handle = Handle, sync = Sync}, Ops) ->
+    case bitcask_txn_locker:begin_commit(TxnId) of
+        {ok, {Pid, Msg}} ->
+            Token = bitcask_cpp_nifs:txn_commit_token(Pid, Msg),
+            R = bitcask:txn_commit(Handle, Ops, Sync, Token),
+            ok = bitcask_txn_locker:end_commit(TxnId),
+            ok = bitcask_cpp_nifs:txn_commit_token_disarm(Token),
+            release(TxnId),
             R;
-        {?MODULE, handoff_failed, Pid, Why} ->
-            erlang:demonitor(Mon, [flush]),
-            case Why of
-                timeout     -> throw(?TIMEOUT);
-                unknown_txn -> throw({?ABORT, locker_restarted})
-            end;
-        {'DOWN', Mon, process, Pid, Why} ->
-            %% 不该发生（committer 自己兜住了引擎异常）。结果不确定：若已
-            %% handoff，锁随它的 DOWN 由 locker 清；否则由 run_once 的 catch 放。
-            {error, {committer_down, Why}}
-    end.
-
-committer(Caller, TxnId, Handle, Ops, Sync) ->
-    case bitcask_txn_locker:handoff(TxnId, self()) of
-        ok ->
-            R = try bitcask:txn_commit(Handle, Ops, Sync)
-                catch Class:Reason -> {error, {Class, Reason}}
-                end,
-            ok = bitcask_txn_locker:release_all(TxnId),
-            Caller ! {?MODULE, committed, self(), R};
-        {error, Why} ->
-            Caller ! {?MODULE, handoff_failed, self(), Why}
+        {error, timeout}     -> throw(?TIMEOUT);
+        {error, unknown_txn} -> throw({?ABORT, locker_restarted})
     end.
 
 %% 二级索引展开。额外 op 的 key 在提交前补写锁（仍属 2PL 的增长段，

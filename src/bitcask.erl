@@ -40,7 +40,7 @@
          merge/1, merge/2, merge/3,
          range/2, range/3, range_fold/5,
          put_batch_atomic/2,
-         txn_commit/2, txn_commit/3,
+         txn_commit/2, txn_commit/3, txn_commit/4,
          needs_merge/1,
          needs_merge/2,
          is_frozen/1,
@@ -551,6 +551,16 @@ txn_commit(Handle, Ops) -> txn_commit(Handle, Ops, sync_on_commit).
 txn_commit(Handle, Ops, Sync) when Sync =:= sync_on_commit;
                                    Sync =:= no_sync ->
     case bitcask_cpp_nifs:cask_txn_commit(ref(Handle), Ops, Sync) of
+        ok    -> ok;
+        Other -> normalize_error(Other)
+    end.
+
+%% 同 /3，执行期间 pin 住提交令牌（bitcask_cpp_nifs:txn_commit_token/2）。
+%% bitcask_txn 的 locker 靠令牌的析构通知判断"这批不会再动盘"再放锁；一般
+%% 应用用不上。
+txn_commit(Handle, Ops, Sync, Token)
+  when Sync =:= sync_on_commit; Sync =:= no_sync ->
+    case bitcask_cpp_nifs:cask_txn_commit(ref(Handle), Ops, Sync, Token) of
         ok    -> ok;
         Other -> normalize_error(Other)
     end.

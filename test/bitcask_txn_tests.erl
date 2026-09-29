@@ -499,19 +499,17 @@ timeout_test_() ->
 %% ===================================================================
 
 commit_failed_test_() ->
-    {"txn_commit 返回错误 → {aborted,{commit_failed,_}}，锁全放",
+    {"引擎拒绝提交 → {aborted,{commit_failed,_}}，整批不落、锁全放（真实 NIF 错误路径）",
      fun() ->
         with_dir(fun(D) ->
             R = open(D),
-            meck:new(bitcask, [passthrough]),
-            meck:expect(bitcask, txn_commit, fun(_, _, _) -> {error, io_error} end),
-            try
-                ?assertEqual({aborted, {commit_failed, io_error}},
-                             ?T:transaction(R, fun(Tx) -> ?T:write(Tx, <<"k">>, <<"v">>) end)),
-                ?assertMatch(#{locks := 0, txns := 0}, wait_clean())
-            after
-                meck:unload(bitcask)
-            end,
+            %% "_txn:" 是引擎 TxnCask 的保留前缀：校验失败、零副作用。
+            ?assertMatch({aborted, {commit_failed, {invalid_option, _}}},
+                         ?T:transaction(R, fun(Tx) ->
+                             ok = ?T:write(Tx, <<"k">>, <<"v">>),
+                             ?T:write(Tx, <<"_txn:x">>, <<"v">>)
+                         end)),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
             ?assertEqual(not_found, bitcask:get(R, <<"k">>)),
             bitcask:close(R)
         end)
@@ -925,7 +923,7 @@ older_txn_never_restarts_test_() ->
      end}}.
 
 %% ===================================================================
-%% 幂等键 + committer 移交（设计 §4.5 / §4.5.1）
+%% 幂等键 + 提交完成通知（设计 §4.5 / §4.5.1）
 %% ===================================================================
 
 %% 计数器 +1，并向 Owner 报一次"Fun 跑过"（测试专用副作用）。
@@ -1032,13 +1030,15 @@ idem_purge_test_() ->
         end)
      end}.
 
-%% 调用进程在提交途中被 kill：锁必须等批落盘才放（committer 移交），否则
+%% 调用进程在提交途中被 kill：锁必须等批落盘才放（NIF 完成通知），否则
 %% 重试者可能在批落盘前查标记 → 看不到 → 再执行一次。每次执行写一个唯一
 %% 的 exec 键，断言每轮恰好一个（计数器 RMW 断言不够：两次执行若读到同一
 %% 个旧值，各写 V+1，重复执行被丢更新掩盖掉）。
-%% 大批（~4MB + sync）把 dirty NIF 的执行窗口撑宽；轮询 A 的调用栈，等它
-%% 进入提交阶段（Fun 已跑完）再 kill，前半轮直接 kill、后半轮再随机延迟
-%% [0, NIF 耗时]——确定性地打在"提交中"，也覆盖"刚提交完"。
+%% 大批（~8MB + sync）把 dirty NIF 的执行窗口撑宽。kill 时刻：A 进入 NIF
+%% （current_function 是 NIF——⚠️ 这时它多半还在 dirty 队列里排队，直接 kill
+%% 得到的是"NIF 永不执行"，那条路径归 nif_commit_notify_test_）之后再睡
+%% [NIF 耗时的 1/4, 3/4]，落在真正执行中。orphan_timeouts 不许涨：锁是被令牌
+%% 析构通知放的，不是 30s 兜底计时器放的。
 idem_killed_mid_commit_test_() ->
     {"提交途中 kill 调用方 + 同幂等键重试：每轮恰好执行一次",
      {timeout, 300, fun() ->
@@ -1046,17 +1046,22 @@ idem_killed_mid_commit_test_() ->
             R = open(D),
             Big = binary:copy(<<"x">>, 4096),
             Fun = fun(Round, Tag) -> fun(Tx) ->
-                      [ok = ?T:write(Tx, <<"big", (bin(I))/binary>>, Big) || I <- lists:seq(1, 1000)],
+                      [ok = ?T:write(Tx, <<"big", (bin(I))/binary>>, Big) || I <- lists:seq(1, 2000)],
                       ok = ?T:write(Tx, <<"exec-", Round/binary, "-", Tag>>, <<>>),
                       Tag
                   end end,
             {Us, {atomic, _}} = timer:tc(fun() -> ?T:transaction(R, Fun(<<"warm">>, $w), []) end),
+            NifMs = max(4, (element(1, timer:tc(fun() ->
+                        ok = bitcask:txn_commit(R, [{put, <<"big", (bin(I))/binary>>, Big}
+                                                    || I <- lists:seq(1, 2000)], sync_on_commit)
+                    end)) div 1000)),
+            #{orphan_timeouts := Orph0} = ?L:status(),
             Rounds = 30,
             Seen = [begin
                         K = bin(N),
                         A = spawn(fun() -> ?T:transaction(R, Fun(K, $a), [{idem_key, K}]) end),
                         ok = wait_in_commit(A),
-                        N > Rounds div 2 andalso timer:sleep(rand:uniform(3) - 1),
+                        timer:sleep(NifMs div 4 + rand:uniform(NifMs div 2)),
                         exit(A, kill),
                         {atomic, Who} = ?T:transaction(R, Fun(K, $b),
                                                        [{idem_key, K}, {retries, infinity}]),
@@ -1064,26 +1069,67 @@ idem_killed_mid_commit_test_() ->
                                       bitcask:get(R, <<"exec-", K/binary, "-", T>>) =/= not_found],
                         {K, Who, Execs}
                     end || N <- lists:seq(1, Rounds)],
-            ?debugFmt("txn ~pus, A 已提交 ~p / 重试者执行 ~p",
-                      [Us, length([x || {_, $a, _} <- Seen]),
+            ?debugFmt("txn ~pus, nif ~pms, A 已提交 ~p / 重试者执行 ~p",
+                      [Us, NifMs, length([x || {_, $a, _} <- Seen]),
                        length([x || {_, $b, _} <- Seen])]),
             ?assertEqual([], [X || {_, Who, Execs} = X <- Seen, Execs =/= [Who]]),
-            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            ?assertMatch(#{locks := 0, txns := 0, orphan_timeouts := Orph0}, wait_clean()),
             bitcask:close(R)
         end)
      end}}.
 
-%% 忙等 Pid 进入"提交中"：栈上是引擎 NIF（调用方自己提交的实现）或正在等
-%% committer（移交实现）。进程已死 → ok。
+%% 忙等 Pid 进入 txn_commit NIF。进程已死 → ok。
 wait_in_commit(Pid) ->
-    case erlang:process_info(Pid, current_stacktrace) of
+    case erlang:process_info(Pid, current_function) of
         undefined -> ok;
-        {current_stacktrace, St} ->
-            case lists:any(fun({bitcask_cpp_nifs, cask_txn_commit, 3, _}) -> true;
-                              ({bitcask_txn, commit_via_committer, 2, _}) -> true;
-                              (_) -> false
-                           end, St) of
-                true  -> ok;
-                false -> erlang:yield(), wait_in_commit(Pid)
-            end
+        {current_function, {bitcask_cpp_nifs, cask_txn_commit, _}} -> ok;
+        _ -> erlang:yield(), wait_in_commit(Pid)
     end.
+
+nif_commit_notify_test_() ->
+    {"提交令牌：disarm 不发；不 disarm 进程一退就发；NIF 执行中 / 排队中被 kill 都发（后者整批不落）",
+     {timeout, 120, fun() ->
+        with_dir(fun(D) ->
+            R = open(D), Me = self(),
+            Recv = fun(Tag, Ms) -> receive {note, Tag} -> ok after Ms -> no_notify end end,
+            Tok = fun(Tag) -> bitcask_cpp_nifs:txn_commit_token(Me, {note, Tag}) end,
+            %% 正常 + disarm：不发
+            spawn(fun() -> T = Tok(1),
+                           ok = bitcask:txn_commit(R, [{put, <<"a">>, <<"1">>}], no_sync, T),
+                           ok = bitcask_cpp_nifs:txn_commit_token_disarm(T) end),
+            ?assertEqual(no_notify, Recv(1, 300)),
+            %% 引擎拒绝、不 disarm：进程退出放掉令牌即发
+            spawn(fun() -> {error, _} = bitcask:txn_commit(R, [], no_sync, Tok(2)) end),
+            ?assertEqual(ok, Recv(2, 5000)),
+            ?assertError(badarg, bitcask:txn_commit(R, [{put, <<"b">>, <<"1">>}], no_sync, make_ref())),
+            Big = binary:copy(<<"x">>, 4096),
+            Ops = fun(P) -> [{put, <<P/binary, (bin(I))/binary>>, Big} || I <- lists:seq(1, 1000)] end,
+            %% NIF 执行中被 kill：通知在批落盘之后
+            [begin
+                 {A, M} = spawn_monitor(fun() ->
+                              bitcask:txn_commit(R, Ops(<<"run">>), sync_on_commit, Tok({run, N}))
+                          end),
+                 ok = wait_in_commit(A),
+                 exit(A, kill),
+                 receive {'DOWN', M, _, _, _} -> ok end,
+                 ?assertEqual(ok, Recv({run, N}, 5000)),
+                 ?assertMatch({ok, _}, bitcask:get(R, <<"run1000">>))
+             end || N <- lists:seq(1, 3)],
+            %% 排队中被 kill：先占满全部 dirty IO 调度器，A 只能排队；kill 后
+            %% NIF 永不执行——通知照样到（令牌随进程退出析构），整批不落
+            NDio = erlang:system_info(dirty_io_schedulers),
+            Hogs = [spawn(fun() -> erts_debug:dirty_io(wait, 1500) end) || _ <- lists:seq(1, NDio)],
+            timer:sleep(100),
+            {A2, M2} = spawn_monitor(fun() ->
+                           bitcask:txn_commit(R, Ops(<<"queued">>), sync_on_commit, Tok(queued))
+                       end),
+            ok = wait_in_commit(A2),
+            exit(A2, kill),
+            receive {'DOWN', M2, _, _, _} -> ok end,
+            ?assertEqual(ok, Recv(queued, 5000)),
+            [exit(H, kill) || H <- Hogs],
+            timer:sleep(1600),
+            ?assertEqual(not_found, bitcask:get(R, <<"queued1">>)),
+            bitcask:close(R)
+        end)
+     end}}.

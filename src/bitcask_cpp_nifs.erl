@@ -51,6 +51,9 @@
          %% v5.1.0 S34/S35：引擎原子批 + 多键事务
          cask_put_batch_atomic/2,
          cask_txn_commit/3,
+         cask_txn_commit/4,
+         txn_commit_token/2,
+         txn_commit_token_disarm/1,
          %% libbitcask 6.6.0：进程级线程数上限
          set_thread_limits/2,
          thread_limits/0]).
@@ -188,6 +191,21 @@ cask_put_batch_atomic(_Ref, _Ops) -> erlang:nif_error({error, not_loaded}).
 -spec cask_txn_commit(reference(), list(), sync_on_commit | no_sync) ->
     ok | {error, term()} | atom().
 cask_txn_commit(_Ref, _Ops, _Sync) -> erlang:nif_error({error, not_loaded}).
+
+%% 同 /3，执行期间 pin 住提交令牌 Token（txn_commit_token/2 建）。令牌析构时
+%% 若仍 armed 就把 Msg 发给 Pid——析构只可能发生在 NIF 返回之后，或调用方在
+%% NIF 开始前被 kill（NIF 永不执行）之后，即"这批不会再动盘"。给 bitcask_txn
+%% 的 locker 用：调用进程在 dirty NIF 中被 kill 时 DOWN 先于落盘到达。
+-spec cask_txn_commit(reference(), list(), sync_on_commit | no_sync, reference()) ->
+    ok | {error, term()} | atom().
+cask_txn_commit(_Ref, _Ops, _Sync, _Token) -> erlang:nif_error({error, not_loaded}).
+
+-spec txn_commit_token(pid(), term()) -> reference().
+txn_commit_token(_Pid, _Msg) -> erlang:nif_error({error, not_loaded}).
+
+%% 撤销令牌的析构通知（正常提交完成后调）。
+-spec txn_commit_token_disarm(reference()) -> ok.
+txn_commit_token_disarm(_Token) -> erlang:nif_error({error, not_loaded}).
 
 %% -----------------------------------------------------------------------
 %% libbitcask 6.6.0：进程级线程数上限（索引池 map worker / Search 池槽数）。

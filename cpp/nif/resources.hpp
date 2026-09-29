@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <new>
 #include <utility>
@@ -29,6 +30,7 @@ namespace bitcask::nif {
 extern ErlNifResourceType* g_cask_resource_type;
 extern ErlNifResourceType* g_cask_iter_resource_type;
 extern ErlNifResourceType* g_cask_range_iter_resource_type;
+extern ErlNifResourceType* g_txn_token_resource_type;
 
 // 包住 C++ Cask 对象的 NIF 资源。Cask 自己持有 KeyDir 和 active write/hint
 // file，析构会顺序释放它们。
@@ -72,6 +74,39 @@ struct CaskRangeIterHandle {
     }
 };
 
+// bitcask_txn 的提交令牌：**析构即通知**。
+//
+// 调用方每次提交建一个（txn_commit_token/2），当参数传给 cask_txn_commit/4，
+// NIF 执行期间再额外 keep 一份。于是析构（最后一个 ref 放掉）只可能发生在：
+//   (a) NIF 已返回，且调用方已丢掉令牌；或
+//   (b) 调用方在排进 dirty 队列后、NIF 真正开始前被 kill——NIF 永远不会跑，
+//       进程退出清理时放掉令牌。
+// 两种都是"这批不会再动盘"的时刻，析构时若仍 armed 就把 msg 发给 pid。
+// 正常路径调用方提交完 disarm（txn_commit_token_disarm/1），析构不发。
+// ⚠️ 为什么不在 NIF 返回前直接 enif_send：(b) 里 NIF 根本不执行，发不出来；
+//    且调用方已死时用它的 env 发会被 ERTS 按文档丢弃（发送者不存活）。
+//    析构回调的 callback env 发消息是文档内用法，两种情况都覆盖。
+struct TxnTokenHandle {
+    ErlNifPid pid{};
+    ErlNifEnv* menv = nullptr;       // 进程无关 env，msg 的归属
+    ERL_NIF_TERM msg = 0;
+    std::atomic<bool> armed{true};
+
+    TxnTokenHandle(const ErlNifPid& p, ErlNifEnv* /*src*/, ERL_NIF_TERM m) noexcept
+        : pid(p), menv(enif_alloc_env()) {
+        msg = enif_make_copy(menv, m);
+    }
+    TxnTokenHandle(const TxnTokenHandle&)            = delete;
+    TxnTokenHandle& operator=(const TxnTokenHandle&) = delete;
+    void fire(ErlNifEnv* caller_env) noexcept {
+        if (armed.load(std::memory_order_acquire)) {
+            enif_send(caller_env, &pid, menv, msg);   // 成功后 menv 失效，只能 free
+        }
+        enif_free_env(menv);
+        menv = nullptr;
+    }
+};
+
 // 注册全部资源类型；任一注册失败返回 false。
 // 线程安全: 否；仅 on_load 单线程调用一次。
 [[nodiscard]] bool register_resources(ErlNifEnv* env) noexcept;
@@ -97,5 +132,6 @@ ERL_NIF_TERM make_resource(ErlNifEnv* env, ErlNifResourceType* rt, Args&&... arg
 void cask_resource_dtor(ErlNifEnv* env, void* obj) noexcept;
 void cask_iter_resource_dtor(ErlNifEnv* env, void* obj) noexcept;
 void cask_range_iter_resource_dtor(ErlNifEnv* env, void* obj) noexcept;
+void txn_token_resource_dtor(ErlNifEnv* env, void* obj) noexcept;
 
 }  // namespace bitcask::nif
