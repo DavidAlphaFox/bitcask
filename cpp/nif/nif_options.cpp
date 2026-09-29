@@ -214,11 +214,11 @@ void parse_2tuple_option(ErlNifEnv* env, const ERL_NIF_TERM* tup, CaskOptions& o
         } else {
             // P4:{sync_strategy, {puts, N}} —— 单写者组提交，每 N 次写 fsync。
             int arity = 0;
-            const ERL_NIF_TERM* tup = nullptr;
+            const ERL_NIF_TERM* puts_tup = nullptr;
             int n = 0;
-            if (enif_get_tuple(env, val, &arity, &tup) && arity == 2 &&
-                tup[0] == atoms().puts &&
-                enif_get_int(env, tup[1], &n) && n > 0) {
+            if (enif_get_tuple(env, val, &arity, &puts_tup) && arity == 2 &&
+                puts_tup[0] == atoms().puts &&
+                enif_get_int(env, puts_tup[1], &n) && n > 0) {
                 o.sync_every_n = static_cast<std::uint32_t>(n);
             }
         }
