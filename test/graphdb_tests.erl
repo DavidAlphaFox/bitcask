@@ -436,3 +436,234 @@ scan_delete_during_iteration_test_() ->
             graphdb:close(R)
         end)
     end}.
+
+%% ===================================================================
+%% del_vertex 按边分批（A7）、计数器读错误传播（A8）、etype 注册并发（A9）
+%% ===================================================================
+
+%% 邻居 X 的出度计数应恰好等于它现存的出边数（in 边被摘 = 计数同批 -1）。
+counters_consistent(R, Etype, Srcs, Dsts) ->
+    [begin
+         {ok, Edges} = graphdb:out_edges(R, X, #{etype => Etype}),
+         ?assertEqual({ok, length(Edges)}, graphdb:degree(R, X, Etype))
+     end || X <- Srcs],
+    [begin
+         {ok, Edges} = graphdb:in_edges(R, Y, #{etype => Etype}),
+         {ok, DegI} = case bitcask:get(R, <<"degi", Y:64/big, Etype:32/big>>) of
+                          {ok, <<N:64/big>>} -> {ok, N};
+                          not_found          -> {ok, 0}
+                      end,
+         ?assertEqual(length(Edges), DegI)
+     end || Y <- Dsts],
+    ok.
+
+del_vertex_many_batches_test_() ->
+    {"hub 顶点 del_vertex 跨多个原子批：全部邻居 deg/degi 精确、自身计数键清空",
+     {timeout, 120, fun() ->
+        with_dir(fun(D) ->
+            R = graphdb:open(D, [read_write]),
+            Dsts = lists:seq(1001, 1150),
+            Srcs = lists:seq(2001, 2150),
+            %% 300 条边 × 3 键 = 900 个 remove > ?DEL_BATCH → 至少 2 批
+            [ok = graphdb:put_edge(R, 1, 7, Y) || Y <- Dsts],
+            [ok = graphdb:put_edge(R, X, 7, 1) || X <- Srcs],
+            ok = graphdb:put_edge(R, 1, 7, 1),           %% 自环
+            ?assertEqual({ok, 151}, graphdb:degree(R, 1, 7)),
+            ok = graphdb:del_vertex(R, 1),
+            ?assertEqual({ok, []}, graphdb:out_edges(R, 1)),
+            ?assertEqual({ok, []}, graphdb:in_edges(R, 1)),
+            counters_consistent(R, 7, Srcs, Dsts),
+            [?assertEqual({ok, 0}, graphdb:degree(R, X, 7)) || X <- Srcs],
+            %% 自身计数键整体清掉（不是留个 0）
+            ?assertEqual(not_found, bitcask:get(R, <<"deg", 1:64/big, 7:32/big>>)),
+            ?assertEqual(not_found, bitcask:get(R, <<"degi", 1:64/big, 7:32/big>>)),
+            ?assertEqual({ok, 0}, graphdb:degree(R, 1, 7)),
+            graphdb:close(R)
+        end)
+     end}}.
+
+del_vertex_partial_failure_converges_test_() ->
+    {"del_vertex 第 2 批失败：已删的边计数已对齐、未删的边计数未动；重跑收敛",
+     {timeout, 120, fun() ->
+        with_dir(fun(D) ->
+            R = graphdb:open(D, [read_write]),
+            Dsts = lists:seq(1001, 1150),
+            Srcs = lists:seq(2001, 2150),
+            [ok = graphdb:put_edge(R, 1, 7, Y) || Y <- Dsts],
+            [ok = graphdb:put_edge(R, X, 7, 1) || X <- Srcs],
+            Calls = counters:new(1, []),
+            meck:new(bitcask, [passthrough]),
+            meck:expect(bitcask, put_batch_atomic,
+                        fun(H, Ops) ->
+                                counters:add(Calls, 1, 1),
+                                case counters:get(Calls, 1) of
+                                    2 -> {error, injected};
+                                    _ -> meck:passthrough([H, Ops])
+                                end
+                        end),
+            try
+                ?assertEqual({error, injected}, graphdb:del_vertex(R, 1)),
+                ?assert(counters:get(Calls, 1) >= 2)
+            after
+                meck:unload(bitcask)
+            end,
+            %% 第 1 批已提交、第 2 批没提交：顶点还在，剩下的边与计数自洽
+            ?assertMatch({ok, [_ | _]}, graphdb:out_edges(R, 1)),
+            counters_consistent(R, 7, Srcs, Dsts),
+            %% 重跑：收敛到全删、全部计数精确
+            ok = graphdb:del_vertex(R, 1),
+            ?assertEqual({ok, []}, graphdb:out_edges(R, 1)),
+            ?assertEqual({ok, []}, graphdb:in_edges(R, 1)),
+            counters_consistent(R, 7, Srcs, Dsts),
+            [?assertEqual({ok, 0}, graphdb:degree(R, X, 7)) || X <- Srcs],
+            ?assertEqual(not_found, bitcask:get(R, <<"deg", 1:64/big, 7:32/big>>)),
+            graphdb:close(R)
+        end)
+     end}}.
+
+counter_read_error_propagates_test_() ->
+    {"计数键读错误 → put_edge/del_edge 返回 {error, _}，整批不提交、计数不动",
+     fun() ->
+        with_dir(fun(D) ->
+            R = seeded(D),
+            ?assertEqual({ok, 2}, graphdb:degree(R, 1, 7)),
+            meck:new(bitcask, [passthrough]),
+            meck:expect(bitcask, get,
+                        fun(_H, <<"deg", _/binary>>) -> {error, io_error};
+                           (H, K) -> meck:passthrough([H, K])
+                        end),
+            try
+                ?assertEqual({error, io_error}, graphdb:put_edge(R, 1, 7, 9)),
+                ?assertEqual({error, io_error}, graphdb:del_edge(R, 1, 7, 2))
+            after
+                meck:unload(bitcask)
+            end,
+            ?assertEqual({error, not_found}, graphdb:edge(R, 1, 7, 9)),
+            ?assertEqual({ok, #{src => 1, etype => 7, dst => 2, rank => 0, props => <<>>}},
+                         graphdb:edge(R, 1, 7, 2)),
+            ?assertEqual({ok, 2}, graphdb:degree(R, 1, 7)),
+            %% 记录形态不对也不覆盖
+            ok = bitcask:put(R, <<"deg", 5:64/big, 7:32/big>>, <<"garbage">>),
+            ?assertMatch({error, {invalid_counter, _}}, graphdb:put_edge(R, 5, 7, 6)),
+            ?assertEqual({error, not_found}, graphdb:edge(R, 5, 7, 6)),
+            graphdb:close(R)
+        end)
+     end}.
+
+register_etype_concurrent_test_() ->
+    {"16 进程并发注册 16 个不同名字 → 16 个不同 id；同名并发 → 同一个 id",
+     {timeout, 60, fun() ->
+        with_dir(fun(D) ->
+            R = graphdb:open(D, [read_write]),
+            Me = self(),
+            Names = [<<"et-", (integer_to_binary(I))/binary>> || I <- lists:seq(1, 16)],
+            Ps = [spawn_link(fun() -> Me ! {self(), graphdb:register_etype(R, N)} end)
+                  || N <- Names],
+            Ids = [receive {P, {ok, Id}} -> Id end || P <- Ps],
+            ?assertEqual(lists:seq(1, 16), lists:sort(Ids)),
+            %% 名字 ↔ id 双向一致
+            [?assertEqual({ok, N}, graphdb:etype_name(R, element(2, graphdb:etype_id(R, N))))
+             || N <- Names],
+            Ps2 = [spawn_link(fun() -> Me ! {self(), graphdb:register_etype(R, <<"same">>)} end)
+                   || _ <- lists:seq(1, 16)],
+            Same = [receive {P, Res} -> Res end || P <- Ps2],
+            ?assertEqual([{ok, 17}], lists:usort(Same)),
+            ?assertEqual({ok, 17}, graphdb:register_etype(R, <<"same">>)),
+            ?assertEqual({ok, 18}, graphdb:register_etype(R, <<"later">>)),
+            graphdb:close(R)
+        end)
+     end}}.
+
+%% ===================================================================
+%% 6.6.1 B 档：hub 去重不再二次方、expand 分片 + 失败清理、
+%% range_take 计数、strict 计数（$i 开头的 vid）
+%% ===================================================================
+
+neighbors_hub_dedupe_test_() ->
+    {"hub 5000 出邻居（前 100 个经第二个 etype 重复）：去重、保序、长度 5000",
+     {timeout, 120, fun() ->
+        with_dir(fun(D) ->
+            R = graphdb:open(D, [read_write]),
+            [ok = graphdb:put_edge(R, 0, 7, I) || I <- lists:seq(1, 5000)],
+            [ok = graphdb:put_edge(R, 0, 8, I) || I <- lists:seq(1, 100)],
+            {ok, Ns} = graphdb:neighbors(R, 0, out),
+            ?assertEqual(lists:seq(1, 5000), Ns),
+            %% limit 走计数路径：拿前 10 个（etype 7 块在前，按 dst 升序）
+            ?assertEqual(lists:seq(1, 10), dsts_of(graphdb:out_edges(R, 0, #{limit => 10}))),
+            ?assertEqual({ok, 5100}, graphdb:degree(R, 0)),
+            graphdb:close(R)
+        end)
+     end}}.
+
+bfs_expand_failure_cleans_up_test_() ->
+    {"展开途中引擎报错：bfs 返回 {error,{graphdb_expand,_}}，信箱里没有残留的 worker 消息",
+     fun() ->
+        with_dir(fun(D) ->
+            R = seeded(D),
+            Boom = <<"e", 3:64/big>>,
+            meck:new(bitcask, [passthrough]),
+            meck:expect(bitcask, range_fold,
+                        fun(H, {Lo, Hi}, O, F, A) ->
+                                case binary:longest_common_prefix([Lo, Boom]) =:= byte_size(Boom) of
+                                    true  -> {error, boom};
+                                    false -> meck:passthrough([H, {Lo, Hi}, O, F, A])
+                                end
+                        end),
+            try
+                %% 第二层 frontier = [2, 3]：3 的展开失败，2 那片被 kill
+                ?assertMatch({error, {graphdb_expand, _}}, graphdb:bfs(R, 1, #{})),
+                ?assertMatch({error, {graphdb_expand, _}}, graphdb:k_hop(R, 1, 3, #{}))
+            after
+                meck:unload(bitcask)
+            end,
+            timer:sleep(50),
+            {messages, Msgs} = process_info(self(), messages),
+            Leaked = [M || M <- Msgs,
+                           (is_tuple(M) andalso tuple_size(M) =:= 5
+                            andalso element(3, M) =:= process)          %% DOWN（带 tag 或不带）
+                           orelse (is_tuple(M) andalso tuple_size(M) =:= 3
+                                   andalso is_reference(element(1, M)))], %% {Ref, Idx, Lists}
+            ?assertEqual([], Leaked),
+            %% 引擎恢复后照常
+            ?assertEqual({ok, [{1, 0}, {2, 1}, {3, 1}, {4, 2}]}, graphdb:bfs(R, 1, #{})),
+            graphdb:close(R)
+        end)
+     end}.
+
+bfs_large_frontier_test_() ->
+    {"星形 0→1..300 再 →301：frontier 300 个顶点分片展开，结果与逐点语义一致",
+     {timeout, 60, fun() ->
+        with_dir(fun(D) ->
+            R = graphdb:open(D, [read_write]),
+            [ok = graphdb:put_edge(R, 0, 7, I) || I <- lists:seq(1, 300)],
+            [ok = graphdb:put_edge(R, I, 7, 301) || I <- lists:seq(1, 300)],
+            {ok, Reach} = graphdb:bfs(R, 0, #{}),
+            ?assertEqual([{0, 0} | [{I, 1} || I <- lists:seq(1, 300)]] ++ [{301, 2}], Reach),
+            ?assertEqual({ok, lists:seq(1, 300) ++ [301]}, graphdb:k_hop(R, 0, 2, #{})),
+            graphdb:close(R)
+        end)
+     end}}.
+
+degree_strict_parse_i_vid_test_() ->
+    {"vid 首字节为 $i：e<vid> 前缀区间混进 ei 键（任何 dst<256 的入边），度数不能多数",
+     fun() ->
+        with_dir(fun(D) ->
+            R = graphdb:open(D, [read_write]),
+            Vid = 16#69 bsl 56,                       %% "e",$i,0,0,0,0,0,0,0 …
+            ok = graphdb:put_edge(R, Vid, 7, 5),
+            %% 9→5 的反向键 "ei" ++ <<5:64>> ++ … 落在 Vid 的 e 前缀区间里
+            ok = graphdb:put_edge(R, 9, 7, 5),
+            ok = graphdb:put_edge(R, 9, 7, 0),
+            ?assertEqual({ok, 1}, graphdb:degree(R, Vid)),
+            ?assertEqual([5], dsts_of(graphdb:out_edges(R, Vid))),
+            %% 计数键缺失时的按需扫描（删掉计数键模拟 P3 前存量）
+            ok = bitcask:delete(R, <<"deg", Vid:64/big, 7:32/big>>),
+            ?assertEqual({ok, 1}, graphdb:degree(R, Vid, 7)),
+            {atomic, {1, 1}} = graphdb:transaction(R, fun(Tx) ->
+                                   {ok, A} = graphdb:degree_txn(Tx, Vid),
+                                   {ok, B} = graphdb:degree_txn(Tx, Vid, 7),
+                                   {A, B}
+                               end),
+            graphdb:close(R)
+        end)
+     end}.

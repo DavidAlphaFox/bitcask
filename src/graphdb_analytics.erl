@@ -11,7 +11,9 @@
 %% 数亿边量级的生产路径应在 NIF 内物化（P5+ 基准后再定），不在本模块范围。
 %%
 %% 算法（均为样例级实现）：
-%%   pagerank             — 阻尼 + dangling 质量校正，L1 收敛
+%%   pagerank             — 阻尼 + dangling 质量校正，L1 收敛；沿**入边拉取**
+%%                          （pull）——每轮 O(N+M)，不是逐边 setelement 拷整个
+%%                          rank 元组的 O(N·M)
 %%   connected_components — 无向最小标号传播（收敛轮数 = 图直径量级）
 %%   sssp                 — 单源最短路径（CSR 无权：即 BFS 距离；带权需把
 %%                          边属性纳入物化，后续版本）
@@ -50,29 +52,30 @@
 materialize(Handle, Opts) when is_map(Opts) ->
     case collect_edges(Handle, maps:get(etype, Opts, undefined)) of
         {error, _} = E -> E;
-        {ok, EdgeSet}  -> {ok, build_csr(gb_sets:to_list(EdgeSet))}
+        {ok, Pairs}    -> {ok, build_csr(lists:usort(Pairs))}
     end.
 
-%% 收集 (Src, Dst) 对，gb_sets 去重。
+%% 收集 (Src, Dst) 对：只 cons 进列表，最后一次 usort 去重——range 按 key 序
+%% 出货，输入近乎有序，归并排序比逐边 gb_sets 插入便宜得多。
 collect_edges(Handle, undefined) ->
     Fun = fun(K, _V, _T, _O, Acc) ->
               case K of
                   <<"e", S:64/big, _Tt:32/big, D:64/big, _Rr:64/big>> ->
-                      gb_sets:add({S, D}, Acc);
+                      [{S, D} | Acc];
                   _ -> Acc                                 %% 病理 vid 防御
               end
           end,
-    scan(Handle, <<"e">>, <<"f">>, Fun, gb_sets:empty());
+    scan(Handle, <<"e">>, <<"f">>, Fun, []);
 collect_edges(Handle, Etype) ->
     Fun = fun(K, _V, _T, _O, Acc) ->
               case K of
                   <<"et", Etype:32/big, S:64/big, D:64/big, _Rr:64/big>> ->
-                      gb_sets:add({S, D}, Acc);
+                      [{S, D} | Acc];
                   _ -> Acc
               end
           end,
     Lo = <<"et", Etype:32/big>>,
-    scan(Handle, Lo, graphdb:succ(Lo), Fun, gb_sets:empty()).
+    scan(Handle, Lo, graphdb:succ(Lo), Fun, []).
 
 scan(Handle, Lo, Hi, Fun, Acc0) ->
     case bitcask:range_fold(Handle, {Lo, Hi}, [], Fun, Acc0) of
@@ -80,13 +83,15 @@ scan(Handle, Lo, Hi, Fun, Acc0) ->
         Acc            -> {ok, Acc}
     end.
 
-%% 排序边对 → 双向 CSR 二进制。
+%% 排序去重后的边对 → 双向 CSR 二进制。
 build_csr(EdgeList) ->
     Vids = lists:usort(lists:append([[S, D] || {S, D} <- EdgeList])),
     N = length(Vids),
     Idx = maps:from_list(lists:zip(Vids, lists:seq(0, N - 1))),
-    Out = lists:sort([{maps:get(S, Idx), maps:get(D, Idx)} || {S, D} <- EdgeList]),
-    Rev = lists:sort([{maps:get(D, Idx), maps:get(S, Idx)} || {S, D} <- EdgeList]),
+    %% 每条边只查一次 index。index 随 vid 单调，所以 Out 与 EdgeList 同序，
+    %% 不必再排；Rev 才要排。
+    Out = [{maps:get(S, Idx), maps:get(D, Idx)} || {S, D} <- EdgeList],
+    Rev = lists:sort([{J, I} || {I, J} <- Out]),
     {Xadj, Adjncy} = csr_arrays(Out, N),
     {XadjR, AdjncyR} = csr_arrays(Rev, N),
     #csr{n = N,
@@ -153,48 +158,44 @@ pagerank(#csr{} = Csr, Opts) when is_map(Opts) ->
     true = (is_float(Damping) andalso Damping >= 0.0 andalso Damping =< 1.0)
         orelse erlang:error(badarg, [Csr, Opts]),
     N = Csr#csr.n,
+    OutDeg = list_to_tuple([outdeg(Csr, I) || I <- lists:seq(0, N - 1)]),
     R0 = list_to_tuple(lists:duplicate(N, 1.0 / N)),
-    Final = pr_iter(Csr, R0, Damping, Eps, MaxIter, 0),
+    Final = pr_iter(Csr, OutDeg, R0, Damping, Eps, MaxIter, 0),
     #{vid_of(Csr, I) => element(I + 1, Final) || I <- lists:seq(0, N - 1)}.
 
-pr_iter(_Csr, R, _D, _Eps, MaxIter, Iter) when Iter >= MaxIter -> R;
-pr_iter(#csr{n = N} = Csr, R, D, Eps, MaxIter, Iter) ->
-    Dangling = dangling_sum(Csr, R, 0, 0.0),
+%% 一轮 = 两趟线性扫：① 每个顶点的贡献 R_j / outdeg_j（dangling 的记 0，
+%% 质量另算）→ 元组；② 沿转置 CSR（xadjr/adjncyr）把每个顶点的入邻居贡献
+%% 加起来，按 index 序 cons 出列表再 list_to_tuple 一次。
+%% ⚠️ 以前是沿出边 scatter：每条边 setelement 一次 N 元组——编译器只对同一
+%%    函数体里连续的 setelement 免拷贝，递归里每次都整拷，一轮 O(N·M)。
+pr_iter(_Csr, _OutDeg, R, _D, _Eps, MaxIter, Iter) when Iter >= MaxIter -> R;
+pr_iter(#csr{n = N} = Csr, OutDeg, R, D, Eps, MaxIter, Iter) ->
+    {Contrib, Dangling} = contrib(N, R, OutDeg, [], 0.0),
     Base = (1.0 - D) / N + D * Dangling / N,
-    Acc0 = list_to_tuple(lists:duplicate(N, Base)),
-    New = scatter_out(Csr, R, Acc0, D, 0),
+    New = list_to_tuple(pull(Csr, Contrib, Base, D, N - 1, [])),
     case l1(New, R) < Eps of
         true  -> New;
-        false -> pr_iter(Csr, New, D, Eps, MaxIter, Iter + 1)
+        false -> pr_iter(Csr, OutDeg, New, D, Eps, MaxIter, Iter + 1)
     end.
 
-dangling_sum(#csr{n = N} = Csr, R, I, Acc) when I < N ->
-    case outdeg(Csr, I) of
-        0 -> dangling_sum(Csr, R, I + 1, Acc + element(I + 1, R));
-        _ -> dangling_sum(Csr, R, I + 1, Acc)
-    end;
-dangling_sum(_Csr, _R, _I, Acc) -> Acc.
+%% 从后往前扫（I 递减），cons 出来的列表自然是正序。
+contrib(0, _R, _OutDeg, Acc, Dangling) ->
+    {list_to_tuple(Acc), Dangling};
+contrib(I, R, OutDeg, Acc, Dangling) ->
+    Rank = element(I, R),
+    case element(I, OutDeg) of
+        0   -> contrib(I - 1, R, OutDeg, [0.0 | Acc], Dangling + Rank);
+        Deg -> contrib(I - 1, R, OutDeg, [Rank / Deg | Acc], Dangling)
+    end.
 
-%% 沿出边把 rank 贡献散到邻居。
-scatter_out(#csr{n = N} = Csr, R, Acc, D, I) when I < N ->
-    case outdeg(Csr, I) of
-        0 -> scatter_out(Csr, R, Acc, D, I + 1);
-        Deg ->
-            Share = D * element(I + 1, R) / Deg,
-            S = u32(Csr#csr.xadj, I), E = u32(Csr#csr.xadj, I + 1),
-            Acc2 = scatter_range(Csr#csr.adjncy, S, E, Share, Acc),
-            scatter_out(Csr, R, Acc2, D, I + 1)
-    end;
-scatter_out(_Csr, _R, Acc, _D, _I) -> Acc.
+pull(_Csr, _Contrib, _Base, _D, I, Acc) when I < 0 -> Acc;
+pull(#csr{xadjr = XR, adjncyr = AR} = Csr, Contrib, Base, D, I, Acc) ->
+    Sum = sum_range(AR, u32(XR, I), u32(XR, I + 1), Contrib, 0.0),
+    pull(Csr, Contrib, Base, D, I - 1, [Base + D * Sum | Acc]).
 
-scatter_range(_AJ, S, S, _Share, Acc) -> Acc;
-scatter_range(AJ, S, E, Share, Acc) ->
-    J = u32(AJ, S),
-    scatter_range(AJ, S + 1, E, Share, set_add(Acc, J, Share)).
-
-set_add(Tuple, Idx0, Add) ->
-    P = Idx0 + 1,
-    setelement(P, Tuple, element(P, Tuple) + Add).
+sum_range(_AJ, S, S, _Contrib, Acc) -> Acc;
+sum_range(AJ, S, E, Contrib, Acc) ->
+    sum_range(AJ, S + 1, E, Contrib, Acc + element(u32(AJ, S) + 1, Contrib)).
 
 l1(New, Old) -> l1(tuple_size(New), New, Old, 0.0).
 
@@ -249,42 +250,37 @@ cc_min_range(AJ, S, E, M, Labels) ->
 %% Opts 保留（当前内容被忽略）。
 %% =========================================================================
 
+%% 一张 map 兼作 visited 与距离表（#{Index => Depth}）：只碰可达顶点，
+%% O(V+E)。以前是 N 元组逐点 setelement（每次整拷，O(N·可达数)）外加一张
+%% 冗余的 seen map，末了还全表扫一遍挑 < Inf 的。
 sssp(#csr{} = Csr, Src, Opts) when is_map(Opts) ->
     case maps:find(Src, Csr#csr.idx) of
         error -> {error, not_found};
         {ok, SI} ->
-            Inf = 1 bsl 62,
-            Dist0 = list_to_tuple(lists:duplicate(Csr#csr.n, Inf)),
-            Dist1 = setelement(SI + 1, Dist0, 0),
-            Final = bfs_layers(Csr, [SI], 0, Dist1, #{SI => true}),
-            Reach = [{I, element(I + 1, Final)}
-                     || I <- lists:seq(0, Csr#csr.n - 1),
-                        element(I + 1, Final) < Inf],
-            {ok, maps:from_list([{vid_of(Csr, I), D} || {I, D} <- Reach])}
+            Final = bfs_layers(Csr, [SI], 0, #{SI => 0}),
+            {ok, maps:fold(fun(I, Dd, M) -> M#{vid_of(Csr, I) => Dd} end, #{}, Final)}
     end.
 
-bfs_layers(_Csr, [], _Depth, Dist, _Seen) -> Dist;
-bfs_layers(Csr, Frontier, Depth, Dist, Seen) ->
-    Next = lists:append([adj_idxs(Csr, I) || I <- Frontier]),
-    {FreshR, Seen2} =
+bfs_layers(Csr, Frontier, Depth, Dist) ->
+    D1 = Depth + 1,
+    {FreshR, Dist2} =
         lists:foldl(fun(J, {Fs, M}) ->
-                        case maps:is_key(J, M) of
+                        case is_map_key(J, M) of
                             true  -> {Fs, M};
-                            false -> {[J | Fs], M#{J => true}}
+                            false -> {[J | Fs], M#{J => D1}}
                         end
                     end,
-                    {[], Seen}, Next),
-    case lists:reverse(FreshR) of
-        [] -> Dist;
-        Fresh ->
-            Dist2 = lists:foldl(fun(J, Acc) -> setelement(J + 1, Acc, Depth + 1) end,
-                                Dist, Fresh),
-            bfs_layers(Csr, Fresh, Depth + 1, Dist2, Seen2)
+                    {[], Dist}, lists:append([adj_idxs(Csr, I) || I <- Frontier])),
+    case FreshR of
+        [] -> Dist2;
+        _  -> bfs_layers(Csr, lists:reverse(FreshR), D1, Dist2)
     end.
 
 adj_idxs(Csr, I) ->
-    S = u32(Csr#csr.xadj, I), E = u32(Csr#csr.xadj, I + 1),
-    [u32(Csr#csr.adjncy, K) || K <- lists:seq(S, E - 1)].
+    adj_range(Csr#csr.adjncy, u32(Csr#csr.xadj, I), u32(Csr#csr.xadj, I + 1), []).
+
+adj_range(_AJ, S, S, Acc) -> lists:reverse(Acc);
+adj_range(AJ, S, E, Acc)  -> adj_range(AJ, S + 1, E, [u32(AJ, S) | Acc]).
 
 %% ---- CSR 二进制原语 ----
 

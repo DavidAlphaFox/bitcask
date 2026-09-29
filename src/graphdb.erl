@@ -70,8 +70,11 @@
 %% 所有扫描解析走 strict parse（家族字节 + 精确 29/30 字节 + owner vid 校验），
 %% 不匹配的条目一律跳过——泄漏的键被无害过滤。
 %%
-%% ⚠️ del_vertex 对度数 > @DEL_BATCH 的顶点分多个原子批删除：跨批不原子
-%% （设计文档 §5 批量级联的 MVP 取舍）。
+%% ⚠️ del_vertex 对度数大的顶点分多个原子批删除：**按边切块**，每批装的是
+%% 这批边的三个键 + 恰好这批边引起的邻居计数器增量（计数基值在该批提交前
+%% 才读）——每批自洽，中途失败后重跑 del_vertex 会收敛（剩下的边照常摘、
+%% 计数照常对齐）；自身计数键与顶点键在最后一批（按 deg<vid>/degi<vid>
+%% 前缀扫掉，重跑也不留残值）。跨批仍不原子（设计文档 §5 MVP 取舍）。
 %%
 %% 复杂度注记：BFS 的 frontier 展开是一顶点一进程并行（设计文档 §6.2），
 %% 每个进程自开自用自己的 range 迭代器（迭代器不可跨进程共享的契约天然
@@ -106,6 +109,7 @@
 -define(ETYPE_MAX, 16#FFFFFFFF).
 -define(RANK_MAX,  16#FFFFFFFFFFFFFFFF).
 -define(EXPAND_TIMEOUT_MS, 30000).
+-define(EXPAND_SEQ_MAX, 4).                 % frontier 不超过它就串行展开
 -define(ROOT, root).
 
 -type handle() :: term().                       %% bitcask:open/2 的返回值，不透明透传
@@ -192,59 +196,72 @@ put_vertex(Handle, Vid, Doc) ->
 get_vertex(Handle, Vid) ->
     normalize_not_found(bitcask:get(Handle, nkey(Vid))).
 
-%% 级联删除：先收集全部 incident 边的双向 key，再连同顶点 key 一并删除。
-%% 度数 ≤ @DEL_BATCH 的顶点单批原子；超过则分批（跨批不原子，见模块头）。
+%% 级联删除：先收集全部 incident 边，按边分批摘除（每批 ≤ @DEL_BATCH 个 op），
+%% 最后一批清自身计数键 + 顶点本体。批与批之间不原子，但每批自洽（模块头）。
 del_vertex(Handle, Vid) ->
-    case {Vid, out_edges(Handle, Vid), in_edges(Handle, Vid)} of
-        {{error, _} = E, _, _} -> E;
-        {_, {error, _} = E, _} -> E;
-        {_, _, {error, _} = E} -> E;
-        {_, {ok, Out}, {ok, In}} ->
-            %% 每条 incident 边（无论从哪侧收集）都要摘掉正向 + 反向 + et 三个键；
-            %% 自环会在两侧各出现一次 → 重复 remove，原子批按 LWW apply，无害。
-            PairF = fun(#{src := S, etype := T, dst := D, rank := R}) ->
-                        [{remove, ekey(S, T, D, R)},
-                         {remove, eikey(D, T, S, R)},
-                         {remove, etkey(T, S, D, R)}]
-                    end,
-            PairI = fun(#{dst := D, etype := T, src := S, rank := R}) ->
-                        [{remove, ekey(S, T, D, R)},
-                         {remove, eikey(D, T, S, R)},
-                         {remove, etkey(T, S, D, R)}]
-                    end,
-            %% 邻居计数器增量聚合：in 边 (X→vid) 使 X 的出度 -1；
-            %% out 边 (vid→Y) 使 Y 的入度 -1。同 (端点, etype) 合并成一次 RMW。
-            DecOut = agg_counts([{S, T} || #{src := S, etype := T} <- In]),
-            DecIn  = agg_counts([{D, T} || #{dst := D, etype := T} <- Out]),
-            CounterOps =
-                [counter_delta(Handle, degkey(X, T), -C)
-                 || {{X, T}, C} <- maps:to_list(DecOut)]
-                ++ [counter_delta(Handle, degikey(Y, T), -C)
-                    || {{Y, T}, C} <- maps:to_list(DecIn)],
-            OwnEtypes = lists:usort([T || #{etype := T} <- Out]
-                                    ++ [T || #{etype := T} <- In]),
-            OwnCounters = [{remove, degkey(Vid, T)}  || T <- OwnEtypes]
-                        ++ [{remove, degikey(Vid, T)} || T <- OwnEtypes],
-            Ops = lists:flatmap(PairF, Out)
-                ++ lists:flatmap(PairI, In)
-                ++ CounterOps
-                ++ OwnCounters
-                ++ [{remove, nkey(Vid)}],
-            del_chunks(Handle, Ops)
+    _ = nkey(Vid),                              %% 借 codec 校验 vid
+    case {out_edges(Handle, Vid), in_edges(Handle, Vid)} of
+        {{error, _} = E, _} -> E;
+        {_, {error, _} = E} -> E;
+        {{ok, Out}, {ok, In}} ->
+            %% 每条 incident 边一个单元：三个键的 remove + 它对**邻居**计数器
+            %% 的影响。out 边 (vid→Y) 使 Y 的入度 -1；in 边 (X→vid) 使 X 的
+            %% 出度 -1。自环在两侧各出现一次 → 三键重复 remove（原子批按 LWW
+            %% apply，无害）、两个自身计数器各 -1（最后一批整体删掉，无害）。
+            Units = [{edge_removes(E), degikey(D, T)} || #{dst := D, etype := T} = E <- Out]
+                 ++ [{edge_removes(E), degkey(S, T)}  || #{src := S, etype := T} = E <- In],
+            case del_edge_chunks(Handle, chunk_units(Units, ?DEL_BATCH div 4)) of
+                ok    -> del_vertex_self(Handle, Vid);
+                Error -> Error
+            end
     end.
 
-del_chunks(_Handle, []) -> ok;
-del_chunks(Handle, Ops) ->
-    {Chunk, Rest} = take_at_most(Ops, ?DEL_BATCH),
-    case bitcask:put_batch_atomic(Handle, Chunk) of
-        ok    -> del_chunks(Handle, Rest);
-        Error -> Error
+edge_removes(#{src := S, etype := T, dst := D, rank := R}) ->
+    [{remove, ekey(S, T, D, R)},
+     {remove, eikey(D, T, S, R)},
+     {remove, etkey(T, S, D, R)}].
+
+%% 一批：这批边的 remove + 同 (端点, etype) 聚合后的计数器 RMW——基值在
+%% 组批时才读，所以前面的批已经提交的减量不会被重复算。
+del_edge_chunks(_Handle, []) -> ok;
+del_edge_chunks(Handle, [Units | Rest]) ->
+    Removes = lists:append([Rs || {Rs, _} <- Units]),
+    Decs = agg_counts([CK || {_, CK} <- Units]),
+    case counter_ops(Handle, [{CK, -C} || {CK, C} <- maps:to_list(Decs)]) of
+        {error, _} = E -> E;
+        {ok, CounterOps} ->
+            case bitcask:put_batch_atomic(Handle, Removes ++ CounterOps) of
+                ok    -> del_edge_chunks(Handle, Rest);
+                Error -> Error
+            end
     end.
 
-take_at_most(Ops, N) -> take_at_most(Ops, N, []).
-take_at_most(Ops, 0, Acc) -> {lists:reverse(Acc), Ops};
-take_at_most([], _N, Acc) -> {lists:reverse(Acc), []};
-take_at_most([Op | Rest], N, Acc) -> take_at_most(Rest, N - 1, [Op | Acc]).
+%% 最后一批：自身全部计数键（deg<vid>/degi<vid> 前缀扫——不只当前有边的
+%% etype，上次中途失败留下的残值也一起清）+ 顶点键。
+del_vertex_self(Handle, Vid) ->
+    DegLo  = <<"deg",  Vid:64/big>>,
+    DegiLo = <<"degi", Vid:64/big>>,
+    KeysOf = fun(Lo, Size) ->
+                     range_take(Handle, Lo, succ(Lo), infinity,
+                                fun(K, _V) when byte_size(K) =:= Size -> {ok, K};
+                                   (_, _) -> skip
+                                end)
+             end,
+    case {KeysOf(DegLo, 3 + 8 + 4), KeysOf(DegiLo, 4 + 8 + 4)} of
+        {{error, _} = E, _} -> E;
+        {_, {error, _} = E} -> E;
+        {{ok, DegKeys}, {ok, DegiKeys}} ->
+            bitcask:put_batch_atomic(
+              Handle, [{remove, K} || K <- DegKeys ++ DegiKeys] ++ [{remove, nkey(Vid)}])
+    end.
+
+%% 按 N 个单元切块（每单元 3 个 remove + 至多 1 个计数器 put → ≤ 4N 个 op）。
+chunk_units([], _N) -> [];
+chunk_units(L, N)  -> chunk_units(L, N, N, [], []).
+
+chunk_units([], _N, _Left, Cur, Acc)   -> lists:reverse([lists:reverse(Cur) | Acc]);
+chunk_units(L, N, 0, Cur, Acc)         -> chunk_units(L, N, N, [], [lists:reverse(Cur) | Acc]);
+chunk_units([X | T], N, Left, Cur, Acc) -> chunk_units(T, N, Left - 1, [X | Cur], Acc).
 
 %% =========================================================================
 %% 边 — 双向键原子双写（设计文档 §5）
@@ -261,21 +278,40 @@ put_edge(Handle, Src, Etype, Dst, Opts) when is_map(Opts) ->
         {ok, _} ->
             bitcask:put_batch_atomic(Handle, [{put, ekey(Src, Etype, Dst, Rank), Props}]);
         {error, not_found} ->
-            bitcask:put_batch_atomic(
-              Handle, [{put, ekey(Src, Etype, Dst, Rank), Props},
-                       {put, eikey(Dst, Etype, Src, Rank), <<>>},
-                       {put, etkey(Etype, Src, Dst, Rank), <<>>},
-                       {put, degkey(Src, Etype),  <<(bump(Handle, degkey(Src, Etype), 1)):64/big>>},
-                       {put, degikey(Dst, Etype), <<(bump(Handle, degikey(Dst, Etype), 1)):64/big>>}]);
+            case counter_ops(Handle, [{degkey(Src, Etype), 1}, {degikey(Dst, Etype), 1}]) of
+                {error, _} = E -> E;
+                {ok, CounterOps} ->
+                    bitcask:put_batch_atomic(
+                      Handle, [{put, ekey(Src, Etype, Dst, Rank), Props},
+                               {put, eikey(Dst, Etype, Src, Rank), <<>>},
+                               {put, etkey(Etype, Src, Dst, Rank), <<>>}
+                               | CounterOps])
+            end;
         {error, _} = E ->
             E
     end.
 
-%% 读-改-写计数基值（缺 key = 0）。
+%% 读-改-写计数基值。缺 key = 0（不下穿 0）；读错误 / 记录形态不对**不能**
+%% 当成 0 去写——那会把一次瞬时 IO 错误变成永久归零的计数器，调用方拿
+%% {error, _} 且整批不提交。
 bump(Handle, Key, Delta) ->
     case bitcask:get(Handle, Key) of
-        {ok, <<N:64/big>>} -> max(0, N + Delta);
-        _                  -> max(0, Delta)
+        {ok, <<N:64/big>>} -> {ok, max(0, N + Delta)};
+        {ok, _}            -> {error, {invalid_counter, Key}};
+        not_found          -> {ok, max(0, Delta)};
+        {error, _} = E     -> E
+    end.
+
+%% 一组 {CounterKey, Delta} → 一组 {put, Key, <<N:64>>}；任一读失败整组失败。
+counter_ops(Handle, Pairs) ->
+    counter_ops(Handle, Pairs, []).
+
+counter_ops(_Handle, [], Acc) ->
+    {ok, lists:reverse(Acc)};
+counter_ops(Handle, [{Key, Delta} | Rest], Acc) ->
+    case bump(Handle, Key, Delta) of
+        {ok, N}        -> counter_ops(Handle, Rest, [{put, Key, <<N:64/big>>} | Acc]);
+        {error, _} = E -> E
     end.
 
 %% 点查（rank = 0 的简单图语义）。upsert 后读到的是最后一次写入。
@@ -296,12 +332,15 @@ del_edge(Handle, Src, Etype, Dst, Rank) ->
         {error, not_found} ->
             ok;                                  %% 幂等删除
         {ok, _} ->
-            bitcask:put_batch_atomic(
-              Handle, [{remove, ekey(Src, Etype, Dst, Rank)},
-                       {remove, eikey(Dst, Etype, Src, Rank)},
-                       {remove, etkey(Etype, Src, Dst, Rank)},
-                       {put, degkey(Src, Etype),  <<(bump(Handle, degkey(Src, Etype), -1)):64/big>>},
-                       {put, degikey(Dst, Etype), <<(bump(Handle, degikey(Dst, Etype), -1)):64/big>>}]);
+            case counter_ops(Handle, [{degkey(Src, Etype), -1}, {degikey(Dst, Etype), -1}]) of
+                {error, _} = E -> E;
+                {ok, CounterOps} ->
+                    bitcask:put_batch_atomic(
+                      Handle, [{remove, ekey(Src, Etype, Dst, Rank)},
+                               {remove, eikey(Dst, Etype, Src, Rank)},
+                               {remove, etkey(Etype, Src, Dst, Rank)}
+                               | CounterOps])
+            end;
         {error, _} = E ->
             E
     end.
@@ -350,10 +389,9 @@ put_edge_txn(Tx, Src, Etype, Dst, Opts) when is_map(Opts) ->
 edge_txn(Tx, Src, Etype, Dst) -> edge_txn(Tx, Src, Etype, Dst, 0).
 edge_txn(Tx, Src, Etype, Dst, Rank) ->
     case txn_read(Tx, ekey(Src, Etype, Dst, Rank), read) of
-        {ok, Props} when is_binary(Props) ->
+        {ok, Props} ->                        %% 引擎值恒为 binary
             {ok, #{src => Src, etype => Etype, dst => Dst,
                    rank => Rank, props => Props}};
-        {ok, _}   -> {error, invalid_edge_props};
         not_found -> {error, not_found}
     end.
 
@@ -376,7 +414,7 @@ del_edge_txn(Tx, Src, Etype, Dst, Rank) ->
 degree_txn(Tx, Vid) -> degree_txn(Tx, Vid, undefined).
 degree_txn(Tx, Vid, undefined) ->
     {Lo, _Hi} = out_range(Vid, undefined),
-    {ok, length(txn_prefix_range(Tx, Lo, read))};
+    {ok, count_own_e(Vid, txn_prefix_range(Tx, Lo, read))};
 degree_txn(Tx, Vid, Etype) ->
     ok = v_t32(Etype),
     case txn_read(Tx, degkey(Vid, Etype), read) of
@@ -384,8 +422,14 @@ degree_txn(Tx, Vid, Etype) ->
         {ok, _}            -> {error, invalid_degree_record};
         not_found          ->
             {Lo, _Hi} = out_range(Vid, Etype),
-            {ok, length(txn_prefix_range(Tx, Lo, read))}
+            {ok, count_own_e(Vid, txn_prefix_range(Tx, Lo, read))}
     end.
+
+%% 前缀扫出来的行里只数**本顶点的 e 键**（strict parse + owner 校验）：
+%% 首字节是 $i 的 vid，其 e<vid> 前缀区间里会混进 ei 家族的键（"ei" + dst…），
+%% 直接 length 就多数了。
+count_own_e(Vid, Rows) ->
+    length([K || {K, _} <- Rows, {ok, Src, _, _, _} <- [parse_e(K)], Src =:= Vid]).
 
 %% 邻接扫描的事务版：前缀读锁 + 合并缓冲。Opts 同直通版（etype / limit）。
 %% 返回 {ok, [edge()]}（与直通版同形；引擎错误已在事务内 abort）。
@@ -444,11 +488,13 @@ txn_prefix_range(Tx, Prefix, Lock) ->
         Rows            -> Rows
     end.
 
-%% 计数 RMW：写锁下读、算、写回缓冲。缺 key = 0，不下穿 0。
+%% 计数 RMW：写锁下读、算、写回缓冲。缺 key = 0，不下穿 0；读错误由
+%% txn_read 中止事务，记录形态不对也中止——不拿坏值覆盖。
 bump_txn(Tx, Key, Delta) ->
     N = case txn_read(Tx, Key, write) of
             {ok, <<Cur:64/big>>} -> max(0, Cur + Delta);
-            _                    -> max(0, Delta)
+            not_found            -> max(0, Delta);
+            {ok, _}              -> bitcask_txn:abort({invalid_counter, Key})
         end,
     bitcask_txn:write(Tx, Key, <<N:64/big>>).
 
@@ -534,12 +580,19 @@ degree(Handle, Vid, Etype) ->
         {error, _} = E     -> E
     end.
 
-%% 按需计数：O(出度) 前缀扫描，Etype = undefined 数全部。
+%% 按需计数：O(出度) 前缀扫描，Etype = undefined 数全部。整数累加，不攒列表；
+%% strict parse + owner 校验（见 count_own_e 的说明——ei 键会混进来）。
 count_out(Handle, Vid, Etype) ->
     {Lo, Hi} = out_range(Vid, Etype),
-    case range_take(Handle, Lo, Hi, infinity, fun(_K, _V) -> {ok, count} end) of
+    Fun = fun(K, _V, _T, _O, N) ->
+              case parse_e(K) of
+                  {ok, Src, _, _, _} when Src =:= Vid -> N + 1;
+                  _ -> N
+              end
+          end,
+    case bitcask:range_fold(Handle, {Lo, Hi}, [], Fun, 0) of
         {error, _} = E -> E;
-        {ok, Items}    -> {ok, length(Items)}
+        N              -> {ok, N}
     end.
 
 %% et 家族：按类型全局列边（key 序 = (src, dst, rank) 字典序）。
@@ -574,9 +627,6 @@ neighbors_where(Handle, Vid, Dir, Pred) when is_function(Pred, 2) ->
                                           end)
                               end, Ns)}
     end.
-
-counter_delta(Handle, Key, Delta) ->
-    {put, Key, <<(bump(Handle, Key, Delta)):64/big>>}.
 
 agg_counts(Pairs) ->
     lists:foldl(fun(K, M) -> M#{K => maps:get(K, M, 0) + 1} end, #{}, Pairs).
@@ -619,12 +669,20 @@ bfs(Handle, Start, Opts) when is_map(Opts) ->
     Etype = maps:get(etype, Opts, undefined),
     Visit = maps:get(visit, Opts, undefined),
     maybe_visit(Visit, Start, 0),
-    bfs_layers(Handle, [Start], #{Start => true}, 0, MaxDepth,
-               Dir, Etype, Visit, [{Start, 0}]).
+    %% expand/4 在展开失败（引擎错误 / 工作进程超时）时 raise；这里收成
+    %% spec 承诺的 {error, _}，k_hop 的错误分支才是活的。
+    try bfs_layers(Handle, [Start], #{Start => true}, 0, MaxDepth,
+                   Dir, Etype, Visit, [[{Start, 0}]])
+    catch
+        error:{graphdb_expand, Reason} -> {error, {graphdb_expand, Reason}};
+        error:graphdb_expand_timeout   -> {error, graphdb_expand_timeout}
+    end.
 
+%% Acc 是**逆序的层列表**（每层一个 [{Vid, Depth}]），最后 append 一次——
+%% 以前每层 `Acc ++ [...]` 整拷累积结果，深图上是 O(V·depth)。
 bfs_layers(_Handle, _Frontier, _Visited, Depth, MaxDepth, _Dir, _Etype, _Visit,
            Acc) when Depth >= MaxDepth ->
-    {ok, Acc};
+    {ok, lists:append(lists:reverse(Acc))};
 bfs_layers(Handle, Frontier, Visited, Depth, MaxDepth, Dir, Etype, Visit, Acc) ->
     Nbrs = expand(Handle, Frontier, Dir, Etype),
     {FreshR, Visited2} =
@@ -636,12 +694,12 @@ bfs_layers(Handle, Frontier, Visited, Depth, MaxDepth, Dir, Etype, Visit, Acc) -
                     end,
                     {[], Visited}, Nbrs),
     case lists:reverse(FreshR) of
-        [] -> {ok, Acc};
+        [] -> {ok, lists:append(lists:reverse(Acc))};
         Fresh ->
             D1 = Depth + 1,
             [maybe_visit(Visit, N, D1) || N <- Fresh],
             bfs_layers(Handle, Fresh, Visited2, D1, MaxDepth, Dir, Etype, Visit,
-                       Acc ++ [{N, D1} || N <- Fresh])
+                       [[{N, D1} || N <- Fresh] | Acc])
     end.
 
 %% k-hop 邻域：距起点 1..K 跳的顶点（不含起点），BFS 发现序。
@@ -659,35 +717,41 @@ shortest_path(_Handle, Src, Dst, _Opts) when Src =:= Dst ->
 shortest_path(Handle, Src, Dst, Opts) when is_map(Opts) ->
     _ = nkey(Src), _ = nkey(Dst),
     Etype = maps:get(etype, Opts, undefined),
-    bidir(Handle, Src, Dst, Etype,
-          #{Src => ?ROOT}, [Src], #{Dst => ?ROOT}, [Dst]).
+    %% 展开失败（引擎错误 / worker 超时）由 expand_grouped raise，这里收成
+    %% {error, _}，与 bfs/3 一致。
+    try bidir(Handle, Etype, #{Src => ?ROOT}, [Src], 1, #{Dst => ?ROOT}, [Dst], 1)
+    catch
+        error:{graphdb_expand, Reason} -> {error, {graphdb_expand, Reason}};
+        error:graphdb_expand_timeout   -> {error, graphdb_expand_timeout}
+    end.
 
 %% 每轮：选 frontier 较小的一侧展开一层；新节点命中对侧 visited → 拼路径。
 %% 父指针：fwd 侧 parent = 发现者（指向起点方向）；bwd 侧展开用 in 边
 %%（找到的是前驱），parent = 发现者（指向终点方向）——两侧父链都指向
 %% 本侧 root，stitch 时天然拼成 Src→Dst。
-bidir(Handle, Src, Dst, Etype, FwdMap, FwdF, BwdMap, BwdF) ->
-    case length(FwdF) =< length(BwdF) of
+%% frontier 的长度作为参数带着走（FwdN / BwdN），不每轮 length/1。
+bidir(Handle, Etype, FwdMap, FwdF, FwdN, BwdMap, BwdF, BwdN) ->
+    case FwdN =< BwdN of
         true ->
             case expand_layer(Handle, FwdF, out, Etype, FwdMap) of
-                {[], _FwdMap2} ->
+                {[], 0, _FwdMap2} ->
                     {error, no_path};
-                {NewF, FwdMap2} ->
+                {NewF, NewN, FwdMap2} ->
                     case first_in(NewF, BwdMap) of
                         not_found ->
-                            bidir(Handle, Src, Dst, Etype, FwdMap2, NewF, BwdMap, BwdF);
+                            bidir(Handle, Etype, FwdMap2, NewF, NewN, BwdMap, BwdF, BwdN);
                         M ->
                             {ok, stitch(M, FwdMap2, BwdMap)}
                     end
             end;
         false ->
             case expand_layer(Handle, BwdF, in, Etype, BwdMap) of
-                {[], _BwdMap2} ->
+                {[], 0, _BwdMap2} ->
                     {error, no_path};
-                {NewF, BwdMap2} ->
+                {NewF, NewN, BwdMap2} ->
                     case first_in(NewF, FwdMap) of
                         not_found ->
-                            bidir(Handle, Src, Dst, Etype, FwdMap, FwdF, BwdMap2, NewF);
+                            bidir(Handle, Etype, FwdMap, FwdF, FwdN, BwdMap2, NewF, NewN);
                         M ->
                             {ok, stitch(M, FwdMap, BwdMap2)}
                     end
@@ -695,21 +759,22 @@ bidir(Handle, Src, Dst, Etype, FwdMap, FwdF, BwdMap, BwdF) ->
     end.
 
 %% 展开一层：新节点并入 visited（parent = 发现者），去重保序。
-%% 返回 {NewFrontier, Map2}；frontier 耗尽 → {[], Map}。
+%% 返回 {NewFrontier, 长度, Map2}；frontier 耗尽 → {[], 0, Map}。
+%% 取邻居走 expand_grouped（大 frontier 并行），折叠顺序仍是 frontier 序、
+%% 邻居序——父指针与最终路径和逐点串行完全一致。
 expand_layer(Handle, Frontier, Dir, Etype, Map) ->
-    {NewFR, Map2} =
-        lists:foldl(fun(V, {Fs, M}) ->
-                        Nbrs = neighbor_list(Handle, V, Dir, Etype),
-                        lists:foldl(fun(N, {Fs2, M2}) ->
-                                        case maps:is_key(N, M2) of
-                                            true  -> {Fs2, M2};
-                                            false -> {[N | Fs2], M2#{N => V}}
+    Grouped = expand_grouped(Handle, Frontier, Dir, Etype),
+    {NewFR, N, Map2} =
+        lists:foldl(fun({V, Nbrs}, Acc0) ->
+                        lists:foldl(fun(Nb, {Fs, Cnt, M}) ->
+                                        case maps:is_key(Nb, M) of
+                                            true  -> {Fs, Cnt, M};
+                                            false -> {[Nb | Fs], Cnt + 1, M#{Nb => V}}
                                         end
-                                    end,
-                                    {Fs, M}, Nbrs)
+                                    end, Acc0, Nbrs)
                     end,
-                    {[], Map}, Frontier),
-    {lists:reverse(NewFR), Map2}.
+                    {[], 0, Map}, lists:zip(Frontier, Grouped)),
+    {lists:reverse(NewFR), N, Map2}.
 
 first_in([], _Map) -> not_found;
 first_in([V | Rest], Map) ->
@@ -735,27 +800,34 @@ walk_up(V, Map, Acc) ->
 %% =========================================================================
 %% etype registry（设计文档 §3.4：t / tn 家族）
 %%
-%% ⚠️ 注册是「读-判-写」，并发盲注册同名会双 id 分叉——低频操作，调用方须
-%% 串行化（或建库时一次性注册，open-time schema）。
+%% 注册是「读-判-写」：在 bitcask_txn 事务里对 "t" 前缀（同时罩住 t<id> 与
+%% tn<name> 两个家族）拿写锁再做——并发注册不同名字不会算出同一个 Next
+%% 把两种边类型合并，同名并发也只会得到一个 id。已注册的名字走只读路径
+%%（缓冲为空不碰引擎）。
 %% =========================================================================
 
 register_etype(Handle, Name) when is_binary(Name), Name =/= <<>>,
                                   byte_size(Name) < 16#FFFF ->
-    case etype_id(Handle, Name) of
-        {ok, _} = Ok ->
-            Ok;
-        {error, not_found} ->
-            case next_etype_id(Handle) of
-                {error, _} = E ->
-                    E;
-                {ok, Next} ->
-                    Ops = [{put, <<"t", Next:32/big>>, Name},
-                           {put, tnkey(Name), <<Next:32/big>>}],
-                    case bitcask:put_batch_atomic(Handle, Ops) of
-                        ok    -> {ok, Next};
-                        Error -> Error
+    Res = bitcask_txn:transaction(
+            Handle,
+            fun(Tx) ->
+                    ok = bitcask_txn:lock_prefix(Tx, <<"t">>, write),
+                    case txn_read(Tx, tnkey(Name), write) of
+                        {ok, <<Id:32/big>>} ->
+                            {ok, Id};
+                        {ok, _} ->
+                            {error, invalid_etype_record};
+                        not_found ->
+                            Next = next_etype_id_txn(Tx),
+                            ok = bitcask_txn:write(Tx, <<"t", Next:32/big>>, Name),
+                            ok = bitcask_txn:write(Tx, tnkey(Name), <<Next:32/big>>),
+                            {ok, Next}
                     end
-            end
+            end),
+    case Res of
+        {atomic, R}                      -> R;
+        {aborted, {commit_failed, Why}}  -> {error, Why};
+        {aborted, Why}                   -> {error, Why}
     end;
 register_etype(_Handle, Name) -> erlang:error(badarg, [Name]).
 
@@ -783,32 +855,82 @@ degikey(Vid, Etype) -> <<"degi", Vid:64/big, Etype:32/big>>.
 etkey(Etype, Src, Dst, Rank) ->
     <<"et", Etype:32/big, Src:64/big, Dst:64/big, Rank:64/big>>.
 
-%% t 家族扫描：["t", "u")（"u" = succ("t")）。同区间里会混进 "tn"/"t…" 更长的
-%% key（如 "tn…"），strict 5 字节解析过滤。id 从 1 起。
-next_etype_id(Handle) ->
-    case bitcask:range(Handle, {<<"t">>, <<"u">>}) of
-        {error, _} = E -> E;
-        Entries ->
-            Ids = [Id || {<<"t", Id:32/big>>, _V} <- Entries],
-            {ok, lists:max([0 | Ids]) + 1}
-    end.
+%% t 家族扫描：前缀 "t"（= ["t", "u")）。同区间里会混进 "tn…" 更长的 key，
+%% strict 5 字节解析过滤。id 从 1 起。前缀写锁已在调用方持有。
+next_etype_id_txn(Tx) ->
+    Ids = [Id || {<<"t", Id:32/big>>, _V} <- txn_prefix_range(Tx, <<"t">>, write)],
+    lists:max([0 | Ids]) + 1.
 
 %% =========================================================================
 %% 内部
 %% =========================================================================
 
-%% 一顶点一进程展开（设计文档 §6.2）；结果按 frontier 顺序收齐，输出确定。
+%% 并行展开 frontier（设计文档 §6.2）；结果按 frontier 顺序拼接，输出确定。
+%%
+%% frontier 切成至多 dirty_io_schedulers 片（range_start / next_batch 都挂
+%% dirty IO，真正的并行度就是这个数），一片一个进程顺序展开——以前一顶点一
+%% 进程，一万个 frontier 就一万次 spawn + 结果拷贝，并行度却没多一分。
+%% 每片把 {Ref, Idx, [邻居列表]} 发回；调用方按 Idx 拼接。
+%% 失败纪律：任一片挂掉 / 总超时 → 其余全部 kill + demonitor flush，再 raise
+%% （bfs/3 收成 {error, _}）——以前失败只 raise 不清理，别的片的 DOWN 会漏进
+%% 调用方信箱；每片各自 30s 的超时也会叠加成 30s × 片数。
 expand(Handle, Frontier, Dir, Etype) ->
-    Mons = [spawn_monitor(fun() -> exit({graphdb, neighbor_list(Handle, V, Dir, Etype)}) end)
-            || V <- Frontier],
-    lists:append([receive
-                      {'DOWN', MRef, process, _Pid, {graphdb, L}} -> L;
-                      {'DOWN', MRef, process, _Pid, Reason} ->
-                          erlang:error({graphdb_expand, Reason})
-                  after ?EXPAND_TIMEOUT_MS ->
-                          erlang:error(graphdb_expand_timeout)
-                  end
-                  || {_, MRef} <- Mons]).
+    lists:append(expand_grouped(Handle, Frontier, Dir, Etype)).
+
+%% 与 Frontier 等长同序的 [[邻居]]——shortest_path 要按"谁发现的"记父指针，
+%% 不能用拍平的结果。小 frontier（≤ @EXPAND_SEQ_MAX）就地串行：双向搜索开头
+%% 两侧都只有 1 个顶点，起进程比那一两次 range 还贵。失败统一 raise
+%% {graphdb_expand, Reason}（并行路径是 worker 的退出原因）。
+expand_grouped(Handle, Frontier, Dir, Etype) when length(Frontier) =< ?EXPAND_SEQ_MAX ->
+    try [neighbor_list(Handle, V, Dir, Etype) || V <- Frontier]
+    catch error:Reason -> erlang:error({graphdb_expand, Reason})
+    end;
+expand_grouped(Handle, Frontier, Dir, Etype) ->
+    K = max(1, min(length(Frontier), erlang:system_info(dirty_io_schedulers))),
+    Slices = slice(Frontier, ceil_div(length(Frontier), K)),
+    Ref = make_ref(), Me = self(),
+    %% monitor 带 tag：DOWN 消息以 {Ref, 'DOWN'} 开头，只匹配我们自己的 worker，
+    %% 不会误吞调用方的其它 DOWN。
+    Workers = [{Idx, spawn_opt(fun() ->
+                                   Me ! {Ref, Idx, [neighbor_list(Handle, V, Dir, Etype)
+                                                    || V <- Slice]}
+                               end, [{monitor, [{tag, {Ref, 'DOWN'}}]}])}
+               || {Idx, Slice} <- lists:zip(lists:seq(1, length(Slices)), Slices)],
+    Deadline = erlang:monotonic_time(millisecond) + ?EXPAND_TIMEOUT_MS,
+    Results = collect_slices(Workers, Ref, Deadline, #{}),
+    lists:append([maps:get(Idx, Results) || {Idx, _} <- Workers]).
+
+collect_slices([], _Ref, _Deadline, Acc) ->
+    Acc;
+collect_slices(Workers, Ref, Deadline, Acc) ->
+    Wait = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {Ref, Idx, Lists} ->
+            {value, {Idx, {_Pid, MRef}}, Rest} = lists:keytake(Idx, 1, Workers),
+            erlang:demonitor(MRef, [flush]),
+            collect_slices(Rest, Ref, Deadline, Acc#{Idx => Lists});
+        {{Ref, 'DOWN'}, _MRef, process, _Pid, Reason} ->
+            %% 结果消息总先于同一发送者的 DOWN 到达，所以走到这里一定是异常退出
+            kill_workers(Workers),
+            erlang:error({graphdb_expand, Reason})
+    after Wait ->
+            kill_workers(Workers),
+            erlang:error(graphdb_expand_timeout)
+    end.
+
+kill_workers(Workers) ->
+    [begin exit(Pid, kill), erlang:demonitor(MRef, [flush]) end
+     || {_, {Pid, MRef}} <- Workers],
+    ok.
+
+%% 按 N 个一片连续切（保序）。调用方保证 L 非空（空 frontier 不会走到 expand）。
+slice(L, N) -> slice(L, N, N, [], []).
+
+slice([], _N, _Left, Cur, Acc)   -> lists:reverse([lists:reverse(Cur) | Acc]);
+slice(L, N, 0, Cur, Acc)         -> slice(L, N, N, [], [lists:reverse(Cur) | Acc]);
+slice([X | T], N, Left, Cur, Acc) -> slice(T, N, Left - 1, [X | Cur], Acc).
+
+ceil_div(A, B) -> (A + B - 1) div B.
 
 neighbor_list(Handle, V, out, Etype) ->
     case out_edges(Handle, V, etype_opt(Etype)) of
@@ -840,35 +962,38 @@ range_take(Handle, Lo, Hi, Limit, Parse) when is_integer(Limit), Limit >= 0 ->
              catch throw:{graphdb, limit, L} -> {ok, L} end
     end.
 
+%% 累加器带计数：以前每收一项 length(Acc) 一次，limit = L 时 O(L²)——
+%% 正是 limit 存在的意义（hub）所在的场景。
 do_range_take(Handle, Lo, Hi, Limit, Parse) ->
-    Fun = fun(K, V, _T, _O, Acc) ->
+    Fun = fun(K, V, _T, _O, {N, Acc}) ->
               case Parse(K, V) of
-                  skip -> Acc;
+                  skip -> {N, Acc};
                   {ok, Item} ->
-                      Acc2 = [Item | Acc],
-                      case (Limit =:= infinity) orelse (length(Acc2) < Limit) of
-                          true  -> Acc2;
-                          false -> throw({graphdb, limit, lists:reverse(Acc2)})
+                      N2 = N + 1,
+                      case (Limit =:= infinity) orelse (N2 < Limit) of
+                          true  -> {N2, [Item | Acc]};
+                          false -> throw({graphdb, limit, lists:reverse([Item | Acc])})
                       end
               end
           end,
-    case bitcask:range_fold(Handle, {Lo, Hi}, [], Fun, []) of
+    case bitcask:range_fold(Handle, {Lo, Hi}, [], Fun, {0, []}) of
         {error, _} = E -> E;
-        Acc            -> {ok, lists:reverse(Acc)}
+        {_, Acc}       -> {ok, lists:reverse(Acc)}
     end.
 
 maybe_props(<<>>) -> <<>>;
 maybe_props(V) when is_binary(V) -> V;
 maybe_props(_) -> <<>>.                          %% 防御：非 binary 边值按空处理
 
+%% 保序去重。cons + 末尾 reverse——以前 `Out ++ [V]` 逐项拷贝，hub 上 O(d²)。
 dedupe(L) ->
     {L2, _} = lists:foldl(fun(V, {Out, Seen}) ->
-                              case maps:is_key(V, Seen) of
+                              case is_map_key(V, Seen) of
                                   true  -> {Out, Seen};
-                                  false -> {Out ++ [V], Seen#{V => true}}
+                                  false -> {[V | Out], Seen#{V => true}}
                               end
                           end, {[], #{}}, L),
-    L2.
+    lists:reverse(L2).
 
 normalize_not_found(not_found)      -> {error, not_found};
 normalize_not_found({error, _} = E) -> E;
