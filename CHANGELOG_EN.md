@@ -6,9 +6,11 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [6.6.1] — 2026-09-29
 
 Patch release: a concurrency fix in the transaction layer, plus idempotency
-keys. libbitcask stays at 6.6.0; on-disk format and existing APIs are
-unchanged — the only additions are NIF entry points and `bitcask_txn`
-options / functions.
+keys, followed by a project-wide review that fixed 12 correctness issues (NIF
+lifetimes / exception barrier, merge scheduler, fold error shapes, graphdb
+counters, embedder pool dispatch, CI). libbitcask stays at 6.6.0; on-disk format
+and existing APIs are unchanged — the only additions are NIF entry points and
+`bitcask_txn` options / functions. ⚠️ Minimum OTP is now **27** (stdlib `json`).
 
 ### Fixed
 
@@ -31,8 +33,141 @@ options / functions.
   within noise of the pre-fix numbers (8 vCPU: P=1 47–59k, P=8 100–120k
   txn/s).
 
+- **NIF: `cask_close` vs in-flight calls and live iterators.** close used to
+  delete the Cask object outright — a `get` on a normal scheduler could run
+  concurrently with the dirty close (UB per the cask.hpp contract), and a fold
+  iterator still alive after close hit a use-after-free on its next `next`.
+  `CaskHandle` now carries a `shared_mutex`: every cask-using entry point holds
+  it shared, close holds it exclusive; close only calls `Cask::close()` and
+  leaves the object to the resource destructor; fold iterator handles keep the
+  parent resource alive (as range iterators already did) and `next` after close
+  returns `{error, closed}`. Ordinary calls on a closed handle are still badarg.
+- **NIF: C++ exception barrier.** `cpp/nif/` had no `try/catch` at all, so a
+  `bad_alloc` or `std::system_error` crossing the NIF boundary meant
+  `std::terminate` for the whole node. Every function-table entry is now wrapped
+  in `guarded<>`: `bad_alloc` → `{error, allocation_error}`, anything else →
+  `{error, {exception, What}}`. Caller parameters are also capped: search k / ef
+  ≤ 10⁶, range `prefetch` ≤ 65536 and `prefetch_threads` ≤ 256 (clamped, so an
+  INT_MAX k no longer allocates itself to death).
+- **NIF: `encode_meta` encoded `true` / `false` as null** — the "other atoms are
+  null" branch came before the boolean branches, which were unreachable, so an
+  `eq true` filter never matched. Now shares the correctly ordered
+  `parse_meta_value` with the filter parser; the duplicate is gone.
+- **`bitcask_merge_worker` crashed on first use**: `do_merge` did
+  `[_,_,Args3] = Args` after the merge, a badmatch for the 2-arg `merge/1,2`
+  form; on worker exit `handle_info` returned `{stop, State}`, which is not a
+  valid gen_server return, so the scheduler died too and dropped its queue. It
+  now logs and moves on to the next queued item; 2-arg Opts are usort'ed as
+  `merge_items`' `umerge` requires; the third argument accepts `{Files, Expired}`,
+  a plain Files list, or `all`.
+- **fold family `case_clause` on bare NIF atoms**: `fold/6`, `fold_keys/3,6`,
+  `list_keys`, `stream_fold` and `cask_merge_dir` matched only `{ok,_}`/`{error,_}`;
+  a bare `out_of_date` / `closed` / `mode_mismatch` crashed — and the app default
+  `max_fold_puts = 0` is exactly the setting that produces `out_of_date`. All go
+  through `normalize_error/1` now and return `{error, out_of_date}` etc.; the five
+  collectors share one `with_fold_iter/5` skeleton.
+- **`bitcask_stream` kept the iterator after `done`**, pinning the keydir
+  snapshot until `stop/1` (many consumers never call it); `next` after `stop`
+  hung forever (stop had flushed the monitor). It now releases on `done`/error;
+  `next` takes a temporary monitor per call and returns `done` once the producer
+  is gone.
+- **`graphdb:del_vertex` chunked blindly by 500 ops**, so for high-degree
+  vertices edge removals and neighbour counter updates landed in different
+  batches; a failure in between left counters permanently too high and a retry
+  did not converge. It now chunks **by edge**: each batch holds its edges' three
+  keys plus exactly those edges' counter deltas (base values read right before
+  that batch), and the last batch prefix-scans away all of the vertex's own
+  counter keys plus the vertex key — every batch is self-consistent, retries
+  converge.
+- **`graphdb` counters treated read errors as "missing"**: `bump/3` fell back to
+  0 on `{error,_}` and on malformed records and committed anyway, turning a
+  transient I/O error into a permanently zeroed counter. Read errors now
+  propagate and nothing is committed; malformed records →
+  `{error, {invalid_counter, Key}}`; the transactional path aborts likewise.
+- **`graphdb:register_etype` had no lock**: two concurrent registrations of
+  different names computed the same next id and silently merged two edge types.
+  It now runs inside a `bitcask_txn` transaction under a write prefix lock on
+  `"t"` (covering both `t<id>` and `tn<name>`).
+- **A bad `bitcask_txn` option could take down the whole locker group**:
+  `lock_wait_timeout` was passed to the shard unchecked, `start_timer` raised
+  badarg, the shard crashed, one_for_all restarted everything and every live
+  transaction got `locker_restarted`; a few such calls in 10 s exceeded the
+  restart intensity. The facade now validates (bad values → badarg) and the
+  shard's `register` falls back to defaults; `{timeout, 0}` is legal (immediate
+  timeout). Also: `try_wake` dropped an expired waiter without re-waking the
+  waiters it had been blocking (they waited for the 5 s backstop) — fixed.
+- **Embedder pool picked workers by `message_queue_len` only**: a gen_server
+  dequeues the request before `handle_call`, so a worker mid-forward-pass reads
+  0 like an idle one, and ties sorted by name so `_0` always won — a 2-slot pool
+  ran one request at a time. Load is now busy(0/1, from `current_function`) +
+  queue length, ties random. **`slots => K` thread oversubscription**: each
+  worker took `available_cpus - 2` threads, i.e. 4 slots on 8 vCPUs = 24 ggml
+  threads; the pool now injects `n_threads` split evenly across workers. The
+  default-threads fallback moves from `logical_processors` (reports the host's
+  count in containers) to `schedulers_online`.
+- **CI could not pass**: `erlang.yml` invoked the deleted `./rebar3`, its matrix
+  was OTP 22–25 while `bitcask_embedder_util` uses the stdlib `json` module
+  (27+), and those images' gcc cannot build C++23. Now setup-beam with OTP 27 /
+  28; `minimum_otp_vsn` raised to 27.
+
+### Changed (performance)
+
+- **range / fold**: `range_loop` treats a batch shorter than 256 as end-of-range
+  instead of making one more dirty NIF call for `done` (about a third fewer
+  dirty calls per graphdb hop); `fold/3` and `list_keys/1` use the batched NIF
+  (128 per batch) instead of one round trip per entry; `fold_keys/3,6` and
+  `list_keys` use the new `cask_fold_next_keys_batch/2` and no longer copy every
+  value into a binary just to discard it (⚠️ the engine's `CaskIter::next()`
+  still reads the value — what is saved is the cross-boundary copy and BEAM
+  garbage; a true key-only iterator needs an upstream API).
+- **NIF scheduling**: `cask_fold_start`, `cask_fold_next_batch` and the new keys
+  batch run on dirty IO (the first opens every sealed file, the others do up to
+  1024 preads). `cask_put` / `cask_delete` move to dirty IO on demand: when the
+  cask has `o_sync` / `{puts, N}`, the value is a map (`put_doc`), or the value
+  is over 64 KiB; small plain writes still run inline on a normal scheduler.
+- **NIF odds and ends**: fold steps no longer copy the whole `Entry` (value
+  included); `make_ok` / `make_error` use cached atoms; binaries are built with
+  `enif_make_new_binary` (≤ 64 bytes become heap binaries directly, one
+  malloc/free less); `make_search_hits` returns `{error, allocation_error}`
+  instead of silently dropping hits when allocation fails.
+- **`bitcask_txn_locker`**: no wake scan on release when nobody waits on the
+  shard; DOWN looks up a `mons` map instead of a full-table `match_object`;
+  `overlapping` skips `tab2list` when there are no prefix locks; the `held`
+  table is a `duplicate_bag` keyed by `{TxnId, Shard}` and released with one
+  `ets:take` (a bag keyed by TxnId scans the chain on every insert /
+  delete_object — O(L²) for large transactions); the grant decision uses a
+  short-circuit `blocked/4`; enqueue appends instead of re-sorting.
+  `bitcask_txn` restart backoff is capped exponential jitter
+  (`min(10 bsl Attempt, 200)` ms) and no longer sleeps past the deadline.
+  Measured (8 vCPU, `no_sync`, same-session comparison): 50 keys per
+  transaction P=1 2.5k → 3.4k txn/s, P=8 5.7k → 7.6k (about +35%); single-key
+  transactions are level within noise (P=8 around 110k).
+- **`graphdb`**: `dedupe` and `bfs_layers` lose their quadratic `++`; `expand`
+  slices the frontier by dirty-IO scheduler count (no more one process per
+  vertex), uses a single overall deadline, and kills + demonitors every worker
+  on failure (DOWN messages used to leak into the caller's mailbox);
+  `do_range_take` carries a counter; `count_out` / `degree_txn` fold with an
+  integer accumulator and apply the strict parse (vids whose first byte is `$i`
+  used to count `ei`-family keys).
+- **`graphdb_analytics`**: PageRank pulls along the reverse CSR, O(N+M) per
+  iteration (it used to `setelement`-copy an N-tuple per edge); `sssp` uses one
+  map instead of a tuple plus a Seen map; `materialize` does one `usort`
+  instead of a `gb_sets` insert per edge.
+- **Embedder HTTP**: batch chunks are sent concurrently (`max_inflight`,
+  default 4, one overall deadline); `inets` / httpc start once at init under a
+  dedicated `bitcask_embedder` profile; the `max_batch` option now takes effect
+  (documented but ignored before — always 64); the duplicated openai /
+  anthropic code moved into `bitcask_embedder_util:http_init/4`, with headers
+  built once at init.
+
 ### Added
 
+- **`bitcask:put_docs/2`**: writes a list of documents with **one**
+  `embed_batch` call for auto-embedding (`put/3` embeds one document at a time
+  and `embed_batch` had no caller in `src/` — batching is the main indexing
+  throughput lever per the design doc). Embedding failure →
+  `{error, {embed_failed, _}}` with nothing written; a failing put →
+  `{error, {Key, Reason}}` with earlier puts kept (**not atomic**).
 - **Idempotency keys**: `bitcask_txn:transaction/3` option `{idem_key, K}`. A
   given K commits at most once; a repeat skips Fun and returns
   `{atomic, FirstResult}`. The marker (holding the result) commits atomically

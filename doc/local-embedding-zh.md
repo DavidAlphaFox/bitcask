@@ -325,7 +325,13 @@ K 个同配置 worker，`config` 原样透传（**不注入** `gpu_index`——�
 ```
 
 - **K 个 worker = K 份权重 + K 个 context = K 路真正并发的 forward**。请求经
-  `{embedder, Name}` 引用时由 proxy 按 least-queue 分摊，对调用方透明。
+  `{embedder, Name}` 引用时由 proxy 按负载（正在算的那一次 + 排队条数）分摊，
+  平局随机，对调用方透明。
+- **`n_threads` 按 worker 数均分**：不绑卡的 worker 若没显式给 `n_threads`，
+  池给每个注入 `max(1, (可用核数 − 2) div K)`，而不是各拿一份 `可用核数 − 2`——
+  后者在 8 vCPU 上 `slots => 4` 就是 24 个 ggml 线程抢 8 个核，超订是断崖
+  （§6）。显式给了 `n_threads`、或配了 `backend => cuda | vulkan` /
+  `gpu_index` 的不动。
 - ⚠️ **权重按份数涨**：0.6B Q8 ≈ 0.7 GB/份，K = 4 就是 ~2.8 GB（GPU 显存或
   内存）。llama_context 不可跨线程共享，一份权重多 context 需要另一套 NIF API，
   目前没有；所以并发的价格就是权重份数，文档明说比藏着你强。

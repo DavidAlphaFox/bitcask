@@ -311,6 +311,7 @@ ok
 | `range/2,3`, `range_fold/5` | 有序范围查询 `[Lo, Hi)`，代价 **O(range)**；per-key 弱一致（非快照）；`{prefetch, N}` 可批量并发取值 |
 | `put_batch_atomic/2`, `txn_commit/2,3` | 跨崩溃原子批 / 多键事务；`Ops :: [{put,K,V} \| {remove,K}]`；⚠️ 首次调用把目录 meta 懒升级为 v6 |
 | `bitcask_txn:transaction/2,3`, `read/2,3`, `write/3`, `delete/2`, `abort/1` | **隔离事务**：2PL 点锁 + 死锁检测 + 重跑；`{atomic,R} \| {aborted,Why}`；选项 `retries`/`timeout`/`lock_wait_timeout`/`sync`/`index_fun`；`read/3` 的 `write` 模式给读-改-写用 |
+| `bitcask:put_docs/2` | **批量写文档**：`[{Key, Doc}]`，需要嵌入的文本**一次** `embed_batch` 完成；嵌入失败不写任何一条，某条 put 失败返回 `{error, {Key, Reason}}`（非原子） |
 | `bitcask_txn:idem_lookup/2`, `idem_purge/2,3` | **幂等键**（`transaction/3` 选项 `{idem_key, K}`，`{idem_result, false}` 不存结果）：同键至多提交一次，重来返回首次结果；`idem_lookup` 不上锁自查，`idem_purge(H, MaxAgeSec [, [{chunk, N}]])` 流式按块清理旧标记 |
 | `bitcask_txn:lock_prefix/3`, `prefix_range/2,3` | **前缀锁**：罩住以 Prefix 开头的全部 key（含将来的）；`prefix_range` = 前缀锁 + range + 合并本事务缓冲，事务内扫描无幻读 |
 | `graphdb:transaction/2,3`, `put_edge_txn/4,5`, `del_edge_txn/4,5`, `edge_txn/4,5`, `degree_txn/2,3`, `put_vertex_txn/3`, `get_vertex_txn/2`, `out_edges_txn/2,3`, `in_edges_txn/2,3`, `del_vertex_txn/2` | 图层事务式读写：边五键 + 计数器锁下同批提交，并发计数精确；邻接扫描前缀锁无幻读；`del_vertex_txn` 级联一批提交；与直通 `put_edge` 不要混用于同一图 |

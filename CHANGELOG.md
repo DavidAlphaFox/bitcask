@@ -5,8 +5,10 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 
 ## [6.6.1] — 2026-09-29
 
-补丁版：事务层修一个并发 bug，外加幂等键。libbitcask 仍是 6.6.0，盘上格式与
-既有 API 不变；新增的只有 NIF 入口与 `bitcask_txn` 选项 / 函数。
+补丁版：事务层修一个并发 bug，外加幂等键；随后一轮全项目审查修掉 12 处正确性
+问题（NIF 生命周期 / 异常屏障、merge 调度器、fold 错误形态、graphdb 计数器、
+embedder 池调度、CI）。libbitcask 仍是 6.6.0，盘上格式与既有 API 不变；新增的只有
+NIF 入口与 `bitcask_txn` 选项 / 函数。⚠️ 最低 OTP 提到 **27**（stdlib `json`）。
 
 ### Fixed
 
@@ -22,8 +24,104 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
   开销：每个写事务多两次轻量 NIF 调用和一次 ETS 写；单 key + `no_sync` 的吞吐
   与修复前在噪声内持平（8 vCPU：P=1 47–59k、P=8 100–120k txn/s）。
 
+- **NIF：`cask_close` 与在途调用 / 迭代器的生命周期**。以前 close 直接 delete
+  Cask 对象——普通调度器上的 `get` 能与 dirty 的 close 并发（cask.hpp 契约里的
+  UB），close 后仍活着的 fold 迭代器下一次 `next` 是 use-after-free。现在
+  `CaskHandle` 带 `shared_mutex`：所有用 cask 的入口持 shared 锁，close 持 unique
+  锁；close 只调 `Cask::close()` 不删对象，fold 迭代器句柄 keep 住父资源（与 range
+  迭代器同款），close 后 `next` → `{error, closed}`。已 close 句柄上的普通调用仍
+  是 badarg（行为不变）。
+- **NIF：C++ 异常屏障**。之前 `cpp/nif/` 没有任何 `try/catch`，`bad_alloc` 或
+  `std::system_error` 穿过 NIF 边界就是 `std::terminate` 整个节点。现在函数表里
+  每个入口都套 `guarded<>`：`bad_alloc` → `{error, allocation_error}`，其它 →
+  `{error, {exception, What}}`。顺带给调用方参数加上限：search 的 k / ef ≤ 10⁶，
+  range 的 `prefetch` ≤ 65536、`prefetch_threads` ≤ 256（超出夹住，不再是一个
+  INT_MAX 的 k 就 bad_alloc）。
+- **NIF：`encode_meta` 把 `true` / `false` 编成 null**——"其它 atom 当 null"的分支
+  排在布尔之前，布尔分支永远走不到，`eq true` 的 filter 永远空集。与 filter 解析
+  共用一份 `parse_meta_value`（顺序正确的那份），删掉重复实现。
+- **`bitcask_merge_worker` 一用就崩**：`do_merge` 在 merge 之后 `[_,_,Args3] = Args`，
+  `merge/1,2` 的两参形态必 badmatch；worker 异常退出时 `handle_info` 返回
+  `{stop, State}`——不是合法的 gen_server 返回值，调度器自己也跟着死、队列丢光。
+  现在只记日志、继续出队；两参形态的 Opts 也 usort（`merge_items` 的 `umerge` 要求
+  有序）；第三参接受 `{Files, Expired}`、裸 Files 列表、`all` 三种。
+- **fold 家族对 NIF 裸原子 `case_clause`**：`fold/6`、`fold_keys/3,6`、`list_keys`、
+  `stream_fold`、`cask_merge_dir` 只匹配 `{ok,_}`/`{error,_}`，NIF 返回裸
+  `out_of_date` / `closed` / `mode_mismatch` 就崩——app 默认 `max_fold_puts = 0` 正是
+  最容易撞上 `out_of_date` 的配置。统一走 `normalize_error/1`，返回
+  `{error, out_of_date}` 等。五个收集器合并成一个 `with_fold_iter/5` 骨架。
+- **`bitcask_stream` 读到 `done` 后不释放迭代器**，keydir 快照一直钉到 `stop/1`
+  （很多消费者读完就不调 stop）；`stop` 之后再 `next` 永久挂起（stop 已 flush 掉
+  monitor）。现在 `done` / 错误即释放；`next` 每次临时 monitor，producer 已退出
+  → `done`。
+- **`graphdb:del_vertex` 按 500 个 op 硬切块**，高度数顶点的边删除和邻居计数器落在
+  不同批，中途失败计数器永久偏高、重跑不收敛。改成**按边切块**：每批 = 这批边的三个
+  键 + 恰好这批边的计数器增量（基值在该批提交前才读），最后一批按前缀扫掉自身全部
+  计数键 + 顶点键——每批自洽，重跑收敛。
+- **`graphdb` 计数器把读错误当 key 不存在**：`bump/3` 对 `{error,_}` 和坏记录都回落到
+  0 再提交，一次瞬时 IO 错误变成永久归零。现在读错误原样返回、整批不提交，坏记录
+  → `{error, {invalid_counter, Key}}`；事务版同样中止。
+- **`graphdb:register_etype` 无锁**：两个不同名字并发注册算出同一个 Next id，两种
+  边类型静默合并。现在在 `bitcask_txn` 事务里持 `"t"` 前缀写锁做（同时罩住 `t<id>`
+  与 `tn<name>`）。
+- **`bitcask_txn` 选项坏值能打崩整个 locker 组**：`lock_wait_timeout` 不校验直接送进
+  分片，`start_timer` badarg → 分片崩 → one_for_all 全组重启、所有在途事务
+  `locker_restarted`，10 秒内几次就超过重启强度。现在门面校验（坏值 badarg），
+  分片 `register` 再兜一层（不合法用默认）；`{timeout, 0}` 合法（立刻超时）。
+  另：`try_wake` 丢弃过期等待者后没重新唤醒它挡着的人（要等 5s 兜底），补上。
+- **Embedder 池选 worker 只看 `message_queue_len`**：gen_server 先取走请求再跑
+  `handle_call`，正在做 forward 的 worker 队列也是 0，平局按名字排序 `_0` 永远赢——
+  两路并发实际一路在干活。现在负载 = 在算(0/1，按 `current_function` 判) + 队列，
+  平局随机。**`slots => K` 线程超订**：每个 worker 各拿 `可用核数-2` 个线程，8 vCPU
+  上 4 槽 = 24 个 ggml 线程；现在池按 worker 数均分注入 `n_threads`。默认线程数的
+  兜底从 `logical_processors`（容器里报宿主机核数）改为 `schedulers_online`。
+- **CI 跑不过**：`erlang.yml` 调已删除的 `./rebar3`，矩阵 OTP 22–25 但
+  `bitcask_embedder_util` 用的 stdlib `json` 是 27 才有，且那些镜像的 gcc 编不了
+  C++23。改为 setup-beam + OTP 27 / 28；`minimum_otp_vsn` 提到 27。
+
+### Changed（性能）
+
+- **range / fold**：`range_loop` 批不满 256 即到尾，不再多打一次 dirty NIF 等 `done`
+  （graphdb 每跳省约三分之一的 dirty 调用）；`fold/3`、`list_keys/1` 改走批量 NIF
+  （128 条一批），不再逐条往返；`fold_keys/3,6`、`list_keys` 走新的
+  `cask_fold_next_keys_batch/2`，不再把每个 value 拷成 binary 再丢掉（⚠️ 引擎侧
+  `CaskIter::next()` 仍会读 value，省的是跨边界拷贝与 BEAM 垃圾；真正的 key-only
+  迭代要上游开 API）。
+- **NIF 调度**：`cask_fold_start`、`cask_fold_next_batch`、新的 keys batch 挂 dirty IO
+  （前者要 open 每个 sealed 文件，后两者一次最多 1024 次 pread）。`cask_put` /
+  `cask_delete` 按需转 dirty IO：cask 配了 `o_sync` / `{puts, N}`、value 是 map
+  （`put_doc`）、或 value > 64 KiB；其余小值写仍在普通调度器上内联跑。
+- **NIF 小项**：fold 每步不再整拷 `Entry`（含 value）；`make_ok` / `make_error` 用
+  缓存的原子；binary 构造改 `enif_make_new_binary`（≤ 64 字节直接建 heap binary，少
+  一次 malloc/free）；`make_search_hits` 分配失败不再静默丢命中，返回
+  `{error, allocation_error}`。
+- **`bitcask_txn_locker`**：本分片无人等待时 release 不做唤醒扫描；DOWN 按
+  `mons` 表直查，不再全表 `match_object`；无前缀锁时 `overlapping` 不 `tab2list`；
+  `held` 表按 `{TxnId, Shard}` 建键的 `duplicate_bag`，放锁一次 `ets:take`（按 TxnId
+  建键的 bag 每次 insert / delete_object 都要扫链，大事务 O(L²)）；授予判定用短路的
+  `blocked/4`；入队追加不重排。`bitcask_txn` 重跑退避改带上限的指数抖动
+  （`min(10 bsl Attempt, 200)` ms），过了 deadline 不再白等一轮。实测（8 vCPU，
+  `no_sync`，同时段对比）：50 key / 事务 P=1 2.5k → 3.4k txn/s、P=8 5.7k → 7.6k
+  （约 +35%）；单 key 事务在噪声内持平（P=8 约 110k）。
+- **`graphdb`**：`dedupe`、`bfs_layers` 去掉 `++` 二次方拼接；`expand` 按 dirty IO
+  调度器数切片（不再一顶点一进程），单一总 deadline，失败时 kill + demonitor 全部
+  worker（以前 DOWN 会漏进调用方信箱）；`do_range_take` 带计数器；`count_out` /
+  `degree_txn` 走 `range_fold` 整数累加并补上 strict parse（首字节是 `$i` 的 vid 会把
+  `ei` 家族的键数进去）。
+- **`graphdb_analytics`**：PageRank 改沿反向 CSR 拉取，每轮 O(N+M)（原来每条边
+  `setelement` 拷整个 N 元组）；`sssp` 用一张 map 取代 tuple + Seen；`materialize`
+  一次 `usort` 取代逐边 `gb_sets`。
+- **Embedder HTTP**：批量分块并发发送（`max_inflight`，默认 4，单一总 deadline）；
+  `inets` / httpc 在 init 起一次，用独立 profile `bitcask_embedder`；`max_batch` 选项
+  真正生效（以前文档有、代码忽略，恒为 64）；openai / anthropic 的重复代码并进
+  `bitcask_embedder_util:http_init/4`，headers 在 init 构造一次。
+
 ### Added
 
+- **`bitcask:put_docs/2`**：批量写文档并**一次** `embed_batch` 完成自动嵌入（以前
+  `put/3` 逐条嵌入，`embed_batch` 在 `src/` 里没有调用者——设计稿里批量是索引吞吐的
+  主要杠杆）。嵌入失败 → `{error, {embed_failed, _}}` 且不写任何一条；某条 put 失败
+  → `{error, {Key, Reason}}`，之前的已写入（**非原子**）。
 - **幂等键** `bitcask_txn:transaction/3` 选项 `{idem_key, K}`：同一个 K 至多提交
   一次，重来不跑 Fun、直接返回 `{atomic, 首次结果}`。标记（含结果）与数据同批原子
   提交；开跑前持标记写锁，同键并发调用串行。`idem_lookup/2`（不上锁自查）、

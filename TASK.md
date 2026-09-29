@@ -497,6 +497,48 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## R1 — 全项目审查：A 档正确性修复（6.6.1）
+
+> 六路并行审查（KV 门面 / graphdb / locker / embedder / C++ NIF / 构建测试）约 70 条
+> 发现，按"先修什么"分四档；本节是 A 档 12 条，全部有回归测试。B（性能）、C（构建
+> 测试）、D（清理）三档见审查记录，未动。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **R1-1** | **NIF `cask_close` 生命周期**：以前直接 `cask.reset()`——普通调度器上的 get 与 dirty close 并发是 cask.hpp 契约里的 UB；fold 迭代器持裸 `parent_`，close 后 next 是 UAF。`CaskHandle` 加 `shared_mutex` + `closed` 标志，入口经 `lock_cask_checked` 持 shared 锁（返回带锁的 `CaskLock`，`operator->`/隐式转指针让调用点几乎不改），close 持 unique 锁、只 `Cask::close()` 不删对象；`CaskIterHandle` 像 range 那样 keep 住父资源，next 持父 shared 锁、closed → `{error, closed}`。⚠️ 保留"已 close 句柄上普通调用 badarg"的旧行为（`lock_cask_checked` 对 closed 返回空）。 | ✅ |
+| **R1-2** | **异常屏障**：函数表 45 个入口全部 `guarded<>`（`bad_alloc` → allocation_error，其它 → `{exception, What}`）。参数上限：k/ef ≤ 10⁶（`get_topk`）、prefetch ≤ 65536、prefetch_threads ≤ 256。 | ✅ |
+| **R1-3** | **`encode_meta` 布尔**：`term_to_meta_value` 的"其它 atom → null"排在 true/false 前面。删掉这份拷贝，`parse_meta_value` 加 `other_atoms_as_null` 参数两处共用。 | ✅ |
+| **R1-4** | **merge 调度器**：`[_,_,Args3] = Args` 两参必崩；`{stop, State}` 非法返回。改为记日志继续出队；两参 Opts 也 usort；第三参归一 `{Files,Expired}` / 裸列表 / `all`。 | ✅ |
+| **R1-5** | **fold 家族裸原子**：五个收集器 + `cask_merge_dir` + stream 统一 `normalize_error`；收集器合并成 `with_fold_iter/5`。 | ✅ |
+| **R1-6** | **stream**：`done`/错误即 release（keydir 解冻）；`next` 每次临时 monitor，stop 后 `done` 而不是挂死。⚠️ 踩坑：producer 报错消息里只能带 Reason，外层再包 `{error, _}`——第一版双重包成 `{error, {error, closed}}`。 | ✅ |
+| **R1-7** | **`graphdb:del_vertex` 按边切块**（`?DEL_BATCH div 4` 条边一批，每批 ≤ 500 op），计数基值在该批提交前读；最后一批前缀扫掉自身全部计数键。meck 让第 2 批失败 → 重跑收敛（测试）。 | ✅ |
+| **R1-8** | **`graphdb` 计数器读错误传播**：`bump/3` 返回 `{ok,N} \| {error,_}`，`counter_ops/2` 整组失败即整批不提交；坏记录 `{invalid_counter, Key}`；事务版同样 abort。`not_found` 仍 0 基（计数键与图层同版本发布，没有无计数键的存量数据）。 | ✅ |
+| **R1-9** | **`register_etype` 上锁**：`bitcask_txn` 事务 + `lock_prefix("t", write)`；16 进程 × 16 名并发 → 16 个不同 id。顺带修掉 dialyzer 的两处死分支（199 删、650 让 `bfs` 真的返回 `{error,_}`）。 | ✅ |
+| **R1-10** | **locker 选项校验**：门面 `parse_opts` 校验 `timeout`/`lock_wait_timeout`（坏值 badarg，`{timeout,0}` 合法）；分片 `register` 兜底用默认值。`try_wake` 过期分支补 `wake_around`。 | ✅ |
+| **R1-11** | **embedder 池**：`pick/1` 负载 = `current_function` 不在 gen_server 模块 (1) + 队列长度，平局 `rand:uniform()` 打破；池按 worker 数均分注入 `n_threads`（`worker_threads/2` 纯函数），GPU 绑定的不动；`default_threads` 兜底改 `schedulers_online`。 | ✅ |
+| **R1-12** | **CI**：`erlang.yml` 改 setup-beam + OTP 27/28 + `rebar3`（仓库早已不 vendor `./rebar3`）；`minimum_otp_vsn` 22 → 27（`json` 模块）。 | ✅ |
+| **R1-13** | 回归：全量 eunit **254/254**、xref 干净、dialyzer 8 条 → 6 条（余下 4 条是 locker 用记录语法写 match spec、2 条是 graphdb / analytics 的防御性死分支，归 C 档）。新增测试 17 例。⚠️ 两个 harness 坑：eunit 同一进程跑整模块，"信箱为空"这种断言会撞上别的用例留下的 `{'EXIT',_,normal}`，要只看自己的消息；`bitcask:stream/1` 返回 `{ok, S}` 不是 `S`。 | ✅ |
+
+---
+
+## R2 — 全项目审查：B 档性能（6.6.1）
+
+> 审查里的 B 档 18 条，四路并行（NIF + fold 家族 / locker / graphdb / embedder）。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **R2-1** | **range / fold**：`range_loop` 短批即止；`fold/3`、`list_keys` 走批量 NIF（128/批）；新 NIF `cask_fold_next_keys_batch/2` 给 `fold_keys/3,6`、`list_keys`。⚠️ key-only 只省了跨边界拷贝：`CaskIter::next()` 一定会 pread value，引擎里不读 value 的路径（`drain_live_keys`）是 `parallel_scan` 私有的——要真省 I/O 得上游开 API。 | ✅ |
+| **R2-2** | **NIF 调度**：`cask_fold_start/3,4`、`cask_fold_next_batch`、keys batch → dirty IO。`cask_put` / `cask_delete` 做成分发器：`o_sync` / `{puts,N}` / map value / value > 64 KiB 时 `enif_schedule_nif` 转 dirty，其余内联。为此把 `guarded<>` 从 nif_main.cpp 挪进 nif_helpers（被调度的 impl 也要过异常屏障）。⚠️ `{puts,N}` 是按 cask 判的：没轮到第 N 次的 put 也会转 dirty。 | ✅ |
+| **R2-3** | **NIF 小项**：`iter_next_common` 返回 POD `EntryMeta` 不再整拷 Entry；`make_ok/error` 用缓存原子；`make_binary_checked` → `enif_make_new_binary`；`make_search_hits` 分配失败返回错误而不是静默少几条。 | ✅ |
+| **R2-4** | **locker**：`wake_around` 空等待守卫；`#state.mons` 取代 DOWN 的全表 `match_object`；`overlapping` 先 `ets:first(Plens)`；`?HELD` 改 `{{TxnId, Shard}, LockId}` duplicate_bag + `ets:take`；`blocked/4` 短路；入队追加；timer 处理先 find 再 take。`status/0` 的 match spec 改 `ets:fun2ms`——dialyzer 在 locker 上的 4 条警告清零。实测同时段对比（`no_sync`）：50 key/事务 P=1 2.5k → 3.4k、P=8 5.7k → 7.6k txn/s（+35%）；单 key 持平。 | ✅ |
+| **R2-5** | **`bitcask_txn`**：重跑退避 `rand:uniform(min(10 bsl Attempt, 200))`，sleep 前先看 deadline；`prefix_covers` 空表短路。 | ✅ |
+| **R2-6** | **graphdb**：`dedupe` / `bfs_layers` 去 `++`；`expand` 按 `dirty_io_schedulers` 切片 + 带 tag 的 monitor + 单一 deadline + 失败时 kill/demonitor 全部 worker；`do_range_take` 计数器；`count_out` / `degree_txn` strict parse（`16#69 bsl 56` 这种 vid 会把 `ei` 键数进去，有测试）。 | ✅ |
+| **R2-7** | **graphdb_analytics**：PageRank 沿反向 CSR 拉取（O(N+M)/轮，测试里对照一份 map 版 scatter 参考实现，逐顶点 < 1e-9）；`sssp` 单 map；`materialize` 一次 usort，正向数组不再重排（index 对 vid 单调）。 | ✅ |
+| **R2-8** | **embedder**：新 API `bitcask:put_docs/2`（一次 `embed_batch`）；HTTP 分块并发（`max_inflight` 默认 4）；httpc 独立 profile、init 起一次；`max_batch` 生效；openai / anthropic 并进 `http_init/4`。 | ✅ |
+| **R2-9** | 回归：全量 eunit **274/274**、xref 干净、dialyzer **0**（审查前 8 条）。 | ✅ |
+
+---
+
 ## 明确排除（V7+ 或永久取消）
 
 | 条目 | 决策 | 理由 |
