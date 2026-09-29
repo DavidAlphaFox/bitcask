@@ -20,9 +20,6 @@
 %%       字节裁剩（UTF-8 下字节数 ≤ N ⟹ token 数 ≤ N，保守安全）。
 %%     timeout_ms（默认 30000）— 单次 embedding 请求的总超时（毫秒）。
 %%     connect_timeout_ms（默认 5000）— 建连超时（毫秒）。
-%%   旧 API（deprecated，保留向后兼容）：
-%%     embed/1 — 从 application env 取配置
-%%     embed/3 — 显式传 Url/Model/Text
 %%
 %%   JSON：用 OTP 27+ 内置 json 模块（仓库本机 OTP 28，erl -version 实证）。
 %%
@@ -34,11 +31,8 @@
 
 -behaviour(bitcask_embedder).
 
-%% New context-based API
+%% Provider behaviour API
 -export([init/1, embed/2, embed_batch/2]).
-
-%% Legacy API (deprecated — use bitcask_embedder:new/2 + embed/2 + dim/1)
--export([embed/1, embed/3, dim/0]).
 
 %% 模型原生维度默认值（dim）。MRL 落库维度 vector_dim 缺省 = dim。
 %% 其余可选项（max_input_bytes / timeout_ms / connect_timeout_ms / max_batch /
@@ -69,32 +63,6 @@ embed_batch(#{url := _, model := _} = Cfg, Texts) when is_list(Texts) ->
     bitcask_embedder_util:http_embed_batch(Cfg, Texts).
 
 %% ===================================================================
-%% Legacy API (deprecated)
-%% ===================================================================
-
-%% @deprecated Use bitcask_embedder:new(openai, Opts) + bitcask_embedder:embed/2.
--spec embed(binary()) -> {ok, binary()} | {error, term()}.
-embed(Text) when is_binary(Text) ->
-    case {application:get_env(bitcask, embedder_url),
-          application:get_env(bitcask, embedder_model)} of
-        {{ok, Url}, {ok, Model}} -> embed(#{url => Url, model => to_bin(Model)}, Text);
-        _ -> {error, embedder_not_configured}
-    end.
-
-%% @deprecated Use bitcask_embedder:new/2 + bitcask_embedder:embed/2.
--spec embed(string(), binary(), binary()) -> {ok, binary()} | {error, term()}.
-embed(Url, Model, Text) when is_binary(Text) ->
-    embed(#{url => Url, model => to_bin(Model)}, Text).
-
-%% @deprecated Use bitcask_embedder:dim/1.
--spec dim() -> pos_integer().
-dim() ->
-    case application:get_env(bitcask, embedder_dim) of
-        {ok, D} when is_integer(D), D > 0 -> D;
-        _ -> 2560
-    end.
-
-%% ===================================================================
 %% Internal
 %% ===================================================================
 
@@ -104,7 +72,4 @@ build_headers(ApiKey) when is_binary(ApiKey) ->
     [{"Authorization", "Bearer " ++ binary_to_list(ApiKey)}];
 build_headers(ApiKey) when is_list(ApiKey) ->
     [{"Authorization", "Bearer " ++ ApiKey}].
-
-to_bin(B) when is_binary(B) -> B;
-to_bin(L) when is_list(L)   -> list_to_binary(L).
 

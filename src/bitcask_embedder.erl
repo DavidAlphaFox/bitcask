@@ -79,16 +79,9 @@
 -callback embed_batch(Config :: map(), [binary()]) ->
     {ok, [{ok, binary()} | {error, term()}]} | {error, term()}.
 
-%% -------------------------------------------------------------------
-%% Legacy behaviour (deprecated) — 旧式 embed/1 + dim/0。
-%% 新代码请用 new/2 + embed/2 + dim/1。
-%% 保留是为了平滑迁移现有 mock 和已部署的 callback 模块。
-%% -------------------------------------------------------------------
--callback embed(Text :: binary()) -> {ok, Vec :: binary()} | {error, term()}.
--callback dim() -> pos_integer().
-
-%% 旧回调设为 optional：新 provider 只需实现 init/1 + embed/2。
--optional_callbacks([dim/0, embed/1, embed_batch/2]).
+%% 旧式 embed/1 + dim/0 回调已删除（6.7.0）：框架从不调用它们，维度走 ctx
+%% 的 dim / vector_dim。provider 只需实现 init/1 + embed/2，embed_batch/2 可选。
+-optional_callbacks([embed_batch/2]).
 
 %% -------------------------------------------------------------------
 %% Framework: 构建 provider 上下文
