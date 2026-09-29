@@ -98,22 +98,17 @@ init([]) ->
 
 %% 入队 / 去重 / 启动 worker。
 handle_call({merge, Args0}, _From, #state { queue = Q } = State) ->
-    %% Args0 可能是 [Dir, Opts] 或 [Dir, Opts, {Files, Expired}]。
-    %% 当后者出现时把内部的 Opts、Files、Expired 全部 usort 一遍，
-    %% 这样后续的 keyfind / keyreplace 比较时签名稳定，不会因为顺序
-    %% 不同而错过去重机会。
+    %% Args0 是 [Dir, Opts] 或 [Dir, Opts, FilesArg]。两种形态的 Opts 都
+    %% usort（merge_items 的 umerge 要求两边有序——以前 2 元形态漏了，
+    %% 同目录合并时签名不稳、去重失效）；FilesArg 接受 bitcask:merge/3
+    %% 认的全部形态：{Files, Expired} 二元组、裸 Files 列表、all。
     [Dirname|_] = Args0,
     Args1 =
-        case length(Args0) of
-            3 ->
-                [_, Opts0, Tuple0] = Args0,
-                {Files, Expired} = Tuple0,
-                Opts = lists:usort(Opts0),
-                Tuple = {lists:usort(Files),
-                         lists:usort(Expired)},
-                [Dirname, Opts, Tuple];
-            _ ->
-                Args0
+        case Args0 of
+            [_, Opts0, FilesArg] ->
+                [Dirname, lists:usort(Opts0), normalize_files(FilesArg)];
+            [_, Opts0] ->
+                [Dirname, lists:usort(Opts0)]
         end,
     Args = list_to_tuple(Args1),
     %% queue 里以 Dir 为 key（tuple 第 1 个元素）做去重。
@@ -131,7 +126,7 @@ handle_call({merge, Args0}, _From, #state { queue = Q } = State) ->
             case State#state.worker of
                 undefined ->
                     %% worker 空闲——立刻 spawn 干活
-                    WorkerPid = spawn_link(fun() -> do_merge(Args0) end),
+                    WorkerPid = spawn_link(fun() -> do_merge(Args1) end),
                     {reply, ok, State#state { worker = WorkerPid }};
                 _ ->
                     %% worker 在忙——挂队列，等 'EXIT' 出队
@@ -147,23 +142,22 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 %% worker 正常结束：如果 queue 非空，pop 第一个继续跑。
-handle_info({'EXIT', _Pid, normal}, #state { queue = Q } = State) ->
-    case Q of
-        [] ->
-            {noreply, State#state { worker = undefined }};
-        [Args0|Q2] ->
-            Args = tuple_to_list(Args0),
-            WorkerPid = spawn_link(fun() -> do_merge(Args) end),
-            {noreply, State#state { queue = Q2,
-                                    worker = WorkerPid }}
-    end;
+handle_info({'EXIT', Pid, normal}, #state { worker = Pid } = State) ->
+    {noreply, start_next(State)};
 
-%% worker 非正常退出：记录后停掉调度器自身，让 supervisor 重启。
-%% 队列里的 pending 请求会丢，但这种情况通常是底层出大问题，
-%% 重启把状态清干净比硬撑更安全。
+%% worker 非正常退出：记录，然后照常出队下一项。
+%% 以前这里 {stop, State}——既不是合法的 gen_server 返回值（调度器自己
+%% 以 bad_return_value 死掉），也会把队列里已经答复过 ok 的请求全丢掉；
+%% 而 do_merge 早已 catch 住 bitcask:merge 的错误，能走到这里的只有
+%% worker 进程本身被 kill 之类的外部原因，与其它目录的请求无关。
 handle_info({'EXIT', Pid, Reason}, #state { worker = Pid } = State) ->
-    ?LOG_ERROR("Merge worker PID exited: ~p\n", [Reason]),
-    {stop, State}.
+    ?LOG_ERROR("Merge worker ~p exited: ~p\n", [Pid, Reason]),
+    {noreply, start_next(State)};
+
+%% 其它 'EXIT'（不是当前 worker 的——比如 worker 换代后的迟到消息）和
+%% 未知消息一律忽略，别让调度器为它们崩。
+handle_info(_Msg, State) ->
+    {noreply, State}.
 
 terminate(_Reason, State) ->
     %% supervisor shutdown 时强制干掉在跑的 worker。catch 是因为 worker
@@ -175,16 +169,34 @@ code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 %% =========================================================================
-%% 内部：去重合并
+%% 内部：出队 / 去重合并
 %% =========================================================================
 
-%% 把同 Dir 的两次请求合并成一条。Opts 取 umerge 并集；如果两边都是 3 元
-%% 组（带 {Files, Expired}），Files / Expired 也取并集；如果一边 2 元一边 3 元，
-%% 保留 3 元那一份的 Files / Expired（信息量更全）。
+%% 当前 worker 已退出：队列非空就 spawn 下一项，否则回到空闲。
+start_next(#state { queue = [] } = State) ->
+    State#state { worker = undefined };
+start_next(#state { queue = [Args0|Q2] } = State) ->
+    Args = tuple_to_list(Args0),
+    WorkerPid = spawn_link(fun() -> do_merge(Args) end),
+    State#state { queue = Q2, worker = WorkerPid }.
+
+%% merge/3 第三参归一：二元组与裸列表都变成有序的 {Files, Expired}
+%% （bitcask:merge/3 两种都认）；all 原样保留。
+normalize_files({Files, Expired}) when is_list(Files), is_list(Expired) ->
+    {lists:usort(Files), lists:usort(Expired)};
+normalize_files(Files) when is_list(Files) ->
+    {lists:usort(Files), []};
+normalize_files(all) ->
+    all.
+
+%% 把同 Dir 的两次请求合并成一条。Opts 取 umerge 并集（两边入队时都已
+%% usort）；如果两边都是 3 元组（带 {Files, Expired}），Files / Expired 也取
+%% 并集；如果一边 2 元一边 3 元，保留 3 元那一份的 Files / Expired
+%% （信息量更全）。
 merge_items(New, Old) ->
     Dirname = element(1, New),
     OOpts = element(2, Old),
-    NOpts = lists:usort(element(2, New)),
+    NOpts = element(2, New),
     Opts = lists:umerge(OOpts, NOpts),
     case {size(New), size(Old)} of
         {3, 3} ->
@@ -199,13 +211,16 @@ merge_items(New, Old) ->
            {Dirname, Opts, element(3, New)}
     end.
 
-%% Files / Expired 都是已排序列表（入队前 usort 过）。合并后再把已知
-%% expired 的从待 merge 列表里减掉——已经要删了就没必要再合并它们。
+%% Files / Expired 都是已排序列表（入队前 normalize_files 过）。合并后再把
+%% 已知 expired 的从待 merge 列表里减掉——已经要删了就没必要再合并它们。
+%% 任一边是 all（让 cask 自己挑）就取 all：它覆盖任何显式列表。
+merge_files(all, _Old) -> all;
+merge_files(_New, all) -> all;
 merge_files(New, Old) ->
     {NFiles, NExp} = New,
     {OFiles, OExp} = Old,
-    Files0 = lists:umerge(lists:usort(NFiles), OFiles),
-    Expired = lists:umerge(lists:usort(NExp), OExp),
+    Files0 = lists:umerge(NFiles, OFiles),
+    Expired = lists:umerge(NExp, OExp),
     %% O9：两边都是有序去重列表，ordsets:subtract 是 O(n+m)
     %% 的归并减法；`--` 是 O(n*m)，大目录（数百文件）下白白平方。
     Files = ordsets:subtract(Files0, Expired),
@@ -226,14 +241,19 @@ do_merge(Args) ->
             Start = os:timestamp(),
             Result = (catch apply(bitcask, merge, Args)),
             ElapsedSecs = timer:now_diff(os:timestamp(), Start) / 1000000,
-            [_,_,Args3] = Args,
+            %% 日志只报目录：以前 [_,_,Args3] = Args 在 2 元形态上必
+            %% badmatch——merge/1,2 经调度器走一次就崩一次 worker。
+            Dir = hd(Args),
             case Result of
                 ok ->
                     ?LOG_INFO("Merged ~p in ~p seconds.\n",
-                                          [Args3, ElapsedSecs]);
+                                          [Dir, ElapsedSecs]);
                 {Error, Reason} when Error == error; Error == 'EXIT' ->
                     ?LOG_ERROR("Failed to merge ~p: ~p\n",
-                                           [Args3, Reason])
+                                           [Dir, Reason]);
+                Other ->
+                    ?LOG_ERROR("Failed to merge ~p: ~p\n",
+                                           [Dir, Other])
             end;
         false ->
             ok
