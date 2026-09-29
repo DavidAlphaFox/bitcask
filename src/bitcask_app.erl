@@ -2,12 +2,12 @@
 %% bitcask_app
 %%
 %%   OTP application 行为模块。bitcask 注册成 application 是为了让
-%%   bitcask:open/2 在 catch application:start(bitcask) 时把所有默认参数
-%%   （max_file_size、open_timeout、sync_strategy 之类）从 .app.src 的 env
-%%   段加载进来。
+%%   bitcask:open/2 启动应用时（bitcask:ensure_app_started/0，失败不再被吞）
+%%   把所有默认参数（max_file_size、open_timeout、sync_strategy 之类）从
+%%   .app.src 的 env 段加载进来。
 %%
-%%   start/2 把控制权交给 bitcask_sup（顶层 supervisor）；该 supervisor 启
-%%   动 bitcask_merge_worker 单例。stop/1 是 OTP 要求的回调，bitcask 没有
+%%   start/2 先应用 {thread_limits, _}，再把控制权交给 bitcask_sup（顶层
+%%   supervisor）；它启动 merge 调度器、事务 locker 组与可选的 embedder。stop/1 是 OTP 要求的回调，bitcask 没有
 %%   需要在 application 下线时收尾的全局资源——sup 会自动 shutdown 子进
 %%   程；NIF 资源由 BEAM GC 兜底。
 %%

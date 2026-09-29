@@ -20,8 +20,8 @@
 %%
 %%   StreamRef 由 spawn 它的进程独占；跨进程共享是 undefined behaviour。
 %%
-%%   底层用 cask_fold_start（多 IterRef 并发）而不是 cask_iterator
-%%   （per-cask 单实例），所以同一个 Ref 上可以同时开多个 stream。
+%%   底层用 cask_fold_start（每个 stream 独立一个 IterRef），所以同一个 Ref
+%%   上可以同时开多个 stream。
 %%
 %% Copyright (c) 2010 Basho Technologies, Inc. — Apache License 2.0.
 %% =========================================================================
