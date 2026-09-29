@@ -8,8 +8,9 @@
 %%
 %%   Erlang 层只做三件事：
 %%     1. 选项归一化（opt_value/2 处理 Opts > app env > undefined 的优先级）；
-%%     2. 把 bitcask_cpp_nifs:cask_iterator/cask_fold_* 返回的元组重新组装成
-%%        历史外部接口里出现的 #bitcask_entry 记录，保持调用方的兼容性；
+%%     2. 把 bitcask_cpp_nifs:cask_fold_* 返回的元组重新组装成历史外部接口里
+%%        出现的 #bitcask_entry 记录，保持调用方的兼容性（遍历一律走 fold 家族
+%%        与 stream/1；legacy 的状态化 iterator/3 NIF 已下线）；
 %%     3. 把 fold/6、fold_keys/6 里历史遗留的 µs/ms 单位换算成 cask_cpp 期望
 %%        的「秒」（cask_max_age/1）和「次数」（cask_max_put/1）。
 %%
@@ -39,7 +40,7 @@
          stream_fold/3, stream_fold/4,
          stream/1, next/1, stop/1, with_stream/2,
          merge/1, merge/2, merge/3,
-         range/2, range/3, range_fold/5,
+         range/2, range/3, range_fold/5, prefix_succ/1,
          put_batch_atomic/2,
          txn_commit/2, txn_commit/3, txn_commit/4,
          needs_merge/1,
@@ -194,7 +195,6 @@ open(Dirname) -> open(Dirname, []).
 %%     {error, Reason}      — 通常是 write_locked / enoent / mode_mismatch
 -spec open(Dirname::string(), Opts::[_]) -> {reference(), term()} | {error, term()}.
 open(Dirname, Opts) ->
-    catch application:load(bitcask),
     case ensure_app_started() of
         {error, _} = E -> E;
         ok             -> open_1(Dirname, Opts)
@@ -202,7 +202,9 @@ open(Dirname, Opts) ->
 
 %% ⚠️ **不再吞掉 application:start 的失败。**
 %%
-%% 从前这里是一句 `catch application:start(bitcask)`，返回值直接丢掉。加了
+%% 从前这里是一句 `catch application:start(bitcask)`，返回值直接丢掉。
+%% （application:start 在未加载时自己会 load，所以前面也不需要单独的
+%% application:load。）加了
 %% 可选的 embedder child 之后那样做是危险的：application env 里配了嵌入模型
 %% 但路径写错时，bitcask_sup 起不来 → application 起不来 → 而 open 照常返回
 %% 一个句柄。之后所有 put #{text=>...} 都不会有向量，症状要等到检索结果不对
@@ -537,6 +539,18 @@ with_stream(Handle, Fun) -> bitcask_stream:with_stream(ref(Handle), Fun).
 
 %% 收集 [Lo, Hi) 的全部 {Key, Value}，按 key 字典序。
 range(Handle, {Lo, Hi}) -> range(Handle, {Lo, Hi}, []).
+
+%% 前缀扫描的上界：字典序后继——去尾部连续 0xFF、末字节 +1；空 / 全 0xFF →
+%% undefined（无上界）。range(H, {P, prefix_succ(P)}) = 以 P 开头的全部 key。
+%% 例：<<"ab">> → <<"ac">>，<<"a",255>> → <<"b">>。bitcask_txn 与 graphdb 共用
+%% 这一份（以前各有一份，graphdb 那份走 list 往返）。
+-spec prefix_succ(binary()) -> binary() | undefined.
+prefix_succ(<<>>) -> undefined;
+prefix_succ(Bin) when is_binary(Bin) ->
+    case binary:last(Bin) of
+        16#FF -> prefix_succ(binary_part(Bin, 0, byte_size(Bin) - 1));
+        B     -> <<(binary_part(Bin, 0, byte_size(Bin) - 1))/binary, (B + 1)>>
+    end.
 
 range(Handle, {Lo, Hi}, Opts) ->
     Fun = fun(K, V, _T, _O, Acc) -> [{K, V} | Acc] end,

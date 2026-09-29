@@ -306,7 +306,7 @@ prefix_range(#bitcask_txn_ctx{handle = Handle} = Tx, Prefix, Opts)
   when is_binary(Prefix), is_list(Opts) ->
     Buf = buffer(Tx),
     lock_prefix_(Tx, Prefix, proplists:get_value(lock, Opts, read)),
-    case bitcask:range(Handle, {Prefix, succ(Prefix)}) of
+    case bitcask:range(Handle, {Prefix, bitcask:prefix_succ(Prefix)}) of
         {error, _} = E -> E;
         Rows ->
             Size = byte_size(Prefix),
@@ -323,13 +323,6 @@ prefix_range(#bitcask_txn_ctx{handle = Handle} = Tx, Prefix, Opts)
             end
     end.
 
-%% 字典序后继：去尾部连续 0xFF、末字节 +1；全 0xFF → undefined（无上界）。
-succ(<<>>) -> undefined;
-succ(Bin) ->
-    case binary:last(Bin) of
-        16#FF -> succ(binary_part(Bin, 0, byte_size(Bin) - 1));
-        B     -> <<(binary_part(Bin, 0, byte_size(Bin) - 1))/binary, (B + 1)>>
-    end.
 
 %% 事务绑定的 cask 句柄。给上层（graphdb）在事务内做**不上锁**的辅助读
 %% （如计数键缺失时的按需扫描）用；经它做的读写不受 2PL 保护。
@@ -525,7 +518,7 @@ idem_purge(Handle, MaxAgeSec, Opts) when is_integer(MaxAgeSec), MaxAgeSec >= 0, 
     Cutoff = os:system_time(second) - MaxAgeSec,
     Chunk = proplists:get_value(chunk, Opts, ?IDEM_PURGE_CHUNK),
     true = is_integer(Chunk) andalso Chunk > 0,
-    Range = {?IDEM_PREFIX, succ(?IDEM_PREFIX)},
+    Range = {?IDEM_PREFIX, bitcask:prefix_succ(?IDEM_PREFIX)},
     case bitcask:range_fold(Handle, Range, [],
                             fun(K, V, _T, _O, Acc) ->
                                     case idem_at(V) =< Cutoff of

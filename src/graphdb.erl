@@ -160,17 +160,11 @@ eikey(Dst, Etype, Src, Rank) ->
 
 %% 字典序后继：去尾部连续 0xFF 字节、末字节 +1；全 0xFF → undefined（无上界）。
 %% 例：succ(<<"ab">>) = <<"ac">>，succ(<<"a",255>>) = <<"b">>。
+%% 实现在 bitcask:prefix_succ/1（bitcask_txn 共用）；这里保留 codec 的公开名，
+%% 并维持原约束：空 binary 不是合法前缀（badarg / function_clause）。
 -spec succ(binary()) -> binary() | undefined.
 succ(Bin) when is_binary(Bin), byte_size(Bin) > 0 ->
-    Rev = lists:reverse(binary_to_list(Bin)),
-    case do_succ(Rev) of
-        undefined -> undefined;
-        L         -> list_to_binary(lists:reverse(L))
-    end.
-
-do_succ([])           -> undefined;             %% 全 0xFF：无上界
-do_succ([255 | Rest]) -> do_succ(Rest);
-do_succ([B | Rest])   -> [B + 1 | Rest].        %% B < 255（255 已被上一子句吃掉）
+    bitcask:prefix_succ(Bin).
 
 %% strict 解析：非本家族 / 长度不符 → skip（见模块头「病理 vid 防御」）。
 parse_e(<<"e", Src:64/big, Etype:32/big, Dst:64/big, Rank:64/big>>) ->
@@ -190,8 +184,7 @@ parse_ei(_) ->
 %% Doc 为 binary，或 #{text => ...} 等 bitcask:put 支持的文档形态
 %%（索引模式下自动进 BM25 / 向量——设计文档 §5）。
 put_vertex(Handle, Vid, Doc) ->
-    _ = nkey(Vid),                              %% 借 codec 校验 vid
-    bitcask:put(Handle, nkey(Vid), Doc).
+    bitcask:put(Handle, nkey(Vid), Doc).        %% nkey 顺带校验 vid
 
 get_vertex(Handle, Vid) ->
     normalize_not_found(bitcask:get(Handle, nkey(Vid))).
@@ -272,17 +265,17 @@ put_edge(Handle, Src, Etype, Dst, Opts) when is_map(Opts) ->
     Rank  = maps:get(rank, Opts, 0),
     Props = maps:get(props, Opts, <<>>),
     true = is_binary(Props) orelse erlang:error(badarg, [Handle, Src, Etype, Dst, Opts]),
-    _ = ekey(Src, Etype, Dst, Rank),            %% 借 codec 校验四元组
+    EK = ekey(Src, Etype, Dst, Rank),           %% 顺带校验四元组；各处共用一份
     %% upsert：边已存在 → 只改属性（计数器/et 不动）；否则全量插入。
-    case edge(Handle, Src, Etype, Dst, Rank) of
+    case bitcask:get(Handle, EK) of
         {ok, _} ->
-            bitcask:put_batch_atomic(Handle, [{put, ekey(Src, Etype, Dst, Rank), Props}]);
-        {error, not_found} ->
+            bitcask:put_batch_atomic(Handle, [{put, EK, Props}]);
+        not_found ->
             case counter_ops(Handle, [{degkey(Src, Etype), 1}, {degikey(Dst, Etype), 1}]) of
                 {error, _} = E -> E;
                 {ok, CounterOps} ->
                     bitcask:put_batch_atomic(
-                      Handle, [{put, ekey(Src, Etype, Dst, Rank), Props},
+                      Handle, [{put, EK, Props},
                                {put, eikey(Dst, Etype, Src, Rank), <<>>},
                                {put, etkey(Etype, Src, Dst, Rank), <<>>}
                                | CounterOps])
@@ -327,16 +320,16 @@ edge(Handle, Src, Etype, Dst, Rank) ->
 
 del_edge(Handle, Src, Etype, Dst) -> del_edge(Handle, Src, Etype, Dst, 0).
 del_edge(Handle, Src, Etype, Dst, Rank) ->
-    _ = ekey(Src, Etype, Dst, Rank),
-    case edge(Handle, Src, Etype, Dst, Rank) of
-        {error, not_found} ->
+    EK = ekey(Src, Etype, Dst, Rank),
+    case bitcask:get(Handle, EK) of
+        not_found ->
             ok;                                  %% 幂等删除
         {ok, _} ->
             case counter_ops(Handle, [{degkey(Src, Etype), -1}, {degikey(Dst, Etype), -1}]) of
                 {error, _} = E -> E;
                 {ok, CounterOps} ->
                     bitcask:put_batch_atomic(
-                      Handle, [{remove, ekey(Src, Etype, Dst, Rank)},
+                      Handle, [{remove, EK},
                                {remove, eikey(Dst, Etype, Src, Rank)},
                                {remove, etkey(Etype, Src, Dst, Rank)}
                                | CounterOps])
