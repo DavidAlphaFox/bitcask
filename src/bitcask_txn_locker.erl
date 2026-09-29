@@ -92,11 +92,6 @@
 
 -include_lib("stdlib/include/ms_transform.hrl").
 
--ifdef(PULSE).
--compile({parse_transform, pulse_instrument}).
--include_lib("pulse_otp/include/pulse_otp.hrl").
--endif.
-
 -export([start_link/1, shard_count/0, shard_of/1,
          register/2, acquire/3, check/1, notify_target/1, begin_commit/1, release_all/1,
          status/0]).

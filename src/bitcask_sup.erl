@@ -48,11 +48,6 @@
 
 -behaviour(supervisor).
 
--ifdef(PULSE).
--compile({parse_transform, pulse_instrument}).
--include_lib("pulse_otp/include/pulse_otp.hrl").
--endif.
-
 -export([start_link/0]).
 -export([init/1]).
 
