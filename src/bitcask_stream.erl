@@ -14,7 +14,9 @@
 %%     {bitcask_stream_next, From}  — 拉下一条
 %%     bitcask_stream_stop           — 消费者主动结束
 %%     {'DOWN', Mon, _, _, _}        — 消费者崩溃
-%%   三条退出路径都汇聚到 try/after，保证 cask_fold_release 一定执行。
+%%   三条退出路径都汇聚到 try/after，保证 cask_fold_release 一定执行；
+%%   拉到 done / error 时**立刻**释放（不等 stop）——迭代器钉着 keydir
+%%   快照（is_frozen），消费者读完就不再调 stop 的情况很常见。
 %%
 %%   StreamRef 由 spawn 它的进程独占；跨进程共享是 undefined behaviour。
 %%
@@ -58,19 +60,27 @@ stream(Ref) ->
 %%   {ok, Key, Value} - 一条 entry
 %%   done             - 迭代完成（idempotent：之后再调还返回 done）
 %%   {error, Reason}  - 迭代过程出错或 producer 异常退出
+%%
+%% 每次 next 临时 monitor 一下 producer：stop/1 已经 demonitor+flush 了长期
+%% 的那个，stop 之后再 next 没有任何消息能唤醒我们——以前是永久挂起。
+%% producer 已退出（noproc）或正常退出一律当 done；异常退出报出来。
 -spec next(term()) -> {ok, binary(), binary()} | done | {error, term()}.
 next(?STREAM(Pid, MRef)) ->
+    Mon = erlang:monitor(process, Pid),
     Pid ! {bitcask_stream_next, self()},
-    receive
-        {bitcask_stream_entry, Pid, K, V}    -> {ok, K, V};
-        {bitcask_stream_done,  Pid}          -> done;
-        {bitcask_stream_error, Pid, Reason}  -> {error, Reason};
-        %% producer 在我们 send next 之前就死了的情况——通常是 done 之后
-        %% 自己退出（不会发生，本实现 producer 收到 done 后会 drain；但
-        %% 兜底处理）。
-        {'DOWN', MRef, process, Pid, normal} -> done;
-        {'DOWN', MRef, process, Pid, Reason} -> {error, {producer_died, Reason}}
-    end.
+    Res = receive
+              {bitcask_stream_entry, Pid, K, V}    -> {ok, K, V};
+              {bitcask_stream_done,  Pid}          -> done;
+              {bitcask_stream_error, Pid, Reason}  -> {error, Reason};
+              {'DOWN', Mon, process, Pid, normal}  -> done;
+              {'DOWN', Mon, process, Pid, noproc}  -> done;
+              {'DOWN', Mon, process, Pid, Reason}  -> {error, {producer_died, Reason}};
+              %% stream/1 建的长期 monitor：producer 在 stop 之前崩了
+              {'DOWN', MRef, process, Pid, normal} -> done;
+              {'DOWN', MRef, process, Pid, Reason} -> {error, {producer_died, Reason}}
+          end,
+    erlang:demonitor(Mon, [flush]),
+    Res.
 
 %% 显式停止；幂等。不等 producer 实际清理完毕——producer 自己的 try/after
 %% 会保证 cask_fold_release 在它退出前跑掉。
@@ -98,7 +108,9 @@ with_stream(Ref, Fun) ->
 %% =========================================================================
 
 %% 启动 fold；成功就发 ready，进入主循环；失败就报错给 parent 后退出。
-%% 关键：try/after 保证无论怎么退出 cask_fold_release 都跑。
+%% 关键：try/after 保证无论怎么退出 cask_fold_release 都跑（release 幂等，
+%% 主循环里提前放过的再放一次是 no-op）。NIF 启动失败可能是裸 atom
+%% （closed 等），归一成 {error, _} 再报给 parent。
 producer_init(Ref, Parent) ->
     case bitcask_cpp_nifs:cask_fold_start(Ref, -1, -1) of
         {ok, IterRef} ->
@@ -107,25 +119,32 @@ producer_init(Ref, Parent) ->
             try producer_loop(IterRef, ParentMon)
             after bitcask_cpp_nifs:cask_fold_release(IterRef)
             end;
-        {error, Reason} ->
-            Parent ! {bitcask_stream_error, self(), Reason}
+        Other ->
+            Parent ! {bitcask_stream_error, self(), error_reason(Other)}
     end.
 
+%% 消息里只带 Reason（stream/1、next/1 那头再包成 {error, Reason}）。
+error_reason({error, Reason}) -> Reason;
+error_reason(Reason)          -> Reason.
+
 %% 主循环：等 next 请求 / stop / consumer DOWN。
-%% next 取到 done 或 error 之后转入 drain 状态——不再拉新数据，但保留
-%% 进程响应能力，让 consumer 可以再调 next（拿到幂等的 done）或 stop。
+%% next 取到 done 或 error 之后**先释放迭代器**（解冻 keydir），再转入
+%% drain 状态——不再拉新数据，但保留进程响应能力，让 consumer 可以再调
+%% next（拿到幂等的 done）或 stop。
 producer_loop(IterRef, ParentMon) ->
     receive
         {bitcask_stream_next, From} ->
             case bitcask_cpp_nifs:cask_fold_next(IterRef) of
-                done ->
-                    From ! {bitcask_stream_done, self()},
-                    drain_loop(ParentMon);
                 {ok, K, V} ->
                     From ! {bitcask_stream_entry, self(), K, V},
                     producer_loop(IterRef, ParentMon);
-                {error, Reason} ->
-                    From ! {bitcask_stream_error, self(), Reason},
+                done ->
+                    bitcask_cpp_nifs:cask_fold_release(IterRef),
+                    From ! {bitcask_stream_done, self()},
+                    drain_loop(ParentMon);
+                Other ->
+                    bitcask_cpp_nifs:cask_fold_release(IterRef),
+                    From ! {bitcask_stream_error, self(), error_reason(Other)},
                     drain_loop(ParentMon)
             end;
         bitcask_stream_stop ->
