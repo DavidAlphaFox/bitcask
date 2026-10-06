@@ -39,6 +39,25 @@ libbitcask 6.6.1 修的是我们报上去的 `feedbacks/2026-10-06-meta-filter-q
   （`eq/neq/gt/gte/lt/lte/in/exists`，可用 `and`/`or` 嵌套）；另有 `limit` 与 `select`。
   规划器选一个索引驱动：有全文条件走倒排，只有 key 条件走 `range`，都没有就全表 `range`；
   两条路径都把 `where` 下推给引擎。不用 match spec 的原因：值要经过分词，全文条件只能交给倒排。
+- **`bitcask_query:page/2,1` 分页**：返回 `{ok, Rows, Cont}`，没有下一页时 `Cont` 为 `done`。
+  游标是不透明的 term，不占服务端资源。
+  - key 驱动的游标是下一页起始 key；
+  - 全文检索的游标是已消费的引擎命中数，依赖同分前缀稳定，翻页不重不漏；
+  - 向量 / 混合 / `search_fields` 的游标按已返回的 key 去重，不会重复，但可能漏。
+- **`bitcask_query` 支持向量与混合检索**：
+  - `vector => VecBin | {text, Bin}`（`{text, Bin}` 整个查询只 embed 一次）；
+  - 只给 `vector` 走 `search_vector`，可带 `ef`；
+  - 和 `text => {match, Q}` 一起给走 `search_hybrid`；
+  - `where` 照样下推，`key` 照样后过滤。
+- **二级索引**：`bitcask_query:create_index/2`、`drop_index/2`、`indexes/1`，配合维护索引的写入接口
+  `bitcask_query:put/3`、`delete/2`，以及 `explain/2`（查看规划结果）。
+  - 只有 `where` 的查询会挑一个已建索引字段上的 eq / in / 大小比较 / exists 条件，转成索引键上的 range。
+  - 值的编码保序且能自行判断结束位置，类型语义与引擎 MetaFilter 一致。
+  - ⚠️ 不是原子的：上游原子批写不进带 meta 的文档（已报 libbitcask
+    `feedbacks/2026-10-06-atomic-batch-doc-meta.md`）。写入时加 key 锁，按「加新项 → 写文档 → 删旧项」的顺序执行；
+    读取时回表校验，保证不会出现错行或重复行。索引字段的写入必须走 `bitcask_query:put/delete`。
+- **`bitcask_txn:lock_key/3`**：只拿点锁、不读不写（同 `mnesia:lock`）。二级索引的写入靠它给 key 加锁。
+  `read/2,3` 的 spec 改准：未缓冲的 key 直接返回 `bitcask:get` 的结果，在索引模式下是 map。
 - **`bitcask:decode_meta/1`**：`encode_meta/1` 的反方向（新 NIF `cask_decode_meta`）。
 
 ### 文档

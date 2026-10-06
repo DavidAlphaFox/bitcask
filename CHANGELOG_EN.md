@@ -49,6 +49,30 @@ unchanged, and so is the on-disk format. libbitcask 6.6.1 fixes the five items w
   text condition, `range` for key-only queries, and a full-table `range` otherwise. Both paths push
   `where` down to the engine. Not match specs, because values are tokenized and text conditions can
   only be answered by the index.
+- **`bitcask_query:page/2,1` paging**: returns `{ok, Rows, Cont}`, with `Cont = done` when there
+  is no next page. The cursor is an opaque term that holds no server-side resources.
+  - The key-driven cursor is the next start key.
+  - The full-text cursor is the number of engine hits consumed; thanks to prefix-stable ties,
+    paging has no duplicates and no gaps.
+  - Vector / hybrid / `search_fields` cursors deduplicate by the keys already returned, so there
+    are no duplicates, but hits can be missed.
+- **Vector and hybrid search in `bitcask_query`**:
+  - `vector => VecBin | {text, Bin}` (`{text, Bin}` is embedded once per query);
+  - `vector` alone runs `search_vector` and accepts `ef`;
+  - `vector` together with `text => {match, Q}` runs `search_hybrid`;
+  - `where` is still pushed down and `key` still post-filters.
+- **Secondary indexes**: `bitcask_query:create_index/2`, `drop_index/2` and `indexes/1`, plus the
+  index-maintaining writes `bitcask_query:put/3` and `delete/2`, and `explain/2` to show the chosen plan.
+  - A `where`-only query picks one eq / in / comparison / exists condition on an indexed field and runs it as a
+    range over index keys.
+  - Values are encoded order-preserving and self-delimiting, with the engine MetaFilter's type semantics.
+  - ⚠️ Not atomic: upstream atomic batches cannot carry documents with meta (reported as libbitcask
+    `feedbacks/2026-10-06-atomic-batch-doc-meta.md`). Writes take a key lock and run in the order add new entries →
+    write document → remove old entries; reads check every candidate against the document, so there are no wrong
+    or duplicate rows. Writes to indexed fields must go through `bitcask_query:put/delete`.
+- **`bitcask_txn:lock_key/3`**: takes a point lock without reading or writing (like `mnesia:lock`); the
+  secondary-index writes use it to lock the key. The `read/2,3` spec is corrected: an unbuffered key returns
+  whatever `bitcask:get` returns, which is a map in index mode.
 - **`bitcask:decode_meta/1`**: inverse of `encode_meta/1` (new NIF `cask_decode_meta`).
 
 ### Docs
