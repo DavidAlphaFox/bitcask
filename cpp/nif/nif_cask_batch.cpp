@@ -1,6 +1,7 @@
 // 粗粒度 cask_* NIF — v5.1.0 S35 引擎原子批 + S34 多键事务。
 //
-// 两个入口，同一条底层实现（Cask::put_batch_atomic）：
+// 两个入口，同一条底层实现（Cask::put_batch_atomic）。批内 value 可以是
+// binary 或 doc map（libbitcask 6.6.2 kPutDoc，与 put/3 同形）：
 //
 //   cask_put_batch_atomic(Ref, Ops)      裸原子批。批内允许同 key 多次
 //                                        （依序 apply = 批内 LWW），允许空批。
@@ -28,6 +29,7 @@
 //（底层 write_mu_ 串行化），但都可能写很多字节 + fsync，故挂 dirty IO 调度。
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -46,19 +48,31 @@ namespace {
 // 解析出来的单条操作。key/value 的 span 借用 caller 的 ErlNifBinary——
 // enif_inspect_binary 给出的指针在本次 NIF 调用返回前一直有效，而
 // put_batch_atomic / commit 都是同步完成的，所以不需要拷贝。
-struct ParsedOp {
-    bool remove = false;
-    std::span<const std::byte> key;
-    std::span<const std::byte> value;
+//
+// libbitcask 6.6.2：value 是 doc map（形态同 put/3）时走 kPutDoc——文档与它的
+// 二级索引项可以同批落盘。DocInput 与它的向量缓冲放进 DocSlot，由 unique_ptr
+// 持有（地址稳定），op 只借指针。
+struct DocSlot {
+    DocInput doc;
+    std::vector<float> vec;   // doc.vector 指向这里
 };
 
-// Ops 列表 → ParsedOp 向量。接受两种形态：
-//   {put, Key, Value}   写
+struct ParsedOp {
+    enum class Kind : std::uint8_t { kPut, kRemove, kPutDoc } kind = Kind::kPut;
+    std::span<const std::byte> key;
+    std::span<const std::byte> value;
+    const DocInput* doc = nullptr;
+};
+
+// Ops 列表 → ParsedOp 向量。接受三种形态：
+//   {put, Key, Value}   写（Value 是 binary）
+//   {put, Key, DocMap}  写结构化文档（text / meta / vector / fields，同 put/3）
 //   {remove, Key}       删
 // 任何其它形态（元数不符 / 标签不认 / 元素不是 binary）一律 false → badarg。
 // 与 open/2 选项「不识别静默跳过」的宽松语义**刻意相反**：批里悄悄丢一条
 // 操作会让「原子」这个词失去意义。
-bool parse_ops(ErlNifEnv* env, ERL_NIF_TERM list, std::vector<ParsedOp>& out) {
+bool parse_ops(ErlNifEnv* env, ERL_NIF_TERM list, std::vector<ParsedOp>& out,
+               std::vector<std::unique_ptr<DocSlot>>& docs) {
     if (!enif_is_list(env, list)) return false;
     ERL_NIF_TERM head, tail = list;
     while (enif_get_list_cell(env, tail, &head, &tail)) {
@@ -68,19 +82,27 @@ bool parse_ops(ErlNifEnv* env, ERL_NIF_TERM list, std::vector<ParsedOp>& out) {
 
         ParsedOp op;
         ErlNifBinary key_bin{};
-        if (arity == 3 && tup[0] == atoms().put) {
+        if (arity == 3 && tup[0] == atoms().put && enif_is_map(env, tup[2])) {
+            if (!ensure_binary(env, tup[1], key_bin)) return false;
+            auto slot = std::make_unique<DocSlot>();
+            if (!parse_doc_map(env, tup[2], slot->doc, slot->vec)) return false;
+            op.kind = ParsedOp::Kind::kPutDoc;
+            op.key  = as_bytes(key_bin);
+            op.doc  = &slot->doc;
+            docs.push_back(std::move(slot));
+        } else if (arity == 3 && tup[0] == atoms().put) {
             ErlNifBinary val_bin{};
             if (!ensure_binary(env, tup[1], key_bin) ||
                 !ensure_binary(env, tup[2], val_bin)) {
                 return false;
             }
-            op.remove = false;
-            op.key    = as_bytes(key_bin);
-            op.value  = as_bytes(val_bin);
+            op.kind  = ParsedOp::Kind::kPut;
+            op.key   = as_bytes(key_bin);
+            op.value = as_bytes(val_bin);
         } else if (arity == 2 && tup[0] == atoms().remove) {
             if (!ensure_binary(env, tup[1], key_bin)) return false;
-            op.remove = true;
-            op.key    = as_bytes(key_bin);
+            op.kind = ParsedOp::Kind::kRemove;
+            op.key  = as_bytes(key_bin);
         } else {
             return false;
         }
@@ -105,15 +127,19 @@ ERL_NIF_TERM nif_cask_put_batch_atomic(ErlNifEnv* env, int /*argc*/,
     if (!h) return enif_make_badarg(env);
 
     std::vector<ParsedOp> parsed;
-    if (!parse_ops(env, argv[1], parsed)) return enif_make_badarg(env);
+    std::vector<std::unique_ptr<DocSlot>> docs;
+    if (!parse_ops(env, argv[1], parsed, docs)) return enif_make_badarg(env);
     if (parsed.empty()) return atoms().ok;   // 空批 = no-op，不碰 meta 纪元
 
     std::vector<Cask::BatchOp> ops;
     ops.reserve(parsed.size());
     for (const auto& p : parsed) {
+        using T = Cask::BatchOp::Type;
         ops.push_back(Cask::BatchOp{
-            p.remove ? Cask::BatchOp::Type::kRemove : Cask::BatchOp::Type::kPut,
-            p.key, p.value});
+            p.kind == ParsedOp::Kind::kRemove   ? T::kRemove
+            : p.kind == ParsedOp::Kind::kPutDoc ? T::kPutDoc
+                                                : T::kPut,
+            p.key, p.value, p.doc});
     }
 
     auto r = h->cask->put_batch_atomic(ops);
@@ -156,14 +182,18 @@ ERL_NIF_TERM nif_cask_txn_commit(ErlNifEnv* env, int argc,
     }
 
     std::vector<ParsedOp> parsed;
-    if (!parse_ops(env, argv[1], parsed)) return enif_make_badarg(env);
+    std::vector<std::unique_ptr<DocSlot>> docs;
+    if (!parse_ops(env, argv[1], parsed, docs)) return enif_make_badarg(env);
 
     std::vector<TxnOp> ops;
     ops.reserve(parsed.size());
     for (const auto& p : parsed) {
+        using T = TxnOp::Type;
         ops.push_back(TxnOp{
-            p.remove ? TxnOp::Type::kRemove : TxnOp::Type::kPut,
-            p.key, p.value});
+            p.kind == ParsedOp::Kind::kRemove   ? T::kRemove
+            : p.kind == ParsedOp::Kind::kPutDoc ? T::kPutDoc
+                                                : T::kPut,
+            p.key, p.value, p.doc});
     }
 
     TxnCask txn(h->cask.get(), sync);
