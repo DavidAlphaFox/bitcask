@@ -227,9 +227,16 @@ errors** (since 6.1.0) — they call for different remedies, hence the split:
 
 ## Atomic batches and multi-key transactions (6.0.0)
 
-`Ops :: [{put, Key, Value} | {remove, Key}]`, with `Key`/`Value` both
-`binary()`. Any unrecognized shape (wrong tag, wrong arity, non-binary) raises
-`badarg` — entries are **never silently dropped**, since quietly losing one would
+`Ops :: [{put, Key, Value} | {remove, Key}]`. `Key` is a `binary()`; `Value` is a `binary()` or a doc map
+in the same shape as `put/3` (`text` / `meta` / `vector` / `fields`; supported since libbitcask 6.6.2), so a
+document and its secondary-index entries can land in one batch.
+- With an embedder configured, doc maps that have `text` but no `vector` are embedded with a single
+  `embed_batch` call, as in `put_docs/2`; if embedding fails, nothing in the batch is written.
+- A wrong vector dimension rejects the whole batch with no side effects.
+- In KV mode a doc map keeps only its text, the same as `put/3`.
+
+Any unrecognized shape (wrong tag, wrong arity, a key that is not a binary, a value that is neither a binary
+nor a map) raises `badarg` — entries are **never silently dropped**, since quietly losing one would
 make "atomic" meaningless.
 
 After a crash or power loss the batch **either fully applies or does not apply at
@@ -482,18 +489,21 @@ ok = bitcask_query:drop_index(H, <<"year">>).
 - **Storage**: indexes live in the same cask as the data under the reserved prefix `<<0,"bitcask_query:">>`.
   Full scans skip those keys, and `bitcask_query:put` rejects keys with that prefix. In index mode the entries
   are empty-text documents: full-text search never hits them, and in our measurements they do not change BM25 scores.
-- **Consistency** (⚠️ not atomic): libbitcask atomic batches cannot carry documents with meta, so a document
-  and its index entries cannot be written in one batch (reported upstream).
-  - Writes take the key's write lock, then add new entries, write the document, and remove old entries. A crash
-    part-way can leave stale entries but never drops one.
-  - Reads check every candidate against the document's current value before evaluating the full `where`, so
-    stale entries never produce wrong or duplicate rows.
-  - Cost: one extra `get` per hit, plus a lock and a read of the old value on every write.
+- **Consistency**: every `bitcask_query:put/delete` is one `bitcask_txn` transaction.
+  - It locks the key and reads the old meta, then commits the document, the new entries and the removal of the
+    old entries in a single commit batch (supported since libbitcask 6.6.2).
+  - A crash leaves either the whole batch or none of it, and concurrent writes to the same key are serialized by
+    the lock.
+  - Commits use `no_sync`, so durability matches `bitcask:put`.
+  - Reads still check every candidate against the document's current value before evaluating the full `where`.
+    That check exists for writes that bypass `bitcask_query:put`, and costs almost nothing, since a hit's row
+    already needs a `get` of the document.
 - ⚠️ **Writes to indexed fields must go through `bitcask_query:put/delete`.** If a direct `bitcask:put` changes
   meta, the new value is not findable through the index, and the old value's stale entry is filtered out on read.
   Fix it with `drop_index` followed by `create_index`.
 - `create_index` registers the index as `building` first, so writes start maintaining it; after the backfill it
-  becomes `ready`, and only then do queries use it.
+  becomes `ready`, and only then do queries use it. The backfill does not take key locks, so racing writes can
+  leave stale entries, which the read check filters out; nothing is missed.
 
 Why not match specs: values are analyzed strings, so text conditions can only be answered by
 the inverted index (tokenized in C++), and structured conditions live in `meta`. The planner

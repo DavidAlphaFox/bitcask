@@ -209,8 +209,14 @@ embedder 生成并写入向量；显式传 `vector` 则跳过。
 
 ## 原子批与多键事务（6.0.0）
 
-`Ops :: [{put, Key, Value} | {remove, Key}]`，`Key`/`Value` 都是 `binary()`。
-形态不认（标签错 / 元数错 / 非 binary）一律 `badarg`——**绝不静默丢弃**，
+`Ops :: [{put, Key, Value} | {remove, Key}]`。`Key` 是 `binary()`；`Value` 是 `binary()`，
+或者 doc map（与 `put/3` 同形：`text` / `meta` / `vector` / `fields`；随 libbitcask 6.6.2 支持）。
+写 doc map 时，文档和它的二级索引项可以同批落盘。
+- 配了 embedder 时，批里「有 `text`、没有 `vector`」的文档会自动 embed，和 `put_docs/2` 一样只调一次 `embed_batch`；embed 失败则整批不写。
+- 向量维度不对时整批拒绝，没有任何副作用。
+- KV 模式下 doc map 只保留 text，与 `put/3` 一致。
+
+形态不认（标签错、元数错、key 不是 binary、value 既不是 binary 也不是 map）一律报 `badarg`——**绝不静默丢弃**，
 批里悄悄少一条会让「原子」失去意义。
 
 崩溃/掉电后**整批要么全生效要么全不生效**（盘上批头声明区间，恢复时区间不完整
@@ -432,13 +438,16 @@ ok = bitcask_query:drop_index(H, <<"year">>).
 - **结果顺序**：按「索引值、再按主键」升序，和全表扫描的「按 key 升序」不同。分页照常可用，游标是下一个索引键。
 - **存储**：索引和数据在同一个 cask 里，用保留前缀 `<<0,"bitcask_query:">>` 隔开。全表查询会跳过这些 key，
   `bitcask_query:put` 拒绝写这个前缀。在索引模式下，索引项是空 text 的文档，全文检索不会命中，实测也不影响 BM25 打分。
-- **一致性**（⚠️ 不是原子的）：libbitcask 的原子批写不进带 meta 的文档，所以文档和索引项没法同批落盘（已报上游）。
-  - 写入时拿该 key 的写锁，依次写新索引项、写文档、删旧索引项。中途崩溃最坏只会多出过期项，不会漏项。
-  - 读取时，每个候选都要回表核对文档当前值是否就是索引项里的值，再判断整个 `where`。所以过期项不会产出错行或重复行。
-  - 代价：每条命中都要多一次 `get`；每次写入都要多一次加锁和读旧值。
+- **一致性**：每次 `bitcask_query:put/delete` 都是一个 `bitcask_txn` 事务。
+  - 先锁住这个 key、读出旧 meta，再把「文档 + 新索引项 + 删旧索引项」放进同一个提交批（随 libbitcask 6.6.2 支持）。
+  - 崩溃时整批要么全在、要么全不在；并发写同一个 key 由锁串行。
+  - 提交用 `no_sync`，持久性与 `bitcask:put` 相同。
+  - 读取时仍会回表核对：文档当前值必须就是索引项里的值，再判断整个 `where`。这一步挡的是绕过 `bitcask_query:put` 的写入；
+    命中行本来就要 `get` 文档，所以几乎不增加开销。
 - ⚠️ **索引字段的写入必须走 `bitcask_query:put/delete`**。直接用 `bitcask:put` 改了 meta 的话，新值查不到，
   旧值的过期项会被读时校验挡掉。修复方法是 `drop_index` 后再 `create_index`。
 - 建索引时先登记为 `building`，这时写入就开始维护索引；回填完成后转为 `ready`，之后查询才会使用它。
+  回填不加 key 锁，和并发写交错时可能多出过期项，会被读时校验挡掉，不会漏。
 
 为什么不用 match spec：值是要分词的字符串，全文条件只能交给倒排索引（在 C++ 侧分词），
 结构化条件只能写在 `meta` 上。规划器按下面的顺序选择从哪里驱动：
