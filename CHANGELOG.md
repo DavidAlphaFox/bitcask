@@ -3,23 +3,48 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
-## [Unreleased]
+## [6.7.1] — 2026-10-06
+
+新增结构化查询 DSL，升级 libbitcask **6.6.0 → 6.6.1**（C API / ABI 纯加法，`SOVERSION` 不变，盘上格式不变），另外本地嵌入后端的 llama.cpp 升到 `b11434`。
+libbitcask 6.6.1 修的是我们报上去的 `feedbacks/2026-10-06-meta-filter-query-gaps.md` 五条。
+
+### Fixed（随 libbitcask 6.6.1）
+
+- **带 meta filter 的检索不再静默少返回**。旧行为是只多取一次 `max(K×4,64)` 个候选再后过滤：
+  1000 篇里满足条件的有 100 篇，`search_text/4` 取 K=10 只返回 6 条。现在引擎会补取到 `K` 条，
+  返回少于 `K` 条就说明满足条件的只有这么多。
+- **同分命中排序稳定**。旧行为是 top-K 按 key 升序选、按 ord 降序输出，导致 K=5 和 K=1000 的
+  结果互相矛盾。现在按 (段次序, 段内写入序) 稳定排序，小 K 的结果是大 K 结果的前缀。
+  ⚠️ 可见变化：同分命中的先后顺序变了，大体上先写入的排在前面。
+
+### Changed
+
+- **本地嵌入后端升级 llama.cpp `b10859` → `b11434`**（opt-in，`BITCASK_WITH_LLAMA=1`；ggml 0.23 → 0.26）。
+  NIF 源码不用改：用到的 51 个 llama/ggml 接口全都还在，没有被弃用的，注入的构建选项也都有效。
+  构建仍是 14 个 CPU 变体，Vulkan 自动打开，没装 CUDA Toolkit 时 CUDA 自动关闭。
+  Qwen3-Embedding-0.6B-Q8_0、8 vCPU 实测：
+  - 短查询 33–35 → **22 ms**；
+  - 约 280 token 的文档 890 → **720 ms**；
+  - 语义自检差值 0.590，与升级前一致。
 
 ### Added
 
+- **`search_phrase/4`、`search_fields/4`、`search_near/5`、`search_fuzzy/5`、`search_wildcard/4`**：
+  末位加 meta `Filter` 参数（`undefined` 表示不过滤），语义和补取策略与 `search_text/4` 相同。
+- **`range/3`、`range_fold/5` 新增选项**：
+  - `{want_meta, true}`：`V` 改为 `#{text, meta}`，与 `get` 同形，text 和 meta 出自同一次读；
+  - `{filter, F}`：在 C++ 侧逐条按 meta 筛选，不通过的条目连 value 都不拷贝。
 - **`bitcask_query:q/2` 结构化查询 DSL**：一个查询里组合三类条件——key（`eq` / `prefix` / `range`）、
   全文（`match` / `phrase` / `fields` / `near` / `fuzzy` / `wildcard`）、meta 上的 `where`
   （`eq/neq/gt/gte/lt/lte/in/exists`，可用 `and`/`or` 嵌套）；另有 `limit` 与 `select`。
-  规划器选一个索引驱动：有全文条件走倒排（`match` 把 `where` 下推成引擎 filter），只有 key 条件走
-  `range`，都没有就全表 `range`。不用 match spec 的原因：值要经过分词，全文条件只能交给倒排。
-  `where` 的 BEAM 侧求值和引擎 MetaFilter 逐条一致。
+  规划器选一个索引驱动：有全文条件走倒排，只有 key 条件走 `range`，都没有就全表 `range`；
+  两条路径都把 `where` 下推给引擎。不用 match spec 的原因：值要经过分词，全文条件只能交给倒排。
 - **`bitcask:decode_meta/1`**：`encode_meta/1` 的反方向（新 NIF `cask_decode_meta`）。
 
-### 已知问题（上游，已报 libbitcask `feedbacks/2026-10-06-meta-filter-query-gaps.md`）
+### 文档
 
-- 带 meta filter 的 `search_text` 会静默少返回（只多取一次 `max(K×4,64)` 个候选再后过滤；
-  1000 篇文档里满足条件的有 100 篇，K=10 只返回 6 条）。`bitcask_query` 会补齐，直接调 `search_text/4` 不会。
-- 同分命中的 top-K 按 key 升序选取、按 ord 降序输出，所以大 K 的结果不是小 K 结果的延长。
+- meta filter 一节按 NIF 实际行为重写：8 种操作符、`Key` 只收 binary、`children` 只收 map、
+  补上求值语义。几处示例原来写的是 `field =>`，NIF 只认 `key =>`，照抄会报 `badarg`，已改正。
 
 ## [6.7.0] — 2026-09-29
 

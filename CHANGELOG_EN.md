@@ -3,26 +3,60 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [6.7.1] — 2026-10-06
+
+Adds a structured query DSL, upgrades libbitcask **6.6.0 → 6.6.1**, and moves the local embedding backend to llama.cpp `b11434`. The C API / ABI change is additive only, `SOVERSION` is
+unchanged, and so is the on-disk format. libbitcask 6.6.1 fixes the five items we reported in
+`feedbacks/2026-10-06-meta-filter-query-gaps.md`.
+
+### Fixed (via libbitcask 6.6.1)
+
+- **Filtered searches no longer silently return too few hits.** Previously the engine fetched
+  `max(K×4,64)` candidates once and then post-filtered: with 100 matching documents out of 1000,
+  `search_text/4` with K=10 returned 6. Now it keeps fetching until it has `K` hits, so fewer than
+  `K` means that is all there is.
+- **Equal-score hits are ordered stably.** Previously top-K selection was by key ascending but
+  output was by ord descending, so K=5 and K=1000 disagreed. Hits are now ordered by (segment order,
+  write order within a segment), and a smaller K's result is a prefix of a larger K's.
+  ⚠️ Visible change: the relative order of equal-score hits differs, with earlier writes now
+  roughly first.
+
+### Changed
+
+- **Local embedding backend upgraded to llama.cpp `b11434`** from `b10859` (opt-in,
+  `BITCASK_WITH_LLAMA=1`; ggml 0.23 → 0.26). No NIF source changes: all 51 llama/ggml calls the
+  NIF uses still exist, none are deprecated, and the injected build options are still valid. The
+  build still produces 14 CPU variants; Vulkan is enabled automatically, and CUDA is disabled
+  automatically when no CUDA Toolkit is installed.
+  Measured with Qwen3-Embedding-0.6B-Q8_0 on 8 vCPUs:
+  - short query 33–35 → **22 ms**;
+  - ~280-token document 890 → **720 ms**;
+  - semantic self-check margin 0.590, the same as before the upgrade.
 
 ### Added
 
+- **`search_phrase/4`, `search_fields/4`, `search_near/5`, `search_fuzzy/5`, `search_wildcard/4`**:
+  a trailing meta `Filter` (`undefined` = none), with the same semantics and refill behaviour as
+  `search_text/4`.
+- **New `range/3` / `range_fold/5` options**:
+  - `{want_meta, true}`: `V` becomes `#{text, meta}`, the same shape as `get`, with text and meta
+    taken from the same read;
+  - `{filter, F}`: filters on meta per entry in C++; entries that fail are not even copied.
 - **`bitcask_query:q/2` structured query DSL**: combines three kinds of condition in one query —
   key (`eq` / `prefix` / `range`), full text (`match` / `phrase` / `fields` / `near` / `fuzzy` /
   `wildcard`) and a `where` on meta (`eq/neq/gt/gte/lt/lte/in/exists`, nestable with `and`/`or`) —
   plus `limit` and `select`. The planner drives from one index: the inverted index when there is a
-  text condition (`match` pushes `where` down as an engine filter), `range` for key-only queries, and a
-  full-table `range` otherwise. Not match specs, because values are tokenized and text conditions can
-  only be answered by the index. BEAM-side `where` evaluation matches the engine MetaFilter exactly.
+  text condition, `range` for key-only queries, and a full-table `range` otherwise. Both paths push
+  `where` down to the engine. Not match specs, because values are tokenized and text conditions can
+  only be answered by the index.
 - **`bitcask:decode_meta/1`**: inverse of `encode_meta/1` (new NIF `cask_decode_meta`).
 
-### Known issues (upstream, reported as libbitcask `feedbacks/2026-10-06-meta-filter-query-gaps.md`)
+### Docs
 
-- A filtered `search_text` silently returns too few hits (it overfetches `max(K×4,64)` candidates
-  once, then post-filters; with 100 matching documents out of 1000, K=10 returns 6). `bitcask_query`
-  fills the gap; calling `search_text/4` directly does not.
-- For equal scores, top-K selection is by key ascending but output is by ord descending, so a
-  larger K's result does not extend a smaller K's.
+- Rewrote the meta-filter section to match what the NIF actually accepts: 8 operators, `Key` must
+  be a binary, `children` takes only maps, and the evaluation semantics are now documented. Several
+  examples used `field =>`, but the NIF only accepts `key =>` and returns `badarg` otherwise; they
+  are fixed.
 
 ## [6.7.0] — 2026-09-29
 
