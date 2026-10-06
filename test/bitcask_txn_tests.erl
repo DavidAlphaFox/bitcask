@@ -587,6 +587,24 @@ txn_process_death_test_() ->
 %% index_fun / 跨 cask
 %% ===================================================================
 
+doc_map_write_test_() ->
+    {"write/3 收 doc map：读自己的写给 map；提交后 meta 落盘（libbitcask 6.6.2）",
+     fun() ->
+        with_dir(fun(D) ->
+            H = bitcask:open(D, [read_write, {analyzer, whitespace}]),
+            Doc = #{text => <<"hello">>, meta => bitcask:encode_meta(#{<<"n">> => 1})},
+            {atomic, Seen} = bitcask_txn:transaction(
+                               H, fun(Tx) ->
+                                          ok = bitcask_txn:write(Tx, <<"k">>, Doc),
+                                          ok = bitcask_txn:lock_key(Tx, <<"other">>, write),
+                                          bitcask_txn:read(Tx, <<"k">>)
+                                  end),
+            ?assertEqual({ok, Doc}, Seen),
+            ?assertEqual({ok, Doc}, bitcask:get(H, <<"k">>)),
+            bitcask:close(H)
+        end)
+    end}.
+
 index_fun_test_() ->
     {"index_fun 的额外 op 与主数据同批原子提交；与缓冲 key 重合 → index_conflict",
      fun() ->

@@ -269,8 +269,11 @@ read(#bitcask_txn_ctx{handle = Handle} = Tx, Key, Lock)
         error            -> bitcask:get(Handle, Key)
     end.
 
--spec write(term(), binary(), binary()) -> ok.
-write(#bitcask_txn_ctx{id = TxnId} = Tx, Key, Val) when is_binary(Key), is_binary(Val) ->
+%% Val 是 binary，或 doc map（与 bitcask:put/3 同形；libbitcask 6.6.2 起提交批
+%% 收结构化文档，meta / vector / fields 与数据同批落盘）。
+-spec write(term(), binary(), binary() | map()) -> ok.
+write(#bitcask_txn_ctx{id = TxnId} = Tx, Key, Val)
+  when is_binary(Key), (is_binary(Val) orelse is_map(Val)) ->
     Buf = buffer(Tx),
     not_reserved(Key),
     lock(Tx, Key, write),
