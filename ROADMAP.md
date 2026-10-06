@@ -6,6 +6,30 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 6.7.1 落地
+
+### 结构化查询 DSL + libbitcask 6.6.1 ✅
+
+值是要分词的字符串，Mnesia 那种 match spec / QLC 套不上：全文条件只能交给倒排，
+结构化条件只能写在 meta 上。所以做成 DSL 加一个小规划器——`bitcask_query:q/2`
+把 key、全文、meta `where` 三类条件拆开，选一个索引驱动，`where` 下推给引擎。
+`where` 的 BEAM 侧求值与引擎 MetaFilter 逐条一致，测试拿检索下推、range 下推、
+BEAM 求值三条路径互相对照。
+
+做的过程中按代码对账，找出上游 5 处问题，报到 libbitcask
+`feedbacks/2026-10-06-meta-filter-query-gaps.md`：带 filter 的检索静默少返回、同分
+top-K 选取和输出顺序不一致（offset 翻页会出重复页）、迭代器解出 meta 又丢掉、
+filter 只挂在三种检索上、没有只按 meta 筛选的扫描。上游 6.6.1 全部收下，这边随即
+适配：新增各检索的 filter 参数版本与 range 的 `want_meta` / `filter`，查询层删掉
+为绕开这些问题写的补丁。
+
+### llama.cpp 升级 b10859 → b11434 ✅
+
+本地嵌入后端（opt-in）的子模块升级：`ca86fb2` → `5e03bdd`（tag `b11434`），ggml 0.23 → 0.26。
+不涉及 libbitcask，核心 `bitcask_cpp.so` 不变。NIF 源码零改动：用到的 51 个 llama/ggml 接口
+全都还在，没有被弃用的。CPU 版本数（14）和 Vulkan 自动探测都没变。真实模型跑 llama 测试
+25/25 通过；CPU 嵌入短查询 33–35 → 22 ms，语义自检差值 0.590 与升级前一致。
+
 ## 6.7.0 落地
 
 ### 事务层：提交中途放锁修复 + 幂等键 ✅

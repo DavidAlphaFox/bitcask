@@ -584,6 +584,21 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## Q1 — 结构化查询 DSL + libbitcask 6.6.1 适配（6.7.1）
+
+> 起因：要「类似 mnesia 的查询语句」。值要经过分词，match spec / QLC 套不上，改做 DSL。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **Q1-1** | `bitcask:decode_meta/1`（NIF `cask_decode_meta`，与 `encode_meta` 对称：null → `undefined`，坏 blob → `badarg`）。 | ✅ |
+| **Q1-2** | `bitcask_query:q/2`：`key`（eq/prefix/range）+ `text`（match/phrase/fields/near/fuzzy/wildcard）+ `where`（8 种操作符 + and/or 嵌套）+ `limit` / `select`；查询不合法 → `{error, {bad_query, _}}`。规划：有 text 走 `search_*`，只有 key 走 `range`，都没有走全表 `range`，`no_index` 回落 `fold`。`where` 的 BEAM 侧求值与 `meta_filter.hpp` 逐条对齐（类型不同不相等、缺失字段按 null、无 meta 过不了任何条件）。 | ✅ |
+| **Q1-3** | 上游反馈 `~/workspace/libbitcask/feedbacks/2026-10-06-meta-filter-query-gaps.md`，5 条（2 条结果错、不报错，都实际复现）。⚠️ 坑：同分时 K=5 返回 d5..d1，K=1000 时 d1 排最后——「翻倍 K 后只处理新增部分」会漏结果（实测查出 0 条），改成按 key 缓存、每轮从头组装。 | ✅ |
+| **Q1-4** | 文档：meta filter 一节按 NIF 实测行为重写（`Key` 只收 binary、`children` 只收 map、8 种操作符、求值语义）；5 处示例里的 `field =>` 改为 `key =>`（原写法照抄会 `badarg`）。 | ✅ |
+| **Q1-5** | 子模块 libbitcask 6.6.0 → **6.6.1**（上游收下全部 5 条）。NIF：phrase/fields/near/fuzzy/wildcard 多注册一个带末位 Filter 的 arity；range 收 `{want_meta, true}`（条目变 5 元组，门面转成 `#{text, meta}`）和 `{filter, F}`。上游 `RangeOptions::filter` 是借用指针，所以 filter 由资源句柄持有，析构时先放迭代器。查询层删掉绕开上游问题的补丁，五种检索都下推 `where`，扫描路径不再逐行 `get`。测试 +13（含同分前缀稳定、filter 补满 K 两条上游回归）。全量 eunit **292/292**，xref / dialyzer 干净。 | ✅ |
+| **Q1-6** | **6.7.1 发版**：C API 纯加法、盘上格式不变、对既有调用方唯一可见变化是同分命中的先后顺序 → patch。 | ✅ |
+
+---
+
 ## 明确排除（V7+ 或永久取消）
 
 | 条目 | 决策 | 理由 |

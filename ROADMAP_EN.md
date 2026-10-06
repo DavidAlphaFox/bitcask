@@ -6,6 +6,33 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 6.7.1 shipped
+
+### Structured query DSL + libbitcask 6.6.1 ✅
+
+Values are tokenized strings, so Mnesia-style match specs / QLC do not fit: text conditions can
+only be answered by the inverted index, and structured conditions live in meta. Hence a DSL with a
+small planner: `bitcask_query:q/2` splits a query into key, full-text and meta `where` conditions,
+drives from one index and pushes `where` down to the engine. BEAM-side `where` evaluation matches
+the engine MetaFilter exactly; the tests cross-check search pushdown, range pushdown and BEAM
+evaluation against each other.
+
+Reviewing the engine code along the way turned up five upstream issues, filed as libbitcask
+`feedbacks/2026-10-06-meta-filter-query-gaps.md`: filtered searches silently returned too few hits;
+equal-score top-K selection disagreed with the output order (so offset paging repeated pages);
+iterators decoded meta and then dropped it; only three kinds of search accepted a filter; and there
+was no meta-only scan. Upstream 6.6.1 took all five. This release adapts to it: filter versions of
+each search, `want_meta` / `filter` on `range`, and the query layer's workarounds removed.
+
+### llama.cpp upgrade b10859 → b11434 ✅
+
+Submodule upgrade for the opt-in local embedding backend: `ca86fb2` → `5e03bdd` (tag `b11434`),
+ggml 0.23 → 0.26. No libbitcask change; the core `bitcask_cpp.so` is untouched. No NIF source
+changes: all 51 llama/ggml calls it uses still exist and none are deprecated. The CPU variant
+count (14) and Vulkan auto-detection are unchanged. The llama tests pass 25/25 against a real
+model; CPU short-query embedding went from 33–35 ms to 22 ms, and the semantic self-check margin
+is 0.590, the same as before.
+
 ## 6.7.0 shipped
 
 ### Transaction layer: mid-commit lock release fix + idempotency keys ✅
