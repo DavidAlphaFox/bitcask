@@ -386,42 +386,68 @@ put(Handle, Key, Value) ->
 %%     {error, {embed_failed, R}} / {error, {embed_failed, [{Key, R}, ...]}}。
 %%   * embed 都成功后按列表顺序逐条 put；某条 put 失败 → 停下，返回
 %%     {error, {Key, Reason}}。⚠️ **不原子**：前面已写入的保留（要原子用
-%%     put_batch_atomic，但它只收 binary 值、不做 embed）。
+%%     put_batch_atomic——libbitcask 6.6.2 起它也收 doc map，并同样做 embed）。
 %%   * 无 embedder（open 时没配）或文档已带 vector / 不是 #{text := _} → 原样
 %%     逐条 put，不碰 embedder。
 %%   * 空列表 → ok。
 put_docs(_Handle, []) ->
     ok;
-put_docs({_Ref, Ctx} = Handle, Docs) when is_list(Docs) ->
-    Need = case Ctx of
-               undefined -> [];
-               _ -> [{K, T} || {K, #{text := T} = D} <- Docs,
-                               is_binary(T), not is_map_key(vector, D)]
-           end,
+put_docs(Handle, Docs) when is_list(Docs) ->
+    Keys = [K || {K, _} <- Docs],
+    case fill_vectors(Handle, Keys, [V || {_, V} <- Docs]) of
+        {ok, Filled}   -> put_docs_seq(Handle, lists:zip(Keys, Filled));
+        {error, _} = E -> E
+    end.
+
+%% 自动 embed 的批量版（put_docs / put_batch_atomic / txn_commit 共用）：
+%% Values 里「#{text := binary()} 且没有 vector」的文档收成一批，一次
+%% embed_batch 补上 vector；其余原样。按位置配对——同一个 key 在批里出现
+%% 多次、文本不同时也各拿各的向量。Keys 与 Values 等长，只用于报错。
+%%   无 embedder / 不需要 embed → {ok, Values}
+%%   整批失败 → {error, {embed_failed, R}}
+%%   有条目失败 → {error, {embed_failed, [{Key, R}]}}，一条都不补
+fill_vectors({_Ref, undefined}, _Keys, Values) ->
+    {ok, Values};
+fill_vectors({_Ref, Ctx}, Keys, Values) ->
+    Indexed = lists:zip(lists:seq(1, length(Values)), Values),
+    Need = [{I, T} || {I, #{text := T} = D} <- Indexed,
+                      is_binary(T), not is_map_key(vector, D)],
     case Need of
-        [] ->
-            put_docs_seq(Handle, Docs);
+        [] -> {ok, Values};
         _ ->
             case bitcask_embedder:embed_batch(Ctx, [T || {_, T} <- Need]) of
                 {error, R} ->
                     {error, {embed_failed, R}};
                 {ok, Results} ->
-                    Paired = lists:zip([K || {K, _} <- Need], Results),
-                    case [{K, R} || {K, {error, R}} <- Paired] of
+                    Paired = lists:zip([I || {I, _} <- Need], Results),
+                    case [{lists:nth(I, Keys), R} || {I, {error, R}} <- Paired] of
                         [] ->
-                            Vecs = maps:from_list([{K, V} || {K, {ok, V}} <- Paired]),
-                            Filled = [case D of
-                                          #{text := T} when is_binary(T),
-                                                            not is_map_key(vector, D) ->
-                                              {K, D#{vector => maps:get(K, Vecs)}};
-                                          _ -> {K, D}
-                                      end || {K, D} <- Docs],
-                            put_docs_seq(Handle, Filled);
+                            Vecs = maps:from_list([{I, V} || {I, {ok, V}} <- Paired]),
+                            {ok, [case Vecs of
+                                      #{I := V} -> D#{vector => V};
+                                      _         -> D
+                                  end || {I, D} <- Indexed]};
                         Failed ->
                             {error, {embed_failed, Failed}}
                     end
             end
     end.
+
+%% 批 ops 里 {put, K, DocMap} 的自动 embed：只动 doc map，顺序与形态不变。
+fill_batch_vectors(Handle, Ops) ->
+    Puts = [{K, V} || {put, K, V} <- Ops, is_map(V)],
+    case Puts of
+        [] -> {ok, Ops};
+        _ ->
+            case fill_vectors(Handle, [K || {K, _} <- Puts], [V || {_, V} <- Puts]) of
+                {ok, Filled}   -> {ok, refill(Ops, Filled)};
+                {error, _} = E -> E
+            end
+    end.
+
+refill([{put, K, V} | Ops], [F | Fs]) when is_map(V) -> [{put, K, F} | refill(Ops, Fs)];
+refill([Op | Ops], Fs)                               -> [Op | refill(Ops, Fs)];
+refill([], [])                                       -> [].
 
 %% 逐条 put；到这里的 #{text} 文档要么已带 vector、要么没有 embedder，put/3
 %% 都不会再去 embed。
@@ -618,7 +644,10 @@ range_loop(IterRef, Fun, Acc) ->
 %% =========================================================================
 %% v5.1.0：跨崩溃原子批 / 多键事务
 %%
-%% Ops :: [{put, Key, Value} | {remove, Key}]，Key/Value 都是 binary。
+%% Ops :: [{put, Key, Value} | {remove, Key}]，Key 是 binary；Value 是 binary，
+%% 或 doc map（与 put/3 同形：text / meta / vector / fields，libbitcask 6.6.2
+%% kPutDoc）——文档与它的二级索引项可以同批落盘。配了 embedder 时，doc map
+%% 的自动 embed 与 put_docs/2 相同（一次 embed_batch；失败则整批不写）。
 %%
 %% 崩溃/掉电后**整批要么全生效要么全不生效**——盘上批头声明区间，恢复时
 %% 区间不完整即整批截断。原子性与持久性正交：没 fsync 就掉电仍可能整批
@@ -632,11 +661,28 @@ range_loop(IterRef, Fun, Acc) ->
 %% =========================================================================
 
 %% 裸原子批：允许批内同 key 多次（依序 apply = 批内 LWW），空批是 no-op。
-put_batch_atomic(Handle, Ops) ->
-    case bitcask_cpp_nifs:cask_put_batch_atomic(ref(Handle), Ops) of
-        ok    -> ok;
-        Other -> normalize_error(Other)   % 裸 atom 故障归一，同 range_fold
+put_batch_atomic(Handle, Ops0) ->
+    with_vectors(Handle, Ops0, fun(Ops) ->
+        case bitcask_cpp_nifs:cask_put_batch_atomic(ref(Handle), Ops) of
+            ok    -> ok;
+            Other -> normalize_error(Other)   % 裸 atom 故障归一，同 range_fold
+        end
+    end).
+
+with_vectors(Handle, Ops0, Fun) ->
+    case is_proper_list(Ops0) of
+        true ->
+            case fill_batch_vectors(Handle, Ops0) of
+                {ok, Ops}      -> Fun(Ops);
+                {error, _} = E -> E
+            end;
+        false ->
+            Fun(Ops0)             % 不是真列表：原样交给 NIF 报 badarg
     end.
+
+is_proper_list([_ | T]) -> is_proper_list(T);
+is_proper_list([])      -> true;
+is_proper_list(_)       -> false.
 
 %% 事务提交：比 put_batch_atomic 多一层校验——批非空、key 非空、key 互不
 %% 重复、不占用 "_txn:" 保留前缀。违反任一条返回
@@ -645,22 +691,26 @@ txn_commit(Handle, Ops) -> txn_commit(Handle, Ops, sync_on_commit).
 
 %% Sync :: sync_on_commit（默认，提交点显式 fsync，防掉电）
 %%       | no_sync（依赖 {sync_strategy, ...}，只防进程崩溃）
-txn_commit(Handle, Ops, Sync) when Sync =:= sync_on_commit;
-                                   Sync =:= no_sync ->
-    case bitcask_cpp_nifs:cask_txn_commit(ref(Handle), Ops, Sync) of
-        ok    -> ok;
-        Other -> normalize_error(Other)
-    end.
+txn_commit(Handle, Ops0, Sync) when Sync =:= sync_on_commit;
+                                    Sync =:= no_sync ->
+    with_vectors(Handle, Ops0, fun(Ops) ->
+        case bitcask_cpp_nifs:cask_txn_commit(ref(Handle), Ops, Sync) of
+            ok    -> ok;
+            Other -> normalize_error(Other)
+        end
+    end).
 
 %% 同 /3，执行期间 pin 住提交令牌（bitcask_cpp_nifs:txn_commit_token/2）。
 %% bitcask_txn 的 locker 靠令牌的析构通知判断"这批不会再动盘"再放锁；一般
 %% 应用用不上。
-txn_commit(Handle, Ops, Sync, Token)
+txn_commit(Handle, Ops0, Sync, Token)
   when Sync =:= sync_on_commit; Sync =:= no_sync ->
-    case bitcask_cpp_nifs:cask_txn_commit(ref(Handle), Ops, Sync, Token) of
-        ok    -> ok;
-        Other -> normalize_error(Other)
-    end.
+    with_vectors(Handle, Ops0, fun(Ops) ->
+        case bitcask_cpp_nifs:cask_txn_commit(ref(Handle), Ops, Sync, Token) of
+            ok    -> ok;
+            Other -> normalize_error(Other)
+        end
+    end).
 
 %% =========================================================================
 %% 目录级 merge

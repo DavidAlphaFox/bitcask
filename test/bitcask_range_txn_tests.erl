@@ -287,6 +287,61 @@ batch_bad_shape_test_() ->
     end}.
 
 %% ===================================================================
+%% 批内结构化文档（libbitcask 6.6.2 kPutDoc）
+%% ===================================================================
+
+batch_doc_test_() ->
+    {"原子批 / 事务收 doc map：meta 与 put/3 同样落盘、可检索；坏向量整批零副作用",
+     fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, [read_write, {analyzer, whitespace}, {vector_dim, 4}]),
+            Meta = bitcask:encode_meta(#{<<"c">> => <<"red">>}),
+            Vec = << <<X:32/float-little>> || X <- [1.0, 0.0, 0.0, 0.0] >>,
+            ok = bitcask:put_batch_atomic(
+                   R, [{put, <<"d1">>, #{text => <<"apple pie">>, meta => Meta, vector => Vec}},
+                       {put, <<"ix">>, <<>>},
+                       {remove, <<"nope">>}]),
+            ?assertEqual({ok, #{text => <<"apple pie">>, meta => Meta}}, bitcask:get(R, <<"d1">>)),
+            ?assertMatch({ok, [{<<"d1">>, _, _}]},
+                         bitcask:search_text(R, <<"apple">>, 5,
+                                             [#{key => <<"c">>, op => eq, value => <<"red">>}])),
+            ?assertMatch({ok, [{<<"d1">>, _, _} | _]}, bitcask:search_vector(R, Vec, 1)),
+            ok = bitcask:txn_commit(R, [{put, <<"d2">>, #{text => <<"pear">>, meta => Meta}},
+                                        {remove, <<"ix">>}]),
+            ?assertEqual({ok, #{text => <<"pear">>, meta => Meta}}, bitcask:get(R, <<"d2">>)),
+            %% 维度错：整批拒，前面那条 binary put 也不落
+            ?assertMatch({error, {invalid_option, _}},
+                         bitcask:put_batch_atomic(
+                           R, [{put, <<"k0">>, <<"plain">>},
+                               {put, <<"bad">>, #{text => <<"y">>,
+                                                  vector => <<0:32/float-little>>}}])),
+            ?assertEqual(not_found, bitcask:get(R, <<"k0">>)),
+            %% 坏形态的 doc map（vector 不是 4 字节的倍数）→ badarg
+            ?assertError(badarg, bitcask:put_batch_atomic(
+                                   R, [{put, <<"b">>, #{text => <<"y">>, vector => <<1, 2, 3>>}}])),
+            bitcask:close(R)
+        end)
+    end}.
+
+batch_doc_auto_embed_test_() ->
+    {"配了 embedder：批里 #{text} 无 vector 的文档自动 embed（一次 embed_batch）；同 key 多次各拿各的",
+     fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, [read_write, {analyzer, whitespace},
+                                 {embedder, {{custom, bitcask_embedder_mock}, #{}}}]),
+            ok = bitcask:put_batch_atomic(R, [{put, <<"a">>, #{text => <<"first">>}},
+                                              {put, <<"a">>, #{text => <<"second">>}},
+                                              {put, <<"b">>, #{text => <<"third">>}}]),
+            {ok, Q} = bitcask:embed(R, <<"second">>),
+            ?assertMatch({ok, [{<<"a">>, _, _} | _]}, bitcask:search_vector(R, Q, 1)),
+            ok = bitcask:txn_commit(R, [{put, <<"c">>, #{text => <<"fourth">>}}]),
+            {ok, Q4} = bitcask:embed(R, <<"fourth">>),
+            ?assertMatch({ok, [{<<"c">>, _, _} | _]}, bitcask:search_vector(R, Q4, 1)),
+            bitcask:close(R)
+        end)
+    end}.
+
+%% ===================================================================
 %% txn_commit
 %% ===================================================================
 
