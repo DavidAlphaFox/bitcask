@@ -21,30 +21,30 @@
 %%   （C++ analyzer），BEAM 侧逐行拿原文比没法和分词结果一致；结构化条件只能
 %%   落在 meta 上。所以查询拆成三类条件，由规划器决定谁驱动：
 %%
-%%     有 text      → search_* 驱动（按分数降序）。match 把 where 下推成引擎
-%%                    meta filter；其它几种引擎不收 filter，逐条 get 后在 BEAM
-%%                    求值。key 条件对命中做后过滤。
-%%     有 key 无 text → {eq,K} 走 get；prefix/range 走 range（按 key 升序）。
-%%     都没有       → 全表 range（按 key 升序）；OKI 不可用（no_index）回落 fold
-%%                    （顺序未定义）。
+%%     有 text      → search_* 驱动（按分数降序），where 下推成引擎 meta
+%%                    filter；key 条件对命中做后过滤。
+%%     有 key 无 text → {eq,K} 走 get；prefix/range 走 range（按 key 升序），
+%%                    where 下推成 range 的 filter，meta 随条目带回。
+%%     都没有       → 全表 range，同上；OKI 不可用（no_index）回落 fold + 逐行
+%%                    get、BEAM 求值（顺序未定义）。
 %%
-%%   where 语义与引擎 MetaFilter 逐条对齐（meta_filter.hpp）：
+%%   where 语义与引擎 MetaFilter 逐条对齐（meta_filter.hpp），BEAM 侧求值只在
+%%   {eq,K} 与 fold 回落两处用：
 %%     * 无 meta 的文档过不了任何非空 where（含 neq）。
 %%     * eq/neq/in 只在同类型间相等：1 与 1.0 不等；缺失字段读作 undefined，
 %%       所以 {F, eq, undefined} 命中缺失字段。in 对缺失字段恒假。
 %%     * gt/gte/lt/lte 只比 integer-integer、float-float，其它组合恒假。
 %%     * exists = 字段存在且非 null。
 %%
-%%   ⚠️ 已知约束（上游改了再删，见 libbitcask feedbacks/2026-10-06-meta-filter-query-gaps.md）：
-%%     * 引擎带 filter 的 search_text 只多取一次 max(K×4,64) 个候选再后过滤，
-%%       不够就静默少给。这里按「返回不足 → 用同样候选数的无 filter 查询判断
-%%       候选是否已穷尽 → 未穷尽就 K 翻倍重查」补齐；正确，但重查有成本。
-%%     * fold/range 不带 meta：有 where 或要 meta 时逐行补一次 get，text 也取
-%%       get 那一份，保证同一行的 text/meta 来自同一版本。range 本身是 per-key
-%%       弱一致（非快照），查询期间的并发写可能部分可见。
-%%     * 引擎 topK 上限 100 万（cpp/nif/term_conv.hpp kMaxTopK）。text 驱动在
-%%       这个上限内凑不够 / 判不了穷尽 → {error, {too_many_hits, 1000000}}，
-%%       不静默截断。
+%%   一致性：range 是 per-key 弱一致（非快照），查询期间的并发写可能部分可见；
+%%   扫描路径同一行的 text 与 meta 出自同一次读。text 驱动时命中只带 key，
+%%   text/meta 由随后的 get 取——两次读之间被改写的文档，返回的是新版本
+%%   （可能已不满足 where）。
+%%
+%%   依赖 libbitcask ≥ 6.6.1：带 filter 的检索补取到 K（返回不足 K 即已穷尽），
+%%   同分命中前缀稳定。引擎 topK 上限 100 万（cpp/nif/term_conv.hpp
+%%   kMaxTopK）：text 驱动在这个上限内凑不够 → {error, {too_many_hits, 1000000}}，
+%%   不静默截断。
 %% =========================================================================
 -module(bitcask_query).
 
@@ -198,25 +198,26 @@ run(H, #plan{} = P) ->
 
 %% ---- key 驱动：range（有序）/ fold 兜底 ---------------------------------
 
-scan(H, Lo, Hi, #plan{limit = Limit} = P) ->
-    Step = fun(K, V, Acc) ->
-                   case scan_row(H, K, V, P) of
-                       skip -> Acc;
-                       Row  -> take(Row, Acc, Limit)
-                   end
-           end,
-    RangeFun = fun(K, V, _T, _O, Acc) -> Step(K, V, Acc) end,
-    Res = try bitcask:range_fold(H, {Lo, Hi}, [], RangeFun, {0, []})
+scan(H, Lo, Hi, #plan{limit = Limit, where = W, select = S} = P) ->
+    %% where 下推给 range 的 filter；要 meta 时条目带回 meta（与 text 同一次读）。
+    WantMeta = W =/= undefined orelse lists:member(meta, S),
+    Opts = [{want_meta, true} || WantMeta] ++
+           [{filter, to_filter(W)} || W =/= undefined],
+    RangeFun = fun(K, V, _T, _O, Acc) ->
+                       take(shape(range_row(K, V), S), Acc, Limit)
+               end,
+    Res = try bitcask:range_fold(H, {Lo, Hi}, Opts, RangeFun, {0, []})
           catch throw:{?MODULE, done, Done} -> Done
           end,
     case Res of
         {error, no_index} ->
             %% 只读打开一个从未建过 OKI 的目录。fold 是快照、顺序未定义，
-            %% 按 key 边界在 BEAM 侧过滤。
+            %% 按 key 边界在 BEAM 侧过滤，where 逐行 get 后在 BEAM 求值。
             FoldFun = fun(K, V, Acc) ->
-                              case in_bounds(K, Lo, Hi) of
-                                  true  -> Step(K, V, Acc);
-                                  false -> Acc
+                              case in_bounds(K, Lo, Hi) andalso fold_row(H, K, V, P) of
+                                  false -> Acc;
+                                  skip  -> Acc;
+                                  Row   -> take(Row, Acc, Limit)
                               end
                       end,
             finish(try bitcask:fold(H, FoldFun, {0, []})
@@ -225,6 +226,9 @@ scan(H, Lo, Hi, #plan{limit = Limit} = P) ->
         Other ->
             finish(Other)
     end.
+
+range_row(K, #{text := T, meta := MB}) -> #{key => K, text => T, meta => meta(MB)};
+range_row(K, T) when is_binary(T)      -> #{key => K, text => T, meta => undefined}.
 
 %% 攒满 limit 就抛出去提前结束迭代（range_fold / fold 的 after 会放迭代器）。
 take(Row, {N, Rows}, Limit) ->
@@ -237,9 +241,9 @@ take(Row, {N, Rows}, Limit) ->
 finish({error, _} = E) -> E;
 finish({_N, Rows})     -> {ok, lists:reverse(Rows)}.
 
-%% range/fold 给的 V 只有 text。需要 meta（where 或 select）时整行改用 get
-%% 那一份——text 和 meta 才是同一版本。
-scan_row(H, K, V, #plan{where = W, select = S} = P) ->
+%% fold 给的 V 只有 text。需要 meta（where 或 select）时整行改用 get 那一份
+%% ——text 和 meta 才是同一版本。
+fold_row(H, K, V, #plan{where = W, select = S} = P) ->
     case W =:= undefined andalso not lists:member(meta, S) of
         true  -> shape(#{key => K, text => V, meta => undefined}, S);
         false -> fetch_row(H, K, P)
@@ -282,17 +286,16 @@ in_bounds(K, Lo, Hi) ->
 
 %% ---- text 驱动 ---------------------------------------------------------
 %%
-%% 凑不够 limit 就翻倍 K 重查。⚠️ 大 K 的结果**不是**小 K 结果的延长：
-%% 同分时引擎按 key 升序挑进 top-K、输出却按 ord 降序排（K=5 给
-%% d0005..d0001，K=1000 时 d0001 排最后）。所以每轮按引擎最新给的顺序从头
-%% 组装，已经求值过的 key 记在 Seen 里，不重复 get。
+%% where 下推给引擎，引擎补取到 K，所以没有 key 条件时一次就够：返回不足 K
+%% 即已穷尽。有 key 条件时它在 BEAM 侧后过滤，凑不够 limit 就翻倍 K 重查。
+%% 已经处理过的 key 记在 Seen 里不重复 get；每轮按引擎最新给的顺序从头组装
+%% ——search_fields 多字段时不保证小 K 是大 K 的前缀（libbitcask 6.6.1 说明）。
 
-text_driven(H, #plan{limit = Limit, key = Key, where = W} = P) ->
-    PostFilter = Key =/= undefined orelse (W =/= undefined andalso not pushable(P)),
+text_driven(H, #plan{limit = Limit, key = Key} = P) ->
     K0 = case Limit of
-             infinity             -> ?MAX_TOPK;
-             L when PostFilter    -> min(max(L * 4, 64), ?MAX_TOPK);
-             L                    -> min(L, ?MAX_TOPK)
+             infinity                   -> ?MAX_TOPK;
+             L when Key =/= undefined   -> min(max(L * 4, 64), ?MAX_TOPK);
+             L                          -> min(L, ?MAX_TOPK)
          end,
     try text_loop(H, P, K0, #{})
     catch throw:{?MODULE, done, Acc} -> finish(Acc)
@@ -301,7 +304,7 @@ text_driven(H, #plan{limit = Limit, key = Key, where = W} = P) ->
 text_loop(H, #plan{limit = Limit, select = S} = P, KReq, Seen0) ->
     case search(H, P, KReq) of
         {error, _} = E -> E;
-        {ok, Hits, Exhausted} ->
+        {ok, Hits} ->
             {Acc, Seen} =
                 lists:foldl(
                   fun({Key, _Ord, Score}, {A, Sn}) ->
@@ -316,30 +319,21 @@ text_loop(H, #plan{limit = Limit, select = S} = P, KReq, Seen0) ->
                           end
                   end, {{0, []}, Seen0}, Hits),
             if
-                Exhausted         -> finish(Acc);
-                KReq >= ?MAX_TOPK -> {error, {too_many_hits, ?MAX_TOPK}};
+                length(Hits) < KReq -> finish(Acc);    % 候选已穷尽
+                KReq >= ?MAX_TOPK   -> {error, {too_many_hits, ?MAX_TOPK}};
                 %% limit 未满（满了已在 take 里抛出）且候选没穷尽 → 翻倍。
-                true              -> text_loop(H, P, min(KReq * 2, ?MAX_TOPK), Seen)
+                true                -> text_loop(H, P, min(KReq * 2, ?MAX_TOPK), Seen)
             end
     end.
 
-%% 一条命中 → 行（不含 score）或 skip。
-text_row(H, Key, #plan{key = KC, where = W, select = S} = P) ->
+%% 一条命中 → 行（不含 score）或 skip。where 已由引擎判过。
+text_row(H, Key, #plan{key = KC, select = S}) ->
     case key_ok(Key, KC) of
         false -> skip;
         true ->
-            BeamWhere = W =/= undefined andalso not pushable(P),
-            case BeamWhere orelse lists:member(text, S) orelse lists:member(meta, S) of
+            case lists:member(text, S) orelse lists:member(meta, S) of
                 false -> #{key => Key};
-                true ->
-                    case get_doc(H, Key) of
-                        skip -> skip;
-                        #{meta := M} = Doc ->
-                            case not BeamWhere orelse eval(W, M) of
-                                true  -> Doc;
-                                false -> skip
-                            end
-                    end
+                true  -> get_doc(H, Key)
             end
     end.
 
@@ -347,39 +341,22 @@ key_ok(_K, undefined)      -> true;
 key_ok(K, {eq, K2})        -> K =:= K2;
 key_ok(K, {range, Lo, Hi}) -> in_bounds(K, Lo, Hi).
 
-%% 只有 search_text 收 meta filter。
-pushable(#plan{text = {match, _}, where = W}) -> W =/= undefined;
-pushable(#plan{})                             -> false.
-
-%% 返回 {ok, Hits, Exhausted}：Exhausted = 倒排里已经没有更多候选。
-search(H, #plan{text = {match, Q}} = P, KReq) ->
-    case pushable(P) of
-        false -> plain(bitcask:search_text(H, Q, KReq), KReq);
-        true ->
-            case bitcask:search_text(H, Q, KReq, to_filter(P#plan.where)) of
-                {ok, Hits} when length(Hits) >= KReq ->
-                    {ok, Hits, false};
-                {ok, Hits} ->
-                    %% 返回不足 K：可能真没了，也可能是引擎 max(K×4,64) 的
-                    %% 候选被 filter 筛空了。用同样候选数的无 filter 查询判断。
-                    Cand = min(max(KReq * 4, 64), ?MAX_TOPK),
-                    case bitcask:search_text(H, Q, Cand) of
-                        {ok, All}      -> {ok, Hits, length(All) < Cand};
-                        {error, _} = E -> E
-                    end;
-                Other -> err(Other)
-            end
-    end;
-search(H, #plan{text = {phrase, Q}}, K)      -> plain(bitcask:search_phrase(H, Q, K), K);
-search(H, #plan{text = {fields, Q}}, K)      -> plain(bitcask:search_fields(H, Q, K), K);
-search(H, #plan{text = {wildcard, Q}}, K)    -> plain(bitcask:search_wildcard(H, Q, K), K);
-search(H, #plan{text = {near, Q, Slop}}, K)  -> plain(bitcask:search_near(H, Q, Slop, K), K);
-search(H, #plan{text = {fuzzy, Q, Ed}}, K)   -> plain(bitcask:search_fuzzy(H, Q, Ed, K), K).
-
-plain({ok, Hits}, K) -> {ok, Hits, length(Hits) < K};
-plain(Other, _K)     -> err(Other).
+search(H, #plan{text = T, where = W}, K) ->
+    F = case W of
+            undefined -> undefined;
+            _         -> to_filter(W)
+        end,
+    err(case T of
+            {match, Q}       -> bitcask:search_text(H, Q, K, F);
+            {phrase, Q}      -> bitcask:search_phrase(H, Q, K, F);
+            {fields, Q}      -> bitcask:search_fields(H, Q, K, F);
+            {wildcard, Q}    -> bitcask:search_wildcard(H, Q, K, F);
+            {near, Q, Slop}  -> bitcask:search_near(H, Q, Slop, K, F);
+            {fuzzy, Q, Ed}   -> bitcask:search_fuzzy(H, Q, Ed, K, F)
+        end).
 
 %% search NIF 的故障可能是裸 atom（no_index 等，见 bitcask:normalize_error）。
+err({ok, _} = Ok)   -> Ok;
 err({error, _} = E) -> E;
 err(Other)          -> {error, Other}.
 

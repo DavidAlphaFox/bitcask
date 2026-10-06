@@ -2,11 +2,11 @@
 %% bitcask_query_tests:
 %%   bitcask_query DSL + bitcask:decode_meta/1。
 %%
-%%   重点两条：
-%%     * where 的 BEAM 侧求值与引擎 MetaFilter 逐条一致——同一组 where 一份
-%%       下推给 search_text、一份走扫描在 BEAM 求值，命中集合必须相等。
-%%     * 引擎带 filter 的 search_text 会静默少给（候选只多取 max(K×4,64)），
-%%       q/2 要补齐到 limit。语料与 libbitcask feedbacks/2026-10-06 的复现同款。
+%%   重点：
+%%     * where 的三条执行路径逐条一致——下推给检索（match / phrase）、下推给
+%%       range 的 filter、{eq,K} 取出后在 BEAM 求值，命中集合必须相等。
+%%     * libbitcask 6.6.1 的两处修复在这一层的回归（feedbacks/2026-10-06 原场景）：
+%%       带 filter 的检索补取到 K；同分命中小 K 是大 K 的前缀。
 %% -------------------------------------------------------------------
 -module(bitcask_query_tests).
 
@@ -130,7 +130,7 @@ where_cases() ->
       [<<"a1">>, <<"a4">>]}].
 
 where_scan_test_() ->
-    {"where 在扫描路径（BEAM 求值）上的语义",
+    {"where 在扫描路径（range filter 下推）上的语义",
      fun() ->
         with_dir(fun(D) ->
             R = open_mixed(D),
@@ -140,17 +140,23 @@ where_scan_test_() ->
         end)
     end}.
 
-where_pushdown_agrees_test_() ->
-    {"同一组 where：下推给引擎（match）与 BEAM 求值（phrase）命中相同",
+where_paths_agree_test_() ->
+    {"同一组 where：检索下推（match/phrase）、range 下推、BEAM 求值（{eq,K}）命中相同",
      fun() ->
         with_dir(fun(D) ->
             R = open_mixed(D),
+            AllKeys = keys(bitcask_query:q(R, #{select => [key]})),
             Sort = fun(Q) -> lists:sort(keys(bitcask_query:q(R, Q))) end,
             [begin
-                 Engine = Sort(#{text => {match, <<"apple">>}, where => W}),
-                 Beam   = Sort(#{text => {phrase, <<"apple">>}, where => W}),
-                 ?assertEqual({W, Want}, {W, Engine}),
-                 ?assertEqual({W, Want}, {W, Beam})
+                 Match  = Sort(#{text => {match, <<"apple">>}, where => W}),
+                 Phrase = Sort(#{text => {phrase, <<"apple">>}, where => W}),
+                 Range  = Sort(#{key => {prefix, <<>>}, where => W}),
+                 Beam   = lists:sort(lists:append(
+                            [keys(bitcask_query:q(R, #{key => {eq, K}, where => W}))
+                             || K <- AllKeys])),
+                 [?assertEqual({W, Path, Want}, {W, Path, Got})
+                  || {Path, Got} <- [{match, Match}, {phrase, Phrase},
+                                     {range, Range}, {beam, Beam}]]
              end || {W, Want} <- where_cases()],
             bitcask:close(R)
         end)
@@ -161,17 +167,18 @@ where_pushdown_agrees_test_() ->
 %% ===================================================================
 
 filtered_text_fills_limit_test_() ->
-    {"满足 filter 的 100 篇：limit 10/50 给满，infinity 给全；引擎直调会少给",
+    {"满足 filter 的 100 篇：limit 10/50 给满，infinity 给全",
      {timeout, 120,
       fun() ->
         with_dir(fun(D) ->
             R = open_apples(D),
             W = {<<"tag">>, eq, <<"keep">>},
-            %% 引擎直调的现状（上游修好后这条会变，届时删掉）。
-            {ok, Raw} = bitcask:search_text(R, <<"apple">>, 10,
-                                            [#{key => <<"tag">>, op => eq,
-                                               value => <<"keep">>}]),
-            ?assert(length(Raw) < 10),
+            %% libbitcask 6.6.1 回归：引擎直调也补取到 K（6.6.0 只给 6 条）。
+            F = [#{key => <<"tag">>, op => eq, value => <<"keep">>}],
+            {ok, Raw} = bitcask:search_text(R, <<"apple">>, 10, F),
+            ?assertEqual(10, length(Raw)),
+            {ok, RawP} = bitcask:search_phrase(R, <<"apple pie">>, 10, F),
+            ?assertEqual(10, length(RawP)),
             [?assertEqual(L, length(keys(bitcask_query:q(
                                  R, #{text => {match, <<"apple">>}, where => W,
                                       limit => L}))))
@@ -205,6 +212,65 @@ text_with_key_filter_test_() ->
             bitcask:close(R)
         end)
       end}}.
+
+tied_scores_prefix_stable_test_() ->
+    {"同分命中：小 K 是大 K 的前缀（libbitcask 6.6.1 回归；6.6.0 下 K=5 与 K=1000 矛盾）",
+     {timeout, 120,
+      fun() ->
+        with_dir(fun(D) ->
+            R = open_apples(D),
+            {ok, Big} = bitcask:search_text(R, <<"apple">>, 1000),
+            [begin
+                 {ok, Small} = bitcask:search_text(R, <<"apple">>, K),
+                 ?assertEqual({K, lists:sublist(Big, K)}, {K, Small})
+             end || K <- [1, 5, 64, 999]],
+            bitcask:close(R)
+        end)
+      end}}.
+
+range_meta_filter_test_() ->
+    {"range：{want_meta,true} 带回 meta、{filter,F} 在引擎侧筛；坏 filter → badarg",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open_mixed(D),
+            {ok, MetaA1} = bitcask:get(R, <<"a1">>),
+            [{<<"a1">>, V}] = bitcask:range(R, {<<"a1">>, <<"a2">>}, [{want_meta, true}]),
+            ?assertEqual(MetaA1, V),
+            [{<<"b2">>, #{meta := undefined}}] =
+                bitcask:range(R, {<<"b2">>, undefined}, [{want_meta, true}]),
+            ?assertEqual([<<"a1">>, <<"a3">>],
+                         [K || {K, _} <- bitcask:range(
+                                          R, {undefined, undefined},
+                                          [{filter, [#{key => <<"cat">>, op => eq,
+                                                       value => <<"db">>}]}])]),
+            %% 不带 want_meta 时 value 仍是裸 text
+            [{<<"a1">>, <<"apple a1">>}] =
+                bitcask:range(R, {<<"a1">>, <<"a2">>},
+                              [{filter, #{key => <<"cat">>, op => exists}}]),
+            ?assertError(badarg, bitcask:range(R, {undefined, undefined},
+                                               [{filter, [#{op => eq}]}])),
+            bitcask:close(R)
+        end)
+    end}.
+
+search_filter_arities_test_() ->
+    {"phrase/fields/near/fuzzy/wildcard 的 Filter 版本：过滤生效，undefined = 不过滤",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open_mixed(D),
+            F = [#{key => <<"cat">>, op => eq, value => <<"db">>}],
+            Ks = fun({ok, Hits}) -> lists:sort([K || {K, _, _} <- Hits]) end,
+            DB = [<<"a1">>, <<"a3">>],
+            ?assertEqual(DB, Ks(bitcask:search_phrase(R, <<"apple">>, 10, F))),
+            ?assertEqual(DB, Ks(bitcask:search_fields(R, <<"apple">>, 10, F))),
+            ?assertEqual(DB, Ks(bitcask:search_near(R, <<"apple">>, 0, 10, F))),
+            ?assertEqual(DB, Ks(bitcask:search_fuzzy(R, <<"aple">>, 1, 10, F))),
+            ?assertEqual(DB, Ks(bitcask:search_wildcard(R, <<"app*">>, 10, F))),
+            ?assertEqual(6, length(Ks(bitcask:search_phrase(R, <<"apple">>, 10, undefined)))),
+            ?assertError(badarg, bitcask:search_phrase(R, <<"apple">>, 10, [bad])),
+            bitcask:close(R)
+        end)
+    end}.
 
 %% ===================================================================
 %% 其它模式 / 错误
