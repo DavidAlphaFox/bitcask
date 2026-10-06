@@ -27,15 +27,15 @@
 %%
 %%   === 一致性 ===
 %%
-%%   ⚠️ 不是原子的：libbitcask 的原子批 value 只能是 text，带 meta 的文档进
-%%   不了同一批（已报上游 feedbacks/2026-10-06-atomic-batch-doc-meta.md）。所以：
-%%     * 写：拿该 key 的写锁（bitcask_txn 的锁管理器），先加新索引项、再写
-%%       文档、最后删旧索引项。任何一步之间崩溃，最坏是多出过期的索引项，
-%%       不会漏。
-%%     * 读：索引项只是候选。每条都 get 文档，核对「文档当前值的编码 == 索引
-%%       项里的编码」再求值整个 where——过期项永远不会产出行，也不会产出重复行。
-%%   前提：索引字段的写入都走 bitcask_query:put/delete。直接 bitcask:put 改了
-%%   meta 的话，新值缺索引项（查不到），旧值的项被读校验挡掉；rebuild 能修。
+%%   * 写：一个 bitcask_txn 事务——锁 key、读旧 meta，「文档 + 新索引项 + 删
+%%     旧索引项」同一个提交批落盘（libbitcask 6.6.2 起提交批收带 meta 的文档；
+%%     上游反馈 feedbacks/2026-10-06-atomic-batch-doc-meta.md）。崩溃时整批要么
+%%     全在要么全不在；并发写同一个 key 由锁串行。
+%%   * 读：仍然回表校验「文档当前值的编码 == 索引项里的编码」再求值整个
+%%     where。经 bitcask_query:put/delete 写入时它从不拦下任何东西；它挡的是
+%%     绕过这两个函数的写入——直接 bitcask:put 改了 meta，旧值的项成了过期项，
+%%     校验让它既不产出错行也不产出重复行（新值缺项、查不到，重建索引能修）。
+%%     命中本来就要 get 文档取 text/meta，校验几乎不额外花钱。
 %% =========================================================================
 -module(bitcask_query_index).
 
@@ -78,7 +78,8 @@ field(F) -> throw({bad_query, {field, F}}).
 
 %% 建索引：先登记 building（此后经 bitcask_query:put 的写入就开始维护
 %% 索引项），再回填存量，最后转 ready——只有 ready 的索引才会被查询选用。
-%% 回填与并发写交错时最坏多出过期项，读校验挡掉。已存在 → ok（幂等）。
+%% 回填不加 key 锁，与并发写交错时可能多出过期项（回填读到旧 meta 写了旧
+%% 值的项，而写入方已删过它），读校验挡掉；不会漏。已存在 → ok（幂等）。
 create(H, Field0) ->
     Field = field(Field0),
     case proplists:get_value(Field, list(H)) of
@@ -140,60 +141,58 @@ put(H, Key, Doc) when is_binary(Key) ->
     reject_reserved(Key),
     case [F || {F, _} <- list(H)] of
         []     -> bitcask:put(H, Key, Doc);
-        Fields -> locked(H, Key, fun(Old) -> write(H, Key, Doc, Old, Fields) end)
+        Fields -> locked(H, Key, fun(Tx, Old) -> write(Tx, Key, Doc, Old, Fields) end)
     end.
 
 delete(H, Key) when is_binary(Key) ->
     reject_reserved(Key),
     case [F || {F, _} <- list(H)] of
         []     -> bitcask:delete(H, Key);
-        Fields -> locked(H, Key, fun(Old) -> remove(H, Key, Old, Fields) end)
+        Fields -> locked(H, Key, fun(Tx, Old) -> remove(Tx, Key, Old, Fields) end)
     end.
 
 reject_reserved(Key) ->
     is_reserved(Key) andalso throw({bad_query, {reserved_key, Key}}).
 
-%% 同一个 key 的索引维护者之间互斥：借 bitcask_txn 拿写锁（只读事务——
-%% 缓冲为空，提交时不碰引擎），锁下直接读写引擎。Fun 幂等，锁等待超时导致
-%% 重跑也安全。旧值在锁下用 bitcask:get 读（不经 bitcask_txn:read：缓冲
-%% 为空时两者等价，而 get 在索引模式下给的是 #{text, meta}）。
+%% 一次索引维护 = 一个 bitcask_txn 事务：锁住 key、读旧 meta、把「文档 +
+%% 新索引项 + 删旧索引项」放进同一个提交批（libbitcask 6.6.2 起提交批收带
+%% meta 的文档）。并发写同一个 key 由锁串行，崩溃时整批要么全在要么全不在。
+%% 用 no_sync：与 bitcask:put 的持久性一致（不在每次写入上付 fsync）。
 locked(H, Key, Fun) ->
     R = bitcask_txn:transaction(
           H, fun(Tx) ->
                      ok = bitcask_txn:lock_key(Tx, Key, write),
+                     %% 旧值在锁下直接 bitcask:get：本事务还没写这个 key，
+                     %% 与 bitcask_txn:read 等价，且索引模式下给的是 #{text, meta}。
                      Old = case bitcask:get(H, Key) of
                                {ok, V}        -> meta_blob(V);
                                not_found      -> undefined;
                                {error, _} = E -> bitcask_txn:abort(E)
                            end,
-                     Fun(Old)
-             end, [{retries, 10}]),
+                     Fun(Tx, Old)
+             end, [{retries, 10}, {sync, no_sync}]),
     case R of
-        {atomic, ok}               -> ok;
-        {atomic, {error, _} = E}   -> E;
-        {aborted, {error, _} = E}  -> E;
-        {aborted, Why}             -> {error, Why}
+        {atomic, ok}                         -> ok;
+        {aborted, {commit_failed, {error, _} = E}} -> E;
+        {aborted, {commit_failed, E}}        -> {error, E};
+        {aborted, {error, _} = E}            -> E;
+        {aborted, Why}                       -> {error, Why}
     end.
 
-write(H, Key, tombstone, Old, Fields) ->
-    remove(H, Key, Old, Fields);
-write(H, Key, Doc, Old, Fields) ->
+write(Tx, Key, tombstone, Old, Fields) ->
+    remove(Tx, Key, Old, Fields);
+write(Tx, Key, Doc, Old, Fields) ->
     NewE = entries(Key, new_meta(Doc), Fields),
     OldE = entries(Key, Old, Fields),
-    ok = batch(H, [{put, E, <<>>} || E <- NewE -- OldE]),
-    case bitcask:put(H, Key, Doc) of
-        ok ->
-            ok = batch(H, [{remove, E} || E <- OldE -- NewE]);
-        Err ->
-            %% 文档没写进去：刚加的项是过期项，读校验会挡掉，不必回滚。
-            Err
-    end.
+    ok = bitcask_txn:write(Tx, Key, Doc),
+    [ok = bitcask_txn:write(Tx, E, <<>>) || E <- NewE -- OldE],
+    [ok = bitcask_txn:delete(Tx, E) || E <- OldE -- NewE],
+    ok.
 
-remove(H, Key, Old, Fields) ->
-    case bitcask:delete(H, Key) of
-        ok  -> batch(H, [{remove, E} || E <- entries(Key, Old, Fields)]);
-        Err -> Err
-    end.
+remove(Tx, Key, Old, Fields) ->
+    ok = bitcask_txn:delete(Tx, Key),
+    [ok = bitcask_txn:delete(Tx, E) || E <- entries(Key, Old, Fields)],
+    ok.
 
 meta_blob(#{meta := MB}) -> MB;
 meta_blob(_)             -> undefined.

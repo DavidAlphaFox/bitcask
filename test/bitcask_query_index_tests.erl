@@ -285,3 +285,21 @@ concurrent_same_key_test_() ->
             bitcask:close(R)
         end)
       end}}.
+
+auto_embed_through_index_test_() ->
+    {"有索引时经 bitcask_query:put 写 #{text}：照样自动 embed（走提交批），索引项同批",
+     fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, [read_write, {analyzer, whitespace},
+                                 {embedder, {{custom, bitcask_embedder_mock}, #{}}}]),
+            ok = bitcask_query:create_index(R, <<"c">>),
+            ok = bitcask_query:put(R, <<"a">>, #{text => <<"alpha">>,
+                                                 meta => m(#{<<"c">> => 1})}),
+            {ok, Q} = bitcask:embed(R, <<"alpha">>),
+            ?assertMatch({ok, [{<<"a">>, _, _} | _]}, bitcask:search_vector(R, Q, 1)),
+            ?assertEqual([<<"a">>], keys(bitcask_query:q(R, #{where => {<<"c">>, eq, 1}}))),
+            ?assertEqual(1, length(ix_entries(R))),
+            bitcask:close(R)
+        end)
+    end}.
+
