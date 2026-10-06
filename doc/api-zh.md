@@ -390,21 +390,65 @@ blob 非法会报 `badarg`。`get` 在没有 meta 时返回 `undefined`，由调
                                                % | {fuzzy,Q,MaxEdit} | {wildcard,P}
     where  => [{<<"year">>, gte, 2024},
                {'or', [{<<"cat">>, in, [<<"db">>, <<"kv">>]}, {<<"hot">>, eq, true}]}],
-    limit  => 100,                             % 默认 infinity
+    vector => VecBin,                          % | {text, Bin}；与 {match,_} 同给 = 混合检索
+    limit  => 100,                             % 默认 infinity；page/2 里是每页条数
     select => [key, text, meta, score]         % 默认全要
 }).
 %% Row = #{key, text, meta => map() | undefined, score}，score 只在 text 驱动时有
 ```
+
+**分页**：`bitcask_query:page(H, Query)` 和 `page(Cont)` 都返回 `{ok, Rows, Cont}`，没有下一页时 `Cont` 为 `done`；`page(done)` 返回 `{ok, [], done}`。`limit` 就是每页条数，必须给。
+游标是不透明的 term，不占服务端资源，丢掉即可。每页会多取 1 条，用来判断还有没有下一页，所以条数正好整除时，最后一页是满的，并直接返回 `done`。
+
+| 驱动 | 游标 | 翻页保证 |
+|---|---|---|
+| key（range） | 下一页起始 key | 不重不漏，按 key 升序（`range` 本身不是快照，翻页期间的写入可能出现在后面的页里） |
+| 全文检索（`search_fields` 除外） | 已消费的引擎命中数 | 不重不漏（依赖 libbitcask 6.6.1 的同分前缀稳定）；每页按偏移重查，越往后越贵 |
+| 向量 / 混合 / `search_fields` | 已返回过的 key 集合 | **不重复，但可能漏**：K 变了结果也会变（HNSW 近似、RRF 融合、多字段逐字段 top-K 求和），翻页时新挤进前排的命中不会再出现 |
+
+**向量 / 混合**：
+- `vector => VecBin`（f32 小端，长度为 `vector_dim * 4` 字节）或 `{text, Bin}`（用句柄的 embedder 编码；整个查询包括翻页只 embed 一次）。
+- 只给 `vector` 时走 `search_vector`，可以带 `ef`（默认 0，表示由引擎决定）。
+- 和 `text => {match, Q}` 同时给时走 `search_hybrid`（RRF 融合），这时不能带 `ef`；配其它全文检索类型会报 `{bad_query, {hybrid_needs_match, _}}`。
+- `where` 照样下推；`score` 在向量检索时是相似度，在混合检索时是 RRF 分数。
+- 向量检索带 filter 时，引擎本身就可能少返回结果（HNSW），这时返回不足 K 条也只能当作已经取完。
+
+### 二级索引
+
+按 meta 字段建索引，让只有 `where` 的查询不必扫全表，相当于 `mnesia:index_read`。
+
+```erlang
+ok = bitcask_query:create_index(H, <<"year">>),       % 回填存量；已存在则直接 ok
+ok = bitcask_query:put(H, Key, #{text => T, meta => M}),   % 有索引时写入必须走这里
+ok = bitcask_query:delete(H, Key),
+[{<<"year">>, ready}] = bitcask_query:indexes(H),
+{ok, #{driver := index}} = bitcask_query:explain(H, #{where => {<<"year">>, gte, 2024}}),
+ok = bitcask_query:drop_index(H, <<"year">>).
+```
+
+- **何时使用**：查询里没有 `key`、`text`、`vector` 条件，且顶层 AND 里有某个已建索引字段上的
+  `eq`、`in`、`gt`、`gte`、`lt`、`lte` 或 `exists` 条件时走索引。多个可选时按 eq > in > 大小比较 > exists 的顺序只选一个。
+  `neq`、`{F, eq, undefined}`（命中缺失字段）、多分支 `or` 不走索引。`index => none` 可以强制不用索引。
+- **结果顺序**：按「索引值、再按主键」升序，和全表扫描的「按 key 升序」不同。分页照常可用，游标是下一个索引键。
+- **存储**：索引和数据在同一个 cask 里，用保留前缀 `<<0,"bitcask_query:">>` 隔开。全表查询会跳过这些 key，
+  `bitcask_query:put` 拒绝写这个前缀。在索引模式下，索引项是空 text 的文档，全文检索不会命中，实测也不影响 BM25 打分。
+- **一致性**（⚠️ 不是原子的）：libbitcask 的原子批写不进带 meta 的文档，所以文档和索引项没法同批落盘（已报上游）。
+  - 写入时拿该 key 的写锁，依次写新索引项、写文档、删旧索引项。中途崩溃最坏只会多出过期项，不会漏项。
+  - 读取时，每个候选都要回表核对文档当前值是否就是索引项里的值，再判断整个 `where`。所以过期项不会产出错行或重复行。
+  - 代价：每条命中都要多一次 `get`；每次写入都要多一次加锁和读旧值。
+- ⚠️ **索引字段的写入必须走 `bitcask_query:put/delete`**。直接用 `bitcask:put` 改了 meta 的话，新值查不到，
+  旧值的过期项会被读时校验挡掉。修复方法是 `drop_index` 后再 `create_index`。
+- 建索引时先登记为 `building`，这时写入就开始维护索引；回填完成后转为 `ready`，之后查询才会使用它。
 
 为什么不用 match spec：值是要分词的字符串，全文条件只能交给倒排索引（在 C++ 侧分词），
 结构化条件只能写在 `meta` 上。规划器按下面的顺序选择从哪里驱动：
 
 | 条件 | 驱动方式 | 结果顺序 |
 |---|---|---|
-| 有 `text` | `search_*`，`where` 下推成引擎 meta filter；`key` 条件对命中做后过滤 | 分数降序 |
+| 有 `text` / `vector` | `search_*`（只有 `vector` 走 `search_vector`，和 `{match,_}` 同给走 `search_hybrid`），`where` 下推成引擎 meta filter；`key` 条件对命中做后过滤 | 分数降序 |
 | 无 `text`，`key => {eq,K}` | `get` | — |
 | 无 `text`，有 prefix 或 range | `range`，`where` 下推成 range 的 `filter`，meta 随条目一起带回 | key 升序 |
-| 都没有 | 全表 `range`，同上；OKI 不可用（`no_index`）时回落到 `fold` | key 升序（回落时顺序未定义） |
+| 都没有 | 全表 `range`，同上；OKI 不可用（`no_index`）时回落到 `fold`，收齐后按 key 排序 | key 升序 |
 
 `where` 的语义和引擎 MetaFilter 逐条一致。测试里把检索下推、range 下推、BEAM 侧求值三条路径互相对照：
 

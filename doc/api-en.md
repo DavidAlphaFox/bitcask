@@ -429,11 +429,71 @@ Inverse of `encode_meta/1`: decodes the blob into `#{binary() => V}`, with null 
                                                % | {fuzzy,Q,MaxEdit} | {wildcard,P}
     where  => [{<<"year">>, gte, 2024},
                {'or', [{<<"cat">>, in, [<<"db">>, <<"kv">>]}, {<<"hot">>, eq, true}]}],
-    limit  => 100,                             % default infinity
+    vector => VecBin,                          % | {text, Bin}; with {match,_} = hybrid
+    limit  => 100,                             % default infinity; page size for page/2
     select => [key, text, meta, score]         % default: all
 }).
 %% Row = #{key, text, meta => map() | undefined, score}; score only when text-driven
 ```
+
+**Paging**: `bitcask_query:page(H, Query)` and `page(Cont)` both return `{ok, Rows, Cont}`; `Cont` is
+`done` when there is no next page, and `page(done)` returns `{ok, [], done}`. `limit` is the page
+size and is required. The cursor is an opaque term that holds no server-side resources, so it can
+simply be dropped. Each page fetches one extra row to tell whether another page follows, so when
+the row count divides evenly the last page is full and returns `done` directly.
+
+| Driver | Cursor | Paging guarantee |
+|---|---|---|
+| key (range) | next start key | no duplicates, no gaps, key ascending (`range` is not a snapshot, so writes made while paging may appear on later pages) |
+| full text (except `search_fields`) | engine hits consumed | no duplicates, no gaps (relies on libbitcask 6.6.1's prefix-stable ties); each page requeries with an offset, so deep pages cost more |
+| vector / hybrid / `search_fields` | set of keys already returned | **no duplicates, but hits can be missed**: results change with K (approximate HNSW, RRF fusion, per-field top-K summed), so a hit that moves up into an earlier page while paging is never shown |
+
+**Vector / hybrid**:
+- `vector => VecBin` (f32 little-endian, `vector_dim * 4` bytes) or `{text, Bin}` (encoded with the
+  handle's embedder, once per query including all pages).
+- `vector` alone runs `search_vector` and accepts `ef` (default 0 = engine default).
+- `vector` together with `text => {match, Q}` runs `search_hybrid` (RRF fusion); `ef` is not
+  allowed there, and any other text kind returns `{bad_query, {hybrid_needs_match, _}}`.
+- `where` is still pushed down. `score` is the similarity for vector search and the RRF score for
+  hybrid search.
+- With a filter, vector search can itself return fewer hits than requested (HNSW), so fewer than K
+  hits has to be treated as the end of the results.
+
+### Secondary indexes
+
+Index a meta field so that `where`-only queries no longer scan the whole table, like
+`mnesia:index_read`.
+
+```erlang
+ok = bitcask_query:create_index(H, <<"year">>),       % backfills; ok if it already exists
+ok = bitcask_query:put(H, Key, #{text => T, meta => M}),   % writes must go through here once indexed
+ok = bitcask_query:delete(H, Key),
+[{<<"year">>, ready}] = bitcask_query:indexes(H),
+{ok, #{driver := index}} = bitcask_query:explain(H, #{where => {<<"year">>, gte, 2024}}),
+ok = bitcask_query:drop_index(H, <<"year">>).
+```
+
+- **When it is used**: when the query has no `key`, `text` or `vector` condition and its top-level AND
+  includes an `eq`, `in`, `gt`, `gte`, `lt`, `lte` or `exists` condition on an indexed field. If several qualify,
+  exactly one is picked in the order eq > in > comparison > exists. `neq`, `{F, eq, undefined}` (which matches
+  missing fields) and multi-branch `or` do not use an index. `index => none` forces a scan.
+- **Order**: rows come back by (index value, primary key) ascending, not by key ascending as a full scan
+  returns them. Paging works as usual; the cursor is the next index key.
+- **Storage**: indexes live in the same cask as the data under the reserved prefix `<<0,"bitcask_query:">>`.
+  Full scans skip those keys, and `bitcask_query:put` rejects keys with that prefix. In index mode the entries
+  are empty-text documents: full-text search never hits them, and in our measurements they do not change BM25 scores.
+- **Consistency** (⚠️ not atomic): libbitcask atomic batches cannot carry documents with meta, so a document
+  and its index entries cannot be written in one batch (reported upstream).
+  - Writes take the key's write lock, then add new entries, write the document, and remove old entries. A crash
+    part-way can leave stale entries but never drops one.
+  - Reads check every candidate against the document's current value before evaluating the full `where`, so
+    stale entries never produce wrong or duplicate rows.
+  - Cost: one extra `get` per hit, plus a lock and a read of the old value on every write.
+- ⚠️ **Writes to indexed fields must go through `bitcask_query:put/delete`.** If a direct `bitcask:put` changes
+  meta, the new value is not findable through the index, and the old value's stale entry is filtered out on read.
+  Fix it with `drop_index` followed by `create_index`.
+- `create_index` registers the index as `building` first, so writes start maintaining it; after the backfill it
+  becomes `ready`, and only then do queries use it.
 
 Why not match specs: values are analyzed strings, so text conditions can only be answered by
 the inverted index (tokenized in C++), and structured conditions live in `meta`. The planner
@@ -441,10 +501,10 @@ picks the driver as follows:
 
 | Conditions | Driver | Order |
 |---|---|---|
-| `text` present | `search_*` with `where` pushed down as an engine meta filter; `key` post-filters the hits | score desc |
+| `text` / `vector` present | `search_*` (`vector` alone runs `search_vector`; with `{match,_}`, `search_hybrid`) with `where` pushed down as an engine meta filter; `key` post-filters the hits | score desc |
 | no `text`, `key => {eq,K}` | `get` | — |
 | no `text`, prefix / range | `range`, with `where` pushed down as its `filter` and meta returned with each entry | key asc |
-| neither | full-table `range`, same as above; falls back to `fold` on `no_index` | key asc (undefined on fallback) |
+| neither | full-table `range`, same as above; falls back to `fold` on `no_index`, sorted by key once collected | key asc |
 
 `where` semantics match the engine MetaFilter exactly. The tests cross-check search pushdown, range pushdown and BEAM evaluation against each other.
 
