@@ -51,11 +51,11 @@
          index_errors/1,
          set_thread_limits/2, thread_limits/0,
            search_text/2, search_text/3, search_text/4,
-           search_phrase/2, search_phrase/3,
-           search_fields/2, search_fields/3,
-           search_near/3, search_near/4,
-           search_fuzzy/3, search_fuzzy/4,
-           search_wildcard/2, search_wildcard/3,
+           search_phrase/2, search_phrase/3, search_phrase/4,
+           search_fields/2, search_fields/3, search_fields/4,
+           search_near/3, search_near/4, search_near/5,
+           search_fuzzy/3, search_fuzzy/4, search_fuzzy/5,
+           search_wildcard/2, search_wildcard/3, search_wildcard/4,
            search_vector/2, search_vector/3, search_vector/4, search_vector/5,
            search_hybrid/2, search_hybrid/3, search_hybrid/4, search_hybrid/5,
            embed/2,
@@ -898,6 +898,11 @@ cask_max_put(N) when is_integer(N) -> N.
 %%
 %% 必须在索引模式（open 时带 {analyzer, ...} 选项）打开的 Ref 上调用。
 %% KV 模式下调这些接口会返回 {error, no_index}。
+%%
+%% 每个入口都有一个末位多 Filter 的版本（meta filter，形态见 doc/api-zh.md；
+%% undefined = 不过滤）。libbitcask 6.6.1 起带 filter 时引擎会补取到 K：
+%% 返回少于 K 条即「满足条件的就这么多」。同分命中按 (段次序, 段内写入序)
+%% 稳定排序，小 K 结果是大 K 结果的前缀。
 %% =========================================================================
 
 %% 词袋模式搜索，默认返回前 10 条。
@@ -917,6 +922,9 @@ search_phrase(Handle, Query) ->
 search_phrase(Handle, Query, K) ->
     bitcask_cpp_nifs:cask_search_phrase(ref(Handle), Query, K).
 
+search_phrase(Handle, Query, K, Filter) ->
+    bitcask_cpp_nifs:cask_search_phrase(ref(Handle), Query, K, Filter).
+
 %% 多字段搜索（S8.6）：支持 `field:term^boost` 语法，跨字段加权合并。
 %% 无字段限定的词等价于默认字段词袋搜索。
 search_fields(Handle, Query) ->
@@ -925,12 +933,18 @@ search_fields(Handle, Query) ->
 search_fields(Handle, Query, K) ->
     bitcask_cpp_nifs:cask_search_fields(ref(Handle), Query, K).
 
+search_fields(Handle, Query, K, Filter) ->
+    bitcask_cpp_nifs:cask_search_fields(ref(Handle), Query, K, Filter).
+
 %% 近邻搜索（S8.7）：term 按 Query 词序出现且相邻间隙 ≤ Slop。Slop=0 即短语。
 search_near(Handle, Query, Slop) ->
     search_near(Handle, Query, Slop, 10).
 
 search_near(Handle, Query, Slop, K) ->
     bitcask_cpp_nifs:cask_search_near(ref(Handle), Query, Slop, K).
+
+search_near(Handle, Query, Slop, K, Filter) ->
+    bitcask_cpp_nifs:cask_search_near(ref(Handle), Query, Slop, K, Filter).
 
 %% 模糊搜索（S8.3）：Levenshtein 编辑距离匹配。
 search_fuzzy(Handle, Query, MaxEdit) ->
@@ -939,12 +953,18 @@ search_fuzzy(Handle, Query, MaxEdit) ->
 search_fuzzy(Handle, Query, MaxEdit, K) ->
     bitcask_cpp_nifs:cask_search_fuzzy(ref(Handle), Query, MaxEdit, K).
 
+search_fuzzy(Handle, Query, MaxEdit, K, Filter) ->
+    bitcask_cpp_nifs:cask_search_fuzzy(ref(Handle), Query, MaxEdit, K, Filter).
+
 %% 通配符搜索（S8.4）：支持 * 和 ? 通配符。
 search_wildcard(Handle, Pattern) ->
     search_wildcard(Handle, Pattern, 10).
 
 search_wildcard(Handle, Pattern, K) ->
     bitcask_cpp_nifs:cask_search_wildcard(ref(Handle), Pattern, K).
+
+search_wildcard(Handle, Pattern, K, Filter) ->
+    bitcask_cpp_nifs:cask_search_wildcard(ref(Handle), Pattern, K, Filter).
 
 %% 用句柄里 open 时配置的 embedder 把文本编码成向量。无 embedder → 报错。
 %% 配合 search_vector/search_hybrid 的自动 embed 与 put #{text} 自动 embed。

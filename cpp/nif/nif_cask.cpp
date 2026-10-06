@@ -193,9 +193,35 @@ ERL_NIF_TERM nif_cask_close_write_file(ErlNifEnv* env, int /*argc*/,
     return atoms().ok;
 }
 
+// V5:解析「可选 filter term」 — 形态为 undefined atom → 无 filter;
+// 其它 term 走 parse_filter_term 翻译;解析失败 → badarg。
+// 返回的 unique_ptr 在 NIF 同步生命周期内持有,filter.get() 借给 cask
+// 搜索调用,本函数返回后即析构(与现有 3-arity 一样是同步调用)。
+static std::unique_ptr<bitcask::meta::MetaFilter>
+parse_optional_filter(ErlNifEnv* env, ERL_NIF_TERM term) {
+    if (enif_is_identical(term, atoms().undefined)) {
+        return nullptr;
+    }
+    return parse_filter_term(env, term);
+}
+
 // 以下 7 个搜索 NIF 都委托给 run_search 统一骨架（见 nif_helpers.hpp）：
 // 各入口只负责解析自己的整型参数，再把「具体怎么搜」作为闭包传入。
 // argv 约定：3 参版 = {ref, query, k}；4 参版 = {ref, query, extra, k}。
+// libbitcask 6.6.1 起 phrase/fields/near/fuzzy/wildcard 也收 meta filter：
+// 同一个入口多注册一个 arity，末位多一个 Filter（undefined = 不过滤）。
+
+// argc 比基础 arity 多 1 → 末位是 filter。形态错 → ok=false（调用方转 badarg）。
+static std::unique_ptr<bitcask::meta::MetaFilter>
+trailing_filter(ErlNifEnv* env, int argc, int base_arity,
+                const ERL_NIF_TERM argv[], bool& ok) {
+    ok = true;
+    if (argc <= base_arity) return nullptr;
+    const ERL_NIF_TERM t = argv[base_arity];
+    auto f = parse_optional_filter(env, t);
+    if (!f && !enif_is_identical(t, atoms().undefined)) ok = false;
+    return f;
+}
 
 ERL_NIF_TERM nif_cask_search_text(ErlNifEnv* env, int /*argc*/,
                                     const ERL_NIF_TERM argv[]) {
@@ -204,46 +230,71 @@ ERL_NIF_TERM nif_cask_search_text(ErlNifEnv* env, int /*argc*/,
         [k](Cask& c, std::string_view q) { return c.search_text(q, k); });
 }
 
-ERL_NIF_TERM nif_cask_search_phrase(ErlNifEnv* env, int /*argc*/,
+ERL_NIF_TERM nif_cask_search_phrase(ErlNifEnv* env, int argc,
                                      const ERL_NIF_TERM argv[]) {
     const auto k = static_cast<std::size_t>(get_topk(env, argv[2]));
+    bool ok = false;
+    auto filter = trailing_filter(env, argc, 3, argv, ok);
+    if (!ok) return enif_make_badarg(env);
     return run_search(env, argv[0], argv[1],
-        [k](Cask& c, std::string_view q) { return c.search_phrase(q, k); });
+        [k, &filter](Cask& c, std::string_view q) {
+            return c.search_phrase(q, k, 0, filter.get());
+        });
 }
 
 
 // S8.6：多字段搜索（field:term^boost）。
-ERL_NIF_TERM nif_cask_search_fields(ErlNifEnv* env, int /*argc*/,
+ERL_NIF_TERM nif_cask_search_fields(ErlNifEnv* env, int argc,
                                     const ERL_NIF_TERM argv[]) {
     const auto k = static_cast<std::size_t>(get_topk(env, argv[2]));
+    bool ok = false;
+    auto filter = trailing_filter(env, argc, 3, argv, ok);
+    if (!ok) return enif_make_badarg(env);
     return run_search(env, argv[0], argv[1],
-        [k](Cask& c, std::string_view q) { return c.search_fields(q, k); });
+        [k, &filter](Cask& c, std::string_view q) {
+            return c.search_fields(q, k, filter.get());
+        });
 }
 
 // S8.7：近邻搜索（4 参：ref, query, slop, k）。slop 非负，默认 0。
-ERL_NIF_TERM nif_cask_search_near(ErlNifEnv* env, int /*argc*/,
+ERL_NIF_TERM nif_cask_search_near(ErlNifEnv* env, int argc,
                                    const ERL_NIF_TERM argv[]) {
     const auto slop = static_cast<std::uint32_t>(get_nonneg_int(env, argv[2], 0));
     const auto k    = static_cast<std::size_t>(get_topk(env, argv[3]));
+    bool ok = false;
+    auto filter = trailing_filter(env, argc, 4, argv, ok);
+    if (!ok) return enif_make_badarg(env);
     return run_search(env, argv[0], argv[1],
-        [slop, k](Cask& c, std::string_view q) { return c.search_near(q, slop, k); });
+        [slop, k, &filter](Cask& c, std::string_view q) {
+            return c.search_near(q, slop, k, filter.get());
+        });
 }
 
 // S8.3：模糊搜索（ref, query, max_edit_distance, k）。距离非负，默认 1。
-ERL_NIF_TERM nif_cask_search_fuzzy(ErlNifEnv* env, int /*argc*/,
+ERL_NIF_TERM nif_cask_search_fuzzy(ErlNifEnv* env, int argc,
                                     const ERL_NIF_TERM argv[]) {
     const auto max_edit = static_cast<std::uint32_t>(get_nonneg_int(env, argv[2], 1));
     const auto k        = static_cast<std::size_t>(get_topk(env, argv[3]));
+    bool ok = false;
+    auto filter = trailing_filter(env, argc, 4, argv, ok);
+    if (!ok) return enif_make_badarg(env);
     return run_search(env, argv[0], argv[1],
-        [max_edit, k](Cask& c, std::string_view q) { return c.search_fuzzy(q, k, max_edit); });
+        [max_edit, k, &filter](Cask& c, std::string_view q) {
+            return c.search_fuzzy(q, k, max_edit, filter.get());
+        });
 }
 
 // S8.4：通配符搜索（ref, pattern, k）。
-ERL_NIF_TERM nif_cask_search_wildcard(ErlNifEnv* env, int /*argc*/,
+ERL_NIF_TERM nif_cask_search_wildcard(ErlNifEnv* env, int argc,
                                         const ERL_NIF_TERM argv[]) {
     const auto k = static_cast<std::size_t>(get_topk(env, argv[2]));
+    bool ok = false;
+    auto filter = trailing_filter(env, argc, 3, argv, ok);
+    if (!ok) return enif_make_badarg(env);
     return run_search(env, argv[0], argv[1],
-        [k](Cask& c, std::string_view p) { return c.search_wildcard(p, k); });
+        [k, &filter](Cask& c, std::string_view p) {
+            return c.search_wildcard(p, k, filter.get());
+        });
 }
 
 // V3.6:HNSW 向量检索（ref, vec_bin, k, ef）。vec_bin = f32 LE 二进制
@@ -290,18 +341,6 @@ ERL_NIF_TERM nif_cask_search_hybrid(ErlNifEnv* env, int /*argc*/,
     ERL_NIF_TERM hits = make_search_hits(env, r->hits);
     if (!hits) return make_error(env, atoms().allocation_error);
     return make_ok(env, hits);
-}
-
-// V5:解析「可选 filter term」 — 形态为 undefined atom → 无 filter;
-// 其它 term 走 parse_filter_term 翻译;解析失败 → badarg。
-// 返回的 unique_ptr 在 NIF 同步生命周期内持有,filter.get() 借给 cask
-// 搜索调用,本函数返回后即析构(与现有 3-arity 一样是同步调用)。
-static std::unique_ptr<bitcask::meta::MetaFilter>
-parse_optional_filter(ErlNifEnv* env, ERL_NIF_TERM term) {
-    if (enif_is_identical(term, atoms().undefined)) {
-        return nullptr;
-    }
-    return parse_filter_term(env, term);
 }
 
 ERL_NIF_TERM nif_cask_search_text_4(ErlNifEnv* env, int /*argc*/,
