@@ -59,7 +59,7 @@
            search_vector/2, search_vector/3, search_vector/4, search_vector/5,
            search_hybrid/2, search_hybrid/3, search_hybrid/4, search_hybrid/5,
            embed/2,
-           encode_meta/1]).
+           encode_meta/1, decode_meta/1]).
 
 -include("bitcask.hrl").
 
@@ -1023,3 +1023,10 @@ search_hybrid(Handle, TextQuery, VecBin, K, Filter) when is_binary(VecBin) ->
 %% undefined -> null。失败 → badarg。
 encode_meta(Entries) ->
     bitcask_cpp_nifs:cask_encode_meta(Entries).
+
+%% encode_meta 的反方向：blob → map。null 解回 undefined，其余类型原样对应
+%% （int64 → integer、double → float、string → binary、bool → true|false）。
+%% 非法 blob → badarg。get 在无 meta 时给 undefined，调用方自己分支。
+-spec decode_meta(binary()) -> #{binary() => term()}.
+decode_meta(Bin) ->
+    bitcask_cpp_nifs:cask_decode_meta(Bin).

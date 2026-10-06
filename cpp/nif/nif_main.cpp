@@ -52,6 +52,7 @@ ERL_NIF_TERM nif_cask_search_vector_5   (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_hybrid     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_hybrid_5   (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_encode_meta       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_decode_meta       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_fold_start        (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_fold_start4       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_fold_next         (ErlNifEnv*, int, const ERL_NIF_TERM[]);
@@ -107,6 +108,7 @@ ErlNifFunc kNifFuncs[] = {
     {"cask_search_hybrid",      4, guarded<nif_cask_search_hybrid>,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"cask_search_hybrid",      5, guarded<nif_cask_search_hybrid_5>, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"cask_encode_meta",        1, guarded<nif_cask_encode_meta>,     0},
+    {"cask_decode_meta",        1, guarded<nif_cask_decode_meta>,     0},
     // 迭代：fold 系列（独立 IterRef，可多个并发）
     // start 要 pin 住目录下全部 sealed data file（每个一次 open()）——
     // O(#files) 系统调用；批量 next 一次最多 1024 次 pread。两者都挂 dirty IO，

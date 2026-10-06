@@ -5,10 +5,16 @@
 // 接受形式:#{Key :: binary() => Value} 或 [{Key, Value}]。Value 类型映射:
 // int -> int64, float -> double, binary -> string, true/false -> bool,
 // undefined/其它 atom -> null。失败 → badarg。
+//
+// decode_meta 是反方向:blob → #{Key :: binary() => Value}。null -> undefined,
+// bool -> true/false,int64 -> integer,double -> float,string -> binary。
+// 查询层(bitcask_query)拿 get 回来的 meta 在 BEAM 侧求值 where 用。
 
 #include <algorithm>
 #include <cstring>
+#include <span>
 #include <string>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -88,6 +94,42 @@ ERL_NIF_TERM nif_cask_encode_meta(ErlNifEnv* env, int /*argc*/,
         std::memcpy(out.data, buf.data(), buf.size());
     }
     return enif_make_binary(env, &out);
+}
+
+ERL_NIF_TERM nif_cask_decode_meta(ErlNifEnv* env, int /*argc*/,
+                                   const ERL_NIF_TERM argv[]) {
+    ErlNifBinary in{};
+    if (!enif_inspect_binary(env, argv[0], &in)) return enif_make_badarg(env);
+    auto r = bitcask::meta::decode_meta(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(in.data), in.size));
+    if (!r) return enif_make_badarg(env);
+
+    ERL_NIF_TERM map = enif_make_new_map(env);
+    for (const auto& e : *r) {
+        ERL_NIF_TERM k = make_binary_checked(env, std::as_bytes(
+            std::span<const char>(e.key.data(), e.key.size())));
+        if (!k) return make_error(env, atoms().allocation_error);
+        ERL_NIF_TERM v = std::visit(
+            [env](const auto& x) -> ERL_NIF_TERM {
+                using T = std::decay_t<decltype(x)>;
+                if constexpr (std::is_same_v<T, std::monostate>) {
+                    return atoms().undefined;
+                } else if constexpr (std::is_same_v<T, bool>) {
+                    return x ? atoms().atom_true : atoms().atom_false;
+                } else if constexpr (std::is_same_v<T, std::int64_t>) {
+                    return enif_make_int64(env, x);
+                } else if constexpr (std::is_same_v<T, double>) {
+                    return enif_make_double(env, x);
+                } else {
+                    return make_binary_checked(env, std::as_bytes(
+                        std::span<const char>(x.data(), x.size())));
+                }
+            },
+            e.value);
+        if (!v) return make_error(env, atoms().allocation_error);
+        enif_make_map_put(env, map, k, v, &map);
+    }
+    return map;
 }
 
 }  // namespace bitcask::nif

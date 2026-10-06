@@ -28,6 +28,7 @@
          cask_search_hybrid/4,
          cask_search_hybrid/5,
          cask_encode_meta/1,
+         cask_decode_meta/1,
          cask_fold_start/3,
          cask_fold_start/4,
          cask_fold_next/1,
@@ -107,6 +108,8 @@ cask_search_hybrid(_Ref, _TextBin, _VecBin, _K, _Filter) -> erlang:nif_error({er
 %% int/float/binary/true|false/undefined → int64/f64/string/bool/null)。
 %% 给 eunit 测试用 — 生产路径下 put_doc 的 meta 是由业务自行编码的。
 cask_encode_meta(_Entries) -> erlang:nif_error({error, not_loaded}).
+%% 反方向：meta blob → #{binary() => integer()|float()|binary()|boolean()|undefined}。
+cask_decode_meta(_Bin) -> erlang:nif_error({error, not_loaded}).
 cask_fold_start(_R, _MA, _MP) -> erlang:nif_error({error, not_loaded}).
 cask_fold_start(_R, _MA, _MP, _SeeTomb) -> erlang:nif_error({error, not_loaded}).
 cask_fold_next(_IterRef)      -> erlang:nif_error({error, not_loaded}).
