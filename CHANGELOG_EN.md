@@ -5,9 +5,10 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [6.7.1] — 2026-10-06
 
-Adds a structured query DSL, upgrades libbitcask **6.6.0 → 6.6.1**, and moves the local embedding backend to llama.cpp `b11434`. The C API / ABI change is additive only, `SOVERSION` is
+Adds a structured query DSL (with paging, vector / hybrid search and secondary indexes), upgrades libbitcask **6.6.0 → 6.6.2**, and moves the local embedding backend to llama.cpp `b11434`. The C API / ABI change is additive only, `SOVERSION` is
 unchanged, and so is the on-disk format. libbitcask 6.6.1 fixes the five items we reported in
-`feedbacks/2026-10-06-meta-filter-query-gaps.md`.
+`feedbacks/2026-10-06-meta-filter-query-gaps.md`; 6.6.2 takes `feedbacks/2026-10-06-atomic-batch-doc-meta.md`,
+so atomic batches can write documents with meta.
 
 ### Fixed (via libbitcask 6.6.1)
 
@@ -66,10 +67,16 @@ unchanged, and so is the on-disk format. libbitcask 6.6.1 fixes the five items w
   - A `where`-only query picks one eq / in / comparison / exists condition on an indexed field and runs it as a
     range over index keys.
   - Values are encoded order-preserving and self-delimiting, with the engine MetaFilter's type semantics.
-  - ⚠️ Not atomic: upstream atomic batches cannot carry documents with meta (reported as libbitcask
-    `feedbacks/2026-10-06-atomic-batch-doc-meta.md`). Writes take a key lock and run in the order add new entries →
-    write document → remove old entries; reads check every candidate against the document, so there are no wrong
-    or duplicate rows. Writes to indexed fields must go through `bitcask_query:put/delete`.
+  - Each write is one `bitcask_txn` transaction: lock the key, read the old meta, and commit the document, the
+    new entries and the removal of the old ones in a single commit batch (requires libbitcask 6.6.2). Reads still
+    check candidates against the document, which catches stale entries left by writes that bypass
+    `bitcask_query:put/delete`. Writes to indexed fields must go through `bitcask_query:put/delete`.
+- **Structured documents in atomic batches and transactions** (via libbitcask 6.6.2 `kPutDoc`): values in
+  `put_batch_atomic/2`, `txn_commit/2,3,4` and `bitcask_txn:write/3` may be doc maps (same shape as `put/3`). With
+  an embedder configured, batched documents are embedded automatically (one `embed_batch` call; on failure nothing
+  in the batch is written), sharing the code with `put_docs/2`. Vectors are paired by position, so a key that appears
+  more than once in a batch gets the vector for each of its texts; this also fixes `put_docs/2`, which used to give
+  every copy of a repeated key the same vector even when the texts differed.
 - **`bitcask_txn:lock_key/3`**: takes a point lock without reading or writing (like `mnesia:lock`); the
   secondary-index writes use it to lock the key. The `read/2,3` spec is corrected: an unbuffered key returns
   whatever `bitcask:get` returns, which is a map in index mode.

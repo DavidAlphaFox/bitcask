@@ -5,8 +5,8 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 
 ## [6.7.1] — 2026-10-06
 
-新增结构化查询 DSL，升级 libbitcask **6.6.0 → 6.6.1**（C API / ABI 纯加法，`SOVERSION` 不变，盘上格式不变），另外本地嵌入后端的 llama.cpp 升到 `b11434`。
-libbitcask 6.6.1 修的是我们报上去的 `feedbacks/2026-10-06-meta-filter-query-gaps.md` 五条。
+新增结构化查询 DSL（含分页、向量 / 混合检索、二级索引），升级 libbitcask **6.6.0 → 6.6.2**（C API / ABI 纯加法，`SOVERSION` 不变，盘上格式不变），另外本地嵌入后端的 llama.cpp 升到 `b11434`。
+libbitcask 6.6.1 修的是我们报上去的 `feedbacks/2026-10-06-meta-filter-query-gaps.md` 五条；6.6.2 收下 `feedbacks/2026-10-06-atomic-batch-doc-meta.md`，原子批可以写带 meta 的文档。
 
 ### Fixed（随 libbitcask 6.6.1）
 
@@ -53,9 +53,13 @@ libbitcask 6.6.1 修的是我们报上去的 `feedbacks/2026-10-06-meta-filter-q
   `bitcask_query:put/3`、`delete/2`，以及 `explain/2`（查看规划结果）。
   - 只有 `where` 的查询会挑一个已建索引字段上的 eq / in / 大小比较 / exists 条件，转成索引键上的 range。
   - 值的编码保序且能自行判断结束位置，类型语义与引擎 MetaFilter 一致。
-  - ⚠️ 不是原子的：上游原子批写不进带 meta 的文档（已报 libbitcask
-    `feedbacks/2026-10-06-atomic-batch-doc-meta.md`）。写入时加 key 锁，按「加新项 → 写文档 → 删旧项」的顺序执行；
-    读取时回表校验，保证不会出现错行或重复行。索引字段的写入必须走 `bitcask_query:put/delete`。
+  - 每次写入是一个 `bitcask_txn` 事务：锁 key、读旧 meta，「文档 + 新索引项 + 删旧索引项」同一个提交批落盘
+    （依赖 libbitcask 6.6.2）。读取时仍回表校验，挡住绕过 `bitcask_query:put/delete` 的写入留下的过期项。
+    索引字段的写入必须走 `bitcask_query:put/delete`。
+- **原子批 / 事务写结构化文档**（随 libbitcask 6.6.2 的 `kPutDoc`）：`put_batch_atomic/2`、`txn_commit/2,3,4`
+  和 `bitcask_txn:write/3` 的 value 可以是 doc map（与 `put/3` 同形）。配了 embedder 时，批内文档自动 embed
+  （一次 `embed_batch`，失败整批不写），与 `put_docs/2` 共用同一段代码；按位置配对，所以同一个 key 在批里出现多次也各拿各的向量
+  （这也修掉了 `put_docs/2` 里同 key 多次、文本不同时共用一个向量的问题）。
 - **`bitcask_txn:lock_key/3`**：只拿点锁、不读不写（同 `mnesia:lock`）。二级索引的写入靠它给 key 加锁。
   `read/2,3` 的 spec 改准：未缓冲的 key 直接返回 `bitcask:get` 的结果，在索引模式下是 map。
 - **`bitcask:decode_meta/1`**：`encode_meta/1` 的反方向（新 NIF `cask_decode_meta`）。
