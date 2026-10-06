@@ -131,6 +131,9 @@ struct Atoms {
     ERL_NIF_TERM hi;
     ERL_NIF_TERM prefetch;
     ERL_NIF_TERM prefetch_threads;
+    // libbitcask 6.6.1：range 条目带 meta / 按 meta 筛选。
+    ERL_NIF_TERM want_meta;
+    ERL_NIF_TERM filter;
 
     // v5.1.0 S34/S35：原子批 / 多键事务。
     //   put/remove = 批内操作标签（{put,K,V} / {remove,K}）；

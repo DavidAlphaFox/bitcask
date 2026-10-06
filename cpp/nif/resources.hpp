@@ -94,11 +94,17 @@ struct CaskIterHandle {
 // keep/release 用 enif_keep_resource/enif_release_resource，配对严格：
 // 构造成功即 keep 一次，dtor 里 release 一次。
 struct CaskRangeIterHandle {
+    // libbitcask 6.6.1：RangeOptions::filter 是借用指针，迭代器整个生命期都要
+    // 能读到它——所以由句柄持有。析构时先放 iter 再放 filter（见 ~ 与成员序）。
+    std::unique_ptr<bitcask::meta::MetaFilter> filter;
     std::unique_ptr<CaskRangeIter> iter;
     CaskHandle* owner = nullptr;   // keep 住的父资源，非拥有指针
+    bool want_meta = false;        // next_batch 是否给 5 元组（带 meta）
 
-    CaskRangeIterHandle(std::unique_ptr<CaskRangeIter> it, CaskHandle* o) noexcept
-        : iter(std::move(it)), owner(o) {
+    CaskRangeIterHandle(std::unique_ptr<CaskRangeIter> it, CaskHandle* o,
+                        std::unique_ptr<bitcask::meta::MetaFilter> f = nullptr,
+                        bool wm = false) noexcept
+        : filter(std::move(f)), iter(std::move(it)), owner(o), want_meta(wm) {
         if (owner) enif_keep_resource(owner);
     }
     CaskRangeIterHandle(const CaskRangeIterHandle&)            = delete;

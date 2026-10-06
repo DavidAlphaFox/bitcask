@@ -526,6 +526,10 @@ with_stream(Handle, Fun) -> bitcask_stream:with_stream(ref(Handle), Fun).
 %%                          输出序与内容不变。大窗口 + 冷值形态收益明显，
 %%                          小窗口反而可能被线程创建成本吃掉，故默认关。
 %%   {prefetch_threads, N}  0（默认）= min(在线核数, 4)。
+%%   {want_meta, true}      Value 改为 #{text => Bin, meta => Bin | undefined}
+%%                          （与 get 的索引模式同形；meta 与 text 同一次读）。
+%%   {filter, F}            meta filter（形态同 search_text/4），在 C++ 侧逐条
+%%                          求值，不通过的条目不交出；无 meta 的不通过。
 %%
 %% OKI 不可用时按成因分两个码（6.1.0）——补救方式不同：
 %%   {error, no_index}             索引在本句柄上**本就不建**（只读 / merge_only
@@ -586,7 +590,7 @@ normalize_error(Reason)         -> {error, Reason}.
 %% 等价，但显式不传更省一次 binary 检查。
 range_opts(Lo, Hi, Opts) ->
     Bounds = [{lo, Lo} || is_binary(Lo)] ++ [{hi, Hi} || is_binary(Hi)],
-    Tuning = [{K, V} || K <- [prefetch, prefetch_threads],
+    Tuning = [{K, V} || K <- [prefetch, prefetch_threads, want_meta, filter],
                         (V = proplists:get_value(K, Opts)) =/= undefined],
     Bounds ++ Tuning.
 
@@ -599,7 +603,10 @@ range_loop(IterRef, Fun, Acc) ->
         done -> Acc;
         {ok, Entries} ->
             {Acc1, N} = lists:foldl(fun({K, V, T, O}, {A, C}) ->
-                                            {Fun(K, V, T, O, A), C + 1}
+                                            {Fun(K, V, T, O, A), C + 1};
+                                       ({K, V, T, O, M}, {A, C}) ->  % want_meta
+                                            {Fun(K, #{text => V, meta => M}, T, O, A),
+                                             C + 1}
                                     end, {Acc, 0}, Entries),
             case N < ?RANGE_BATCH of
                 true  -> Acc1;

@@ -48,13 +48,17 @@ constexpr ErlNifUInt64 kMaxPrefetchThreads = 256;
 //   {hi, Binary}              区间上界（不含），缺省/空 = 到尾
 //   {prefetch, N}             N>1 才生效：一次归并 N 个 key 并发取值
 //   {prefetch_threads, N}     0 = min(hardware_concurrency, 4)
+//   {want_meta, true}         条目带 meta（与 value 同一次读，6.6.1）
+//   {filter, F}               meta filter（形态同 search_text/4），C++ 侧逐条
+//                             求值，不通过的连 value 都不拷；无 meta 的不通过
 //
 // lo/hi 的 span 借用 caller 的 ErlNifBinary，只在本次 NIF 调用内有效——
 // 这没问题：make_range_iter 里 lo 仅用于建游标时 seek，hi 被拷进迭代器
 // 自己的 std::string。不识别的键静默跳过，与 open/2 的选项语义一致。
 bool parse_range_options(ErlNifEnv* env, ERL_NIF_TERM list,
                          RangeOptions& out,
-                         ErlNifBinary& lo_bin, ErlNifBinary& hi_bin) {
+                         ErlNifBinary& lo_bin, ErlNifBinary& hi_bin,
+                         std::unique_ptr<bitcask::meta::MetaFilter>& filter) {
     ERL_NIF_TERM head, tail = list;
     while (enif_get_list_cell(env, tail, &head, &tail)) {
         int arity = 0;
@@ -76,6 +80,14 @@ bool parse_range_options(ErlNifEnv* env, ERL_NIF_TERM list,
             if (enif_get_uint64(env, val, &v)) {
                 out.prefetch = static_cast<std::size_t>(std::min<ErlNifUInt64>(v, kMaxPrefetch));
             }
+        } else if (key == atoms().want_meta) {
+            out.want_meta = enif_is_identical(val, atoms().atom_true);
+        } else if (key == atoms().filter) {
+            // undefined = 不过滤；其余形态错 → badarg（与 search_text/4 一致）。
+            if (!enif_is_identical(val, atoms().undefined)) {
+                filter = parse_filter_term(env, val);
+                if (!filter) return false;
+            }
         } else if (key == atoms().prefetch_threads) {
             ErlNifUInt64 v = 0;
             if (enif_get_uint64(env, val, &v)) {
@@ -87,14 +99,21 @@ bool parse_range_options(ErlNifEnv* env, ERL_NIF_TERM list,
     return true;
 }
 
-// 一条 Entry → {K, V, Tstamp, Ord}。分配失败返回 0（调用方转 allocation_error）。
-ERL_NIF_TERM make_range_entry(ErlNifEnv* env, const CaskRangeIter::Entry& e) {
+// 一条 Entry → {K, V, Tstamp, Ord}；want_meta 时 {K, V, Tstamp, Ord, Meta}，
+// Meta 为空 → undefined（与 get 的索引模式形态一致）。
+// 分配失败返回 0（调用方转 allocation_error）。
+ERL_NIF_TERM make_range_entry(ErlNifEnv* env, const CaskRangeIter::Entry& e,
+                              bool want_meta) {
     ERL_NIF_TERM key_bin = make_binary_checked(env, e.key);
     ERL_NIF_TERM val_bin = make_binary_checked(env, e.value);
     if (!key_bin || !val_bin) return 0;
-    return enif_make_tuple4(env, key_bin, val_bin,
-                            enif_make_uint64(env, e.tstamp),
-                            enif_make_uint64(env, e.ord));
+    ERL_NIF_TERM ts  = enif_make_uint64(env, e.tstamp);
+    ERL_NIF_TERM ord = enif_make_uint64(env, e.ord);
+    if (!want_meta) return enif_make_tuple4(env, key_bin, val_bin, ts, ord);
+    ERL_NIF_TERM meta = e.meta.empty() ? atoms().undefined
+                                       : make_binary_checked(env, e.meta);
+    if (!meta) return 0;
+    return enif_make_tuple5(env, key_bin, val_bin, ts, ord, meta);
 }
 
 // 取出可用的 range 迭代器句柄：资源类型对、迭代器未 release、父 cask 未 close。
@@ -127,20 +146,27 @@ ERL_NIF_TERM nif_cask_range_start(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TE
 
     RangeOptions opts;
     ErlNifBinary lo_bin{}, hi_bin{};
-    if (!parse_range_options(env, argv[1], opts, lo_bin, hi_bin)) {
+    std::unique_ptr<bitcask::meta::MetaFilter> filter;
+    if (!parse_range_options(env, argv[1], opts, lo_bin, hi_bin, filter)) {
         return enif_make_badarg(env);
     }
+    // filter 先交给 unique_ptr 持有（堆地址稳定），迭代器借这个地址；随后
+    // 二者一起进资源句柄。
+    opts.filter = filter.get();
 
     auto it = h->cask->make_range_iter(opts);
     if (!it) return fault_to_term(env, it.error());
 
+    const bool want_meta = opts.want_meta;
     auto term = make_resource<CaskRangeIterHandle>(
-        env, g_cask_range_iter_resource_type, std::move(*it), h);
+        env, g_cask_range_iter_resource_type, std::move(*it), h,
+        std::move(filter), want_meta);
     if (!term) return make_error(env, atoms().allocation_error);
     return make_ok(env, term);
 }
 
 // cask_range_next_batch(IterRef, N) -> {ok, [{K,V,Tstamp,Ord}]} | done | {error,_}
+//   （want_meta 时条目为 {K,V,Tstamp,Ord,Meta}）
 //
 // C++ 侧只有单条 next()，这里在 NIF 内循环——收益是把 N 次 BEAM ↔ NIF 往返
 // 压成一次（与 cask_fold_next_batch 同款权衡）。上限 1024，与 fold 批一致：
@@ -169,7 +195,7 @@ ERL_NIF_TERM nif_cask_range_next_batch(ErlNifEnv* env, int /*argc*/, const ERL_N
     // 倒着 cons 以保持字典序（enif_make_list_cell 是 prepend）。
     ERL_NIF_TERM list = enif_make_list(env, 0);
     for (auto it = out.rbegin(); it != out.rend(); ++it) {
-        ERL_NIF_TERM entry = make_range_entry(env, *it);
+        ERL_NIF_TERM entry = make_range_entry(env, *it, ih->want_meta);
         if (!entry) return make_error(env, atoms().allocation_error);
         list = enif_make_list_cell(env, entry, list);
     }

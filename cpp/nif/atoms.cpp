@@ -103,6 +103,8 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     hi                 = a("hi");
     prefetch           = a("prefetch");
     prefetch_threads   = a("prefetch_threads");
+    want_meta          = a("want_meta");
+    filter             = a("filter");
 
     put                = a("put");
     remove             = a("remove");
