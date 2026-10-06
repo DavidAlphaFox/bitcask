@@ -249,14 +249,16 @@ locks_key(TxnId) -> {?MODULE, locks, TxnId}.
 %% 事务内 API
 %% =========================================================================
 
--spec read(term(), binary()) -> {ok, binary()} | not_found | {error, term()}.
+-spec read(term(), binary()) -> {ok, binary() | map()} | not_found | {error, term()}.
 read(Tx, Key) ->
     read(Tx, Key, read).
 
 %% read/3 的 Lock = write：读之前直接拿**写**锁（Mnesia 的 wlock_read）。
 %% 读-改-写模式必须用它：两个事务都先读锁再升级，就是一个确定的死锁
 %% （各自等对方放读锁）——能跑对（检测 + 重跑），但纯属浪费。
--spec read(term(), binary(), read | write) -> {ok, binary()} | not_found | {error, term()}.
+%% 未缓冲的 key 直通 bitcask:get——索引模式下值是 #{text, meta}。
+-spec read(term(), binary(), read | write) ->
+          {ok, binary() | map()} | not_found | {error, term()}.
 read(#bitcask_txn_ctx{handle = Handle} = Tx, Key, Lock)
   when is_binary(Key), (Lock =:= read orelse Lock =:= write) ->
     Buf = buffer(Tx),              % 先做 owner 检查，再去拿锁
