@@ -46,7 +46,7 @@ cmake -S . -B _build/cmake -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release \
 cmake --build _build/cmake --target bitcask_llama -j
 ```
 
-首次会拉 `third_party/llama.cpp` 子模块（约 200 MB，钉在 tag `b10859`）并全量
+首次会拉 `third_party/llama.cpp` 子模块（约 200 MB，钉在 tag `b11434`）并全量
 编译，是分钟级。之后增量是 no-op。
 
 构建完 `priv/` 下会多出一组共享库：

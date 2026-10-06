@@ -569,6 +569,21 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## M15 — llama.cpp 升级 b10859 → b11434（6.7.1）
+
+> submodule `ca86fb2` → `5e03bdd`（tag `b11434`，约 575 个上游提交），ggml 0.23 → 0.26。
+> 本地嵌入后端（opt-in）的依赖刷新，不涉及 libbitcask，核心 `bitcask_cpp.so` 不变。流程照 M13。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M15-1** | 影响面盘点：`nif_llama.cpp` 用到的 51 个 `llama_*` / `ggml_*` 符号与全部 `LLAMA_*` / `GGML_*` 常量逐个在 b11434 头文件里核对，全在位、无 deprecated；CMake 注入的 `GGML_*` 选项仍被上游识别。**NIF 零改动**。 | ✅ |
+| **M15-2** | 子模块原本未初始化（只有 gitlink），先 `update --init --depth 1`，再浅拉 tag `b11434` 并 checkout；`.gitmodules` 的 `branch`、`CMakeLists.txt` 注释、`doc/local-embedding-zh/en.md` 钉版行随动。 | ✅ |
+| **M15-3** | `BITCASK_WITH_LLAMA=1 rebar3 compile` 全量通过，NIF 无新告警：Vulkan AUTO 打开（glslc + Vulkan 1.4.309）、CUDA AUTO 关（无 Toolkit）、14 个 CPU 变体 + `libggml-vulkan.so` + `bitcask_llama.so` 落 `priv/`。 | ✅ |
+| **M15-4** | 运行期：`BITCASK_TEST_GGUF=…/Qwen3-Embedding-0.6B-Q8_0.gguf` 下 `bitcask_llama_tests` **25/25**（三档全跑）。同机对比 M13 记录：短查询 33–35 → 22 ms，约 280 token 文档 890 → 720 ms（n_ctx=512，7 次取中位数）；测试用的近义/无关自检差值 0.590，与升级前一致。 | ✅ |
+| **M15-5** | 回归：`BITCASK_WITH_LLAMA=1` + 模型下全量 eunit **292/292**。⚠️ 照 M13-5：之后不带 `BITCASK_WITH_LLAMA=1` 跑 rebar3 会把 cmake 缓存配回 llama 关，属设计行为。 | ✅ |
+
+---
+
 ## 明确排除（V7+ 或永久取消）
 
 | 条目 | 决策 | 理由 |

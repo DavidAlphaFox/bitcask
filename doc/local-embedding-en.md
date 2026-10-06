@@ -54,7 +54,7 @@ cmake --build _build/cmake --target bitcask_llama -j
 ```
 
 The first run fetches the `third_party/llama.cpp` submodule (~200 MB, pinned to
-tag `b10859`) and compiles all of it — minutes, not seconds. Incremental builds
+tag `b11434`) and compiles all of it — minutes, not seconds. Incremental builds
 after that are a no-op.
 
 Once built, `priv/` gains a set of shared libraries:

@@ -115,7 +115,7 @@ add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/libbitcask"
                  "${CMAKE_BINARY_DIR}/libbitcask-build")
 
 # ---------------------------------------------------------------------------
-# llama.cpp — 本地嵌入后端，git submodule at third_party/llama.cpp（tag b10859）。
+# llama.cpp — 本地嵌入后端，git submodule at third_party/llama.cpp（tag b11434）。
 #
 # **默认关**。打开：cmake -DBITCASK_WITH_LLAMA=ON。理由不是保守，是成本：
 # 打开之后 priv/ 下会多出 ggml-base + 14 个 CPU 变体 + llama 一组共享库，首次
