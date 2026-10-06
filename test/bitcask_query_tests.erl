@@ -12,6 +12,10 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
+%% 计数 embedder（provider 回调）：委托 bitcask_embedder_mock，顺带数调用次数，
+%% 用来断言 {text, Bin} 查询翻页时只 embed 一次。
+-export([init/1, embed/2]).
+
 -define(IDX, [read_write, {analyzer, whitespace}]).
 
 with_dir(Fun) -> bitcask_test_util:with_dir("bitcask_query_", Fun).
@@ -273,6 +277,178 @@ search_filter_arities_test_() ->
     end}.
 
 %% ===================================================================
+%% 分页
+%% ===================================================================
+
+%% 一页一页取到 done，返回 [[Row]]（每页一个列表）。
+all_pages(H, Q) ->
+    {ok, Rows, Cont} = bitcask_query:page(H, Q),
+    drain(Cont, [Rows]).
+
+drain(done, Acc) -> lists:reverse(Acc);
+drain(Cont, Acc) ->
+    {ok, Rows, Next} = bitcask_query:page(Cont),
+    drain(Next, [Rows | Acc]).
+
+page_keys(Pages) -> [[K || #{key := K} <- P] || P <- Pages].
+
+page_range_test_() ->
+    {"range 驱动分页：按 key 升序、不重不漏；整除时最后一页满且 Cont = done",
+     fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, ?IDX),
+            [ok = bitcask:put(R, key(N), #{text => <<"x">>,
+                                           meta => m(#{<<"n">> => N})})
+             || N <- lists:seq(1, 10)],
+            Ten = [key(N) || N <- lists:seq(1, 10)],
+            P3 = page_keys(all_pages(R, #{key => {prefix, <<"d">>}, limit => 3})),
+            ?assertEqual([3, 3, 3, 1], [length(P) || P <- P3]),
+            ?assertEqual(Ten, lists:append(P3)),
+            %% 整除：多取一条的 lookahead 让第二页直接给 done，不多一页空页
+            {ok, A, C1} = bitcask_query:page(R, #{limit => 5}),
+            {ok, B, done} = bitcask_query:page(C1),
+            ?assertEqual(Ten, keys({ok, A ++ B})),
+            ?assertEqual({ok, [], done}, bitcask_query:page(done)),
+            %% where 下推照样分页
+            Odd = page_keys(all_pages(R, #{where => {<<"n">>, in, [1, 3, 5, 7, 9]},
+                                           limit => 2, select => [key]})),
+            ?assertEqual([[key(1), key(3)], [key(5), key(7)], [key(9)]], Odd),
+            %% 区间上界在分页时保持
+            ?assertEqual([[key(2), key(3)], [key(4)]],
+                         page_keys(all_pages(R, #{key => {range, key(2), key(5)},
+                                                  limit => 2}))),
+            bitcask:close(R)
+        end)
+    end}.
+
+page_text_test_() ->
+    {"全文驱动分页：拼起来等于一次取全（同分前缀稳定），带 key 条件也不重不漏",
+     {timeout, 120,
+      fun() ->
+        with_dir(fun(D) ->
+            R = open_apples(D),
+            Q = #{text => {match, <<"apple">>}, where => {<<"tag">>, eq, <<"keep">>}},
+            {ok, All} = bitcask_query:q(R, Q),
+            Pages = page_keys(all_pages(R, Q#{limit => 30})),
+            ?assertEqual([30, 30, 30, 10], [length(P) || P <- Pages]),
+            ?assertEqual(keys({ok, All}), lists:append(Pages)),
+            %% d09xx 共 100 篇，key 在 BEAM 侧后过滤
+            KP = lists:append(page_keys(all_pages(
+                   R, #{text => {match, <<"apple">>}, key => {prefix, <<"d09">>},
+                        limit => 7, select => [key, score]}))),
+            ?assertEqual(100, length(KP)),
+            ?assertEqual(100, length(lists:usort(KP))),
+            bitcask:close(R)
+        end)
+      end}}.
+
+%% ===================================================================
+%% 向量 / 混合
+%% ===================================================================
+
+-define(VOPTS, [read_write, {analyzer, whitespace}, {vector_dim, 4}]).
+
+%% v1..v20：单位向量 [cos θ, sin θ, 0, 0]，θ 随 N 递增——查询 [1,0,0,0] 时
+%% 相似度按 N 严格递减。偶数篇 tag=even。
+open_vectors(D) ->
+    R = bitcask:open(D, ?VOPTS),
+    [ok = bitcask:put(R, vkey(N),
+                      #{text   => <<"vec doc">>,
+                        vector => unit(N),
+                        meta   => m(#{<<"even">> => N rem 2 =:= 0})})
+     || N <- lists:seq(1, 20)],
+    R.
+
+vkey(N) -> list_to_binary(io_lib:format("v~2..0b", [N])).
+
+unit(N) ->
+    T = N * 0.07,
+    bitcask_embedder_mock:vec_bin([math:cos(T), math:sin(T), 0.0, 0.0]).
+
+q0() -> bitcask_embedder_mock:vec_bin([1.0, 0.0, 0.0, 0.0]).
+
+vector_query_test_() ->
+    {"vector：按相似度降序、where 下推、key 后过滤、score 是相似度",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open_vectors(D),
+            ?assertEqual([vkey(1), vkey(2), vkey(3)],
+                         keys(bitcask_query:q(R, #{vector => q0(), limit => 3}))),
+            ?assertEqual([vkey(2), vkey(4), vkey(6)],
+                         keys(bitcask_query:q(R, #{vector => q0(), limit => 3,
+                                                   where => {<<"even">>, eq, true}}))),
+            ?assertEqual([vkey(10), vkey(11)],
+                         keys(bitcask_query:q(R, #{vector => q0(), limit => 2,
+                                                   key => {prefix, <<"v1">>}}))),
+            {ok, [#{score := S1}, #{score := S2}]} =
+                bitcask_query:q(R, #{vector => q0(), limit => 2, ef => 64,
+                                     select => [score]}),
+            ?assert(S1 >= S2),
+            bitcask:close(R)
+        end)
+    end}.
+
+vector_page_test_() ->
+    {"vector 分页（近似游标）：按已返回 key 去重，不重复；小库上不漏",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open_vectors(D),
+            Pages = page_keys(all_pages(R, #{vector => q0(), limit => 6})),
+            Flat = lists:append(Pages),
+            ?assertEqual(length(Flat), length(lists:usort(Flat))),
+            ?assertEqual([vkey(N) || N <- lists:seq(1, 20)], Flat),
+            bitcask:close(R)
+        end)
+    end}.
+
+hybrid_query_test_() ->
+    {"text {match,_} + vector = search_hybrid（RRF），where 下推；与直调一致",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open_vectors(D),
+            ok = bitcask:put(R, <<"t1">>, #{text => <<"needle hay">>, vector => unit(19),
+                                            meta => m(#{<<"even">> => false})}),
+            {ok, Direct} = bitcask:search_hybrid(R, <<"needle">>, q0(), 5),
+            ?assertEqual([K || {K, _, _} <- Direct],
+                         keys(bitcask_query:q(R, #{text => {match, <<"needle">>},
+                                                   vector => q0(), limit => 5}))),
+            Hy = keys(bitcask_query:q(R, #{text => {match, <<"needle">>}, vector => q0(),
+                                           where => {<<"even">>, eq, false}, limit => 5})),
+            ?assert(lists:member(<<"t1">>, Hy)),
+            ?assertEqual([], [K || K <- Hy, lists:member(K, [vkey(N) || N <- [2,4,6,8,10]])]),
+            bitcask:close(R)
+        end)
+    end}.
+
+%% 计数 provider 回调
+init(_Cfg) ->
+    {ok, #{module => ?MODULE, dim => 4, config => #{}}}.
+
+embed(_Cfg, Text) ->
+    counters:add(persistent_term:get({?MODULE, embeds}), 1, 1),
+    bitcask_embedder_mock:embed(Text).
+
+vector_text_embeds_once_test_() ->
+    {"vector => {text, Bin}：自动 embed，且整个翻页过程只 embed 一次",
+     fun() ->
+        with_dir(fun(D) ->
+            Cnt = counters:new(1, []),
+            persistent_term:put({?MODULE, embeds}, Cnt),
+            R = bitcask:open(D, [read_write, {analyzer, whitespace},
+                                 {embedder, {{custom, ?MODULE}, #{}}}]),
+            [ok = bitcask:put(R, vkey(N), #{text => <<"doc ", (vkey(N))/binary>>,
+                                            vector => unit(N)})
+             || N <- lists:seq(1, 12)],
+            Before = counters:get(Cnt, 1),
+            Pages = all_pages(R, #{vector => {text, <<"anything">>}, limit => 5}),
+            ?assertEqual(12, length(lists:append(Pages))),
+            ?assertEqual(1, counters:get(Cnt, 1) - Before),
+            bitcask:close(R),
+            persistent_term:erase({?MODULE, embeds})
+        end)
+    end}.
+
+%% ===================================================================
 %% 其它模式 / 错误
 %% ===================================================================
 
@@ -310,10 +486,18 @@ bad_query_test_() ->
                    #{where => {'or', []}},
                    #{where => {<<"f">>, eq, an_atom}},
                    #{where => {<<"f">>, eq, 1 bsl 64}},
-                   #{where => {"f", eq, 1}}],
+                   #{where => {"f", eq, 1}},
+                   #{vector => <<1,2,3>>},
+                   #{vector => {text, <<>>}},
+                   #{text => {phrase, <<"a">>}, vector => <<0:32>>},
+                   #{text => {match, <<"a">>}, vector => <<0:32>>, ef => 10},
+                   #{ef => 10}],
             [?assertMatch({Q, {error, {bad_query, _}}}, {Q, bitcask_query:q(R, Q)})
              || Q <- Bad],
             ?assertMatch({error, {bad_query, _}}, bitcask_query:q(R, not_a_map)),
+            ?assertMatch({error, {bad_query, {limit, required_for_page}}},
+                         bitcask_query:page(R, #{})),
+            ?assertMatch({error, {bad_cont, _}}, bitcask_query:page(garbage)),
             bitcask:close(R)
         end)
     end}.
