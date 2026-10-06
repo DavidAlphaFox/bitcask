@@ -106,7 +106,7 @@ list，churn 下内存有界，不再依赖 merge 才回收。
 3> bitcask:search_vector(H, {text, <<"fast animal">>}).        % 默认 K=10、Ef=0
 3> bitcask:search_vector(H, VecBin, 20, 128).                  % 显式向量 + 调大 Ef 提召回
 3> bitcask:search_vector(H, {text, <<"fast">>}, 10, 0,
-3>     #{op => eq, field => <<"category">>, value => <<"tech">>}). % + meta filter
+3>     #{key => <<"category">>, op => eq, value => <<"tech">>}). % + meta filter
 
 %% 混合 RRF：search_hybrid(H, Text[, VecOrAuto[, K[, Filter]]])
 4> bitcask:search_hybrid(H, <<"fast brown animal">>).          % 全自动：文本既做 BM25 又 embed
