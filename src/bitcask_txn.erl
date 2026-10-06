@@ -75,7 +75,7 @@
 
 -export([transaction/2, transaction/3,
          read/2, read/3, write/3, delete/2, abort/1,
-         lock_prefix/3, prefix_range/2, prefix_range/3,
+         lock_key/3, lock_prefix/3, prefix_range/2, prefix_range/3,
          handle/1,
          idem_lookup/2, idem_purge/2, idem_purge/3]).
 
@@ -288,6 +288,16 @@ delete(#bitcask_txn_ctx{id = TxnId} = Tx, Key) when is_binary(Key) ->
 -spec abort(term()) -> no_return().
 abort(Reason) ->
     throw({?ABORT, Reason}).
+
+%% 点锁：只拿锁、不读不写（mnesia:lock 的点锁形态）。给「锁下直接操作引擎」
+%% 的调用方用——比如 bitcask_query 的索引维护：文档带 meta 进不了提交批，只能
+%% 锁住 key 后直接写引擎。
+-spec lock_key(term(), binary(), read | write) -> ok.
+lock_key(#bitcask_txn_ctx{} = Tx, Key, Mode)
+  when is_binary(Key), (Mode =:= read orelse Mode =:= write) ->
+    _ = buffer(Tx),                % owner 检查
+    lock(Tx, Key, Mode),
+    ok.
 
 %% 前缀锁：罩住以 Prefix 开头的全部 key（现有的与将来的）。
 -spec lock_prefix(term(), binary(), read | write) -> ok.
