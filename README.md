@@ -322,6 +322,7 @@ ok
 | `search_text/2,3`, `search_phrase/2,3`, `search_fields/2,3` | BM25 检索（全文 / 短语 / `field:term^boost`） |
 | `search_near/3,4`, `search_fuzzy/3,4`, `search_wildcard/2,3` | 近邻 / 模糊（编辑距离）/ 通配符搜索 |
 | `search_vector/2,3,4,5`, `search_hybrid/2,3,4,5` | 向量近邻（HNSW / IVF-RaBitQ / DiskANN 三引擎，`open` 时 `{vector_engine, ...}` 选定）/ RRF 混合检索（BM25 + 向量）；查询传 `{text,_}`（vector）或 `auto`（hybrid）自动 embed；`/5` 末参为 meta filter |
+| `bitcask_query:q/2` | 结构化查询 DSL：key（eq/prefix/range）+ 全文（match/phrase/fields/near/fuzzy/wildcard）+ meta `where` 组合，规划器选一个索引驱动；见 `doc/api-zh.md` |
 | `embed/2` | 用句柄 embedder 把文本编码成向量（`{ok, Vec}`/`{error, no_embedder}`） |
 | `is_empty_estimate/1`, `is_frozen/1`, `close_write_file/1` | 工具函数 |
 

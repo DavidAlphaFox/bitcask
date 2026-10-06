@@ -3,6 +3,27 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+
+- **`bitcask_query:q/2` structured query DSL**: combines three kinds of condition in one query —
+  key (`eq` / `prefix` / `range`), full text (`match` / `phrase` / `fields` / `near` / `fuzzy` /
+  `wildcard`) and a `where` on meta (`eq/neq/gt/gte/lt/lte/in/exists`, nestable with `and`/`or`) —
+  plus `limit` and `select`. The planner drives from one index: the inverted index when there is a
+  text condition (`match` pushes `where` down as an engine filter), `range` for key-only queries, and a
+  full-table `range` otherwise. Not match specs, because values are tokenized and text conditions can
+  only be answered by the index. BEAM-side `where` evaluation matches the engine MetaFilter exactly.
+- **`bitcask:decode_meta/1`**: inverse of `encode_meta/1` (new NIF `cask_decode_meta`).
+
+### Known issues (upstream, reported as libbitcask `feedbacks/2026-10-06-meta-filter-query-gaps.md`)
+
+- A filtered `search_text` silently returns too few hits (it overfetches `max(K×4,64)` candidates
+  once, then post-filters; with 100 matching documents out of 1000, K=10 returns 6). `bitcask_query`
+  fills the gap; calling `search_text/4` directly does not.
+- For equal scores, top-K selection is by key ascending but output is by ord descending, so a
+  larger K's result does not extend a smaller K's.
+
 ## [6.7.0] — 2026-09-29
 
 A concurrency fix in the transaction layer, plus idempotency

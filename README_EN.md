@@ -365,6 +365,7 @@ ok
 | `search_text/2,3`, `search_phrase/2,3`, `search_fields/2,3` | BM25 search (full-text / phrase / `field:term^boost`) |
 | `search_near/3,4`, `search_fuzzy/3,4`, `search_wildcard/2,3` | Proximity / fuzzy (edit-distance) / wildcard search |
 | `search_vector/2,3,4,5`, `search_hybrid/2,3,4,5` | Vector NN (HNSW / IVF-RaBitQ / DiskANN — selected at `open` via `{vector_engine, ...}`) / RRF hybrid (BM25+vector); pass `{text,_}` (vector) or `auto` (hybrid) to auto-embed the query; `/5` takes a trailing meta filter |
+| `bitcask_query:q/2` | Structured query DSL: key (eq/prefix/range) + full text (match/phrase/fields/near/fuzzy/wildcard) + meta `where`; the planner picks one index to drive; see `doc/api-en.md` |
 | `embed/2` | Encode text to a vector via the handle's embedder (`{ok, Vec}`/`{error, no_embedder}`) |
 | `is_empty_estimate/1`, `is_frozen/1`, `close_write_file/1` | Utilities |
 

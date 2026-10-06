@@ -3,6 +3,24 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [Unreleased]
+
+### Added
+
+- **`bitcask_query:q/2` 结构化查询 DSL**：一个查询里组合三类条件——key（`eq` / `prefix` / `range`）、
+  全文（`match` / `phrase` / `fields` / `near` / `fuzzy` / `wildcard`）、meta 上的 `where`
+  （`eq/neq/gt/gte/lt/lte/in/exists`，可用 `and`/`or` 嵌套）；另有 `limit` 与 `select`。
+  规划器选一个索引驱动：有全文条件走倒排（`match` 把 `where` 下推成引擎 filter），只有 key 条件走
+  `range`，都没有就全表 `range`。不用 match spec 的原因：值要经过分词，全文条件只能交给倒排。
+  `where` 的 BEAM 侧求值和引擎 MetaFilter 逐条一致。
+- **`bitcask:decode_meta/1`**：`encode_meta/1` 的反方向（新 NIF `cask_decode_meta`）。
+
+### 已知问题（上游，已报 libbitcask `feedbacks/2026-10-06-meta-filter-query-gaps.md`）
+
+- 带 meta filter 的 `search_text` 会静默少返回（只多取一次 `max(K×4,64)` 个候选再后过滤；
+  1000 篇文档里满足条件的有 100 篇，K=10 只返回 6 条）。`bitcask_query` 会补齐，直接调 `search_text/4` 不会。
+- 同分命中的 top-K 按 key 升序选取、按 ord 降序输出，所以大 K 的结果不是小 K 结果的延长。
+
 ## [6.7.0] — 2026-09-29
 
 事务层修一个并发 bug，外加幂等键；随后一轮全项目审查修掉 12 处正确性
