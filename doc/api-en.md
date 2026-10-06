@@ -331,7 +331,7 @@ search_vector(H, VecBin).                 %% default K=10, default Ef
 search_vector(H, VecBin, 20).             %% set K
 search_vector(H, VecBin, 20, 128).        %% raise Ef for higher recall
 search_vector(H, {text, <<"machine learning">>}, 10, 0,
-              #{op => eq, field => <<"category">>, value => <<"tech">>}). %% auto-embed + filter
+              #{key => <<"category">>, op => eq, value => <<"tech">>}). %% auto-embed + filter
 ```
 
 ### `search_hybrid(H, Text[, VecOrAuto[, K[, Filter]]])`
@@ -359,7 +359,7 @@ search_hybrid(H, <<"intro to machine learning">>).        %% fully auto: text dr
 search_hybrid(H, <<"intro to machine learning">>, auto, 20). %% auto-embed + set K
 search_hybrid(H, <<"machine learning">>, MyVecBin, 10).   %% text → BM25, explicit vector
 search_hybrid(H, <<"machine learning">>, auto, 10,
-              #{op => eq, field => <<"category">>, value => <<"tech">>}). %% + filter
+              #{key => <<"category">>, op => eq, value => <<"tech">>}). %% + filter
 search_hybrid(H, <<"machine learning">>, <<>>, 10).       %% single-leg: BM25 only
 search_hybrid(H, <<>>, MyVecBin, 10).                     %% single-leg: vector only
 ```
@@ -373,23 +373,88 @@ search_hybrid(H, <<>>, MyVecBin, 10).                     %% single-leg: vector 
 ## Meta filters
 
 A filter restricts results to documents whose `meta` matches. Documents with no
-`meta` never pass a filter.
+`meta` never pass a filter (not even `neq`). Passing the atom `undefined` means no filter.
 
-**Condition:** `#{key => Key, op => Op, value => V}` where `Op` is `eq | gte | lte`,
-or `#{key => Key, op => in, values => [V, ...]}`. `Key` may be a binary or atom.
+**Condition:** `#{key => Key, op => Op, value => V}`, where `Op` is one of
+`eq | neq | gt | gte | lt | lte`. There are two other forms:
+- `#{key => Key, op => in, values => [V, ...]}` (the list must not be empty);
+- `#{key => Key, op => exists}` (no `value`).
+
+`Key` must be a binary; an atom is `badarg`. `V` may be an integer (int64), a float, a
+binary, `true`/`false`, or `undefined` (null). Any other atom is `badarg`.
 
 **Combinators:**
-- a **list** of conditions = AND: `[Cond1, Cond2]`
-- `#{logic => 'and' | 'or', conditions => [Cond, ...]}`
-- nested trees via `#{logic => ..., children => [SubFilter, ...]}`
+- a **list** of conditions = AND: `[Cond1, Cond2]` (conditions only)
+- a single condition map can also be passed as a filter on its own
+- `#{logic => 'and' | 'or', conditions => [Cond, ...], children => [SubFilter, ...]}`. All three
+  keys are optional, and `logic` defaults to `'and'`. Each element of `children` must be one of
+  these `logic` maps, not a list.
 
-Malformed shapes (bad `op`, missing `values` for `in`, atom-as-binary misuse) →
-`badarg`.
+**Semantics** (`meta_filter.hpp`):
+- `eq`, `neq` and `in` compare only values of the same type: `1` is not equal to `1.0`.
+- A missing field reads as null, so `{eq, undefined}` matches a missing field. `in` is always
+  false for a missing field.
+- `gt`, `gte`, `lt` and `lte` compare only integer with integer, or float with float. Any other
+  pairing is false.
+- `exists` means the field is present and not null.
+- A filter with no conditions and no children is always true, even when `logic` is `'or'`.
+
+Malformed shapes (unknown `op`, `in` with missing or empty `values`, an atom `Key`, an
+unsupported value type) → `badarg`.
 
 ### `encode_meta(Entries) -> MetaBin`
 Encode a map (or proplist) into the `meta` blob for `put`. Value types: `integer`
 → int64, `float` → double, `binary` → string, `true`/`false` → bool, `undefined`
 → null. Use the result as the `meta` key of a put doc map.
+
+### `decode_meta(MetaBin) -> map()`
+Inverse of `encode_meta/1`: decodes the blob into `#{binary() => V}`, with null as
+`undefined`. An invalid blob → `badarg`. `get` returns `undefined` when a document has no meta.
+
+---
+
+## Structured queries (`bitcask_query`)
+
+```erlang
+{ok, Rows} = bitcask_query:q(H, #{
+    key    => {prefix, <<"doc:">>},            % | {range, Lo, Hi} | {eq, K}
+    text   => {match, <<"distributed storage">>}, % | {phrase,Q} | {fields,Q} | {near,Q,Slop}
+                                               % | {fuzzy,Q,MaxEdit} | {wildcard,P}
+    where  => [{<<"year">>, gte, 2024},
+               {'or', [{<<"cat">>, in, [<<"db">>, <<"kv">>]}, {<<"hot">>, eq, true}]}],
+    limit  => 100,                             % default infinity
+    select => [key, text, meta, score]         % default: all
+}).
+%% Row = #{key, text, meta => map() | undefined, score}; score only when text-driven
+```
+
+Why not match specs: values are analyzed strings, so text conditions can only be answered by
+the inverted index (tokenized in C++), and structured conditions live in `meta`. The planner
+picks the driver as follows:
+
+| Conditions | Driver | Order |
+|---|---|---|
+| `text` present | `search_*`; `match` pushes `where` down as an engine meta filter, the other kinds `get` each hit and evaluate in BEAM; `key` post-filters the hits | score desc |
+| no `text`, `key => {eq,K}` | `get` | — |
+| no `text`, prefix / range | `range` | key asc |
+| neither | full-table `range`; falls back to `fold` on `no_index` | key asc (undefined on fallback) |
+
+`where` semantics match the engine MetaFilter exactly. The tests cross-check pushdown against BEAM evaluation.
+
+- A document with no meta never passes a non-empty `where`.
+- `eq`, `neq` and `in` compare only values of the same type: `1` is not equal to `1.0`. A missing field reads as `undefined`.
+- `gt`, `gte`, `lt` and `lte` compare only integer with integer, or float with float.
+- `exists` means the field is present and not null.
+
+Field names may be binaries or atoms.
+
+Limitations:
+
+- Filtered engine searches can return fewer hits than requested, and the order of equal-score hits is not stable. `q/2` doubles K and requeries until it has enough hits. The results are correct, but the extra queries cost time.
+- On scan paths, a `where` or a `meta` in `select` costs one extra `get` per row.
+- `range` is not a snapshot.
+- A text-driven query that cannot fill its result within the 1,000,000 engine top-K cap returns `{error, {too_many_hits, 1000000}}` rather than silently truncating.
+- An invalid query returns `{error, {bad_query, _}}`.
 
 ---
 

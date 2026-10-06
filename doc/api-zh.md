@@ -302,7 +302,7 @@ search_vector(H, VecBin).                 %% 默认 K=10、Ef 默认
 search_vector(H, VecBin, 20).             %% 指定 K
 search_vector(H, VecBin, 20, 128).        %% 调大 Ef 提召回
 search_vector(H, {text, <<"机器学习">>}, 10, 0,
-              #{op => eq, field => <<"category">>, value => <<"tech">>}). %% 文本自动 embed + 过滤
+              #{key => <<"category">>, op => eq, value => <<"tech">>}). %% 文本自动 embed + 过滤
 ```
 
 ### `search_hybrid(H, Text[, VecOrAuto[, K[, Filter]]])`
@@ -330,7 +330,7 @@ search_hybrid(H, <<"机器学习入门">>).                %% 全自动：文本
 search_hybrid(H, <<"机器学习入门">>, auto, 20).      %% 自动 embed + 指定 K
 search_hybrid(H, <<"机器学习">>, MyVecBin, 10).      %% 文本走 BM25、向量显式给
 search_hybrid(H, <<"机器学习">>, auto, 10,
-              #{op => eq, field => <<"category">>, value => <<"tech">>}). %% + 过滤
+              #{key => <<"category">>, op => eq, value => <<"tech">>}). %% + 过滤
 search_hybrid(H, <<"机器学习">>, <<>>, 10).          %% 单路退化：只 BM25
 search_hybrid(H, <<>>, MyVecBin, 10).                %% 单路退化：只向量
 ```
@@ -342,22 +342,81 @@ search_hybrid(H, <<>>, MyVecBin, 10).                %% 单路退化：只向量
 
 ## Meta 过滤
 
-filter 只返回 `meta` 命中的文档。无 `meta` 的文档一律不通过。
+filter 只返回 `meta` 命中的文档。没有 meta 的文档一律不通过（包括 `neq`）。传原子 `undefined` 表示不过滤。
 
-**单条件：** `#{key => Key, op => Op, value => V}`，`Op` 为 `eq | gte | lte`；或
-`#{key => Key, op => in, values => [V, ...]}`。`Key` 可为 binary 或 atom。
+**单条件：** `#{key => Key, op => Op, value => V}`，其中 `Op` 是 `eq | neq | gt | gte | lt | lte` 之一；
+另有两种特殊形态：
+- `#{key => Key, op => in, values => [V, ...]}`（列表不能为空）；
+- `#{key => Key, op => exists}`（不需要 `value`）。
+
+`Key` 必须是 binary，传 atom 会报 `badarg`。`V` 可以是 integer（int64）、float、binary、`true`/`false`，或者 `undefined`（表示 null）。传其它 atom 会报 `badarg`。
 
 **组合：**
-- **列表** = AND：`[Cond1, Cond2]`
-- `#{logic => 'and' | 'or', conditions => [Cond, ...]}`
-- 树形嵌套：`#{logic => ..., children => [子filter, ...]}`
+- **列表** = AND：`[Cond1, Cond2]`（列表元素只能是单条件）
+- 单条件 map 本身也可以直接作为 filter 传入
+- `#{logic => 'and' | 'or', conditions => [Cond, ...], children => [SubFilter, ...]}`。三个键都可以省略，`logic` 默认是 `'and'`。`children` 的元素必须是这种带 `logic` 的 map，不能是列表。
 
-形态非法（错误 `op`、`in` 缺 `values`、atom 当 binary 误用）→ `badarg`。
+**求值语义**（`meta_filter.hpp`）：
+- `eq`、`neq`、`in` 只在同类型之间判断相等，比如 `1` 不等于 `1.0`。
+- 缺失的字段读作 null，所以 `{eq, undefined}` 能命中缺失字段。`in` 遇到缺失字段一律为假。
+- `gt`、`gte`、`lt`、`lte` 只比较 integer 与 integer、float 与 float，其它组合一律为假。
+- `exists` 表示字段存在且值不是 null。
+- 不含任何条件、也不含子 filter 的 filter 恒为真（即使 `logic` 是 `'or'` 也一样）。
+
+形态非法（未知 `op`、`in` 缺 `values` 或列表为空、atom 当 `Key`、不支持的值类型）→ `badarg`。
 
 ### `encode_meta(Entries) -> MetaBin`
 把 map（或 proplist）编码成 `put` 用的 `meta` blob。值类型：`integer` → int64，
 `float` → double，`binary` → string，`true`/`false` → bool，`undefined` → null。
 结果作为 put doc map 的 `meta` 键。
+
+### `decode_meta(MetaBin) -> map()`
+`encode_meta/1` 的反方向：把 meta blob 解码成 `#{binary() => V}`，null 解回 `undefined`。
+blob 非法会报 `badarg`。`get` 在没有 meta 时返回 `undefined`，由调用方自己判断。
+
+---
+
+## 结构化查询（`bitcask_query`）
+
+```erlang
+{ok, Rows} = bitcask_query:q(H, #{
+    key    => {prefix, <<"doc:">>},            % | {range, Lo, Hi} | {eq, K}
+    text   => {match, <<"分布式 存储">>},        % | {phrase,Q} | {fields,Q} | {near,Q,Slop}
+                                               % | {fuzzy,Q,MaxEdit} | {wildcard,P}
+    where  => [{<<"year">>, gte, 2024},
+               {'or', [{<<"cat">>, in, [<<"db">>, <<"kv">>]}, {<<"hot">>, eq, true}]}],
+    limit  => 100,                             % 默认 infinity
+    select => [key, text, meta, score]         % 默认全要
+}).
+%% Row = #{key, text, meta => map() | undefined, score}，score 只在 text 驱动时有
+```
+
+为什么不用 match spec：值是要分词的字符串，全文条件只能交给倒排索引（在 C++ 侧分词），
+结构化条件只能写在 `meta` 上。规划器按下面的顺序选择从哪里驱动：
+
+| 条件 | 驱动方式 | 结果顺序 |
+|---|---|---|
+| 有 `text` | `search_*`；`match` 把 `where` 下推成引擎 meta filter，其它几种逐条 `get` 后在 BEAM 侧求值；`key` 条件对命中做后过滤 | 分数降序 |
+| 无 `text`，`key => {eq,K}` | `get` | — |
+| 无 `text`，有 prefix 或 range | `range` | key 升序 |
+| 都没有 | 全表 `range`；OKI 不可用（`no_index`）时回落到 `fold` | key 升序（回落时顺序未定义） |
+
+`where` 的语义和引擎 MetaFilter 逐条一致（测试里拿下推和 BEAM 求值两条路径互相对照）：
+
+- 没有 meta 的文档，过不了任何非空 `where`。
+- `eq`、`neq`、`in` 只在同类型之间判断相等，比如 `1` 不等于 `1.0`。缺失的字段读作 `undefined`。
+- `gt`、`gte`、`lt`、`lte` 只比较 integer 与 integer、float 与 float。
+- `exists` 表示字段存在且值不是 null。
+
+字段名可以是 binary 或 atom。
+
+限制：
+
+- 引擎带 filter 检索时会少返回结果，同分命中的排序也不稳定。`q/2` 会翻倍 K 重查补齐，结果是对的，但有额外代价。
+- 有 `where`、或者 `select` 里要 `meta` 时，扫描路径每行要补一次 `get`。
+- `range` 不是快照。
+- text 驱动在 100 万（引擎 topK 上限）以内凑不够结果 → 返回 `{error, {too_many_hits, 1000000}}`，不会悄悄截断。
+- 查询本身不合法 → 返回 `{error, {bad_query, _}}`。
 
 ---
 
