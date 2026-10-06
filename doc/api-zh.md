@@ -182,6 +182,8 @@ embedder 生成并写入向量；显式传 `vector` 则跳过。
 |------|------|------|
 | `{prefetch, N}` | `0`（关） | `N > 1` 时一次归并 N 个 key 并发取值。**只改取值时机，输出序与内容不变。** 大窗口 + 冷值收益明显；小窗口反被线程创建成本吃掉 |
 | `{prefetch_threads, N}` | `0` | `0` = `min(在线核数, 4)`；批内 key 数不足时按 key 数收窄 |
+| `{want_meta, true}` | 关 | `V` 改为 `#{text => Bin, meta => Bin \| undefined}`，形态与 `get` 在索引模式下的返回一致。meta 和 text 出自同一次读 |
+| `{filter, F}` | 无 | meta filter（形态同 `search_text/4`），在 C++ 侧逐条判断，不通过的条目不返回；没有 meta 的条目一律不通过 |
 
 前缀扫描的惯用写法是把上界设成前缀的**下一个字节**：
 `range(H, {<<"user:">>, <<"user;">>})`。
@@ -258,13 +260,16 @@ O(1) 估算；写过任何 key 后恒 `false`。
 | 函数 | 额外参数 |
 |------|---------|
 | `search_text(H, Query[, K[, Filter]])` | 词袋 |
-| `search_phrase(H, Query[, K])` | 精确相邻短语 |
-| `search_fields(H, Query[, K])` | `field:term^boost` 语法；无字段限定词 = 默认字段 |
-| `search_near(H, Query, Slop[, K])` | 词按序出现且间隙 `=< Slop`；`Slop=0` 即短语 |
-| `search_fuzzy(H, Query, MaxEdit[, K])` | Levenshtein 编辑距离 `=< MaxEdit`（通常 1–2） |
-| `search_wildcard(H, Pattern[, K])` | `*` 与 `?` 通配 |
+| `search_phrase(H, Query[, K[, Filter]])` | 精确相邻短语 |
+| `search_fields(H, Query[, K[, Filter]])` | `field:term^boost` 语法；无字段限定词 = 默认字段 |
+| `search_near(H, Query, Slop[, K[, Filter]])` | 词按序出现且间隙 `=< Slop`；`Slop=0` 即短语 |
+| `search_fuzzy(H, Query, MaxEdit[, K[, Filter]])` | Levenshtein 编辑距离 `=< MaxEdit`（通常 1–2） |
+| `search_wildcard(H, Pattern[, K[, Filter]])` | `*` 与 `?` 通配 |
 
-`Filter`（`search_text/4`）是 meta filter——见下。
+`Filter` 是 meta filter（见下），`undefined` 表示不过滤。带 filter 时引擎会补取到 `K` 条：
+返回少于 `K` 条，就说明满足条件的只有这么多。
+同分命中按 (段次序, 段内写入序) 稳定排序：小 `K` 的结果是大 `K` 结果的前缀。
+例外：`search_fields` 有多个字段或多个 boost 组时，结果是逐字段取 top-K 再求和的近似值，不保证这种前缀关系。
 
 ---
 
@@ -396,12 +401,12 @@ blob 非法会报 `badarg`。`get` 在没有 meta 时返回 `undefined`，由调
 
 | 条件 | 驱动方式 | 结果顺序 |
 |---|---|---|
-| 有 `text` | `search_*`；`match` 把 `where` 下推成引擎 meta filter，其它几种逐条 `get` 后在 BEAM 侧求值；`key` 条件对命中做后过滤 | 分数降序 |
+| 有 `text` | `search_*`，`where` 下推成引擎 meta filter；`key` 条件对命中做后过滤 | 分数降序 |
 | 无 `text`，`key => {eq,K}` | `get` | — |
-| 无 `text`，有 prefix 或 range | `range` | key 升序 |
-| 都没有 | 全表 `range`；OKI 不可用（`no_index`）时回落到 `fold` | key 升序（回落时顺序未定义） |
+| 无 `text`，有 prefix 或 range | `range`，`where` 下推成 range 的 `filter`，meta 随条目一起带回 | key 升序 |
+| 都没有 | 全表 `range`，同上；OKI 不可用（`no_index`）时回落到 `fold` | key 升序（回落时顺序未定义） |
 
-`where` 的语义和引擎 MetaFilter 逐条一致（测试里拿下推和 BEAM 求值两条路径互相对照）：
+`where` 的语义和引擎 MetaFilter 逐条一致。测试里把检索下推、range 下推、BEAM 侧求值三条路径互相对照：
 
 - 没有 meta 的文档，过不了任何非空 `where`。
 - `eq`、`neq`、`in` 只在同类型之间判断相等，比如 `1` 不等于 `1.0`。缺失的字段读作 `undefined`。
@@ -412,9 +417,10 @@ blob 非法会报 `badarg`。`get` 在没有 meta 时返回 `undefined`，由调
 
 限制：
 
-- 引擎带 filter 检索时会少返回结果，同分命中的排序也不稳定。`q/2` 会翻倍 K 重查补齐，结果是对的，但有额外代价。
-- 有 `where`、或者 `select` 里要 `meta` 时，扫描路径每行要补一次 `get`。
-- `range` 不是快照。
+- 全文检索返回的命中只有 key，结果行里的 text 和 meta 要再 `get` 一次才能拿到。两次读之间如果文档被改写，返回的是新版本，可能已经不满足 `where`。
+- 有 `key` 条件时，key 过滤在 BEAM 侧对命中做；命中不够 `limit` 时翻倍 K 重查。
+- `range` 不是快照。只有在只读打开一个从未建过 OKI 的目录（`no_index`）时，才回落到 `fold`，此时逐行 `get` 后在 BEAM 侧求值 `where`。
+- 依赖 libbitcask ≥ 6.6.1（带 filter 的检索补取到 K、同分命中前缀稳定）。
 - text 驱动在 100 万（引擎 topK 上限）以内凑不够结果 → 返回 `{error, {too_many_hits, 1000000}}`，不会悄悄截断。
 - 查询本身不合法 → 返回 `{error, {bad_query, _}}`。
 

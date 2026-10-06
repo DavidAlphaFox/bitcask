@@ -195,6 +195,8 @@ filtering the whole table. Backed by the OKI ordered-key index.
 |--------|---------|-------|
 | `{prefetch, N}` | `0` (off) | `N > 1` merges N keys at a time and fetches their values concurrently. **Changes only when values are read — never the output order or contents.** Pays off for large windows over cold values; loses to thread-creation cost on small ones |
 | `{prefetch_threads, N}` | `0` | `0` = `min(online cores, 4)`; narrowed to the key count when a batch is smaller |
+| `{want_meta, true}` | off | `V` becomes `#{text => Bin, meta => Bin \| undefined}`, the same shape `get` returns in index mode. The meta and text come from the same read |
+| `{filter, F}` | none | meta filter (same shape as `search_text/4`). It is evaluated per entry in C++, and entries that fail are not returned. Entries with no meta never pass |
 
 The idiomatic prefix scan sets the upper bound to the **byte after** the prefix:
 `range(H, {<<"user:">>, <<"user;">>})`.
@@ -284,13 +286,18 @@ return (default `10`; `K =< 0` falls back to `10`).
 | Function | Extra params |
 |----------|--------------|
 | `search_text(H, Query[, K[, Filter]])` | bag-of-words |
-| `search_phrase(H, Query[, K])` | exact adjacent phrase |
-| `search_fields(H, Query[, K])` | `field:term^boost` syntax; unscoped terms = default field |
-| `search_near(H, Query, Slop[, K])` | terms in order within gap `=< Slop`; `Slop=0` = phrase |
-| `search_fuzzy(H, Query, MaxEdit[, K])` | Levenshtein distance `=< MaxEdit` (typically 1–2) |
-| `search_wildcard(H, Pattern[, K])` | `*` and `?` wildcards |
+| `search_phrase(H, Query[, K[, Filter]])` | exact adjacent phrase |
+| `search_fields(H, Query[, K[, Filter]])` | `field:term^boost` syntax; unscoped terms = default field |
+| `search_near(H, Query, Slop[, K[, Filter]])` | terms in order within gap `=< Slop`; `Slop=0` = phrase |
+| `search_fuzzy(H, Query, MaxEdit[, K[, Filter]])` | Levenshtein distance `=< MaxEdit` (typically 1–2) |
+| `search_wildcard(H, Pattern[, K[, Filter]])` | `*` and `?` wildcards |
 
-`Filter` (on `search_text/4`) is a meta filter — see below.
+`Filter` is a meta filter (see below); `undefined` means no filter. With a filter, the engine
+keeps fetching candidates until it has `K` hits, so fewer than `K` hits means that is all there
+is. Equal-score hits are ordered stably by (segment order, write order within a segment), so a
+smaller `K`'s result is a prefix of a larger `K`'s. The exception is `search_fields` with several
+fields or boost groups: it approximates by taking each field's top-K and summing, so the prefix
+property does not hold there.
 
 ---
 
@@ -434,12 +441,12 @@ picks the driver as follows:
 
 | Conditions | Driver | Order |
 |---|---|---|
-| `text` present | `search_*`; `match` pushes `where` down as an engine meta filter, the other kinds `get` each hit and evaluate in BEAM; `key` post-filters the hits | score desc |
+| `text` present | `search_*` with `where` pushed down as an engine meta filter; `key` post-filters the hits | score desc |
 | no `text`, `key => {eq,K}` | `get` | — |
-| no `text`, prefix / range | `range` | key asc |
-| neither | full-table `range`; falls back to `fold` on `no_index` | key asc (undefined on fallback) |
+| no `text`, prefix / range | `range`, with `where` pushed down as its `filter` and meta returned with each entry | key asc |
+| neither | full-table `range`, same as above; falls back to `fold` on `no_index` | key asc (undefined on fallback) |
 
-`where` semantics match the engine MetaFilter exactly. The tests cross-check pushdown against BEAM evaluation.
+`where` semantics match the engine MetaFilter exactly. The tests cross-check search pushdown, range pushdown and BEAM evaluation against each other.
 
 - A document with no meta never passes a non-empty `where`.
 - `eq`, `neq` and `in` compare only values of the same type: `1` is not equal to `1.0`. A missing field reads as `undefined`.
@@ -450,9 +457,10 @@ Field names may be binaries or atoms.
 
 Limitations:
 
-- Filtered engine searches can return fewer hits than requested, and the order of equal-score hits is not stable. `q/2` doubles K and requeries until it has enough hits. The results are correct, but the extra queries cost time.
-- On scan paths, a `where` or a `meta` in `select` costs one extra `get` per row.
-- `range` is not a snapshot.
+- Text hits carry only keys, so each row's text and meta come from a follow-up `get`. If a document is rewritten between the two reads, the row shows the newer version, which may no longer match `where`.
+- When there is a `key` condition, keys are filtered in BEAM, and K is doubled and the search rerun until `limit` is filled.
+- `range` is not a snapshot. The query falls back to `fold` only on `no_index` (a read-only open of a directory that never had an OKI); it then calls `get` per row and evaluates `where` in BEAM.
+- Requires libbitcask ≥ 6.6.1, which keeps fetching until filtered searches return K hits and orders equal-score hits stably.
 - A text-driven query that cannot fill its result within the 1,000,000 engine top-K cap returns `{error, {too_many_hits, 1000000}}` rather than silently truncating.
 - An invalid query returns `{error, {bad_query, _}}`.
 
