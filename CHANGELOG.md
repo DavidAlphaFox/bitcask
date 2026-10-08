@@ -3,6 +3,24 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [6.7.2] — 2026-10-08
+
+升级 libbitcask **6.6.2 → 6.7.0**。上游这版只动 C API（纯加法），`SOVERSION` 保持 6，盘上格式不变；
+NIF 不走 C API，对 Erlang 调用方**无 API / 行为变化**，重编即得；NIF 的 `on_unload` 接上了上游新增的拆线程步骤。
+
+### Changed（随 libbitcask 6.7.0）
+
+- 上游新增 C API `bitcask_shutdown`（拆除索引池 / Search 池 / TBB worker，供 FFM / P/Invoke / `dlopen`
+  宿主卸载动态库）与错误码 `BITCASK_ERR_BUSY = 15`。BEAM 侧不经 C API。
+- **NIF `on_unload` 照 `bitcask_shutdown` 的步骤拆线程**：删 PrivData（join 索引池，原本就有）后，再
+  `release_search_arena` + `tbb::finalize`（nothrow，失败静默）。不直接调 `bitcask_shutdown`，因为它只看
+  C API 自己的 registry。⚠️ 实测效果有限：跑过 TBB 并行段的 dirty 调度线程常驻（如候选 ≥ 2048 的短语检索、
+  重开库恢复），`finalize` 返回失败，TBB worker 留着空转在 `libtbb.so` 里；Linux/glibc 上 `bitcask_cpp.so`
+  本来就不会被真正卸载（libstdc++ 的 GNU_UNIQUE 符号让 glibc 把它标成 NODELETE）。新增
+  `bitcask_nif_unload_tests`：peer 节点里 purge → 重载，验证索引池线程退出、重载后照常可用。
+- 上游修复：`put_doc_common` 等 4 个 C API 内部助手不再以裸名导出到 `libbitcask.so` 动态符号表。
+  本仓库静态链接核心库，不受影响。
+
 ## [6.7.1] — 2026-10-06
 
 新增结构化查询 DSL（含分页、向量 / 混合检索、二级索引），升级 libbitcask **6.6.0 → 6.6.2**（C API / ABI 纯加法，`SOVERSION` 不变，盘上格式不变），另外本地嵌入后端的 llama.cpp 升到 `b11434`。

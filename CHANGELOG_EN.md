@@ -3,6 +3,28 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [6.7.2] — 2026-10-08
+
+Upgrades libbitcask **6.6.2 → 6.7.0**. Upstream only touched the C API (additive), `SOVERSION` stays 6 and the
+on-disk format is unchanged. The NIF does not go through the C API, so there is **no API or behaviour change** for
+Erlang callers — just rebuild. The NIF's `on_unload` now runs upstream's new teardown steps.
+
+### Changed (via libbitcask 6.7.0)
+
+- Upstream adds the C API `bitcask_shutdown` (tears down the index pool, the search arena and the TBB workers so
+  FFM / P/Invoke / `dlopen` hosts can unload the library) and the error code `BITCASK_ERR_BUSY = 15`. The BEAM
+  side does not use the C API.
+- **NIF `on_unload` follows the `bitcask_shutdown` steps**: after deleting PrivData (which already joined the
+  index pool) it calls `release_search_arena` + `tbb::finalize` (nothrow, failure ignored). It does not call
+  `bitcask_shutdown` itself, which only looks at the C API's own registry. ⚠️ Measured effect is limited: dirty
+  scheduler threads that ran a TBB parallel region stay alive (e.g. phrase search with ≥ 2048 candidates, recovery
+  on reopen), so `finalize` fails and the TBB workers stay, idling inside `libtbb.so`; and on Linux/glibc
+  `bitcask_cpp.so` is never really unloaded anyway (a libstdc++ GNU_UNIQUE symbol makes glibc mark it NODELETE).
+  New `bitcask_nif_unload_tests`: purge → reload in a peer node, checking that index pool threads exit and the
+  reloaded NIF works.
+- Upstream fix: four internal C API helpers (`put_doc_common` and friends) no longer leak into the dynamic symbol
+  table of `libbitcask.so`. This repo links the core statically and is unaffected.
+
 ## [6.7.1] — 2026-10-06
 
 Adds a structured query DSL (with paging, vector / hybrid search and secondary indexes), upgrades libbitcask **6.6.0 → 6.6.2**, and moves the local embedding backend to llama.cpp `b11434`. The C API / ABI change is additive only, `SOVERSION` is
