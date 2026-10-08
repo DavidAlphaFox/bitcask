@@ -24,6 +24,9 @@
 
 #include <erl_nif.h>
 
+#include <oneapi/tbb/global_control.h>  // task_scheduler_handle / finalize
+
+#include "bitcask/search_arena.hpp"
 #include "atoms.hpp"
 #include "nif_helpers.hpp"
 #include "priv_data.hpp"
@@ -166,8 +169,25 @@ int on_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM /*load_info*/) {
     return 0;
 }
 
+// 卸载时拆掉本 .so 起的后台线程（libbitcask 6.7.0 bitcask_shutdown 的同款
+// 步骤；那个 C API 管的是 C API 自己的 registry，这里用的是 PrivData 里的，
+// 所以照着拆，不直接调它）。ERTS 等本库所有资源都释放后才调 on_unload，
+// 此时不会有 Cask 打开、也不会有查询在跑。
+//   1. delete PrivData → ~KeyDirRegistry → ~IndexPool join 索引池线程；
+//   2. release_search_arena：Search 池对 TBB 运行时的引用（池没建过则无操作）；
+//   3. tbb::finalize（nothrow）：等 TBB worker 退出。跑过检索的 dirty 调度线程
+//      常驻且带着 TBB 线程局部状态，这一步多半返回 false——worker 留着、空转在
+//      libtbb.so 里，不执行本库代码；没有可报告的通道，失败就算了。
 void on_unload(ErlNifEnv* /*env*/, void* priv_data) {
     delete static_cast<PrivData*>(priv_data);
+    try {
+        bitcask::search::release_search_arena();
+        // attach：TBB 没初始化过就不为此去建运行时。
+        oneapi::tbb::task_scheduler_handle handle{oneapi::tbb::attach{}};
+        (void)oneapi::tbb::finalize(handle, std::nothrow);
+    } catch (...) {
+        // on_unload 不能抛进 ERTS。
+    }
 }
 
 }  // namespace
