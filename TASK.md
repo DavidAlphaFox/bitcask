@@ -603,6 +603,23 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## M16 — libbitcask 升级 6.6.2 → 6.7.0（6.7.2）
+
+> submodule `97fdc43` → `b8cc3bf`（tag `6.7.0`）。上游 MINOR，但只动 C API：新增 `bitcask_shutdown` +
+> `BITCASK_ERR_BUSY = 15`（纯加法），4 个 C API 内部助手不再泄进动态符号表；C++ 层只加两个内部函数
+> （`KeyDirRegistry::stop_index_pool_if_idle`、`search::release_search_arena`）。`SOVERSION` 保持 6，
+> 盘上格式不动。本仓库 `vsn` 6.7.1 → **6.7.2**（主版本保持 6.7）。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M16-1** | 影响面核对：`git diff 6.6.2 6.7.0 -- include/ src/` 只有上述两个新增函数；NIF 不 include `c_api/bitcask_kv.h`、不用 `BITCASK_ERR_*`、不用 `TbbLifetime` / `tbb::finalize`，`on_unload` 只删 PrivData → 编译层面零改动。 | ✅ |
+| **M16-2** | submodule fetch tag → checkout `6.7.0` → **先** `git add third_party/libbitcask` 暂存 gitlink（防 rebar pre_hook 回卷）→ `rm -rf _build/cmake priv/bitcask_cpp.so` 全新构建；构建后 `describe --tags` 复核仍为 `6.7.0`。 | ✅ |
+| **M16-3** | 回归：全新 configure 构建 `bitcask_cpp` 通过；`rebar3 eunit` **311/311**；`rebar3 do xref, dialyzer` 干净。 | ✅ |
+| **M16-5** | **NIF `on_unload` 接上拆线程**：`delete PrivData`（~IndexPool join，原有）后补 `release_search_arena` + `tbb::finalize(attach, nothrow)`，失败静默。不调 `bitcask_shutdown`：它看的是 C API 自己的 `c_api_registry()`，不是 PrivData 里的。实测（peer 外的手工脚本，8 vCPU）：轻负载 272 → 281 → 卸载回 272，**改动前也一样**（这 9 个是索引池线程）；短语检索候选 3000 + 重开库后 272 → 288 → 卸载 **279**，剩 7 个 TBB worker——dirty 调度线程跑过 TBB 并行段，finalize 失败，符合上游 §8.3 的限制。⚠️ Linux 上卸载后 `bitcask_cpp.so` 仍在 `/proc/self/maps`：导出表里有 1 个 GNU_UNIQUE 符号（libstdc++ `_Sp_make_shared_tag::_S_ti()::__tag`），glibc 因此标 NODELETE，`dlclose` 从来不卸。新增 `bitcask_nif_unload_tests`（peer 节点 purge → 重载，断言线程数回基线 + 重载可用）；全量 eunit **313/313**。 | ✅ |
+| **M16-4** | 文档：CHANGELOG / README / ROADMAP（中英）、`CMakeLists.txt` 版本注释（顺带把停在 6.6.0 的头注释改到 6.7.0）、`bitcask.app.src` 的 `vsn`。无 Erlang API 变更，`api-zh/en.md` 不动。 | ✅ |
+
+---
+
 ## 明确排除（V7+ 或永久取消）
 
 | 条目 | 决策 | 理由 |

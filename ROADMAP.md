@@ -6,6 +6,14 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 6.7.2 落地
+
+### libbitcask 升级 6.6.2 → 6.7.0 ✅
+
+上游只动 C API：新增 `bitcask_shutdown`（拆进程级后台线程，供 `dlopen` 类宿主卸载动态库）与
+`BITCASK_ERR_BUSY`，外加 4 个内部助手不再泄进动态符号表。NIF 不走 C API；`on_unload` 照
+`bitcask_shutdown` 的步骤拆 Search 池 / TBB（实测效果有限，见 CHANGELOG）。`SOVERSION` 保持 6，盘上格式不变。详见 [`TASK.md`](TASK.md) M16。
+
 ## 6.7.1 落地
 
 ### 结构化查询 DSL + libbitcask 6.6.1 ✅

@@ -6,6 +6,16 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 6.7.2 shipped
+
+### libbitcask upgrade 6.6.2 → 6.7.0 ✅
+
+Upstream only touched the C API: new `bitcask_shutdown` (tears down process-wide background threads so
+`dlopen`-style hosts can unload the library) and `BITCASK_ERR_BUSY`, plus four internal helpers no longer
+leaking into the dynamic symbol table. The NIF does not use the C API; `on_unload` now follows the
+`bitcask_shutdown` teardown of the search arena / TBB (limited effect, see CHANGELOG). `SOVERSION`
+stays 6, on-disk format unchanged. See M16 in [`TASK.md`](TASK.md).
+
 ## 6.7.1 shipped
 
 ### Structured query DSL + libbitcask 6.6.1 ✅
