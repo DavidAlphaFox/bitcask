@@ -22,7 +22,7 @@ set(BITCASK_PRIV_DIR "${CMAKE_SOURCE_DIR}/priv")
 file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 
 # ---------------------------------------------------------------------------
-# libbitcask — git submodule at third_party/libbitcask (6.7.0, commit b8cc3bf)。
+# libbitcask — git submodule at third_party/libbitcask (6.7.1, commit 086fa90)。
 # 提供 C++ 核心库全部 target（bitcask_cask, bitcask_keydir, ...）。
 #
 # ⚠️ 6.2.1 起**不再需要 third_party 符号链接**。此前 libbitcask 的
@@ -113,6 +113,9 @@ file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 # 新错误码 BITCASK_ERR_BUSY=15）+ 4 个 C API 内部助手不再泄进动态符号表。
 # NIF 不走 C API；on_unload 照 bitcask_shutdown 的步骤拆 Search 池 + tbb::finalize
 # （cpp/nif/nif_main.cpp）。SOVERSION 保持 6，盘上格式不动。
+# 6.7.1：纯缺陷修复——Windows 上 merge 后 close 不删退休数据文件（排水排在
+# 释放 mmap 读句柄之前，DeleteFileW 对被映射文件必败；挪后 + 滞留路径记
+# log_error）。C API 零改动、NIF 零改动；Linux 上 unlink 映射文件本就成功。
 
 # ---------------------------------------------------------------------------
 add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/libbitcask"
