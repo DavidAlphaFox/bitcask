@@ -3,6 +3,25 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [6.7.3] — 2026-10-14
+
+Upgrades libbitcask **6.7.0 → 6.7.1** (an upstream PATCH: bug fixes only). The C API is unchanged,
+`SOVERSION` stays 6 and the on-disk format is unchanged; there is **no API or behaviour change** for
+Erlang callers — not one line of this repo's Erlang / NIF code changed, just rebuild.
+
+### Fixed (via libbitcask 6.7.1)
+
+- **On Windows, retired data files were not deleted by `close` after a merge, so disk usage never
+  dropped** (reported by the downstream Jinshu project via Keelson.Bitcask 1.0.6 on Windows x64;
+  upstream `feedbacks/2026-10-10-windows-merge-retired-files-not-deleted-on-close.md`).
+  Root cause: `Cask::close()` ran the drain (`drain_retired_files()`) before releasing the read-handle
+  cache — the files to delete were still mmap'd, and `DeleteFileW` necessarily fails for mapped files
+  on Windows; the failure path put the files back on the retired queue, where the destructor silently
+  dropped them. Fix: the drain now runs after the read handles are released, and paths still stuck on
+  the queue afterwards get an error log (count + reason) instead of a silent drop. On Linux/glibc
+  `unlink` on a mapped file succeeds anyway, so behaviour there is unchanged. Upstream adds the
+  regression test `MergeThenCloseAfterSearchRemovesRetiredFiles`.
+
 ## [6.7.2] — 2026-10-08
 
 Upgrades libbitcask **6.6.2 → 6.7.0**. Upstream only touched the C API (additive), `SOVERSION` stays 6 and the

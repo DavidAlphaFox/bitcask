@@ -3,6 +3,21 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [6.7.3] — 2026-10-14
+
+升级 libbitcask **6.7.0 → 6.7.1**（上游 PATCH：纯缺陷修复）。C API 零改动，`SOVERSION` 保持 6，
+盘上格式不变；对 Erlang 调用方**无 API / 行为变化**，本仓库 Erlang / NIF 代码一行没改，重编即得。
+
+### Fixed（随 libbitcask 6.7.1）
+
+- **Windows 上 merge 之后 `close` 不删退休数据文件，盘上体积不降**（下游锦书经
+  Keelson.Bitcask 1.0.6 在 Windows x64 上报回，上游 `feedbacks/2026-10-10-windows-merge-retired-files-not-deleted-on-close.md`）。
+  根因：`Cask::close()` 的排水（`drain_retired_files()`）排在释放读句柄缓存之前——要删的
+  文件仍被 mmap 映射占用，Windows 上 `DeleteFileW` 对被映射文件必然失败，失败路径把文件
+  放回退休队列、析构时被静默丢弃。修复：排水挪到释放读句柄之后；排水后仍滞留队列的路径
+  记一条错误日志（数量 + 原因），不再静默丢。Linux/glibc 上 `unlink` 对映射文件本就成功，
+  行为不变。上游带回回归测试 `MergeThenCloseAfterSearchRemovesRetiredFiles`。
+
 ## [6.7.2] — 2026-10-08
 
 升级 libbitcask **6.6.2 → 6.7.0**。上游这版只动 C API（纯加法），`SOVERSION` 保持 6，盘上格式不变；
