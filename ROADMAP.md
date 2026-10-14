@@ -6,6 +6,16 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 6.7.3 落地
+
+### libbitcask 升级 6.7.0 → 6.7.1 ✅
+
+上游 PATCH，纯缺陷修复：Windows 上 merge 之后 `close` 不删退休数据文件（排水排在释放
+mmap 读句柄之前，`DeleteFileW` 对被映射文件必败；现在排水挪到释放句柄之后，滞留路径
+记错误日志不再静默丢）。C API 零改动、`SOVERSION` 保持 6、盘上格式不变；Linux 上
+`unlink` 映射文件本就成功，行为不变——本仓库零代码改动，重编即得。详见
+[`TASK.md`](TASK.md) M17。
+
 ## 6.7.2 落地
 
 ### libbitcask 升级 6.6.2 → 6.7.0 ✅

@@ -6,6 +6,17 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 6.7.3 shipped
+
+### libbitcask upgrade 6.7.0 → 6.7.1 ✅
+
+An upstream PATCH, bug fixes only: on Windows, retired data files were not deleted by `close`
+after a merge (the drain ran before the mmap read handles were released, and `DeleteFileW`
+necessarily fails for mapped files; the drain now runs after the handles are released, and
+stuck paths get an error log instead of a silent drop). C API unchanged, `SOVERSION` stays 6,
+on-disk format unchanged; on Linux `unlink` on a mapped file succeeds anyway, so behaviour is
+unchanged — zero code changes in this repo, just rebuild. See M17 in [`TASK.md`](TASK.md).
+
 ## 6.7.2 shipped
 
 ### libbitcask upgrade 6.6.2 → 6.7.0 ✅

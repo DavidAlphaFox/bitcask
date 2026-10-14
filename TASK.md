@@ -620,6 +620,22 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## M17 — libbitcask 升级 6.7.0 → 6.7.1（6.7.3）
+
+> submodule `b8cc3bf` → `086fa90`（tag `6.7.1`）。上游 PATCH，纯缺陷修复：C API 零改动（无新符号、
+> 无结构体变化）；C++ 层只动 `Cask::close()` 内部次序（`drain_retired_files()` 挪到 `read_files_.clear()`
+> 之后——Windows 上 `DeleteFileW` 对仍被 mmap 的退休文件必败）并加一条滞留错误日志。`SOVERSION` 保持 6，
+> 盘上格式不动。本仓库 `vsn` 6.7.2 → **6.7.3**。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M17-1** | 影响面核对：`git diff 6.7.0 6.7.1 --name-only` 里 `include/` / `c_api/` 零文件，`src/` 只有 `cask/cask.cpp` 一处（close 内部排水次序 + log_error）→ 编译层面零改动。 | ✅ |
+| **M17-2** | submodule fetch tag → checkout `6.7.1` → **先** `git add third_party/libbitcask` 暂存 gitlink（防 rebar pre_hook 回卷）→ `rm -rf _build/cmake priv/bitcask_cpp.so` 全新构建；构建后 `describe --tags` 复核仍为 `6.7.1`。 | ✅ |
+| **M17-3** | 回归：全新 configure 构建 `bitcask_cpp` 通过；`rebar3 as prod compile`（warnings_as_errors）零警告；`rebar3 eunit` **313/313**（首轮整套负载下 `nif_commit_notify` 偶发 1 例，单独 3/3 + 整套复跑 313/313，属 R4-7 记录过的负载时序偶发，与上游本次改动无关——close 排水不触及提交令牌路径）；`rebar3 do xref, dialyzer` 干净；escript 冒烟压上游改动点（索引模式 open → put/search → 目录级 merge → **close** → 重开数据/检索完好），`application:get_key(vsn)` = 6.7.3。 | ✅ |
+| **M17-4** | 文档：CHANGELOG / README / ROADMAP（中英）、`CMakeLists.txt` 版本注释、`bitcask.app.src` 的 `vsn`。无 Erlang API 变更，`api-zh/en.md` 不动。 | ✅ |
+
+---
+
 ## 明确排除（V7+ 或永久取消）
 
 | 条目 | 决策 | 理由 |
