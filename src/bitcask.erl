@@ -30,6 +30,7 @@
          close/1,
          close_write_file/1,
          get/2,
+         get_doc/2,
          put/3,
          put_docs/2,
          delete/2,
@@ -53,6 +54,8 @@
            search_text/2, search_text/3, search_text/4,
            search_phrase/2, search_phrase/3, search_phrase/4,
            search_fields/2, search_fields/3, search_fields/4,
+           search_fields_attributed/2, search_fields_attributed/3,
+           search_fields_attributed/4,
            search_near/3, search_near/4, search_near/5,
            search_fuzzy/3, search_fuzzy/4, search_fuzzy/5,
            search_wildcard/2, search_wildcard/3, search_wildcard/4,
@@ -349,6 +352,17 @@ close_write_file(Handle) ->
 %% 过期或被墓碑覆盖的 entry 等同于 not_found。
 get(Handle, Key) ->
     bitcask_cpp_nifs:cask_get(ref(Handle), Key).
+
+%% 读结构化文档并取回命名字段（libbitcask 6.8.0）。与 get/2 不同，这条是
+%% 显式读文档入口；fields 是 #{FieldName => Value}，向量 / meta 缺省为
+%% undefined。覆盖写仍是全量 fields 替换。
+%%
+%% 返回 {ok, #{text := binary(), meta := binary() | undefined,
+%%             vector := binary() | undefined,
+%%             fields := #{binary() => binary()}}}
+%%      | not_found | {error, Reason}。
+get_doc(Handle, Key) ->
+    bitcask_cpp_nifs:cask_get_doc(ref(Handle), Key).
 
 %% 写 Key。put(_, _, tombstone) 是历史接口，等价于 delete。
 %%
@@ -992,6 +1006,18 @@ search_fields(Handle, Query, K) ->
 
 search_fields(Handle, Query, K, Filter) ->
     bitcask_cpp_nifs:cask_search_fields(ref(Handle), Query, K, Filter).
+
+%% search_fields 的命中归属版（libbitcask 6.8.0）。每条命中附实际命中的
+%% 字段名列表，跨字段加权合并的分数与排序同 search_fields；默认字段记 <<>>。
+search_fields_attributed(Handle, Query) ->
+    search_fields_attributed(Handle, Query, 10).
+
+search_fields_attributed(Handle, Query, K) ->
+    bitcask_cpp_nifs:cask_search_fields_attributed(ref(Handle), Query, K).
+
+search_fields_attributed(Handle, Query, K, Filter) ->
+    bitcask_cpp_nifs:cask_search_fields_attributed(ref(Handle), Query, K,
+                                                   Filter).
 
 %% 近邻搜索（S8.7）：term 按 Query 词序出现且相邻间隙 ≤ Slop。Slop=0 即短语。
 search_near(Handle, Query, Slop) ->

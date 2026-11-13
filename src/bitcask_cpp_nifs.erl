@@ -12,6 +12,7 @@
 -export([cask_open/2,
          cask_close/1,
          cask_get/2,
+         cask_get_doc/2,
          cask_put/3,
          cask_delete/2,
          cask_sync/1,
@@ -20,6 +21,7 @@
          cask_search_text/4,
          cask_search_phrase/3, cask_search_phrase/4,
          cask_search_fields/3, cask_search_fields/4,
+         cask_search_fields_attributed/3, cask_search_fields_attributed/4,
          cask_search_near/4, cask_search_near/5,
          cask_search_fuzzy/4, cask_search_fuzzy/5,
          cask_search_wildcard/3, cask_search_wildcard/4,
@@ -82,6 +84,10 @@ init() ->
 cask_open(_Dir, _Opts)        -> erlang:nif_error({error, not_loaded}).
 cask_close(_Ref)              -> erlang:nif_error({error, not_loaded}).
 cask_get(_Ref, _Key)          -> erlang:nif_error({error, not_loaded}).
+%% libbitcask 6.8.0：结构化文档读回。
+%% 返回 #{text => binary(), meta => binary() | undefined,
+%%        vector => binary() | undefined, fields => #{binary() => binary()}}。
+cask_get_doc(_Ref, _Key)      -> erlang:nif_error({error, not_loaded}).
 cask_put(_Ref, _Key, _Val)    -> erlang:nif_error({error, not_loaded}).
 cask_delete(_Ref, _Key)       -> erlang:nif_error({error, not_loaded}).
 cask_sync(_Ref)               -> erlang:nif_error({error, not_loaded}).
@@ -98,6 +104,12 @@ cask_search_wildcard(_Ref, _Pattern, _K) -> erlang:nif_error({error, not_loaded}
 %% libbitcask 6.6.1：同上，末位多一个 meta Filter（undefined = 不过滤）。
 cask_search_phrase(_Ref, _Q, _K, _F) -> erlang:nif_error({error, not_loaded}).
 cask_search_fields(_Ref, _Q, _K, _F) -> erlang:nif_error({error, not_loaded}).
+%% libbitcask 6.8.0：字段命中归属版。返回 [{Key, Ord, Score, [Field]}]；
+%% 默认字段（text / catch-all）记 <<>>。
+cask_search_fields_attributed(_Ref, _Q, _K) ->
+    erlang:nif_error({error, not_loaded}).
+cask_search_fields_attributed(_Ref, _Q, _K, _F) ->
+    erlang:nif_error({error, not_loaded}).
 cask_search_near(_Ref, _Q, _Slop, _K, _F) -> erlang:nif_error({error, not_loaded}).
 cask_search_fuzzy(_Ref, _Q, _MaxEdit, _K, _F) -> erlang:nif_error({error, not_loaded}).
 cask_search_wildcard(_Ref, _Pattern, _K, _F) -> erlang:nif_error({error, not_loaded}).

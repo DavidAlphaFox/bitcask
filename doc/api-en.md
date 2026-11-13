@@ -129,6 +129,20 @@ handle usable (next `put`/`delete` re-acquires the lock and starts a new file).
 ### `get(Handle, Key) -> {ok, Value} | not_found | {error, Reason}`
 `Key`/`Value` are binaries. Expired or tombstoned entries read as `not_found`.
 
+### `get_doc(Handle, Key) -> {ok, Doc} | not_found | {error, Reason}` (6.8.0)
+Explicitly read a structured document and decode its named fields:
+
+```erlang
+#{text   => binary(),
+  meta   => binary() | undefined,
+  vector => binary() | undefined,
+  fields => #{binary() => binary()}}
+```
+
+Field names in `fields` are translated back to their original names via
+`field.schema`; overwrite still replaces all fields. `get/2` does not decode
+fields, leaving its hot path unchanged.
+
 ### `put(Handle, Key, Value) -> ok | {error, Reason}`
 `Value` forms:
 
@@ -298,6 +312,12 @@ return (default `10`; `K =< 0` falls back to `10`).
 | `search_near(H, Query, Slop[, K[, Filter]])` | terms in order within gap `=< Slop`; `Slop=0` = phrase |
 | `search_fuzzy(H, Query, MaxEdit[, K[, Filter]])` | Levenshtein distance `=< MaxEdit` (typically 1–2) |
 | `search_wildcard(H, Pattern[, K[, Filter]])` | `*` and `?` wildcards |
+
+### `search_fields_attributed(H, Query[, K[, Filter]]) -> {ok, Hits} | {error, Reason}` (6.8.0)
+The attributed variant of `search_fields`: `Hits :: [{Key, Ord, Score, Fields}]`,
+where `Fields` is a deduplicated list of matching field-name binaries (the default
+field is `<<>>`). Scores, ordering, `field:term^boost` syntax and meta-filter
+semantics are the same as `search_fields`.
 
 `Filter` is a meta filter (see below); `undefined` means no filter. With a filter, the engine
 keeps fetching candidates until it has `K` hits, so fewer than `K` hits means that is all there

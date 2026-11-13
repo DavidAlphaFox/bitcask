@@ -308,7 +308,7 @@ ok
 | 函数 | 说明 |
 |------|------|
 | `open/1,2` | 打开 cask（KV 模式或通过 `{analyzer, ...}` 启用索引模式） |
-| `get/2`, `put/3`, `delete/2`, `sync/1` | 核心 KV 操作 |
+| `get/2`, `get_doc/2`, `put/3`, `delete/2`, `sync/1` | 核心 KV 操作；`get_doc` 读回结构化文档命名字段 |
 | `fold/3,6`, `fold_keys/3,6`, `list_keys/1` | 迭代（**快照一致**，代价 O(全表)） |
 | `range/2,3`, `range_fold/5` | 有序范围查询 `[Lo, Hi)`，代价 **O(range)**；per-key 弱一致（非快照）；`{prefetch, N}` 可批量并发取值 |
 | `put_batch_atomic/2`, `txn_commit/2,3` | 跨崩溃原子批 / 多键事务；`Ops :: [{put,K,V} \| {remove,K}]`；⚠️ 首次调用把目录 meta 懒升级为 v6 |
@@ -320,7 +320,7 @@ ok
 | `graphdb:transaction/2,3`, `put_edge_txn/4,5`, `del_edge_txn/4,5`, `edge_txn/4,5`, `degree_txn/2,3`, `put_vertex_txn/3`, `get_vertex_txn/2`, `out_edges_txn/2,3`, `in_edges_txn/2,3`, `del_vertex_txn/2` | 图层事务式读写：边五键 + 计数器锁下同批提交，并发计数精确；邻接扫描前缀锁无幻读；`del_vertex_txn` 级联一批提交；与直通 `put_edge` 不要混用于同一图 |
 | `stream/1`, `next/1`, `stop/1`, `with_stream/2` | 流式迭代 |
 | `merge/1,2,3`, `needs_merge/1,2`, `status/1` | 合并管理 |
-| `search_text/2,3,4`, `search_phrase/2,3,4`, `search_fields/2,3,4` | BM25 检索（全文 / 短语 / `field:term^boost`）；末参为 meta filter |
+| `search_text/2,3,4`, `search_phrase/2,3,4`, `search_fields/2,3,4`, `search_fields_attributed/2,3,4` | BM25 检索（全文 / 短语 / `field:term^boost`；归属版附命中字段）；末参为 meta filter |
 | `search_near/3,4,5`, `search_fuzzy/3,4,5`, `search_wildcard/2,3,4` | 近邻 / 模糊（编辑距离）/ 通配符搜索；末参为 meta filter |
 | `search_vector/2,3,4,5`, `search_hybrid/2,3,4,5` | 向量近邻（HNSW / IVF-RaBitQ / DiskANN 三引擎，`open` 时 `{vector_engine, ...}` 选定）/ RRF 混合检索（BM25 + 向量）；查询传 `{text,_}`（vector）或 `auto`（hybrid）自动 embed；`/5` 末参为 meta filter |
 | `bitcask_query:q/2` | 结构化查询 DSL：key（eq/prefix/range）+ 全文（match/phrase/fields/near/fuzzy/wildcard）+ meta `where` 组合，规划器选一个索引驱动；见 `doc/api-zh.md` |
@@ -348,7 +348,7 @@ ok
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
 | `doc/unified-architecture-plan-zh.md` | 统一架构计划（已实施） |
 | `doc/libcask-extraction-zh.md` | **libcask 独立库拆分可行性评估**（2.2.0 规划） |
-| `ROADMAP.md` / `ROADMAP_EN.md` | **路线图**：6.7.3 / 6.7.2 / 6.7.1 / 6.7.0 / 6.6.0 / 6.5.1 / 6.5.0 / 6.4.0 / 6.3.2 / 6.3.1 / 6.2.2 / 6.2.1 / 6.1.0 / 6.0.0 / 5.1.0 / 5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 落地 + 2.1.1 已落地（P5–P15）+ 2.2.0 规划（libcask 独立 / V7+ 向量优化）（中/英） |
+| `ROADMAP.md` / `ROADMAP_EN.md` | **路线图**：6.8.0 / 6.7.3 / 6.7.2 / 6.7.1 / 6.7.0 / 6.6.0 / 6.5.1 / 6.5.0 / 6.4.0 / 6.3.2 / 6.3.1 / 6.2.2 / 6.2.1 / 6.1.0 / 6.0.0 / 5.1.0 / 5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 落地 + 2.1.1 已落地（P5–P15）+ 2.2.0 规划（libcask 独立 / V7+ 向量优化）（中/英） |
 | `TASK.md` | 详细任务拆分与历史 |
 
 ## 项目状态
@@ -367,7 +367,8 @@ ok
 - **3.1.0**（2026-07-01）— 升级 libbitcask v3.1.0（ABI 不破坏）：`{max_read_handles, unlimited}` / `{auto_compact_dead_ratio, R}` 选项、错误原子 `closed`；随库引入 read 句柄默认上限（按 `RLIMIT_NOFILE` 自动推导）、`bitcask.meta` v3 加 CRC32、field.schema FSCH v1 头 + CRC
 - **4.0.0**（2026-07-13）— 升级 libbitcask v4.0.0（ABI 破坏，`SOVERSION` 3→4，源码级兼容）：`{vector_engine, hnsw|ivfrq|diskann}` 向量双引擎 + 调优选项、`{auto_checkpoint_min_docs, N}` 崩溃恢复重放有界；随库引入 IVF-RaBitQ-lite 引擎、DiskANN 引擎（实验性）、AVX2 int8 内核、HNSW `.qc8` mmap 化；`examples/` Wikipedia 检索库示例
 - **4.1.0**（2026-07-15）— 升级 libbitcask v4.1.0（ABI 不破坏，`SOVERSION` 保持 4，盘上格式不变）：对 Erlang 调用方**无 API 变更**，重编即得；随库引入 Phase 5/6 深度审计成果——修复 `close/1` 拆卸路径的进程级永久挂死（`IndexPool` 计数泄漏 + `unregister_lib` 无界 `flush`）、hnsw 三处原子写 rename 前补 `fdatasync`（此前崩溃即半截文件）、`RowChunks`/`MmapSegment` 资源泄漏；`file_util` 归并使 fsync 纪律 4 套收敛为 1 套
-- **6.7.3**（2026-10-14，当前版本）— 升级 libbitcask 6.7.0 → **6.7.1**（PATCH，纯缺陷修复：Windows 上 merge 后 `close` 不删退休数据文件——排水排在释放 mmap 读句柄之前，`DeleteFileW` 对被映射文件必败，退休文件滞留到下次 open；现在排水挪到释放句柄之后，滞留路径记错误日志不再静默丢。C API 零改动，`SOVERSION` 6 不变、盘上格式不变）。Linux 上 `unlink` 映射文件本就成功、行为不变；NIF / Erlang 代码零改动，重编即得
+- **6.8.0**（2026-11-14，当前版本）— 升级 libbitcask 6.7.1 → **6.8.0**（MINOR，纯增量，`SOVERSION` 6 不变、盘上格式不变）。新增 **`get_doc/2`** 读回结构化文档的 `text` / `meta` / `vector` / 命名字段；新增 **`search_fields_attributed/2,3,4`** 让 `field:term` 检索每条命中附实际命中的字段名列表，排序与分数同 `search_fields`
+- **6.7.3**（2026-10-14）— 升级 libbitcask 6.7.0 → **6.7.1**（PATCH，纯缺陷修复：Windows 上 merge 后 `close` 不删退休数据文件——排水排在释放 mmap 读句柄之前，`DeleteFileW` 对被映射文件必败，退休文件滞留到下次 open；现在排水挪到释放句柄之后，滞留路径记错误日志不再静默丢。C API 零改动，`SOVERSION` 6 不变、盘上格式不变）。Linux 上 `unlink` 映射文件本就成功、行为不变；NIF / Erlang 代码零改动，重编即得
 - **6.7.2**（2026-10-08）— 升级 libbitcask 6.6.2 → **6.7.0**（C API 纯加法：新增 `bitcask_shutdown` 供 `dlopen` 宿主卸载动态库、错误码 `BITCASK_ERR_BUSY`；内部助手不再泄进动态符号表）。NIF 不走 C API，对 Erlang 调用方无 API / 行为变化；NIF `on_unload` 照上游步骤拆 Search 池 / TBB（dirty 线程跑过 TBB 时 finalize 会失败，效果有限）；`SOVERSION` 6 不变、盘上格式不变
 - **6.7.1**（2026-10-06）— **结构化查询 DSL** `bitcask_query:q/2`：一个查询里组合 key 条件（`eq`/`prefix`/`range`）、全文条件（`match`/`phrase`/`fields`/`near`/`fuzzy`/`wildcard`）和 meta 上的 `where`（8 种操作符，可用 `and`/`or` 嵌套），另有 `limit` / `select`。规划器选一个索引驱动，`where` 下推给引擎。新增 `bitcask:decode_meta/1`。另有分页（`page/2,1`）、向量 / 混合检索进 DSL、**二级索引**（`create_index/2` 等，写入与文档同批原子落盘）。随库升级 libbitcask 6.6.0 → **6.6.2**，修了我们报上去的问题：带 filter 的检索补取到 K（旧版 K=10 只返回 6 条）、同分命中前缀稳定（⚠️ 同分命中的先后顺序变了）；`search_phrase/fields/near/fuzzy/wildcard` 末位可带 meta filter；`range` 新增 `{want_meta, true}` / `{filter, F}`；原子批 / 事务可以写带 meta 的文档。meta filter 文档按 NIF 实际行为重写，示例里的 `field =>` 改为 `key =>`。C API 纯加法、`SOVERSION` 6 不变、盘上格式不变。本地嵌入后端 llama.cpp `b10859` → **`b11434`**（NIF 源码不用改，CPU 嵌入短查询 33–35 → 22 ms）
 - **6.7.0**（2026-09-29）— 事务层：**修复调用方在提交途中被 kill 时锁提前释放**（`txn_commit` 是 dirty NIF，DOWN 先于落盘送达，按 DOWN 放锁会丢更新；现在带提交令牌进 NIF，令牌析构才通知 locker 放锁，`status()` 新增 `orphan_timeouts`）；**幂等键** `{idem_key, K}` + `idem_lookup/2` / `idem_purge/2`（同键至多提交一次，重来返回首次结果，提交中途被 kill 也能安全重试）；**全项目审查**修掉 12 处正确性问题（NIF `cask_close` 的 use-after-free 与异常屏障、`encode_meta` 布尔、merge 调度器、fold 错误形态、graphdb 计数器、embedder 池调度等），一轮性能优化（locker 多 key 事务 +35%、PageRank O(N+M)、新 API `bitcask:put_docs/2`），构建 / 测试提速与遗留清理。libbitcask 仍 6.6.0，盘上格式不变。⚠️ **最低 OTP 27**；NIF 错误形态有两处变化（`{error, error}` → `{error, invalid_option}`、`{error, unknown}` → `{error, io_error}`），删除了几个无调用者的 NIF 与 openai embedder 旧 API，详见 CHANGELOG

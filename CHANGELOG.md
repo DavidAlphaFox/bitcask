@@ -3,6 +3,23 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [6.8.0] — 2026-11-14
+
+升级 libbitcask **6.7.1 → 6.8.0**（上游 MINOR：纯增量）。C API 新增 `get_doc` 与
+字段归属版 `search_fields`；既有 `get` / `search_fields` 布局与语义零改动，
+`SOVERSION` 保持 6，盘上格式不变。本仓库把两个新能力开到 Erlang 门面：
+
+### Added
+
+- **`bitcask:get_doc/2`**：显式读取结构化文档并取回命名字段，返回
+  `#{text, meta, vector, fields}`；`fields` 是 `#{binary() => binary()}`，
+  `meta` / `vector` 缺省为 `undefined`。`get/2` 仍走原热路径，不解码 fields。
+- **`bitcask:search_fields_attributed/2,3,4`**：`search_fields` 的命中归属版，
+  返回 `[{Key, Ord, Score, [Field]}]`；分数与排序同 `search_fields`，默认字段
+  记 `<<>>`，末参同样支持 meta filter。
+- 新增 `bitcask_libbitcask_680_tests` 覆盖字段读回、命中归属、filter 与
+  KV 模式的 `no_index` 语义。
+
 ## [6.7.3] — 2026-10-14
 
 升级 libbitcask **6.7.0 → 6.7.1**（上游 PATCH：纯缺陷修复）。C API 零改动，`SOVERSION` 保持 6，

@@ -465,6 +465,36 @@ ERL_NIF_TERM make_search_hits(ErlNifEnv* env,
     return list;
 }
 
+ERL_NIF_TERM make_search_field_hits(
+    ErlNifEnv* env,
+    const std::vector<bitcask::search::SearchFieldHit>& hits) {
+    ERL_NIF_TERM list = enif_make_list(env, 0);
+    for (auto it = hits.rbegin(); it != hits.rend(); ++it) {
+        ERL_NIF_TERM key_bin = make_binary_checked(
+            env, std::as_bytes(std::span<const char>(it->key.data(), it->key.size())));
+        if (!key_bin) return 0;
+        ERL_NIF_TERM tuple = enif_make_tuple4(
+            env,
+            key_bin,
+            enif_make_uint64(env, it->ord),
+            enif_make_double(env, it->score),
+            [&] {
+                ERL_NIF_TERM fields = enif_make_list(env, 0);
+                for (auto field = it->fields.rbegin();
+                     field != it->fields.rend(); ++field) {
+                    ERL_NIF_TERM name = make_binary_checked(
+                        env, std::as_bytes(std::span<const char>(
+                                 field->data(), field->size())));
+                    if (!name) return static_cast<ERL_NIF_TERM>(0);
+                    fields = enif_make_list_cell(env, name, fields);
+                }
+                return fields;
+            }());
+        list = enif_make_list_cell(env, tuple, list);
+    }
+    return list;
+}
+
 ERL_NIF_TERM exception_term(ErlNifEnv* env, const char* what) noexcept {
     const std::size_t n = std::strlen(what);
     ERL_NIF_TERM bin;

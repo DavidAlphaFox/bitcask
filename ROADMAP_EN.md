@@ -6,6 +6,15 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 6.8.0 shipped
+
+### libbitcask upgrade 6.7.1 → 6.8.0 ✅
+
+An upstream MINOR, purely additive: structured documents can now read back the named fields
+written by `put_doc`, and field search can report which field matched. This repo exposes them
+as `bitcask:get_doc/2` and `bitcask:search_fields_attributed/2,3,4`. Existing C API layouts
+are unchanged, `SOVERSION` stays 6, and the on-disk format is unchanged.
+
 ## 6.7.3 shipped
 
 ### libbitcask upgrade 6.7.0 → 6.7.1 ✅

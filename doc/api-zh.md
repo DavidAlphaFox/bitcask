@@ -119,6 +119,19 @@ finalize 当前 active 文件并释放 `bitcask.write.lock`，但句柄仍可用
 ### `get(Handle, Key) -> {ok, Value} | not_found | {error, Reason}`
 `Key`/`Value` 为 binary。过期或被墓碑覆盖的 entry 读作 `not_found`。
 
+### `get_doc(Handle, Key) -> {ok, Doc} | not_found | {error, Reason}`（6.8.0）
+显式读取结构化文档并解码命名字段：
+
+```erlang
+#{text   => binary(),
+  meta   => binary() | undefined,
+  vector => binary() | undefined,
+  fields => #{binary() => binary()}}
+```
+
+`fields` 的字段名由 `field.schema` 翻回写入时的原名；覆盖写仍是全量替换。
+`get/2` 不解码 fields，热路径行为不变。
+
 ### `put(Handle, Key, Value) -> ok | {error, Reason}`
 `Value` 形态：
 
@@ -271,6 +284,11 @@ O(1) 估算；写过任何 key 后恒 `false`。
 | `search_near(H, Query, Slop[, K[, Filter]])` | 词按序出现且间隙 `=< Slop`；`Slop=0` 即短语 |
 | `search_fuzzy(H, Query, MaxEdit[, K[, Filter]])` | Levenshtein 编辑距离 `=< MaxEdit`（通常 1–2） |
 | `search_wildcard(H, Pattern[, K[, Filter]])` | `*` 与 `?` 通配 |
+
+### `search_fields_attributed(H, Query[, K[, Filter]]) -> {ok, Hits} | {error, Reason}`（6.8.0）
+`search_fields` 的命中归属版：`Hits :: [{Key, Ord, Score, Fields}]`，
+`Fields` 是去重后的实际命中字段名 binary 列表（默认字段记 `<<>>`）。分数、
+排序、`field:term^boost` 语法与 meta filter 语义同 `search_fields`。
 
 `Filter` 是 meta filter（见下），`undefined` 表示不过滤。带 filter 时引擎会补取到 `K` 条：
 返回少于 `K` 条，就说明满足条件的只有这么多。

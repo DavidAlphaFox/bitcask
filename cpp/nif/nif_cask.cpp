@@ -75,6 +75,55 @@ ERL_NIF_TERM nif_cask_get(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[
     return make_ok(env, val_bin);
 }
 
+// libbitcask 6.8.0：结构化文档读回。get/2 保持 KV 热路径不变；调用方显式
+// 要求 fields 时才用 get_doc_owned，field id 由 field.schema 翻回原名。
+ERL_NIF_TERM nif_cask_get_doc(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
+    auto h = lock_cask_checked(env, argv[0]);
+    ErlNifBinary key{};
+    if (!h || !h->cask || !ensure_binary(env, argv[1], key)) {
+        return enif_make_badarg(env);
+    }
+    auto r = h->cask->get_doc_owned(as_bytes(key));
+    if (!r) return fault_to_term(env, r.error());
+
+    ERL_NIF_TERM map = enif_make_new_map(env);
+    const auto put_value = [&](ERL_NIF_TERM key_term,
+                               std::span<const std::byte> bytes,
+                               bool optional) -> bool {
+        ERL_NIF_TERM value = (optional && bytes.empty())
+                                 ? atoms().undefined
+                                 : make_binary_checked(env, bytes);
+        if (!value) return false;
+        return enif_make_map_put(env, map, key_term, value, &map) != 0;
+    };
+
+    if (!put_value(atoms().text, r->value, false) ||
+        !put_value(atoms().meta, r->meta, true)) {
+        return make_error(env, atoms().allocation_error);
+    }
+    if (!put_value(atoms().vector,
+                   std::as_bytes(std::span<const float>(r->vector)),
+                   true)) {
+        return make_error(env, atoms().allocation_error);
+    }
+
+    ERL_NIF_TERM fields = enif_make_new_map(env);
+    for (const auto& field : r->fields) {
+        auto name = std::as_bytes(std::span<const char>(
+            field.name.data(), field.name.size()));
+        ERL_NIF_TERM name_term = make_binary_checked(env, name);
+        ERL_NIF_TERM value_term = make_binary_checked(env, field.value);
+        if (!name_term || !value_term ||
+            !enif_make_map_put(env, fields, name_term, value_term, &fields)) {
+            return make_error(env, atoms().allocation_error);
+        }
+    }
+    if (!enif_make_map_put(env, map, atoms().fields, fields, &map)) {
+        return make_error(env, atoms().allocation_error);
+    }
+    return make_ok(env, map);
+}
+
 // put / delete 的调度：默认在普通调度器上跑（小值 + 无 sync 策略时一次 put
 // 就是几微秒），但下面几种情况会把普通调度器卡住，先转到 dirty IO 再做：
 //   * {sync_strategy, o_sync}：每条写 O_DSYNC；{puts, N}：每 N 条 fdatasync；
@@ -254,6 +303,29 @@ ERL_NIF_TERM nif_cask_search_fields(ErlNifEnv* env, int argc,
         [k, &filter](Cask& c, std::string_view q) {
             return c.search_fields(q, k, filter.get());
         });
+}
+
+// libbitcask 6.8.0：字段命中归属。除 key/ord/score 外，每条命中附命中的
+// 字段名列表；排序与 search_fields 完全相同。
+ERL_NIF_TERM nif_cask_search_fields_attributed(ErlNifEnv* env, int argc,
+                                               const ERL_NIF_TERM argv[]) {
+    const auto k = static_cast<std::size_t>(get_topk(env, argv[2]));
+    bool ok = false;
+    auto filter = trailing_filter(env, argc, 3, argv, ok);
+    if (!ok) return enif_make_badarg(env);
+
+    auto h = lock_cask_checked(env, argv[0]);
+    ErlNifBinary query_bin{};
+    if (!h || !enif_inspect_binary(env, argv[1], &query_bin)) {
+        return enif_make_badarg(env);
+    }
+    if (!h->cask->has_search()) return make_error(env, atoms().no_index);
+    auto r = h->cask->search_fields_attributed(as_string_view(query_bin), k,
+                                               filter.get());
+    if (!r) return fault_to_term(env, r.error());
+    ERL_NIF_TERM hits = make_search_field_hits(env, *r);
+    if (!hits) return make_error(env, atoms().allocation_error);
+    return make_ok(env, hits);
 }
 
 // S8.7：近邻搜索（4 参：ref, query, slop, k）。slop 非负，默认 0。

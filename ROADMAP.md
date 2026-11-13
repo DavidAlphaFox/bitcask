@@ -6,6 +6,15 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 6.8.0 落地
+
+### libbitcask 升级 6.7.1 → 6.8.0 ✅
+
+上游 MINOR，纯增量：结构化文档可以读回 `put_doc` 写入的命名字段，字段检索能回答
+「命中发生在哪个字段」。本仓库透传为 `bitcask:get_doc/2` 与
+`bitcask:search_fields_attributed/2,3,4`。C API 既有入口布局零改动、`SOVERSION`
+保持 6、盘上格式不变。
+
 ## 6.7.3 落地
 
 ### libbitcask 升级 6.7.0 → 6.7.1 ✅

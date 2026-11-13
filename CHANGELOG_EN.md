@@ -3,6 +3,26 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [6.8.0] — 2026-11-14
+
+Upgrades libbitcask **6.7.1 → 6.8.0** (an upstream MINOR: purely additive). The C API adds
+`get_doc` and a field-attributed variant of `search_fields`; existing `get` /
+`search_fields` layouts and semantics are unchanged, `SOVERSION` stays 6, and the on-disk
+format is unchanged. This repo exposes both capabilities through the Erlang facade:
+
+### Added
+
+- **`bitcask:get_doc/2`** explicitly reads a structured document and returns its named
+  fields as `#{text, meta, vector, fields}`, where `fields` is
+  `#{binary() => binary()}` and missing `meta` / `vector` are `undefined`. `get/2`
+  still uses the original hot path and does not decode fields.
+- **`bitcask:search_fields_attributed/2,3,4`** is the attributed variant of
+  `search_fields`, returning `[{Key, Ord, Score, [Field]}]`. Scores and ordering match
+  `search_fields`; the default field is reported as `<<>>`; the final argument still
+  accepts a meta filter.
+- New `bitcask_libbitcask_680_tests` covers field read-back, hit attribution, filters,
+  and `no_index` in KV mode.
+
 ## [6.7.3] — 2026-10-14
 
 Upgrades libbitcask **6.7.0 → 6.7.1** (an upstream PATCH: bug fixes only). The C API is unchanged,

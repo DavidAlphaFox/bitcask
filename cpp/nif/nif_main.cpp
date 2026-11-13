@@ -39,6 +39,7 @@ using detail::guarded;
 ERL_NIF_TERM nif_cask_open              (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_close             (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_get               (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_get_doc           (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_put               (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_delete            (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_sync              (ErlNifEnv*, int, const ERL_NIF_TERM[]);
@@ -47,6 +48,7 @@ ERL_NIF_TERM nif_cask_search_text       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_text_4     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_phrase     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_fields     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_search_fields_attributed(ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_near       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_fuzzy      (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_wildcard   (ErlNifEnv*, int, const ERL_NIF_TERM[]);
@@ -94,6 +96,8 @@ ErlNifFunc kNifFuncs[] = {
     {"cask_open",              2, guarded<nif_cask_open>,             ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"cask_close",             1, guarded<nif_cask_close>,            ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"cask_get",               2, guarded<nif_cask_get>,              0},
+    // 6.8.0 get_doc 显式解码 fields；仍与 get 同档（单次定位 + 读记录）。
+    {"cask_get_doc",           2, guarded<nif_cask_get_doc>,          0},
     {"cask_put",               3, guarded<nif_cask_put>,              0},
     {"cask_delete",            2, guarded<nif_cask_delete>,           0},
     {"cask_sync",              1, guarded<nif_cask_sync>,             ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -105,6 +109,10 @@ ErlNifFunc kNifFuncs[] = {
     {"cask_search_phrase",      4, guarded<nif_cask_search_phrase>,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"cask_search_fields",      3, guarded<nif_cask_search_fields>,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"cask_search_fields",      4, guarded<nif_cask_search_fields>,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"cask_search_fields_attributed", 3,
+     guarded<nif_cask_search_fields_attributed>, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"cask_search_fields_attributed", 4,
+     guarded<nif_cask_search_fields_attributed>, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"cask_search_near",        4, guarded<nif_cask_search_near>,     ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"cask_search_near",        5, guarded<nif_cask_search_near>,     ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"cask_search_fuzzy",       4, guarded<nif_cask_search_fuzzy>,    ERL_NIF_DIRTY_JOB_CPU_BOUND},

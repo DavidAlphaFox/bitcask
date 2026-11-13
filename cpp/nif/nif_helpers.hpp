@@ -133,6 +133,12 @@ ERL_NIF_TERM make_string_list(ErlNifEnv* env,
 // 一个短了的列表却没有任何错误。
 ERL_NIF_TERM make_search_hits(ErlNifEnv* env, const std::vector<bitcask::search::SearchHit>& hits);
 
+// libbitcask 6.8.0：归属版字段搜索结果 → [{Key, Ord, Score, [Field, ...]}]。
+// 分配失败返回 0，与 make_search_hits 的契约一致。
+ERL_NIF_TERM make_search_field_hits(
+    ErlNifEnv* env,
+    const std::vector<bitcask::search::SearchFieldHit>& hits);
+
 // 异常屏障：C++ 异常穿过 NIF 边界就是 std::terminate——整个节点没了。上游
 // 索引路径文档化了 bad_alloc（cask.hpp），本层也到处 std::vector / std::string，
 // 调用方一个夸张的参数（大 k、大 prefetch）就能触发。函数表里每个入口都套
