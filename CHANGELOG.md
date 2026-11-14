@@ -3,6 +3,19 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [6.8.1] — 2026-11-14
+
+升级 libbitcask **6.8.0 → 6.8.1**（上游 PATCH：纯内部内存结构变更）。全局 DocMap 改为
+live-only store，热点覆盖写的内存随 live docs 而不是历史写入增长。C API / 公共头签名、
+checkpoint sidecar 格式与盘上格式零改动；NIF / Erlang 代码零改动，重编即得。
+
+### Changed（随 libbitcask 6.8.1）
+
+- **DocMap live-only store**：覆盖写与删除在写路径同步淘汰旧 `ord` 的 live row、meta
+  与 delta journal，不再等待 `compact_chunks()`。上游热点基准实测：1M 次覆盖写、
+  1 个 live doc 的 RSS 净增 **0.0625 MiB**；低 churn live set 约
+  **169.5–172.5 bytes/live doc**。BM25 主评分路径仍走段内 dense DocId，检索行为不变。
+
 ## [6.8.0] — 2026-11-14
 
 升级 libbitcask **6.7.1 → 6.8.0**（上游 MINOR：纯增量）。C API 新增 `get_doc` 与

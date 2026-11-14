@@ -22,7 +22,7 @@ set(BITCASK_PRIV_DIR "${CMAKE_SOURCE_DIR}/priv")
 file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 
 # ---------------------------------------------------------------------------
-# libbitcask — git submodule at third_party/libbitcask (6.8.0, commit 22d8a33)。
+# libbitcask — git submodule at third_party/libbitcask (6.8.1, commit 5336a4e)。
 # 提供 C++ 核心库全部 target（bitcask_cask, bitcask_keydir, ...）。
 #
 # ⚠️ 6.2.1 起**不再需要 third_party 符号链接**。此前 libbitcask 的
@@ -120,6 +120,9 @@ file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 # 与语义零改动，SOVERSION 保持 6，盘上格式不动）。C++ 新增 get_doc 读回
 # 命名字段与 search_fields_attributed 字段命中归属；本仓库分别透传为
 # `bitcask:get_doc/2` 与 `bitcask:search_fields_attributed/2,3,4`。
+# 6.8.1：PATCH，纯内部内存结构变更——全局 DocMap 改为 live-only store，热点
+# 覆盖写内存随 live docs 而非历史写入增长。C API / 公共头签名、checkpoint
+# sidecar 格式与盘上格式零改动；NIF / Erlang 代码零改动，重编即得。
 
 # ---------------------------------------------------------------------------
 add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/libbitcask"

@@ -3,6 +3,21 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [6.8.1] — 2026-11-14
+
+Upgrades libbitcask **6.8.0 → 6.8.1** (an upstream PATCH). The global DocMap becomes a
+live-only store, so hot-key overwrite memory grows with live documents instead of historical
+writes. There are no changes to the C API, public header signatures, checkpoint sidecar
+format or on-disk format, and no NIF / Erlang code changes — rebuild to pick it up.
+
+### Changed
+
+- **DocMap live-only store**: overwrites and deletes retire the old ordinal's live row, meta
+  and delta journal on the write path instead of waiting for `compact_chunks()`. Upstream's
+  hot-key benchmark reports a net RSS increase of **0.0625 MiB** after 1M overwrites of one
+  live key; low-churn live sets remain about **169.5–172.5 bytes per live doc**. BM25's main
+  scoring path still uses segment-local dense IDs, so query behaviour is unchanged.
+
 ## [6.8.0] — 2026-11-14
 
 Upgrades libbitcask **6.7.1 → 6.8.0** (an upstream MINOR: purely additive). The C API adds

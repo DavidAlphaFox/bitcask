@@ -6,6 +6,16 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 6.8.1 shipped
+
+### libbitcask upgrade 6.8.0 → 6.8.1 ✅
+
+An upstream PATCH and purely internal memory-structure change: the global DocMap becomes a
+live-only store, so hot-key overwrite memory grows with live documents instead of historical
+writes (upstream measured only ~0.0625 MiB net RSS growth after 1M overwrites of one live
+key). C API / public header signatures, checkpoint sidecar format and on-disk format are
+unchanged; there are no NIF / Erlang code changes — just rebuild.
+
 ## 6.8.0 shipped
 
 ### libbitcask upgrade 6.7.1 → 6.8.0 ✅

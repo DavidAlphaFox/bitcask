@@ -6,6 +6,15 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 6.8.1 落地
+
+### libbitcask 升级 6.8.0 → 6.8.1 ✅
+
+上游 PATCH，纯内部内存结构变更：全局 DocMap 改为 live-only store，热点覆盖写的内存
+随 live docs 而不是历史写入增长（上游 1M 次覆盖写仅 1 个 live doc 的 RSS 净增约
+0.0625 MiB）。C API / 公共头签名、checkpoint sidecar 格式与盘上格式零改动；NIF /
+Erlang 代码零改动，重编即得。
+
 ## 6.8.0 落地
 
 ### libbitcask 升级 6.7.1 → 6.8.0 ✅
