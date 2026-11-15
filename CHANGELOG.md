@@ -3,6 +3,35 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [6.9.0] — 2026-11-15
+
+升级 libbitcask **6.8.1 → 6.9.0**（上游 MINOR：公共 C++ / C API 既有签名与 ABI
+零破坏，`SOVERSION` 保持 6；新错误码追加在枚举尾部）。OKI 成为查找 / 提交权威，
+新库退役内存 KeyDir 与 `.hint` 写路径，健康 Level B v4 目录走 data-only recovery。
+本仓库适配 `IndexRegistry`，并把上游新增的索引损坏硬错误透传为
+**`{error, index_corrupt}`**。
+
+### Added
+
+- **`index_corrupt` 错误原子**：OKI 定位成功但读回 record 的 key / ord 不一致时，
+  引擎显式拒绝；不再折叠成 `not_found`，也绝不返回别的 key 的 value。
+
+### Changed（随 libbitcask 6.9.0）
+
+- **OKI-only 权威与 data-only recovery**：`get` / 写路径 / range / merge relocation
+  都走 `OkiState` / `IndexAuthority`；NIF 侧共享目录注册表由
+  `KeyDirRegistry` 换成 `IndexRegistry`，多 Cask 同目录共享语义不变。
+- **派生辅助布局收紧**：新库停写 `.hint` 与 `kv.keydir.ckpt`，BCOK v3 带 sparse
+  block CRC、BCOM v4 保存提交点元数据；上游验证旧库可打开迁移，回退依赖 data
+  唯一真相。既有 `keydir_cache_entries` 字段保留，继续充当恢复档位。
+
+### Fixed
+
+- **`merge_only` 旁车可完成首次 OKI readiness 重建**：上游 6.9.0 在
+  `ensure_oki_for_write()` 中无条件拒绝 `merge_only`，导致 `bitcask:merge/N`
+  打开旁车时误报 `{error, index_corrupt}`。本仓库子模块跟进 `50417f4`，对
+  `merge_only` 放行 readiness 检查并走内存恢复档重建。
+
 ## [6.8.1] — 2026-11-14
 
 升级 libbitcask **6.8.0 → 6.8.1**（上游 PATCH：纯内部内存结构变更）。全局 DocMap 改为

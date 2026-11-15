@@ -6,6 +6,15 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 6.9.0 落地
+
+### libbitcask 升级 6.8.1 → 6.9.0 ✅
+
+上游 MINOR：OKI-only 权威、data-only recovery，内存 KeyDir 与 hint 写路径退役。
+既有 C++ / C API 签名与 ABI 零破坏，`SOVERSION` 保持 6；新
+`kIndexCorrupt` / `BITCASK_ERR_INDEX_CORRUPT` 追加在尾部。本仓库把 registry 换成
+`IndexRegistry`，透传 `{error, index_corrupt}`，多 Cask 同目录共享语义不变。
+
 ## 6.8.1 落地
 
 ### libbitcask 升级 6.8.0 → 6.8.1 ✅

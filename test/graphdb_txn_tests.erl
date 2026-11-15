@@ -141,6 +141,10 @@ concurrent_hub_degree_exact_test_() ->
      {timeout, 60, fun() ->
         with_dir(fun(D) ->
             R = ?G:open(D, [read_write]),
+            %% 6.9.0 首次公共读会对 Level A 目录做受控 OKI 重建；重建窗口内
+            %% 并发读者显式得到 index_corrupt。这里先串行预热，避免把迁移
+            %% 窗口混进并发事务断言。
+            ?assertEqual({error, not_found}, ?G:get_vertex(R, 1)),
             Hub = 1, NProc = 16, PerProc = 25,
             Parent = self(),
             Pids = [spawn_link(fun() ->
@@ -280,6 +284,9 @@ concurrent_insert_vs_del_vertex_test_() ->
      {timeout, 120, fun() ->
         with_dir(fun(D) ->
             R = ?G:open(D, [read_write]),
+            %% 6.9.0 首次公共读可能触发受控 OKI 重建；并发事务前先预热，
+            %% 迁移窗口的显式 index_corrupt 不应参与并发不变式压测。
+            ?assertEqual({error, not_found}, ?G:get_vertex(R, 1)),
             NV = 12,
             Parent = self(),
             #{lock_wait_timeouts := LWT0} = bitcask_txn_locker:status(),

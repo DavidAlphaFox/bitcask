@@ -6,6 +6,16 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 6.9.0 shipped
+
+### libbitcask upgrade 6.8.1 → 6.9.0 ✅
+
+An upstream MINOR: OKI-only authority, data-only recovery, and retirement of the in-memory
+KeyDir and hint write paths. Existing C++ / C API signatures and ABI are unchanged, `SOVERSION`
+stays 6, and the new `kIndexCorrupt` / `BITCASK_ERR_INDEX_CORRUPT` is appended to the enum.
+This repo switches to `IndexRegistry`, exposes `{error, index_corrupt}`, and keeps the existing
+multi-Cask same-directory sharing semantics.
+
 ## 6.8.1 shipped
 
 ### libbitcask upgrade 6.8.0 → 6.8.1 ✅

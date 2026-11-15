@@ -207,6 +207,7 @@ embedder 生成并写入向量；显式传 `vector` 则跳过。
 |------|------|--------|
 | `{error, no_index}` | 索引在**本句柄上本就不建**：只读 / `merge_only` 打开一个从未建过 OKI 的目录 | 以 `read_write` 重开即自动建；或回落到 `fold` + 前缀过滤 |
 | `{error, index_rebuild_failed}` | 可写 open 时 OKI **试建而败**（IO / 环境问题，细节在 log 里） | 先修环境再重开重试。**不要**当成「没数据」——库是有数据的 |
+| `{error, index_corrupt}` | **6.9.0**：OKI 定位到 record，但读回 key / ord 不一致——索引损坏或陈旧的硬证据 | 重建 / 从 data 或备份恢复；不要当 `not_found`，引擎也不会返回错 key 的值 |
 
 > **只读打开有数据的库，range 是正常的**——RW 会话已把 OKI 落盘，RO 直接读，
 > 不需要（也无权）重建。会报 `no_index` 的是**从未写过的目录**。

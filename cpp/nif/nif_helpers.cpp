@@ -186,6 +186,10 @@ ERL_NIF_TERM fault_to_term(ErlNifEnv* env, const CaskFault& f) noexcept {
         // ——而这两个码调用方通常写在同一个 case 里分流。
         case CaskError::kIndexRebuildFailed:
                                          tag = atoms().index_rebuild_failed; break;
+        // v6.9.0：上游把「OKI 定位成功但读回 key/ord 不一致」从静默错误里拆
+        // 出来。按 6.1.0 的纪律：新错误码直接给 `{error, Tag}`，不带常量
+        // detail；破坏证据本身就是调用方该处理的语义。
+        case CaskError::kIndexCorrupt:   tag = atoms().index_corrupt; break;
         case CaskError::kModeMismatch:   return atoms().mode_mismatch;
         case CaskError::kClosed:         return atoms().closed;
         default:                         tag = atoms().error; break;
@@ -428,7 +432,6 @@ ERL_NIF_TERM fold_start_impl(ErlNifEnv* env, CaskHandle* h,
     auto it = h->cask->make_iter();
     auto r = it->start(maxage, maxputs, /*now_sec*/ 0, see_tombstones);
     if (!r) return fault_to_term(env, r.error());
-    if (*r == keydir::StartIterResult::kOutOfDate) return atoms().out_of_date;
     auto term = make_resource<CaskIterHandle>(env, g_cask_iter_resource_type,
                                                std::move(it), h);
     if (!term) return make_error(env, atoms().allocation_error);

@@ -133,17 +133,16 @@ range_fold_test_() ->
     end}.
 
 range_no_index_test_() ->
-    {"只读打开一个从未写过的目录（无 OKI）→ {error, no_index}，不是 case_clause",
+    {"6.9.0 data-only：只读空目录是合法空 OKI，range 返回 []",
      fun() ->
         with_dir(fun(D) ->
             %% NIF 对 kNoIndex 返回**裸 atom**（legacy 契约），门面必须归一。
             %% 漏了这层归一时这里崩在 bitcask:range_fold/5 里。
             R = bitcask:open(D, []),
-            ?assertEqual({error, no_index},
-                         bitcask:range(R, {undefined, undefined})),
-            ?assertEqual({error, no_index},
-                         bitcask:range_fold(R, {undefined, undefined}, [],
-                                            fun(_K, _V, _T, _O, A) -> A end, [])),
+            ?assertEqual([], bitcask:range(R, {undefined, undefined})),
+            ?assertEqual([], bitcask:range_fold(R, {undefined, undefined}, [],
+                                                fun(_K, _V, _T, _O, A) -> A end,
+                                                [])),
             bitcask:close(R)
         end)
     end}.
@@ -164,14 +163,17 @@ range_readonly_populated_test_() ->
     end}.
 
 range_rebuild_failed_test_() ->
-    {"OKI 试建而败 → {error, index_rebuild_failed}，与 no_index 区分（6.1.0）",
+    {"OKI 重建硬失败时 range 报 index_rebuild_failed，与派生读的 "
+     "index_corrupt 语义区分（6.9.0）",
      fun() ->
         with_dir(fun(D) ->
             RW = open_seeded(D),
             bitcask:close(RW),
-            %% 制造一次重建失败：删掉 OKI 让它想重建，同时在 manifest 路径上
-            %% 放一个**目录**——manifest 是 OKI 的唯一 commit point，原子写
-            %% rename 到目录上必失败。
+            %% 制造一次不可恢复的 OKI 发布失败：删掉 OKI 让它重建，同时在
+            %% manifest 路径上放一个**目录**——manifest 是 OKI 的唯一 commit
+            %% point，原子 rename 到目录上必失败。这不是“仅缓存缺失”，而是
+            %% 权威提交面被占用；get 会显式暴露 index_corrupt，range 保留
+            %% rebuild_failed 的更精确分类。
             %% ⚠️ 这个 fixture 依赖上游的 OKI 文件名；名字变了本例会失败
             %%（而不是静默失效），那正是想要的信号。
             [file:delete(F) || F <- filelib:wildcard(D ++ "/kv.oki.seg-*")],
@@ -179,8 +181,7 @@ range_rebuild_failed_test_() ->
             ok = file:make_dir(D ++ "/kv.oki.manifest"),
 
             R = bitcask:open(D, [read_write]),
-            %% KV 路径不受影响——OKI 只是派生缓存
-            ?assertEqual({ok, <<"v">>}, bitcask:get(R, <<"k042">>)),
+            ?assertEqual({error, index_corrupt}, bitcask:get(R, <<"k042">>)),
             %% range 报「试建而败」，不是「本就不建」
             ?assertEqual({error, index_rebuild_failed},
                          bitcask:range(R, {undefined, undefined})),

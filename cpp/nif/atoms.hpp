@@ -50,6 +50,9 @@ struct Atoms {
     // 时重建撞 IO/环境问题），与 `no_index` 的「本就不建」区分：前者要先修
     // 环境再重开，后者读写方式重开即建。
     ERL_NIF_TERM index_rebuild_failed;
+    // v6.9.0：`CaskError::kIndexCorrupt` —— OKI 定位行读回时 key/ord 不一致。
+    // 这是索引损坏/陈旧的硬证据；绝不当作 NotFound，也不返回别的 key 的值。
+    ERL_NIF_TERM index_corrupt;
     ERL_NIF_TERM mode_mismatch;
     ERL_NIF_TERM closed;  // v3.1.0：CaskError::kClosed —— 对已 close 的 handle 调用
     ERL_NIF_TERM invalid_option;

@@ -222,6 +222,7 @@ errors** (since 6.1.0) — they call for different remedies, hence the split:
 |--------|-------|-----------|
 | `{error, no_index}` | The index **was never built for this handle**: a read-only or `merge_only` open of a directory that has no OKI | Reopen `read_write` and it builds automatically; or fall back to `fold` plus prefix filtering |
 | `{error, index_rebuild_failed}` | A writable open **attempted a rebuild and it failed** (IO / environment problem; details are in the log) | Fix the environment and reopen to retry. Do **not** read this as "no data" — the data is there |
+| `{error, index_corrupt}` | **6.9.0**: the OKI located a record, but its key / ordinal read back differently — hard evidence of a stale or corrupt index | Rebuild / restore from data or backup; never treat this as `not_found`, and the engine does not return another key's value |
 
 > **Read-only opens of a populated database work fine** — the read-write session
 > already persisted the OKI, so a read-only handle just reads it and never needs

@@ -41,6 +41,7 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     bad_crc         = a("bad_crc");
     no_index        = a("no_index");
     index_rebuild_failed = a("index_rebuild_failed");
+    index_corrupt    = a("index_corrupt");
     mode_mismatch   = a("mode_mismatch");
     closed          = a("closed");
     invalid_option  = a("invalid_option");

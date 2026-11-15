@@ -181,7 +181,7 @@ int on_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM /*load_info*/) {
 // 步骤；那个 C API 管的是 C API 自己的 registry，这里用的是 PrivData 里的，
 // 所以照着拆，不直接调它）。ERTS 等本库所有资源都释放后才调 on_unload，
 // 此时不会有 Cask 打开、也不会有查询在跑。
-//   1. delete PrivData → ~KeyDirRegistry → ~IndexPool join 索引池线程；
+//   1. delete PrivData → ~IndexRegistry → ~IndexPool join 索引池线程；
 //   2. release_search_arena：Search 池对 TBB 运行时的引用（池没建过则无操作）；
 //   3. tbb::finalize（nothrow）：等 TBB worker 退出。跑过检索的 dirty 调度线程
 //      常驻且带着 TBB 线程局部状态，这一步多半返回 false——worker 留着、空转在

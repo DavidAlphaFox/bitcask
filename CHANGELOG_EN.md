@@ -3,6 +3,40 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [6.9.0] — 2026-11-15
+
+Upgrades libbitcask **6.8.1 → 6.9.0** (an upstream MINOR: existing C++ / C API
+signatures and ABI are unchanged, `SOVERSION` stays 6, and the new error code is
+appended to the enum). The OKI becomes the lookup / commit authority; new stores retire the
+in-memory KeyDir and `.hint` write paths, and healthy Level B v4 directories recover by
+streaming data records. This repo adapts to `IndexRegistry` and exposes the new hard
+index-corruption error as **`{error, index_corrupt}`**.
+
+### Added
+
+- **`index_corrupt` error atom**: if an OKI lookup locates a record but the key / ordinal read
+  back does not match, the engine refuses the result instead of collapsing it to `not_found`
+  or returning another key's value.
+
+### Changed
+
+- **OKI-only authority and data-only recovery**: `get`, write paths, range iteration and merge
+  relocation all use `OkiState` / `IndexAuthority`. The NIF's per-directory shared registry now
+  holds an `IndexRegistry` instead of `KeyDirRegistry`; sharing one directory across multiple
+  Cask handles keeps its previous semantics.
+- **Tighter derived on-disk layout**: new stores stop writing `.hint` and `kv.keydir.ckpt`;
+  BCOK v3 adds sparse block CRCs and BCOM v4 records metadata commit points. Upstream validates
+  opening / migrating older stores, with recovery relying on `data` as the only durable truth.
+  The existing `keydir_cache_entries` field remains as the recovery-tier switch.
+
+### Fixed
+
+- **A `merge_only` sidecar can now complete its first OKI readiness rebuild**: upstream 6.9.0
+  unconditionally rejected `merge_only` in `ensure_oki_for_write()`, so `bitcask:merge/N`
+  failed to open the sidecar with `{error, index_corrupt}`. The submodule follow-up `50417f4`
+  allows that readiness check and rebuilds through the in-memory recovery tier for
+  `merge_only`.
+
 ## [6.8.1] — 2026-11-14
 
 Upgrades libbitcask **6.8.0 → 6.8.1** (an upstream PATCH). The global DocMap becomes a

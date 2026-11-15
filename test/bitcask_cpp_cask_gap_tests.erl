@@ -765,8 +765,8 @@ fold_keys_populates_real_entry_fields_test_() ->
 %%   只匹配 {ok,_}/{error,_}，这里直接 case_clause。
 %% ===================================================================
 
-fold6_out_of_date_is_error_tuple_test_() ->
-    {"fold/6 + fold_keys/6 撞上 out_of_date 返回 {error, out_of_date}，不崩",
+fold6_normal_start_after_pending_stream_test_() ->
+    {"6.9.0 fold start 不再有 out_of_date 时代；与活跃 stream 并存返回计数",
      fun() ->
         with_dir(fun(D) ->
             R = bitcask:open(D, ?CASK),
@@ -775,10 +775,10 @@ fold6_out_of_date_is_error_tuple_test_() ->
                 {ok, S} = bitcask:stream(R),          % 挂一个 fold 在跑
                 ok = bitcask:put(R, <<"k2">>, <<"v2">>), % fold 期间写 → pending
                 Cnt = fun(_K, _V, A) -> A + 1 end,
-                ?assertEqual({error, out_of_date},
-                             bitcask:fold(R, Cnt, 0, -1, 0, false)),
-                ?assertEqual({error, out_of_date},
-                             bitcask:fold_keys(R, fun(_E, A) -> A + 1 end, 0, -1, 0, false)),
+                ?assertEqual(2, bitcask:fold(R, Cnt, 0, -1, 0, false)),
+                ?assertEqual(2,
+                             bitcask:fold_keys(R, fun(_E, A) -> A + 1 end,
+                                               0, -1, 0, false)),
                 %% 不限就照常能开（复用现有 freeze）
                 ?assert(is_integer(bitcask:fold(R, Cnt, 0, -1, -1, false))),
                 ok = bitcask:stop(S)
@@ -790,18 +790,17 @@ fold6_out_of_date_is_error_tuple_test_() ->
 %% stream 读完即释放迭代器；stop 之后 next 不挂（A6）
 %% ===================================================================
 
-stream_releases_iter_on_done_without_stop_test_() ->
-    {"读到 done 后迭代器立刻释放（is_frozen 回 false），不必等 stop",
+stream_done_does_not_hold_freeze_test_() ->
+    {"6.9.0 OKI 迭代不再冻结 pending 表；done 后资源自然释放",
      fun() ->
         with_dir(fun(D) ->
             R = bitcask:open(D, ?CASK),
             try
                 ok = bitcask:put(R, <<"k">>, <<"v">>),
                 {ok, S} = bitcask:stream(R),
-                %% fold 期间写入 → pending 表建立 → is_frozen 为 true；
-                %% 最后一个迭代器 release 时 pending 合并回主表、frozen 归 false
+                %% 迭代期间写不再触发旧 keydir pending/freeze 语义。
                 ok = bitcask:put(R, <<"k2">>, <<"v2">>),
-                ?assertEqual(true, bitcask:is_frozen(R)),
+                ?assertEqual(false, bitcask:is_frozen(R)),
                 {ok, <<"k">>, <<"v">>} = bitcask:next(S),
                 ?assertEqual(done, bitcask:next(S)),
                 %% 没调 stop——以前这里 producer 还在 drain_loop 里钉着迭代器
