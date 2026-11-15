@@ -6,6 +6,14 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 6.9.1 shipped
+
+### libbitcask upgrade 6.9.0 → 6.9.1 ✅
+
+An upstream PATCH that formally adopts the local merge-only OKI readiness fix carried after
+6.9.0. The C++ / C API, on-disk format and ABI are unchanged, `SOVERSION` stays 6, and the NIF
+/ Erlang code needs no changes. The submodule returns to upstream `6.9.1` (`66609a7`).
+
 ## 6.9.0 shipped
 
 ### libbitcask upgrade 6.8.1 → 6.9.0 ✅

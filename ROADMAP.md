@@ -6,6 +6,14 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 6.9.1 落地
+
+### libbitcask 升级 6.9.0 → 6.9.1 ✅
+
+上游 PATCH，正式收录 6.9.0 后的本地 merge-only OKI readiness 修复。
+公共 C++ / C API、盘上格式与 ABI 零改动，`SOVERSION` 保持 6；NIF / Erlang
+代码零改动，子模块切回上游 `6.9.1`（`66609a7`）。
+
 ## 6.9.0 落地
 
 ### libbitcask 升级 6.8.1 → 6.9.0 ✅

@@ -32,6 +32,20 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
   打开旁车时误报 `{error, index_corrupt}`。本仓库子模块跟进 `50417f4`，对
   `merge_only` 放行 readiness 检查并走内存恢复档重建。
 
+## [6.9.1] — 2026-11-16
+
+升级 libbitcask **6.9.0 → 6.9.1**（上游 PATCH：公共 C++ / C API、盘上格式与
+ABI 零改动，`SOVERSION` 保持 6）。上游正式收录 6.9.0 后本仓库的
+`merge_only` readiness 修复（`8de3319`），子模块从本地跟进提交 `50417f4`
+切回上游 `66609a7`。
+
+### Fixed（随 libbitcask 6.9.1）
+
+- **`merge_only` 旁车 readiness 重建进入上游正式版**：`merge_only` 仍可在
+  OKI 尚未 write-probe ready 时走 `IndexAuthority::rebuild_memory_from_data()`
+  轻量重建；`bitcask:merge/N` 行为与 6.9.0 本地跟进版一致，NIF / Erlang
+  代码零改动。
+
 ## [6.8.1] — 2026-11-14
 
 升级 libbitcask **6.8.0 → 6.8.1**（上游 PATCH：纯内部内存结构变更）。全局 DocMap 改为

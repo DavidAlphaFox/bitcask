@@ -22,7 +22,7 @@ set(BITCASK_PRIV_DIR "${CMAKE_SOURCE_DIR}/priv")
 file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 
 # ---------------------------------------------------------------------------
-# libbitcask — git submodule at third_party/libbitcask (6.9.0-1-g50417f4)。
+# libbitcask — git submodule at third_party/libbitcask (6.9.1, commit 66609a7)。
 # 提供 C++ 核心库全部 target（bitcask_cask, bitcask_keydir, ...）。
 #
 # ⚠️ 6.2.1 起**不再需要 third_party 符号链接**。此前 libbitcask 的
@@ -129,8 +129,9 @@ file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 # 让健康目录 data-only 恢复；索引读回 key/ord 不一致时新增 `index_corrupt`
 # 错误原子。NIF 的共享 registry 改持 IndexRegistry，fold start 的历史
 # out-of-date 分支消失；`keydir_cache_entries` 字段保留作恢复档位。
-# 本地 50417f4：merge_only 旁车允许执行 OKI readiness 重建（用内存恢复档），
-# 保证 bitcask:merge/N 不被首次 open 的 index_corrupt 误拒。
+# 6.9.1：PATCH，正式收录 6.9.0 后的本地 merge-only readiness 修复
+# （50417f4 → 8de3319），子模块回归上游 tag（66609a7）。公共 C++ / C API、
+# 盘上格式与 ABI 零改动，SOVERSION 保持 6；NIF / Erlang 门面零改动。
 
 # ---------------------------------------------------------------------------
 add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/libbitcask"
