@@ -3,6 +3,20 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [6.9.1] — 2026-11-16
+
+Upgrades libbitcask **6.9.0 → 6.9.1** (an upstream PATCH: the C++ / C API, on-disk
+format and ABI are unchanged, and `SOVERSION` stays 6). Upstream formally adopts the
+`merge_only` readiness fix that this repo carried after 6.9.0 (`8de3319`); the submodule
+moves from the local follow-up `50417f4` back to upstream `66609a7`.
+
+### Fixed (via libbitcask 6.9.1)
+
+- **The `merge_only` sidecar readiness rebuild is now upstream**: `merge_only` can still
+  rebuild through `IndexAuthority::rebuild_memory_from_data()` when OKI is not yet
+  write-probe ready. `bitcask:merge/N` behaves as in the 6.9.0 local follow-up; the NIF
+  and Erlang code need no changes.
+
 ## [6.9.0] — 2026-11-15
 
 Upgrades libbitcask **6.8.1 → 6.9.0** (an upstream MINOR: existing C++ / C API
@@ -36,20 +50,6 @@ index-corruption error as **`{error, index_corrupt}`**.
   failed to open the sidecar with `{error, index_corrupt}`. The submodule follow-up `50417f4`
   allows that readiness check and rebuilds through the in-memory recovery tier for
   `merge_only`.
-
-## [6.9.1] — 2026-11-16
-
-Upgrades libbitcask **6.9.0 → 6.9.1** (an upstream PATCH: the C++ / C API, on-disk
-format and ABI are unchanged, and `SOVERSION` stays 6). Upstream formally adopts the
-`merge_only` readiness fix that this repo carried after 6.9.0 (`8de3319`); the submodule
-moves from the local follow-up `50417f4` back to upstream `66609a7`.
-
-### Fixed (via libbitcask 6.9.1)
-
-- **The `merge_only` sidecar readiness rebuild is now upstream**: `merge_only` can still
-  rebuild through `IndexAuthority::rebuild_memory_from_data()` when OKI is not yet
-  write-probe ready. `bitcask:merge/N` behaves as in the 6.9.0 local follow-up; the NIF
-  and Erlang code need no changes.
 
 ## [6.8.1] — 2026-11-14
 
