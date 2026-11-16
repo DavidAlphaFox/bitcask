@@ -3,6 +3,18 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [7.0.1] — 2026-11-16
+
+升级 libbitcask **7.0.0 → 7.0.1**（上游 PATCH：迭代器用过之后再写入时，
+`flush_index` 不再永久阻塞；C API 签名、盘上格式与 ABI 零改动，`SOVERSION`
+保持 7）。子模块从 `677cfca`（`7.0.0`）切到上游 `c7117df`（`7.0.1`）。
+
+### Fixed（随 libbitcask 7.0.1）
+
+- **迭代后写入不再卡住 `flush_index`**：开迭代器不再制造缺失的写序号空洞；
+  其后首次写入不会把提交水位推过永远补不上的空洞，`flush_index` 可正常返回。
+  已被卡住的库无需修复，重开即恢复。NIF / Erlang 门面零改动，重编即得。
+
 ## [7.0.0] — 2026-11-16
 
 升级 libbitcask **6.9.1 → 7.0.0**（C++ ABI 破坏，`SOVERSION` 6→7；C API 既有签名

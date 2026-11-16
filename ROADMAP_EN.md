@@ -6,6 +6,14 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 7.0.1 shipped
+
+### libbitcask upgrade 7.0.0 → 7.0.1 ✅
+
+An upstream PATCH fixes a permanent `flush_index` hang when one write follows iterator use.
+The C API signatures, on-disk format and ABI are unchanged, `SOVERSION` stays 7, and the
+NIF / Erlang code needs no changes. The submodule moves to upstream `7.0.1` (`c7117df`).
+
 ## 7.0.0 shipped
 
 ### libbitcask upgrade 6.9.1 → 7.0.0 ✅

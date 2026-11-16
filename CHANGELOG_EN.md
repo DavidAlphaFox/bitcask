@@ -3,6 +3,20 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [7.0.1] — 2026-11-16
+
+Upgrades libbitcask **7.0.0 → 7.0.1** (an upstream PATCH: after using an iterator and
+writing again, `flush_index` no longer hangs forever; the C API signatures, on-disk format
+and ABI are unchanged, and `SOVERSION` stays 7). The submodule moves from `677cfca`
+(`7.0.0`) to upstream `c7117df` (`7.0.1`).
+
+### Fixed (via libbitcask 7.0.1)
+
+- **Writing after iteration no longer stalls `flush_index`**: opening an iterator no longer
+  creates a missing write ordinal; the next write cannot push the commit watermark past a
+  hole that can never be filled, so `flush_index` returns normally. A store already stuck by
+  the bug recovers on reopen. The NIF and Erlang facade are unchanged — just rebuild.
+
 ## [7.0.0] — 2026-11-16
 
 Upgrades libbitcask **6.9.1 → 7.0.0** (breaking C++ ABI, `SOVERSION` 6→7; existing C API
