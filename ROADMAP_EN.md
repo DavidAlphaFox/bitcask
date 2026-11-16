@@ -6,6 +6,22 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 7.0.0 shipped
+
+### libbitcask upgrade 6.9.1 → 7.0.0 ✅
+
+This is a breaking C++ ABI change (`SOVERSION` 6→7): OKI compaction moves to background,
+size-tiered suffix merges, read views are published as immutable snapshots, run blooms grow,
+and `StatusInfo` gains compaction diagnostics. Existing C API signatures are unchanged and the
+on-disk format is unchanged, so old and new versions can open the same directory. The core NIF
+does not use the changed internal C++ interfaces; no NIF / Erlang source changes are needed.
+
+### llama.cpp upgrade b11434 → v1.0.0 ✅
+
+Opt-in local embedder submodule upgrade: `5e03bdd` → `b1b770d` (tag `v1.0.0`, ggml 1.0.0).
+The public llama / ggml interfaces used by the NIF remain available; both build targets pass,
+and the NIF source is unchanged.
+
 ## 6.9.1 shipped
 
 ### libbitcask upgrade 6.9.0 → 6.9.1 ✅

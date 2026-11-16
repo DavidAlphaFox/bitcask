@@ -3,6 +3,25 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [7.0.0] — 2026-11-16
+
+升级 libbitcask **6.9.1 → 7.0.0**（C++ ABI 破坏，`SOVERSION` 6→7；C API 既有签名
+零增删改，盘上格式零改动）。本地嵌入后端同步升级 llama.cpp `b11434` → `v1.0.0`
+（ggml `0.26` → `1.0.0`）。
+
+### Changed（随 libbitcask 7.0.0）
+
+- **OKI 分级后台归并与不可变读视图**：提交点只调度归并，支持两条归并道、
+  背压与 close 宽限取消；run 集合与冻结内存段整体不可变发布。run bloom 从
+  10 bits/7 哈希提高到 16 bits/11 哈希，`StatusInfo` 新增归并诊断字段。
+- **NIF / Erlang 门面零改动**：核心 NIF 静态链接源码构建，不直接使用上述内部
+  C++ 接口；重编即可获得新行为。
+
+### Changed（随 llama.cpp v1.0.0）
+
+- **本地嵌入后端升级**（opt-in）：`cpp/llama/nif_llama.cpp` 使用的公开嵌入、
+  分词、backend 设备与日志接口仍然可用；NIF 源码零改动，构建配置选项不变。
+
 ## [6.9.1] — 2026-11-16
 
 升级 libbitcask **6.9.0 → 6.9.1**（上游 PATCH：公共 C++ / C API、盘上格式与

@@ -3,6 +3,27 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [7.0.0] — 2026-11-16
+
+Upgrades libbitcask **6.9.1 → 7.0.0** (breaking C++ ABI, `SOVERSION` 6→7; existing C API
+signatures are unchanged and the on-disk format is unchanged). The local embedding backend also
+moves from llama.cpp `b11434` to `v1.0.0` (ggml `0.26` → `1.0.0`).
+
+### Changed (via libbitcask 7.0.0)
+
+- **Size-tiered background OKI compaction and immutable read views**: commit points only schedule
+  compaction; two compaction lanes, back-pressure and bounded close cancellation are supported.
+  Runs and frozen memory segments are published as one immutable snapshot. Run blooms grow from
+  10 bits/7 hashes to 16 bits/11 hashes, and `StatusInfo` gains compaction diagnostics.
+- **No NIF / Erlang facade changes**: the core NIF is statically linked from source and does not
+  use those internal C++ interfaces directly; rebuild to pick up the new behaviour.
+
+### Changed (via llama.cpp v1.0.0)
+
+- **Local embedding backend upgrade** (opt-in): the public embedding, tokenization, backend-device
+  and logging APIs used by `cpp/llama/nif_llama.cpp` remain available; the NIF source and build
+  switches are unchanged.
+
 ## [6.9.1] — 2026-11-16
 
 Upgrades libbitcask **6.9.0 → 6.9.1** (an upstream PATCH: the C++ / C API, on-disk

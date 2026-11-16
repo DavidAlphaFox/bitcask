@@ -22,7 +22,7 @@ set(BITCASK_PRIV_DIR "${CMAKE_SOURCE_DIR}/priv")
 file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 
 # ---------------------------------------------------------------------------
-# libbitcask — git submodule at third_party/libbitcask (6.9.1, commit 66609a7)。
+# libbitcask — git submodule at third_party/libbitcask (7.0.0, commit 677cfca)。
 # 提供 C++ 核心库全部 target（bitcask_cask, bitcask_keydir, ...）。
 #
 # ⚠️ 6.2.1 起**不再需要 third_party 符号链接**。此前 libbitcask 的
@@ -132,13 +132,18 @@ file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 # 6.9.1：PATCH，正式收录 6.9.0 后的本地 merge-only readiness 修复
 # （50417f4 → 8de3319），子模块回归上游 tag（66609a7）。公共 C++ / C API、
 # 盘上格式与 ABI 零改动，SOVERSION 保持 6；NIF / Erlang 门面零改动。
+# 7.0.0：C++ ABI 破坏（SOVERSION 6→7）——StatusInfo 追加 OKI 归并诊断字段，
+# OkiState / ReadView / OkiMergeCursor 接口与布局变更；本仓库是源码级依赖
+# （add_subdirectory），重编即可。C API 既有签名零增删改；盘上格式零改动
+# （manifest v4 / run v3，新旧可互开，无迁移）。核心 NIF 不直接使用这些
+# 内部 C++ 接口，Erlang / NIF 门面零改动。
 
 # ---------------------------------------------------------------------------
 add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/libbitcask"
                  "${CMAKE_BINARY_DIR}/libbitcask-build")
 
 # ---------------------------------------------------------------------------
-# llama.cpp — 本地嵌入后端，git submodule at third_party/llama.cpp（tag b11434）。
+# llama.cpp — 本地嵌入后端，git submodule at third_party/llama.cpp（tag v1.0.0）。
 #
 # **默认关**。打开：cmake -DBITCASK_WITH_LLAMA=ON。理由不是保守，是成本：
 # 打开之后 priv/ 下会多出 ggml-base + 14 个 CPU 变体 + llama 一组共享库，首次

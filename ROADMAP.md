@@ -6,6 +6,20 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 7.0.0 落地
+
+### libbitcask 升级 6.9.1 → 7.0.0 ✅
+
+C++ ABI 破坏，`SOVERSION` 6→7：OKI 改为分级后台归并，读视图整体不可变发布，
+run bloom 加大，`StatusInfo` 追加归并诊断字段。C API 既有签名零增删改，盘上格式
+零改动，新旧可互开。核心 NIF 不直接使用变更的内部 C++ 接口；NIF / Erlang 代码
+零改动，重编即可。
+
+### llama.cpp 升级 b11434 → v1.0.0 ✅
+
+本地嵌入后端（opt-in）子模块升级：`5e03bdd` → `b1b770d`（tag `v1.0.0`，ggml 1.0.0）。
+NIF 用到的 llama / ggml 公开接口仍在；两目标全路径构建通过，NIF 源码零改动。
+
 ## 6.9.1 落地
 
 ### libbitcask 升级 6.9.0 → 6.9.1 ✅
