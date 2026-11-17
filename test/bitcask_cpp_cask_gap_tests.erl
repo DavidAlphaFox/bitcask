@@ -59,6 +59,17 @@ needs_merge_dispatch_test_() ->
         end)
     end}.
 
+index_diagnostic_counters_test_() ->
+    {"7.0.3 index diagnostics expose integer counters", fun() ->
+        with_dir(fun(D) ->
+            R = bitcask:open(D, ?CASK),
+            ok = bitcask:put(R, <<"k">>, <<"v">>),
+            ?assert(is_integer(bitcask:index_errors(R))),
+            ?assert(is_integer(bitcask:index_stale_dropped(R))),
+            bitcask:close(R)
+        end)
+    end}.
+
 %% ===================================================================
 %% sync after empty open (legacy returns ok even with no writes)
 %% ===================================================================

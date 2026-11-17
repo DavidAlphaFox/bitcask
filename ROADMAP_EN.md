@@ -6,6 +6,17 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 7.0.3 shipped
+
+### libbitcask upgrade 7.0.2 → 7.0.3 ✅
+
+An upstream PATCH makes the index pipeline arbitrate by key + LSN and apply work in shards,
+and fixes the large-`put_batch` deadlock, the `close()` escape hatch, overestimated checkpoint
+coverage watermarks, and BM25 score drift from legacy OKI indexes. The C API signatures, on-disk
+format and ABI are unchanged, `SOVERSION` stays 7, and the C++ headers require a same-version
+NIF rebuild. The Erlang facade adds the `index_stale_dropped/1` diagnostic. The submodule moves
+to upstream `7.0.3` (`ce7ce13`).
+
 ## 7.0.2 shipped
 
 ### libbitcask upgrade 7.0.1 → 7.0.2 ✅

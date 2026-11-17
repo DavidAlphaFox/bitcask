@@ -3,6 +3,29 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [7.0.3] — 2026-11-17
+
+升级 libbitcask **7.0.2 → 7.0.3**（上游 PATCH：索引管线去全局顺序化，并修复大
+`put_batch` 索引池死锁、`close()` 逃生门、checkpoint 覆盖水位高估与旧 OKI
+BM25 分数漂移。C API 签名、盘上格式与 ABI 零改动，`SOVERSION` 保持 7；C++
+公共头有结构性变化，NIF 必须与库同版重编）。子模块从 `76aa98d`（`7.0.2`）
+切到上游 `ce7ce13`（`7.0.3`）。
+
+### Changed（随 libbitcask 7.0.3）
+
+- **索引管线改为 key + LSN 裁决、分片并发应用**：同 key 串行、不同 key 并行；
+  reducer / reorder ring / map worker 池退役，恢复重放同样经分片执行器并行。
+  搜索读屏障改等 LSN 连续完成前缀，checkpoint 在执行时刻取覆盖水位并独占保存。
+- **内置文本、向量插件与恢复契约随上游更新**：旧格式 OKI 的 BM25 分数不再受
+  全死段 stale 统计影响；向量插件改用 key + LSN 定位表判重，HNSW 旧检查点可
+  继续读取，7.0.3 写出的乱序图可退回全量重建（不损坏数据）。
+
+### Added
+
+- **`bitcask:index_stale_dropped/1`**：透出上游 `StatusInfo` 新增的过期索引任务
+  计数。正常并发覆盖写下非零是预期；仅当伴随 `index_errors/1` 增长时才需要
+  关注索引应用错误。
+
 ## [7.0.2] — 2026-11-16
 
 升级 libbitcask **7.0.1 → 7.0.2**（上游 PATCH：修复 Windows `atomic_rename`

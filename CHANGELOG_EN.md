@@ -3,6 +3,33 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [7.0.3] — 2026-11-17
+
+Upgrades libbitcask **7.0.2 → 7.0.3** (an upstream PATCH: the index pipeline removes global
+ordering and fixes the large-`put_batch` index-pool deadlock, the `close()` escape hatch,
+overestimated checkpoint coverage watermarks, and BM25 score drift from legacy OKI indexes.
+The C API signatures, on-disk format and ABI are unchanged, and `SOVERSION` stays 7; the C++
+public headers changed structurally, so the NIF must be rebuilt with the same library version).
+The submodule moves from `76aa98d` (`7.0.2`) to upstream `ce7ce13` (`7.0.3`).
+
+### Changed (via libbitcask 7.0.3)
+
+- **The index pipeline now arbitrates by key + LSN and applies work in shards**: writes to the
+  same key stay serial while different keys run concurrently; the reducer, reorder ring and map
+  worker pool are retired, and recovery replay uses the same sharded executor. Search read
+  barriers wait for the contiguous completed-LSN prefix, and checkpoints capture coverage at
+  execution time and save exclusively.
+- **Built-in text/vector plugins and recovery contracts follow upstream**: BM25 scores from
+  legacy OKI indexes no longer absorb stale statistics from fully dead segments; vector plugins
+  use key + LSN location tables for idempotency, old HNSW checkpoints remain readable, and
+  out-of-order graphs written by 7.0.3 fall back to a full rebuild without data loss.
+
+### Added
+
+- **`bitcask:index_stale_dropped/1`** exposes the stale index-task counter newly added to
+  upstream `StatusInfo`. A nonzero value is expected under normal concurrent overwrites; it
+  only warrants attention when it accompanies growth in `index_errors/1`.
+
 ## [7.0.2] — 2026-11-16
 
 Upgrades libbitcask **7.0.1 → 7.0.2** (an upstream PATCH: fixes Windows

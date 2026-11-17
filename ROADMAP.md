@@ -6,6 +6,15 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 7.0.3 落地
+
+### libbitcask 升级 7.0.2 → 7.0.3 ✅
+
+上游 PATCH：索引管线改为 key + LSN 裁决与分片并发应用，并修复大 `put_batch`
+死锁、`close()` 逃生门、checkpoint 覆盖水位高估和旧 OKI BM25 分数漂移。C API
+签名、盘上格式与 ABI 零改动，`SOVERSION` 保持 7；C++ 头面须同版重编。Erlang
+门面新增 `index_stale_dropped/1` 诊断，子模块切到上游 `7.0.3`（`ce7ce13`）。
+
 ## 7.0.2 落地
 
 ### libbitcask 升级 7.0.1 → 7.0.2 ✅

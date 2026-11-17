@@ -32,10 +32,14 @@ ERL_NIF_TERM nif_cask_is_frozen(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM
     return h->cask->is_frozen() ? atoms().atom_true : atoms().atom_false;
 }
 
-// status(Ref) -> {KeyCount, KeyBytes, Epoch, [{Filename,Frag,Dead,Total},...], IndexErrors}
+// status(Ref) ->
+//   {KeyCount, KeyBytes, Epoch, [{Filename,Frag,Dead,Total},...],
+//    IndexErrors, IndexStaleDropped}
 // Erlang facade 只透出 KeyCount + Files；KeyBytes / Epoch / IndexErrors 给 NIF 直接调用方
-// （IndexErrors 另由 facade index_errors/1 单独透出）。
+// （IndexErrors / IndexStaleDropped 另由 facade 单独透出）。
 // v1.1.0：新增 IndexErrors（s.index_errors）——异步索引 worker 吞异常计数，非零 = 索引可能陈旧。
+// v7.0.3：新增 IndexStaleDropped（s.index_stale_dropped）——被 key + LSN 裁决
+// 判为过期而丢弃的索引任务数；正常并发覆盖写下非零是预期行为。
 ERL_NIF_TERM nif_cask_status(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
     auto h = lock_cask_checked(env, argv[0]);
     if (!h) return enif_make_badarg(env);
@@ -49,12 +53,13 @@ ERL_NIF_TERM nif_cask_status(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM ar
             enif_make_uint64(env, f.total_bytes));
         files = enif_make_list_cell(env, e, files);
     }
-    return enif_make_tuple5(env,
+    return enif_make_tuple6(env,
         enif_make_uint64(env, s.key_count),
         enif_make_uint64(env, s.key_bytes),
         enif_make_uint64(env, s.epoch),
         files,
-        enif_make_uint64(env, s.index_errors));
+        enif_make_uint64(env, s.index_errors),
+        enif_make_uint64(env, s.index_stale_dropped));
 }
 
 // needs_merge(Ref) -> false | {true, [LiveFile,...], [ExpiredFile,...]}
