@@ -348,7 +348,7 @@ ok
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
 | `doc/unified-architecture-plan-zh.md` | 统一架构计划（已实施） |
 | `doc/libcask-extraction-zh.md` | **libcask 独立库拆分可行性评估**（2.2.0 规划） |
-| `ROADMAP.md` / `ROADMAP_EN.md` | **路线图**：7.0.1 / 7.0.0 / 6.9.1 / 6.9.0 / 6.8.1 / 6.8.0 / 6.7.3 / 6.7.2 / 6.7.1 / 6.7.0 / 6.6.0 / 6.5.1 / 6.5.0 / 6.4.0 / 6.3.2 / 6.3.1 / 6.2.2 / 6.2.1 / 6.1.0 / 6.0.0 / 5.1.0 / 5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 落地 + 2.1.1 已落地（P5–P15）+ 2.2.0 规划（libcask 独立 / V7+ 向量优化）（中/英） |
+| `ROADMAP.md` / `ROADMAP_EN.md` | **路线图**：7.0.2 / 7.0.1 / 7.0.0 / 6.9.1 / 6.9.0 / 6.8.1 / 6.8.0 / 6.7.3 / 6.7.2 / 6.7.1 / 6.7.0 / 6.6.0 / 6.5.1 / 6.5.0 / 6.4.0 / 6.3.2 / 6.3.1 / 6.2.2 / 6.2.1 / 6.1.0 / 6.0.0 / 5.1.0 / 5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 落地 + 2.1.1 已落地（P5–P15）+ 2.2.0 规划（libcask 独立 / V7+ 向量优化）（中/英） |
 | `TASK.md` | 详细任务拆分与历史 |
 
 ## 项目状态
@@ -367,7 +367,8 @@ ok
 - **3.1.0**（2026-07-01）— 升级 libbitcask v3.1.0（ABI 不破坏）：`{max_read_handles, unlimited}` / `{auto_compact_dead_ratio, R}` 选项、错误原子 `closed`；随库引入 read 句柄默认上限（按 `RLIMIT_NOFILE` 自动推导）、`bitcask.meta` v3 加 CRC32、field.schema FSCH v1 头 + CRC
 - **4.0.0**（2026-07-13）— 升级 libbitcask v4.0.0（ABI 破坏，`SOVERSION` 3→4，源码级兼容）：`{vector_engine, hnsw|ivfrq|diskann}` 向量双引擎 + 调优选项、`{auto_checkpoint_min_docs, N}` 崩溃恢复重放有界；随库引入 IVF-RaBitQ-lite 引擎、DiskANN 引擎（实验性）、AVX2 int8 内核、HNSW `.qc8` mmap 化；`examples/` Wikipedia 检索库示例
 - **4.1.0**（2026-07-15）— 升级 libbitcask v4.1.0（ABI 不破坏，`SOVERSION` 保持 4，盘上格式不变）：对 Erlang 调用方**无 API 变更**，重编即得；随库引入 Phase 5/6 深度审计成果——修复 `close/1` 拆卸路径的进程级永久挂死（`IndexPool` 计数泄漏 + `unregister_lib` 无界 `flush`）、hnsw 三处原子写 rename 前补 `fdatasync`（此前崩溃即半截文件）、`RowChunks`/`MmapSegment` 资源泄漏；`file_util` 归并使 fsync 纪律 4 套收敛为 1 套
-- **7.0.1**（2026-11-16，当前版本）— 升级 libbitcask 7.0.0 → **7.0.1**（PATCH，纯缺陷修复：迭代器用过之后再写一次不再让 `flush_index` 永久阻塞；C API 签名、盘上格式与 `SOVERSION` 7 不变）。NIF / Erlang 代码零改动，重编即得；曾被卡住的库重开即恢复
+- **7.0.2**（2026-11-16，当前版本）— 升级 libbitcask 7.0.1 → **7.0.2**（PATCH，纯缺陷修复：Windows `atomic_rename` 对共享冲突做有界重试；MSVC 大端读取改用标准 `std::byteswap`；C API 签名、盘上格式与 `SOVERSION` 7 不变）。Linux / macOS 行为不变，NIF / Erlang 代码零改动，重编即得
+- **7.0.1**（2026-11-16）— 升级 libbitcask 7.0.0 → **7.0.1**（PATCH，纯缺陷修复：迭代器用过之后再写一次不再让 `flush_index` 永久阻塞；C API 签名、盘上格式与 `SOVERSION` 7 不变）。NIF / Erlang 代码零改动，重编即得；曾被卡住的库重开即恢复
 - **7.0.0**（2026-11-16）— 升级 libbitcask 6.9.1 → **7.0.0**（C++ ABI 破坏，`SOVERSION` 6→7；C API 既有签名零增删改，盘上格式不变）。OKI 改为分级后台归并与不可变读视图，点查换更大 bloom；核心 NIF 不直接触及其变更的内部 C++ 接口，NIF / Erlang 代码零改动，重编即得。本地嵌入后端 llama.cpp 升至 **`v1.0.0`**（ggml 1.0.0）
 - **6.9.0**（2026-11-15）— 升级 libbitcask 6.8.1 → **6.9.0**（MINOR，既有 C++ / C API 签名与 ABI 零破坏，`SOVERSION` 6 不变；新错误码追加在尾部）。OKI-only 架构让点查 / 写 / range / merge 全走 OKI 权威，新库停写内存 KeyDir 与 `.hint`，健康 Level B v4 走 data-only recovery。新增 `{error, index_corrupt}`：索引定位读回 key/ord 不一致时显式拒答。NIF registry 换 `IndexRegistry`，多 Cask 同目录共享语义不变
 - **6.8.1**（2026-11-14）— 升级 libbitcask 6.8.0 → **6.8.1**（PATCH，纯内部内存结构变更，`SOVERSION` 6 不变、盘上格式与 checkpoint sidecar 格式不变）。全局 DocMap 改为 live-only store：热点覆盖写内存随 live docs 而非历史写入增长（上游 1M 次覆盖写仅 1 个 live doc 的 RSS 净增 0.0625 MiB）。C API / 公共头签名零改动；NIF / Erlang 代码零改动，重编即得

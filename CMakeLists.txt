@@ -22,7 +22,7 @@ set(BITCASK_PRIV_DIR "${CMAKE_SOURCE_DIR}/priv")
 file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 
 # ---------------------------------------------------------------------------
-# libbitcask — git submodule at third_party/libbitcask (7.0.1, commit c7117df)。
+# libbitcask — git submodule at third_party/libbitcask (7.0.2, commit 76aa98d)。
 # 提供 C++ 核心库全部 target（bitcask_cask, bitcask_keydir, ...）。
 #
 # ⚠️ 6.2.1 起**不再需要 third_party 符号链接**。此前 libbitcask 的
@@ -139,6 +139,9 @@ file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 # 内部 C++ 接口，Erlang / NIF 门面零改动。
 # 7.0.1：PATCH——修复迭代器用过之后再写一次导致 flush_index 永久阻塞的问题。
 # C API 签名、盘上格式与 SOVERSION 零改动；NIF / Erlang 门面零改动，重编即得。
+# 7.0.2：PATCH——Windows atomic_rename 对共享冲突做有界重试；MSVC 的大端
+# 读取改用 std::byteswap。C API 签名、盘上格式与 SOVERSION 零改动；Linux /
+# macOS 行为不变，NIF / Erlang 门面零改动，重编即得。
 
 # ---------------------------------------------------------------------------
 add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/libbitcask"

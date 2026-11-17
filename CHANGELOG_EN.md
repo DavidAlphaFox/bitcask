@@ -3,6 +3,24 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [7.0.2] — 2026-11-16
+
+Upgrades libbitcask **7.0.1 → 7.0.2** (an upstream PATCH: fixes Windows
+`atomic_rename` sharing conflicts and moves the MSVC big-endian read to standard
+`std::byteswap`; the C API signatures, on-disk format and ABI are unchanged, and
+`SOVERSION` stays 7). The submodule moves from `c7117df` (`7.0.1`) to upstream
+`76aa98d` (`7.0.2`).
+
+### Fixed (via libbitcask 7.0.2)
+
+- **Windows `atomic_rename` no longer breaks on sharing conflicts**: when the target is
+  still briefly open by one of this library's read handles or is delete-pending,
+  `MoveFileExW(REPLACE_EXISTING)` can return `ERROR_ACCESS_DENIED` /
+  `ERROR_SHARING_VIOLATION`. Those two transient conflicts now retry with bounded
+  backoff capped at about 0.5 s; other errors still fail immediately. POSIX `rename(2)`
+  semantics on Linux / macOS are unchanged. The NIF and Erlang facade are unchanged —
+  just rebuild.
+
 ## [7.0.1] — 2026-11-16
 
 Upgrades libbitcask **7.0.0 → 7.0.1** (an upstream PATCH: after using an iterator and

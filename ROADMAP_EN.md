@@ -6,6 +6,15 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 7.0.2 shipped
+
+### libbitcask upgrade 7.0.1 → 7.0.2 ✅
+
+An upstream PATCH fixes Windows `atomic_rename` sharing conflicts and moves the MSVC
+big-endian read to standard `std::byteswap`. The C API signatures, on-disk format and ABI
+are unchanged, `SOVERSION` stays 7, Linux / macOS behavior is unchanged, and the NIF /
+Erlang code needs no changes. The submodule moves to upstream `7.0.2` (`76aa98d`).
+
 ## 7.0.1 shipped
 
 ### libbitcask upgrade 7.0.0 → 7.0.1 ✅

@@ -6,6 +6,15 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 7.0.2 落地
+
+### libbitcask 升级 7.0.1 → 7.0.2 ✅
+
+上游 PATCH：修复 Windows `atomic_rename` 的共享冲突，并把 MSVC 的大端读取切到
+标准 `std::byteswap`。C API 签名、盘上格式与 ABI 零改动，`SOVERSION` 保持 7；
+Linux / macOS 行为不变，NIF / Erlang 代码零改动，子模块切到上游 `7.0.2`
+（`76aa98d`）。
+
 ## 7.0.1 落地
 
 ### libbitcask 升级 7.0.0 → 7.0.1 ✅

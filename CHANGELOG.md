@@ -3,6 +3,21 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [7.0.2] — 2026-11-16
+
+升级 libbitcask **7.0.1 → 7.0.2**（上游 PATCH：修复 Windows `atomic_rename`
+共享冲突；MSVC 大端读取改用标准 `std::byteswap`。C API 签名、盘上格式与 ABI
+零改动，`SOVERSION` 保持 7）。子模块从 `c7117df`（`7.0.1`）切到上游 `76aa98d`
+（`7.0.2`）。
+
+### Fixed（随 libbitcask 7.0.2）
+
+- **Windows `atomic_rename` 不再被共享冲突打断**：目标文件仍被本库读句柄短暂
+  打开或处于 delete-pending 时，`MoveFileExW(REPLACE_EXISTING)` 可能返回
+  `ERROR_ACCESS_DENIED` / `ERROR_SHARING_VIOLATION`。现在对这两类瞬时冲突做
+  约 0.5 s 上限的有界退避重试；其他错误仍立即失败。Linux / macOS 的
+  `rename(2)` 语义不变。NIF / Erlang 门面零改动，重编即得。
+
 ## [7.0.1] — 2026-11-16
 
 升级 libbitcask **7.0.0 → 7.0.1**（上游 PATCH：迭代器用过之后再写入时，
