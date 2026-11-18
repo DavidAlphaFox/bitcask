@@ -3,16 +3,39 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [8.1.0] — 2026-11-19
+
+升级 libbitcask **8.0.0 → 8.1.0**（跨上游 8.0.1 / 8.0.2 / 8.1.0；C API 签名、C ABI、
+盘上容器格式零改动，`SOVERSION` 保持 8）。submodule 从 `eade59e`（`8.0.0`）切到上游
+`13322bd`（`8.1.0`）。NIF / Erlang 门面零改动，重编即得。
+
+> ⚠️ **search 升级须知**：上游把默认字段哨兵改为 `<<1, "_bitcask:default">>`。由
+> 8.0.x（或更早）写出的 search checkpoint / 已封存索引在 8.1.0 下不能无损沿用；
+> 需重建 search 索引，或临时用旧版本读取。KV-only 数据不受影响。
+
+### Changed（随 libbitcask 8.1.0）
+
+- **默认字段哨兵改为 `<<1, "_bitcask:default">>`**：不可见首字节避免用户字段冲突，
+  后缀可读。KV-only 与 C API 零改动；旧 search 数据中的默认字段持久化标识不自动迁移。
+- Windows / MSVC 修复（随 8.0.1 / 8.0.2）：TBB finalize 使用 nothrow 双参重载；
+  MSVC 显式启用 `/EHsc`，保证异常跨守卫时 RAII 正确展开。
+
+### Fixed — 图层
+
+- 分块邻接组读到「头目录里有、盘上没有」的块时，现在会把真空块修复随同一头
+  条件批提交；`del_vertex` 的只读首扫触发的这类修复不再被跳过。该修复由随机
+  并发不变式测试暴露。
+
 ## [8.0.0] — 2026-11-18
 
 升级 libbitcask **7.0.3 → 8.0.0**（上游 MAJOR，S46 原子批条件写：C API 纯加法，C++
 头面追加成员与带缺省值的形参——源码兼容、C++ ABI 变化，`SOVERSION` 7→8；盘上格式
 零改动）。子模块从 `ce7ce13`（`7.0.3`）切到上游 `eade59e`（`8.0.0`）。借这项引擎能力
-把图层换成 **v2 布局**（盘上破坏性变更，旧图库需离线迁移，见下）。
+把图层换成 **布局第 1 版**（盘上破坏性变更，旧图库直接拒开，见下）。
 
 > ⚠️ **升级须知**：用 6.5.0–7.0.3 的 `graphdb` 写过的目录，本版 `graphdb:open/2` 返回
-> `{error, graph_layout_v1}`；先 `graphdb_migrate:v1_to_v2(SrcDir, DstDir)` 迁到新目录。
-> 不用图层的 KV / 检索目录不受影响。
+> `{error, graph_layout_v1}`；若只有中间版写入的无前缀 `g` 配置，则返回
+> `{error, graph_layout_unprefixed_v2}`。不用图层的 KV / 检索目录不受影响。
 
 ### Added（随 libbitcask 8.0.0）
 
@@ -31,12 +54,13 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 - NIF：`cask_get_ord/2`、`cask_put_batch_atomic/3`；`CaskError::kConditionFailed`
   无 op 下标时兜底为 `{error, condition_failed}`。
 
-### Changed — 图层 v2（`doc/graph-adjacency-pack-design-zh.md`）
+### Changed — 图层布局第 1 版（`doc/graph-adjacency-pack-design-zh.md`）
 
-- **一个顶点两个 KV**：`n<vid>`（顶点，不变）+ `a<vid>`（邻接表头：出 / 入边组、
-  组内度数）。邻接表超过 `adj_inline_max`（默认 4 KiB）的 hub 把最大的组拆成块
-  （`a<vid><dir><etype><o><r>`，单块 ≤ `adj_chunk_max`）；超过 `props_inline_max`
-  （默认 128 B）的边属性落 `p` 家族。`e` / `ei` / `et` / `deg` / `degi` 全部退役。
+- **一个顶点两个 KV**：图层 key 统一使用 `<<1,"_g:">>` 全局前缀。`n<vid>`（顶点，
+  不变）+ `a<vid>`（邻接表头：出 / 入边组、组内度数）。邻接表超过 `adj_inline_max`
+  （默认 4 KiB）的 hub 把最大的组拆成块（`a<vid><dir><etype><o><r>`，单块 ≤
+  `adj_chunk_max`）；超过 `props_inline_max`（默认 128 B）的边属性落 `p` 家族。
+  `e` / `ei` / `et` / `deg` / `degi` 全部退役。
   key 数从「3 × 边数 + 计数键」降到「2 × 顶点数 + 块数」——基准里低度数图降 17×、
   平均度数 50 降 145×。
 - **写边 = 两端头的条件写 + 冲突重试**（默认 8 次、指数抖动，`retries => N | infinity`
@@ -48,8 +72,8 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
   家族（O(V + E)），并带上属性。`graphdb_analytics:materialize` 改读 `a` 家族。
 - **事务式 API**：锁粒度改为顶点的邻接表头（不再用前缀锁），头经 `read_guarded`
   读——**直通写与事务写可以混用**。
-- **布局版本**：`graphdb:open/2` 建库写 `g` 键（布局 2 + 分块参数，之后以它为准）；
-  打开 v1 库返回 `{error, graph_layout_v1}`。
+- **布局版本**：`graphdb:open/2` 建库写 `g` 键（布局 1 + 分块参数，之后以它为准）；
+  旧图库分别返回 `{error, graph_layout_v1}` / `{error, graph_layout_unprefixed_v2}`。
 
 ### Added — 图层
 
@@ -58,14 +82,12 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
   批量装载 88.6k 边/秒，为 v1 的 1.05×；整图一批时 253k 边/秒）、
   `in_degree/2,3`、`del_vertex/3`（`retries`、`batch_neighbors => N | infinity`）、`akey/1`、`pkey/4`、`graph_config/1`、`check_invariants/1`（扫
   `a` / `p` 家族核对对称、度数、块目录、外置属性）。
-- `graphdb_migrate:v1_to_v2/2,3`、`verify/2,3`：v1 → v2 离线迁移，流式（两路 range
-  游标按 vid 归并），源库只读，迁移后逐顶点核对。
-- `test/graphdb_bench` 改为 v2 口径并带 v1 参照（key 数、字节数、迁移耗时）。
+- `test/graphdb_bench` 改为当前布局口径并带旧逐边布局参照（key 数、字节数）。
 
 ### Removed
 
-- `graphdb:ekey/3,4`、`eikey/3,4`（v1 key codec）。v1 的计数器回退路径、前缀锁版的
-  `out_edges_txn` / `del_vertex_txn` 随布局一起退役。
+- `graphdb:ekey/3,4`、`eikey/3,4`（旧 key codec）。旧计数器回退路径、前缀锁版的
+  `out_edges_txn` / `del_vertex_txn` 随布局一起退役；不提供自动迁移工具。
 
 ## [7.0.3] — 2026-11-17
 

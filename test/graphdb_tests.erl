@@ -16,6 +16,8 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
+-define(GP, <<1, "_g:">>).
+
 with_dir(Fun) -> bitcask_test_util:with_dir("graphdb_tests_", Fun).
 
 %% 顶点 1..4；边（etype 7）：1→2, 2→3, 3→4, 1→3；边（etype 8）：1→3。
@@ -43,15 +45,17 @@ srcs_of(Other)       -> {bad, Other}.
 %% ===================================================================
 
 nkey_codec_test_() ->
-    {"nkey = \"n\" + vid 大端 8 字节",
-     ?_assertEqual(<<"n", 0, 0, 0, 0, 0, 0, 0, 42>>, graphdb:nkey(42))}.
+    {"nkey = <<1,\"_g:\">> + \"n\" + vid 大端 8 字节",
+     ?_assertEqual(<<?GP/binary, "n", 0, 0, 0, 0, 0, 0, 0, 42>>,
+                   graphdb:nkey(42))}.
 
 akey_pkey_codec_test_() ->
-    {"akey 9 字节、pkey 29 字节，定宽大端",
-     [?_assertEqual(<<"a", 0, 0, 0, 0, 0, 0, 0, 42>>, graphdb:akey(42)),
-      ?_assertEqual(<<"p", 1:64/big, 7:32/big, 2:64/big, 9:64/big>>,
+    {"akey 13 字节、pkey 33 字节，定宽大端",
+     [?_assertEqual(<<?GP/binary, "a", 0, 0, 0, 0, 0, 0, 0, 42>>,
+                    graphdb:akey(42)),
+      ?_assertEqual(<<?GP/binary, "p", 1:64/big, 7:32/big, 2:64/big, 9:64/big>>,
                     graphdb:pkey(1, 7, 2, 9)),
-      ?_assertEqual(29, byte_size(graphdb:pkey(1, 7, 2, 0)))]}.
+      ?_assertEqual(33, byte_size(graphdb:pkey(1, 7, 2, 0)))]}.
 
 succ_codec_test_() ->
     {"succ = 去尾部 0xFF + 末字节进位；全 0xFF 无上界",
@@ -792,19 +796,27 @@ put_del_edges_batch_test_() ->
      end}}.
 
 layout_and_config_test_() ->
-    {"建库写 g（布局 2 + 参数）；重开以 g 为准；v1 库拒开",
+    {"建库写 g（布局 1 + 参数）；重开以 g 为准；旧图库拒开",
      fun() ->
         with_dir(fun(D) ->
             R = graphdb:open(D, [read_write, {adj_inline_max, 512}]),
             ?assertEqual(#{inline_max => 512, chunk_max => 4096, props_max => 128},
                          graphdb:graph_config(R)),
-            {ok, <<2, _/binary>>} = bitcask:get(R, <<"g">>),
+            {ok, <<1, _/binary>>} = bitcask:get(R, <<?GP/binary, "g">>),
             ok = graphdb:close(R),
             R2 = graphdb:open(D, [read_write, {adj_inline_max, 9999}]),
             ?assertEqual(512, maps:get(inline_max, graphdb:graph_config(R2))),
             ok = graphdb:close(R2),
             ?assertError({badarg, {adj_chunk_max, 1}},
                          graphdb:open(D ++ "_x", [read_write, {adj_chunk_max, 1}]))
+        end),
+        with_dir(fun(D) ->
+            B = bitcask:open(D, [read_write]),
+            %% 加全局前缀前的中间布局是 g 版本 2。
+            ok = bitcask:put(B, <<"g">>, <<2:8, 4096:32/big, 4096:32/big, 128:16/big>>),
+            ok = bitcask:close(B),
+            ?assertEqual({error, graph_layout_unprefixed_v2},
+                         graphdb:open(D, [read_write]))
         end),
         with_dir(fun(D) ->
             B = bitcask:open(D, [read_write]),
@@ -819,7 +831,7 @@ layout_and_config_test_() ->
      end}.
 
 %% ===================================================================
-%% v2：直通写的并发正确性（条件写 + 重试，§12「并发正确性」）
+%% 直通写的并发正确性（条件写 + 重试，§12「并发正确性」）
 %% ===================================================================
 
 concurrent_direct_writers_same_hub_test_() ->

@@ -1,6 +1,6 @@
 #!/usr/bin/env escript
 
-%% graphdb_bench — 图存储层 v2（graphdb / graphdb_analytics）手动基准。
+%% graphdb_bench — 图存储层（当前布局第 1 版）手动基准。
 %%
 %% 用法：
 %%   test/graphdb_bench [n_vertices] [n_edges] [bfs_hops] [adj_inline_max]
@@ -15,8 +15,7 @@
 %%   5. bfs K-hop / materialize / pagerank
 %%   6. steady-state one-hop — reopen 后
 %%   7. v1 参照              — 同一份边按 v1 布局写（每边一条 5 记录的原子批：
-%%                             e / ei / et / deg / degi），记 key 数、字节数；
-%%                             再用 graphdb_migrate 迁到 v2，记迁移耗时
+%%                             e / ei / et / deg / degi），记 key 数、字节数
 %% 墙钟取 timer:tc；固定随机种子保证可复现。源为幂律近似（小 id 高频），
 %% 制造真实度分布（含 hub）。
 
@@ -32,9 +31,9 @@ run(NV, NE, Hops, Inline) ->
                     ++ filelib:wildcard("_build/default/lib/*/ebin")),
     {ok, _} = application:ensure_all_started(bitcask),
     Base = "/tmp/graphdb_bench_" ++ integer_to_list(erlang:unique_integer([positive])),
-    [D1, D2, DV1, DM] = [Base ++ S || S <- ["_edge", "_edges", "_v1", "_mig"]],
+    [D1, D2, DV1] = [Base ++ S || S <- ["_edge", "_edges", "_v1"]],
     GOpts = [{adj_inline_max, Inline}, {adj_chunk_max, Inline}],
-    io:format("== graphdb v2 bench: ~p vertices / ~p edges / BFS ~p hops / inline ~p ==~n",
+    io:format("== graphdb bench: ~p vertices / ~p edges / BFS ~p hops / inline ~p ==~n",
               [NV, NE, Hops, Inline]),
     rand:seed(exsss, {42, 43, 44}),
     Edges = [{src_vid(NV), 7, rand:uniform(NV)} || _ <- lists:seq(1, NE)],
@@ -97,8 +96,6 @@ run(NV, NE, Hops, Inline) ->
     ok = bitcask:close(B),
     io:format("~-24s ~10w keys / ~w bytes (~.1f B/edge)~n",
               ["v1 keys / bytes", NKeysV1, dir_bytes(DV1), dir_bytes(DV1) / NE]),
-    {TMig, {ok, MStats}} = timer:tc(fun() -> graphdb_migrate:v1_to_v2(DV1, DM, GOpts) end),
-    io:format("~-24s ~10.1f ms (~p, verified)~n", ["migrate v1 -> v2", TMig / 1000, MStats]),
     os:cmd("rm -rf " ++ Base ++ "_*").
 
 %% v1 put_edge 的盘上效果：e / ei / et 三键 + deg / degi 两个计数器（读-改-写）。

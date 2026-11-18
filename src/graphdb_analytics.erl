@@ -60,26 +60,28 @@ materialize(Handle, Opts) when is_map(Opts) ->
 %% 输入近乎有序，最后一次 usort 去重。
 collect_edges(Handle, Etype) ->
     Want = fun(T) -> Etype =:= undefined orelse T =:= Etype end,
-    Fun = fun(<<"a", S:64/big>>, V, _T, _O, Acc) ->
+    Fun = fun(<< _P:4/binary, "a", S:64/big >>, V, _T, _O, Acc) ->
                   case graphdb_adj:groups_info(vbin(V)) of
                       {ok, Gs} ->
                           lists:foldl(fun({0, T, _C, {entries, Es}}, A) ->
                                               case Want(T) of
-                                                  true  -> [{S, D} || {D, _R, _P} <- Es] ++ A;
+                                                  true  -> [{S, D} || {D, _R, _Pr} <- Es] ++ A;
                                                   false -> A
                                               end;
                                          (_, A) -> A
                                       end, Acc, Gs);
                       error -> Acc
                   end;
-             (<<"a", S:64/big, 0:8, T:32/big, _:128>>, V, _T, _O, Acc) ->
+             (<< _P:4/binary, "a", S:64/big, 0:8, T:32/big, _:128 >>,
+              V, _T, _O, Acc) ->
                   case Want(T) andalso graphdb_adj:decode_chunk(vbin(V)) of
-                      {ok, Es} -> [{S, D} || {D, _R, _P} <- Es] ++ Acc;
+                      {ok, Es} -> [{S, D} || {D, _R, _Pr} <- Es] ++ Acc;
                       _        -> Acc
                   end;
              (_, _, _, _, Acc) -> Acc                     %% 非图层 key / 入边块
           end,
-    scan(Handle, <<"a">>, <<"b">>, Fun, []).
+    {Lo, Hi} = graphdb_adj:range(<<"a">>),
+    scan(Handle, Lo, Hi, Fun, []).
 
 scan(Handle, Lo, Hi, Fun, Acc0) ->
     case bitcask:range_fold(Handle, {Lo, Hi}, [], Fun, Acc0) of

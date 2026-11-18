@@ -2,7 +2,8 @@
 
 中文版：[graph-adjacency-pack-design-zh.md](graph-adjacency-pack-design-zh.md).
 
-Status: **Implemented** (2026-11-18, G1–G6, shipped in **8.0.0**; implementation record in
+Status: **Implemented** (2026-11-18, G1–G6, shipped in **8.0.0**; the repository now follows
+8.1.0; implementation record in
 §14). Supersedes the on-disk layout and write path of
 [graph-layer-design-en.md](graph-layer-design-en.md) ("v1" below); v1's traversal
 algorithms, OLAP materialization layer, etype registry and API shape are kept.
@@ -12,7 +13,7 @@ LSN). It was filed as downstream feedback (libbitcask
 `feedbacks/2026-11-17-conditional-atomic-batch.md`) and shipped upstream in **8.0.0** (S46):
 `Cask::BatchOp::expect` (`kAbsent` / `kOrdEquals`) + `expect_ord` + `kCheck`; a failed
 condition returns `kConditionFailed`, and `BatchOutcome` reports the failing op index and
-every op's LSN. This repository's submodule is at 8.0.0 (`eade59e`); the NIF / facade shape
+every op's LSN. This repository's submodule is now at 8.1.0 (`13322bd`); the NIF / facade shape
 is in §5.3.
 
 ---
@@ -87,16 +88,20 @@ mostly used today.
 
 | Family | Key | Value |
 |---|---|---|
-| `n` | `"n" <vid:64>` | Vertex content (unchanged) |
-| `a` head | `"a" <vid:64>` (9 B) | Adjacency head (§4.2) |
-| `a` chunk | `"a" <vid:64> <dir:8> <etype:32> <other:64> <rank:64>` (30 B) | One chunk of entries (§4.3); the (other, rank) in the key is the chunk's **lower bound** |
-| `p` | `"p" <src:64> <etype:32> <dst:64> <rank:64>` | Edge properties over the inline limit (§4.4) |
-| `t` / `tn` | unchanged | etype registry |
-| `g` | `"g"` (1 B) | Graph metadata: `<<LayoutVer:8, …>>`, v2 = 2 |
+| `n` | `<G> "n" <vid:64>` | Vertex content (unchanged) |
+| `a` head | `<G> "a" <vid:64>` (13 B) | Adjacency head (§4.2) |
+| `a` chunk | `<G> "a" <vid:64> <dir:8> <etype:32> <other:64> <rank:64>` (34 B) | One chunk of entries (§4.3); the (other, rank) in the key is the chunk's **lower bound** |
+| `p` | `<G> "p" <src:64> <etype:32> <dst:64> <rank:64>` | Edge properties over the inline limit (§4.4) |
+| `t` / `tn` | `<G> "t" …` / `<G> "tn" …` | etype registry (record bodies unchanged) |
+| `g` | `<G> "g"` (5 B) | Graph metadata: `<<LayoutVer:8, …>>` = 1 |
+
+`<G>` is the graph-layer namespace `<<16#01, "_g:">>` (4 B), so graph keys cannot collide
+with application KV, full-text, or vector-index keys.
 
 All multi-byte integers are fixed-width big-endian (as in v1: lexicographic order =
 numeric order). `dir`: 0 = out, 1 = in. The head key is a prefix of all the vertex's chunk
-keys, so a prefix range over `"a" <vid>` returns exactly "head + all chunks", head first.
+keys, so a prefix range over `<G> "a" <vid>` returns exactly "head + all chunks", head
+first.
 
 ### 4.2 Head value
 
@@ -362,23 +367,16 @@ range" to "one get". Frontier expansion no longer needs one iterator per vertex.
   v2's families have no such prefix containment (an `a` head being a prefix of its own
   chunks is by design). Parsing still validates lengths strictly.
 
-## 10. Migration
+## 10. Layout Version and Legacy Data
 
-- The `g` key records the layout version. On open: `g` present with version 2 → v2; no
-  `g` but an `e` family present → a v1 store, which v2 code refuses to read or write,
-  asking for migration first.
-- Migration tool `graphdb_migrate:v1_to_v2(SrcDir, DstDir)`, streaming, with memory
-  independent of graph size:
-  - the `e` family in key order is out-edges grouped by src; the `ei` family in key order
-    is in-edges grouped by dst;
-  - the two ordered streams are merged by vid, building each vertex's head (chunked if
-    needed) and writing it into the new directory;
-  - `n`, `t`, `tn` are copied as is; `et`, `deg`, `degi` are dropped (recomputable from
-    the adjacency).
-  - After migration, verification compares out / in edges vertex by vertex.
-- No in-place migration, and no long-term coexistence of v1 / v2 layouts (double the code
-  for little gain). v1 read code survives only in the migration tool.
-- This is a breaking on-disk layout change, shipped as major version 8.0.0.
+- The `g` key records the layout version. On open: `<G> "g"` present with version 1 → the
+  current layout; no new `g` but an old unprefixed `g` is present → an interim layout
+  without the global namespace, rejected with `{error, graph_layout_unprefixed_v2}`;
+  no new `g` but an `e` / `ei` family present → the earlier per-edge layout, rejected with
+  `{error, graph_layout_v1}`.
+- There is no automatic migration and no `graphdb_migrate` tool. Callers must export old
+  graph data and reload it; the fail-loud open checks only prevent treating an old graph
+  directory as an empty new store.
 
 ## 11. Phases
 
@@ -398,8 +396,7 @@ writes were conditional write + retry from day one.
 
 ## 12. Acceptance Criteria
 
-Benchmarks extend `test/graphdb_bench` with a v1 / v2 comparison (same data; the v2 store
-is produced from the v1 store by the migration tool):
+Benchmarks extend `test/graphdb_bench` with the earlier per-edge layout as a reference:
 
 | Metric | Expectation |
 |---|---|
@@ -427,9 +424,8 @@ is produced from the v1 store by the migration tool):
 
 | Module | Content |
 |---|---|
-| `graphdb_adj` (new) | Head / chunk / entry codec; read primitives (`entries` / `lookup` / `counts`); write sessions (`put_edge` / `del_edge` / `all_entries` / `commit`, a condition on every modified head); chunk maintenance (split, drop empty chunks, back to inline, chunk an oversized head); `build_vertex` for migration. IO abstraction `{direct, H}` / `{txn, Tx, Lock}`, so direct and transactional paths share one implementation |
+| `graphdb_adj` (new) | Head / chunk / entry codec; read primitives (`entries` / `lookup` / `counts`); write sessions (`put_edge` / `del_edge` / `all_entries` / `commit`, a condition on every modified head); chunk maintenance (split, drop empty chunks, back to inline, chunk an oversized head). IO abstraction `{direct, H}` / `{txn, Tx, Lock}`, so direct and transactional paths share one implementation |
 | `graphdb` | Facade: layout check at open (`g` key; parameters are read from `g` once per write session, no out-of-process cache), direct API + conflict retry, `put_edges` / `del_edges`, neighbor-batched `del_vertex`, `consistent` reads, transactional API, traversal (unchanged), etype registry (unchanged), `check_invariants/1` |
-| `graphdb_migrate` (new) | `v1_to_v2/2,3`, `verify/2,3`: two range cursors merged by vid, streaming |
 | `graphdb_analytics` | `materialize` scans the `a` family |
 | `bitcask` / NIF | `get_with_ord/2`, conditional batch ops, `put_batch_atomic/3` (`return_ords`), `{error, {conflict, I}}` |
 | `bitcask_txn` | `read_guarded/3` (version guards, §8) |
@@ -450,10 +446,14 @@ is produced from the v1 store by the migration tool):
   default 256). Unsorted random edges rarely repeat a vertex within a batch, so
   aggregation barely helps; sorted, each src head is written once per batch — about 2×
   throughput and half the bytes (§14.3).
-- `graph_layout_v1`: opening is refused only when a v1 out-edge key **and** its paired `ei`
-  reverse key both exist (checking at most the first 64 candidates), so a directory that
-  merely holds an application key of 29 bytes starting with "e" is not misdetected;
-  migrate first.
+- `graph_layout_v1`: opening is refused only when an old per-edge out-edge key **and** its
+  paired `ei` reverse key both exist (checking at most the first 64 candidates), so a
+  directory that merely holds an application key of 29 bytes starting with "e" is not
+  misdetected. There is no migration tool.
+- All graph keys carry the global `<<1,"_g:">>` namespace. If a directory contains only the
+  unprefixed `g` configuration written by the interim 8.0.0 build, opening returns
+  `{error, graph_layout_unprefixed_v2}` instead of silently creating a new prefixed graph
+  beside the old data.
 - Parameters are not cached: each write session reads `g` once (about 5–10% slower for
   low-degree single-edge writes), so handles leave nothing behind whether closed via
   `graphdb:close` or `bitcask:close`, and handles obtained without `graphdb:open` still
@@ -484,7 +484,6 @@ thresholds:
 | Data bytes / edge (put_edges) | 254 | 261 | 263 | 326 |
 | Data bytes / edge (put_edge) | 303 | 323 | 332 | 326 |
 | materialize (ms) | 62 | 54 | 65 | — |
-| Migrate v1 → v2 + verify (ms) | 455 | 486 | 560 | — |
 
 ¹ The v1 reference loads the same edges the v1 way (one 5-record atomic batch per edge +
 counter read-modify-write); three runs gave 44k / 44k / 88k, too noisy for more than an
@@ -501,7 +500,6 @@ expensive writes" shows:
 | Data bytes / edge (put_edge) | 1095 | 314 | 3.5× |
 | Data bytes / edge (put_edges) | 941 | 314 | 3.0× |
 | One-hop out_edges (ms/op) | 0.012 | ~0.02 | — |
-| Migrate v1 → v2 + verify (ms) | 865 | — | — |
 
 Conclusions:
 - Key count (= keydir / OKI resident memory) follows vertex count: 17× fewer on the

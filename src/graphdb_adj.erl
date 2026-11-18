@@ -1,20 +1,20 @@
 %% =========================================================================
-%% graphdb_adj — 图层 v2 的邻接表：盘上编解码 + 读原语 + 写会话
+%% graphdb_adj — 当前图层布局（第 1 版）的邻接表：盘上编解码 + 读原语 + 写会话
 %%
 %% 设计文档：doc/graph-adjacency-pack-design-zh.md（§4 盘上契约、§5 条件写、
 %% §6 写路径）。graphdb 是门面（API / 重试 / 遍历 / 事务包装），本模块是它
-%% 唯一碰 `a` / `p` 家族字节的地方；graphdb_migrate / graphdb_analytics 复用
-%% 这里的编解码。
+%% 唯一碰 `a` / `p` 家族字节的地方；graphdb_analytics 复用这里的编解码。
 %%
 %% ---- Key 家族 ----
-%%   a <vid:64>                                   邻接表头（9 B）
-%%   a <vid:64> <dir:8> <etype:32> <o:64> <r:64>  分块（30 B）；(o, r) 是块的
-%%                                                **下界**：块 0 恒为 (0, 0)，其后
-%%                                                各块 = 建块时的首条。条目 e 属于
-%%                                                下界 ≤ e 的最后一块。下界在块
-%%                                                分裂 / 删除时才变，删掉块内首条
-%%                                                不改 key（不用改名）。
-%%   p <src:64> <etype:32> <dst:64> <rank:64>     超过 props_inline_max 的边属性
+%%   <1,"_g:"> a <vid:64>                                  邻接表头（13 B）
+%%   <1,"_g:"> a <vid:64> <dir:8> <etype:32> <o:64> <r:64> 分块（34 B）；(o,r)
+%%                                                        是块的
+%%                                                     **下界**：块 0 恒为 (0,0)，
+%%                                                     其后各块 = 建块时的首条。
+%%                                                     条目 e 属于下界 ≤ e 的最后
+%%                                                     一块。下界在块分裂 / 删除时
+%%                                                     才变，删掉块内首条不改 key。
+%%   <1,"_g:"> p <src:64> <etype:32> <dst:64> <rank:64>   外置边属性
 %%   dir：0 = 出，1 = 入。头 key 是同顶点全部块 key 的前缀。
 %%
 %% ---- 值 ----
@@ -42,7 +42,7 @@
 %% =========================================================================
 -module(graphdb_adj).
 
--export([head_key/1, chunk_key/4, group_prefix/3, pkey/4, gkey/0,
+-export([prefix/0, range/1, head_key/1, chunk_key/4, group_prefix/3, pkey/4, gkey/0,
          parse_chunk_key/1,
          encode_head/1, decode_head/1, encode_chunk/1, decode_chunk/1,
          default_cfg/0, encode_cfg/1, decode_cfg/1,
@@ -50,7 +50,7 @@
          entries/5, lookup/6, counts/2, head_cond/2,
          %% 写会话
          new_session/2, put_edge/6, del_edge/5, all_entries/2, commit/1, commit/2,
-         %% 迁移 / 分析 / 校验用的纯函数
+         %% 分析 / 校验用的纯函数
          build_vertex/3, groups_info/1]).
 
 -define(VER, 1).
@@ -59,7 +59,8 @@
 -define(F_CHUNKED, 4).
 -define(PEXT, 16#FFFF).
 -define(LB0, {0, 0}).
--define(LAYOUT_VER, 2).
+-define(LAYOUT_VER, 1).
+-define(PREFIX, <<16#01, "_g:">>).
 
 -record(grp, {dir      :: 0 | 1,
               etype    :: non_neg_integer(),
@@ -88,19 +89,31 @@
 %% Keys
 %% =========================================================================
 
-head_key(Vid) -> <<"a", Vid:64/big>>.
+%% 所有图层 key 的全局命名空间：Ctrl-A "_g:"，避免和应用 KV / 全文索引 key 冲突。
+prefix() -> ?PREFIX.
+
+%% 家族扫描区间。Family 只能是单字节家族名（a / p / n / t）。
+range(Family) when is_binary(Family), byte_size(Family) =:= 1 ->
+    Lo = << ?PREFIX/binary, Family/binary >>,
+    {Lo, bitcask:prefix_succ(Lo)}.
+
+head_key(Vid) -> << ?PREFIX/binary, "a", Vid:64/big >>.
 
 chunk_key(Vid, Dir, Etype, {O, R}) ->
-    <<"a", Vid:64/big, Dir:8, Etype:32/big, O:64/big, R:64/big>>.
+    << ?PREFIX/binary, "a", Vid:64/big, Dir:8, Etype:32/big,
+       O:64/big, R:64/big >>.
 
-group_prefix(Vid, Dir, Etype) -> <<"a", Vid:64/big, Dir:8, Etype:32/big>>.
+group_prefix(Vid, Dir, Etype) ->
+    << ?PREFIX/binary, "a", Vid:64/big, Dir:8, Etype:32/big >>.
 
-pkey(S, T, D, R) -> <<"p", S:64/big, T:32/big, D:64/big, R:64/big>>.
+pkey(S, T, D, R) ->
+    << ?PREFIX/binary, "p", S:64/big, T:32/big, D:64/big, R:64/big >>.
 
-gkey() -> <<"g">>.
+gkey() -> << ?PREFIX/binary, "g" >>.
 
-parse_chunk_key(<<"a", Vid:64/big, Dir:8, Etype:32/big, O:64/big, R:64/big>>)
-  when Dir =< 1 ->
+parse_chunk_key(<< _P:4/binary, "a", Vid:64/big, Dir:8, Etype:32/big,
+                   O:64/big, R:64/big >> = K)
+  when binary_part(K, 0, 4) =:= ?PREFIX, Dir =< 1 ->
     {ok, Vid, Dir, Etype, {O, R}};
 parse_chunk_key(_) ->
     skip.
@@ -371,7 +384,7 @@ read_chunks(Io, Vid, Dir, Etype, Limit) ->
     Prefix = group_prefix(Vid, Dir, Etype),
     Fun = fun(K, V, {N, Acc}) ->
                   case {byte_size(K), decode_chunk(V)} of
-                      {30, {ok, Es}} ->
+                      {34, {ok, Es}} ->
                           Taken = take(Es, dec_limit(Limit, N)),
                           N2 = N + length(Taken),
                           Acc2 = lists:reverse(Taken, Acc),
@@ -379,7 +392,7 @@ read_chunks(Io, Vid, Dir, Etype, Limit) ->
                               true  -> throw({graphdb_adj_stop, {N2, Acc2}});
                               false -> {N2, Acc2}
                           end;
-                      {30, error} ->
+                      {34, error} ->
                           throw({graphdb_adj_stop, {error, {bad_adj_chunk, K}}});
                       _ ->
                           {N, Acc}
@@ -489,7 +502,8 @@ locate_lb([Lb | Lbs], Key, _Cur) when Lb =< Key -> locate_lb(Lbs, Key, Lb);
 locate_lb(_, _Key, Cur) -> Cur.
 
 %% 读块（会话内缓存）。块 key 缺失按空块处理：只可能是读头之后有人改过
-%% 这个顶点——提交时头的条件必然不成立，这次计算整个作废。
+%% 这个顶点——提交时头的条件必然不成立，这次计算整个作废；del_vertex 读
+%% 头时带回的条件也守住这类“目录缺失”修复 op。
 get_chunk(Io, #vs{chunks = Cs} = Vs, Key) ->
     case maps:find(Key, Cs) of
         {ok, Es} -> {ok, Es, Vs};
@@ -501,7 +515,8 @@ get_chunk(Io, #vs{chunks = Cs} = Vs, Key) ->
                         error    -> {error, {bad_adj_chunk, Key}}
                     end;
                 not_found ->
-                    {ok, [], Vs#vs{chunks = Cs#{Key => []}}};
+                    {ok, [], touch(Vs#vs{chunks = Cs#{Key => []},
+                                         dirty = (Vs#vs.dirty)#{Key => true}})};
                 {error, _} = E ->
                     E
             end
@@ -618,8 +633,26 @@ load_group_chunks(Io, Vs0, Vid, D, T, Lbs) ->
 %% =========================================================================
 
 %% {ok, Ops, Vs'} | {error, _}
-finalize(_Io, #vs{touched = false} = Vs, _Cfg) ->
-    {ok, [], Vs};
+finalize(Io, #vs{touched = false} = Vs, Cfg) ->
+    %% all_entries/2 只读（用于 del_vertex）也可能修复过 chunk 状态：读非块 0
+    %% 的空块时会把“头目录里有、盘上没有”的块补成真实空块并标脏。此时头尚未
+    %% 被标 touched，仍必须把这类自愈块提交，否则下次读到坏块。
+    case maps:size(Vs#vs.dirty) =/= 0 orelse maps:size(Vs#vs.dels) =/= 0 of
+        false -> {ok, [], Vs};
+        true  ->
+            case normalize_chunked(Vs, Cfg) of
+                #vs{dirty = Dy} = Vs1 when map_size(Dy) =:= 0, map_size(Vs1#vs.dels) =:= 0 ->
+                    {ok, [], Vs1};
+                Vs1 ->
+                    Vs2 = Vs1#vs{touched = true},
+                    case unchunk_small(Io, Vs2, Cfg) of
+                        {error, _} = E -> E;
+                        {ok, Vs3} ->
+                            Vs4 = chunk_oversized(Vs3, Cfg),
+                            {ok, emit_ops(Vs4), Vs4}
+                    end
+            end
+    end;
 finalize(_Io, #vs{vid = Vid, groups = Gs}, _Cfg) when length(Gs) > 16#FFFF ->
     {error, {too_many_groups, Vid}};
 finalize(Io, Vs0, Cfg) ->

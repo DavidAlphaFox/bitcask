@@ -11,6 +11,8 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
+-define(GP, <<1, "_g:">>).
+
 with_dir(Fun) -> bitcask_test_util:with_dir("graphdb_adj_tests_", Fun).
 
 cfg() -> graphdb_adj:default_cfg().
@@ -55,7 +57,8 @@ random_roundtrip_test_() ->
              Out = [{7, O, R, case P of ext -> <<"big">>; _ -> P end} || {O, R, P} <- Es],
              In = [{9, O, R} || {O, R, _} <- Es],
              {Ops, 0} = graphdb_adj:build_vertex(42, {Out, In}, (cfg())#{inline_max => 1 bsl 20}),
-             [{put, <<"a", 42:64>>, Head}] = Ops,
+             GP = ?GP,
+             [{put, <<GP:4/binary, "a", 42:64>>, Head}] = Ops,
              {ok, [{0, 7, C1, {entries, OutEs}}, {1, 9, C2, {entries, InEs}}]} =
                  graphdb_adj:groups_info(Head),
              ?assertEqual({length(Es), length(Es)}, {C1, C2}),
@@ -100,7 +103,7 @@ too_many_groups_test_() ->
 
 chunk_keys(R, Vid) ->
     [K || {K, _} <- bitcask:range(R, {graphdb:akey(Vid), graphdb:akey(Vid + 1)}),
-          byte_size(K) =:= 30].
+          byte_size(K) =:= 34].
 
 head_size(R, Vid) ->
     {ok, H} = bitcask:get(R, graphdb:akey(Vid)),
@@ -127,7 +130,9 @@ chunk_grow_split_shrink_test_() ->
                  ?assert(byte_size(V) =< 256)
              end || K <- Keys],
             %% 全是出边（dir 0）的块
-            ?assertEqual([0], lists:usort([Dd || <<"a", 1:64, Dd:8, _/binary>> <- Keys])),
+            ?assertEqual([0], lists:usort(
+                                [Dd || <<_:4/binary, "a", 1:64, Dd:8, _/binary>>
+                                          <- Keys])),
             ?assertEqual(lists:seq(1, 300), [Y || #{dst := Y} <- element(2, graphdb:out_edges(R, 1))]),
             %% Y = 1 是自环：入边组 7 里有 1，组 8 是那 3 条
             ?assertEqual([1, 900, 901, 902], [S || #{src := S} <- element(2, graphdb:in_edges(R, 1))]),

@@ -2,7 +2,7 @@
 
 English: [graph-adjacency-pack-design-en.md](graph-adjacency-pack-design-en.md)。
 
-状态：**已实施**（2026-11-18，G1–G6，随 **8.0.0**；实现对账见 §14）。取代
+状态：**已实施**（2026-11-18，G1–G6，随 **8.0.0**；当前仓库随 8.1.0；实现对账见 §14）。取代
 [graph-layer-design-zh.md](graph-layer-design-zh.md)（下称 v1）的盘上布局与写路径；
 v1 的遍历算法、OLAP 物化层、etype 注册、API 外形保留。
 
@@ -10,7 +10,7 @@ v1 的遍历算法、OLAP 物化层、etype 注册、API 外形保留。
 （libbitcask `feedbacks/2026-11-17-conditional-atomic-batch.md`），上游在 **8.0.0**
 （S46）发布：`Cask::BatchOp::expect`（`kAbsent` / `kOrdEquals`）+ `expect_ord` +
 `kCheck`，冲突返回 `kConditionFailed`，`BatchOutcome` 回报失败 op 下标与各 op 的
-LSN。本仓库子模块已升到 8.0.0（`eade59e`），NIF / 门面形态见 §5.3。
+LSN。当前仓库子模块为 8.1.0（`13322bd`），NIF / 门面形态见 §5.3。
 
 ---
 
@@ -76,15 +76,18 @@ v2 是「读更便宜、内存更省、写更贵」的交换：
 
 | 家族 | key | 值 |
 |---|---|---|
-| `n` | `"n" <vid:64>` | 顶点内容（不变） |
-| `a` 头 | `"a" <vid:64>`（9 B） | 邻接表头（§4.2） |
-| `a` 块 | `"a" <vid:64> <dir:8> <etype:32> <other:64> <rank:64>`（30 B） | 一块条目（§4.3）；key 里的 (other, rank) 是该块的**下界** |
-| `p` | `"p" <src:64> <etype:32> <dst:64> <rank:64>` | 超过内联上限的边属性（§4.4） |
-| `t` / `tn` | 不变 | etype 注册表 |
-| `g` | `"g"`（1 B） | 图元信息：`<<LayoutVer:8, …>>`，v2 = 2 |
+| `n` | `<G> "n" <vid:64>` | 顶点内容（不变） |
+| `a` 头 | `<G> "a" <vid:64>`（13 B） | 邻接表头（§4.2） |
+| `a` 块 | `<G> "a" <vid:64> <dir:8> <etype:32> <other:64> <rank:64>`（34 B） | 一块条目（§4.3）；key 里的 (other, rank) 是该块的**下界** |
+| `p` | `<G> "p" <src:64> <etype:32> <dst:64> <rank:64>` | 超过内联上限的边属性（§4.4） |
+| `t` / `tn` | `<G> "t" …` / `<G> "tn" …` | etype 注册表（记录体不变） |
+| `g` | `<G> "g"`（5 B） | 图元信息：`<<LayoutVer:8, …>>` = 1 |
+
+`<G>` 是图层全局前缀 `<<16#01, "_g:">>`（4 B），避免图层 key 与应用 KV、全文/向量
+索引 key 撞名。
 
 多字节整数一律大端定宽（与 v1 相同：字典序 = 数值序）。`dir`：0 = 出，1 = 入。
-头 key 是同顶点全部块 key 的前缀，`"a" <vid>` 的前缀 range 恰好取回「头 + 全部块」，
+头 key 是同顶点全部块 key 的前缀，`<G> "a" <vid>` 的前缀 range 恰好取回「头 + 全部块」，
 且头排第一。
 
 ### 4.2 邻接表头的值
@@ -314,18 +317,14 @@ frontier 展开可以改用批量点查，不再需要一顶点一个迭代器�
 - **病理 vid 防御**：v1 里 `ei` / `et` 会落进 `e` 的扫描区间；v2 的家族没有这种
   前缀包含关系（`a` 头是它自己块的前缀，属于设计内）。解析仍按长度严格校验。
 
-## 10. 迁移
+## 10. 布局版本与旧数据
 
-- `g` 键记录布局版本。打开时：有 `g` 且版本 = 2 → v2；无 `g` 但存在 `e` 家族 → v1 库，
-  v2 代码拒绝直接读写，提示先迁移。
-- 迁移工具 `graphdb_migrate:v1_to_v2(SrcDir, DstDir)`，流式、内存占用与图大小无关：
-  - `e` 家族按 key 序就是按 src 聚好的出边；`ei` 家族按 key 序就是按 dst 聚好的入边；
-  - 两路有序流按 vid 归并，逐顶点拼出头（必要时分块）写入新目录；
-  - `n`、`t`、`tn` 原样拷贝；`et`、`deg`、`degi` 丢弃（可由邻接表重算）。
-  - 迁移后校验：两边逐顶点对比出入度与邻居集合。
-- 不做原地迁移，不做 v1 / v2 双布局长期并存（代码量翻倍，收益小）。v1 的读代码只
-  保留在迁移工具里。
-- 这是盘上布局的破坏性变更，随主版本 8.0.0 发布。
+- `g` 键记录布局版本。打开时：有 `<G> "g"` 且版本 = 1 → 当前布局；无新 `g` 但存在旧
+  的无前缀 `g` → 未加全局前缀的中间布局，返回
+  `{error, graph_layout_unprefixed_v2}`；无新 `g` 但存在 `e` / `ei` 家族 → 更早的
+  逐边布局，返回 `{error, graph_layout_v1}`。
+- 不提供自动迁移或 `graphdb_migrate` 工具。旧图数据需要由调用方导出后重灌；
+  fail-loud 的拒开检查只用于避免把旧图目录误当成空库。
 
 ## 11. 阶段拆分
 
@@ -344,7 +343,7 @@ frontier 展开可以改用批量点查，不再需要一顶点一个迭代器�
 
 ## 12. 验收口径
 
-基准沿用 `test/graphdb_bench`，补 v1 / v2 对照（同一份数据，v1 库经迁移工具得到 v2 库）：
+基准沿用 `test/graphdb_bench`，补更早逐边布局参照：
 
 | 指标 | 期望 |
 |---|---|
@@ -372,9 +371,8 @@ frontier 展开可以改用批量点查，不再需要一顶点一个迭代器�
 
 | 模块 | 内容 |
 |---|---|
-| `graphdb_adj`（新） | 头 / 块 / 条目编解码；读原语（`entries` / `lookup` / `counts`）；写会话（`put_edge` / `del_edge` / `all_entries` / `commit`，每个改过的头带条件）；分块维护（分裂、删空块、转回内联、头超限转分块）；迁移用的 `build_vertex`。IO 抽象 `{direct, H}` / `{txn, Tx, Lock}`，直通与事务共用一套逻辑 |
+| `graphdb_adj`（新） | 头 / 块 / 条目编解码；读原语（`entries` / `lookup` / `counts`）；写会话（`put_edge` / `del_edge` / `all_entries` / `commit`，每个改过的头带条件）；分块维护（分裂、删空块、转回内联、头超限转分块）。IO 抽象 `{direct, H}` / `{txn, Tx, Lock}`，直通与事务共用一套逻辑 |
 | `graphdb` | 门面：open 时的布局检查（`g` 键；参数每次写会话读一次 `g`，不做进程外缓存）、直通 API + 冲突重试、`put_edges` / `del_edges`、按邻居分批的 `del_vertex`、`consistent` 读、事务 API、遍历（不变）、etype 注册（不变）、`check_invariants/1` |
-| `graphdb_migrate`（新） | `v1_to_v2/2,3`、`verify/2,3`：两路 range 游标按 vid 归并，流式 |
 | `graphdb_analytics` | `materialize` 改扫 `a` 家族 |
 | `bitcask` / NIF | `get_with_ord/2`、带条件的批 op、`put_batch_atomic/3`（`return_ords`）、`{error, {conflict, I}}` |
 | `bitcask_txn` | `read_guarded/3`（版本守卫，§8） |
@@ -390,8 +388,12 @@ frontier 展开可以改用批量点查，不再需要一顶点一个迭代器�
 - `put_edges` / `del_edges` 先按 src 稳定排序再切批（每批 ≤ `batch_vids`，默认 256）。
   不排序时随机边在批内很少重复同一个顶点，聚合几乎没用；排序后 src 一侧每批只写一次，
   吞吐约 2×、字节约减半（§14.3）。
-- `graph_layout_v1`：open 时探测到 v1 的出边 key **且**它配对的 `ei` 反向 key 也在才
-  拒开（最多核对前 64 条候选），应用自己恰好有 29 字节 "e…" key 的目录不会误判。
+- `graph_layout_v1`：open 时探测到更早逐边布局的出边 key **且**它配对的 `ei` 反向
+  key 也在才拒开（最多核对前 64 条候选），应用自己恰好有 29 字节 "e…" key 的目录
+  不会误判。不提供迁移工具。
+- 图层 key 统一加 `<<1,"_g:">>` 全局前缀。若目录里只有 8.0.0 中间版写的无前缀 `g`
+  配置，open 返回 `{error, graph_layout_unprefixed_v2}`，避免在旧数据旁静默建一套
+  新前缀数据。
 - 图参数不缓存：每次写会话读一次 `g`（低度数逐条加边约慢 5–10%），换来句柄经
   `graphdb:close` 或 `bitcask:close` 关掉都不留残留、绕过 `graphdb:open` 拿到的句柄也
   按建库参数写。
@@ -417,7 +419,6 @@ frontier 展开可以改用批量点查，不再需要一顶点一个迭代器�
 | 数据字节 / 边（put_edges） | 254 | 261 | 263 | 326 |
 | 数据字节 / 边（put_edge） | 303 | 323 | 332 | 326 |
 | materialize（ms） | 62 | 54 | 65 | — |
-| 迁移 v1 → v2 + 校验（ms） | 455 | 486 | 560 | — |
 
 ¹ v1 参照是按 v1 写法（每边一条 5 记录原子批 + 计数器读-改-写）灌的同一份边，三次
 测得 44k / 44k / 88k，波动大，只作量级参考。² v1 数字取自 6.5.0 的基准记录。
@@ -432,7 +433,6 @@ frontier 展开可以改用批量点查，不再需要一顶点一个迭代器�
 | 数据字节 / 边（put_edge） | 1095 | 314 | 3.5× |
 | 数据字节 / 边（put_edges） | 941 | 314 | 3.0× |
 | 一跳 out_edges（ms/op） | 0.012 | ~0.02 | — |
-| 迁移 v1 → v2 + 校验（ms） | 865 | — | — |
 
 结论：
 - key 数（= keydir / OKI 常驻内存）按顶点数走：低度数图降 17×，度数 50 降 145×。

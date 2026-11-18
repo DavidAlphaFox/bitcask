@@ -1,20 +1,20 @@
 %% =========================================================================
-%% graphdb — 图存储层 v2（一个顶点两个 KV：顶点 + 邻接表打包，按 LSN 条件写）
+%% graphdb — 图存储层（当前布局第 1 版：一个顶点两个 KV，按 LSN 条件写）
 %%
-%% 设计文档：doc/graph-adjacency-pack-design-zh.md（v2 盘上布局与写路径）；
-%% 遍历算法、OLAP 物化、etype 注册沿用 doc/graph-layer-design-zh.md（v1）。
+%% 设计文档：doc/graph-adjacency-pack-design-zh.md（盘上布局与写路径）；
+%% 遍历算法、OLAP 物化、etype 注册沿用 doc/graph-layer-design-zh.md。
 %% 邻接表的字节格式与读写原语在 graphdb_adj；本模块是门面。
 %%
-%% 布局（家族字节 + 定宽大端；字典序 = 数值序）：
+%% 布局（<<1,"_g:">> 全局前缀 + 家族字节 + 定宽大端；字典序 = 数值序）：
 %%
-%%   n <vid:64>        → 顶点内容（透传给 bitcask:put，binary 或 #{text=>...}）
-%%   a <vid:64>        → 邻接表头：出边组 + 入边组（按 (dir, etype) 排）+ 各组度数
-%%   a <vid:64> <dir:8> <etype:32> <o:64> <r:64>
+%%   <<1,"_g:">> n <vid:64> → 顶点内容（透传给 bitcask:put，binary 或 #{text=>...}）
+%%   <<1,"_g:">> a <vid:64> → 邻接表头：出边组 + 入边组 + 各组度数
+%%   <<1,"_g:">> a <vid:64> <dir:8> <etype:32> <o:64> <r:64>
 %%                     → hub 的分块（某组超过阈值才有；(o, r) 是块下界）
-%%   p <src:64> <etype:32> <dst:64> <rank:64>
+%%   <<1,"_g:">> p <src:64> <etype:32> <dst:64> <rank:64>
 %%                     → 超过 props_inline_max 的边属性
-%%   t <etype:32> / tn <len:16> <name>  → etype 注册表（不变）
-%%   g                 → 图元信息：布局版本 2 + 分块参数
+%%   <<1,"_g:">> t <etype:32> / tn <len:16> <name> → etype 注册表（不变）
+%%   <<1,"_g:">> g     → 图元信息：布局版本 1 + 分块参数
 %%
 %% key 数量 ≈ 2 × 有边的顶点数 + hub 块数（v1 是 3 × 边数 + 计数键）。
 %%
@@ -51,9 +51,10 @@
 %%   * 多跳遍历跨跳弱一致，与 v1 相同。
 %%
 %% === 布局版本 ===
-%%   open 时：有 `g` 且版本 2 → 用它记下的参数；没有 `g` 但有 v1 的 `e` 家族 →
-%%   {error, graph_layout_v1}（先用 graphdb_migrate:v1_to_v2/2,3 迁移）；都没有
-%%   且可写 → 写 `g`。分块参数只在建库时生效（之后以 `g` 为准）：
+%%   open 时：有新 `g` 且版本 1 → 用它记下的参数；没有新 `g` 但有旧无前缀 `g` →
+%%   {error, graph_layout_unprefixed_v2}；有 v1 的 `e` 家族 →
+%%   {error, graph_layout_v1}（不提供自动迁移）；都没有
+%%   且可写 → 写新 `g`。分块参数只在建库时生效（之后以 `g` 为准）：
 %%     {adj_inline_max, N}    头超过 N 字节就把最大的组分块（默认 4096）
 %%     {adj_chunk_max, N}     单块上限（默认 4096）
 %%     {props_inline_max, N}  边属性超过 N 字节落 p 家族（默认 128）
@@ -150,14 +151,19 @@ init_layout(H, GOpts, RW) ->
             end;
         not_found ->
             Cfg = cfg_from_opts(GOpts),
-            case has_v1_edges(H) of
-                true  -> {error, graph_layout_v1};
-                false when RW ->
-                    case bitcask:put(H, graphdb_adj:gkey(), graphdb_adj:encode_cfg(Cfg)) of
-                        ok    -> ok;
-                        Other -> normalize_error(Other)
-                    end;
-                false -> ok
+            case has_unprefixed_v2(H) of
+                true  -> {error, graph_layout_unprefixed_v2};
+                false ->
+                    case has_v1_edges(H) of
+                        true  -> {error, graph_layout_v1};
+                        false when RW ->
+                            case bitcask:put(H, graphdb_adj:gkey(),
+                                             graphdb_adj:encode_cfg(Cfg)) of
+                                ok    -> ok;
+                                Other -> normalize_error(Other)
+                            end;
+                        false -> ok
+                    end
             end;
         {error, _} when not RW ->
             ok;                                    %% 只读打开从未写过的目录（无 OKI）
@@ -212,16 +218,24 @@ has_v1_edges(H) ->
         throw:{graphdb, not_v1} -> false
     end.
 
+%% 加全局前缀前的中间布局用 g 版本 2。没有新 `g` 但存在旧 `g` 配置时，宁可拒开，
+%% 也不能把旧图数据晾在一边再建一套新前缀数据。
+has_unprefixed_v2(H) ->
+    case bitcask:get(H, <<"g">>) of
+        {ok, <<2:8, _:32/big, _:32/big, _:16/big>>} -> true;
+        _ -> false
+    end.
+
 %% =========================================================================
 %% key codec（公开以便测试 / 工具复用；调用方请勿手工拼这些 key）
 %% =========================================================================
 
-%% 顶点 key：<<"n">> ++ vid 大端 8 字节。
+%% 顶点 key：<<1, "_g:">> ++ "n" ++ vid 大端 8 字节。
 nkey(Vid) ->
     ok = v_v64(Vid),
-    <<"n", Vid:64/big>>.
+    << (graphdb_adj:prefix())/binary, "n", Vid:64/big >>.
 
-%% 邻接表头 key：<<"a">> ++ vid 大端 8 字节。
+%% 邻接表头 key：<<1, "_g:">> ++ "a" ++ vid 大端 8 字节。
 akey(Vid) ->
     ok = v_v64(Vid),
     graphdb_adj:head_key(Vid).
@@ -693,7 +707,7 @@ edges_by_type(Handle, Etype, Opts) when is_map(Opts) ->
                        false -> {N2, Acc2}
                    end
            end,
-    Fun = fun(<<"a", Src:64/big>>, V, _T, _O, A) ->
+    Fun = fun(<< _P:4/binary, "a", Src:64/big >>, V, _T, _O, A) ->
                   case graphdb_adj:groups_info(vbin(V)) of
                       {ok, Gs} ->
                           case lists:keyfind(Etype, 2, [G || {0, _, _, _} = G <- Gs]) of
@@ -702,7 +716,8 @@ edges_by_type(Handle, Etype, Opts) when is_map(Opts) ->
                           end;
                       error -> A
                   end;
-             (<<"a", Src:64/big, 0:8, T:32/big, _:128>>, V, _T, _O, A) when T =:= Etype ->
+             (<< _P:4/binary, "a", Src:64/big, 0:8, T:32/big, _:128 >>,
+              V, _T, _O, A) when T =:= Etype ->
                   case graphdb_adj:decode_chunk(vbin(V)) of
                       {ok, Es} -> Emit(Src, Es, A);
                       error    -> A
@@ -712,7 +727,8 @@ edges_by_type(Handle, Etype, Opts) when is_map(Opts) ->
     Raw = case Limit of
               0 -> {ok, []};
               _ ->
-                  try bitcask:range_fold(Handle, {<<"a">>, <<"b">>}, [], Fun, {0, []}) of
+                  try bitcask:range_fold(Handle, graphdb_adj:range(<<"a">>), [],
+                                         Fun, {0, []}) of
                       {error, _} = Err -> Err;
                       {_, Acc}         -> {ok, lists:reverse(Acc)}
                   catch throw:{graphdb, limit, Acc} -> {ok, lists:reverse(Acc)}
@@ -757,24 +773,28 @@ neighbors_where(Handle, Vid, Dir, Pred) when is_function(Pred, 2) ->
 %% =========================================================================
 
 check_invariants(Handle) ->
-    Scan = fun(<<"a", Vid:64/big>>, V, _T, _O, {Hs, Cs, Bad}) ->
+    Scan = fun(<< _P:4/binary, "a", Vid:64/big >>, V, _T, _O, {Hs, Cs, Bad}) ->
                    case graphdb_adj:groups_info(vbin(V)) of
                        {ok, Gs} -> {Hs#{Vid => Gs}, Cs, Bad};
                        error    -> {Hs, Cs, [{bad_head, Vid} | Bad]}
                    end;
-              (<<"a", _:64, _:8, _:32, _:64, _:64>> = K, V, _T, _O, {Hs, Cs, Bad}) ->
+              (<< _P:4/binary, "a", _:64, _:8, _:32, _:64, _:64 >> = K,
+               V, _T, _O, {Hs, Cs, Bad}) ->
                    case {graphdb_adj:parse_chunk_key(K), graphdb_adj:decode_chunk(vbin(V))} of
                        {{ok, Vid, D, T, Lb}, {ok, Es}} -> {Hs, Cs#{{Vid, D, T, Lb} => Es}, Bad};
                        _ -> {Hs, Cs, [{bad_chunk, K} | Bad]}
                    end;
               (_, _, _, _, A) -> A
            end,
-    PScan = fun(<<"p", S:64/big, T:32/big, D:64/big, R:64/big>>, _V, _T, _O, Acc) ->
+    PScan = fun(<< _P:4/binary, "p", S:64/big, T:32/big, D:64/big, R:64/big >>,
+                 _V, _T, _O, Acc) ->
                     [{S, T, D, R} | Acc];
                (_, _, _, _, Acc) -> Acc
             end,
-    case {bitcask:range_fold(Handle, {<<"a">>, <<"b">>}, [], Scan, {#{}, #{}, []}),
-          bitcask:range_fold(Handle, {<<"p">>, <<"q">>}, [], PScan, [])} of
+    case {bitcask:range_fold(Handle, graphdb_adj:range(<<"a">>), [],
+                             Scan, {#{}, #{}, []}),
+          bitcask:range_fold(Handle, graphdb_adj:range(<<"p">>), [],
+                             PScan, [])} of
         {{error, _} = E, _} -> E;
         {_, {error, _} = E} -> E;
         {{Heads, Chunks, Bad0}, PKeys} ->
@@ -1001,7 +1021,8 @@ register_etype(Handle, Name) when is_binary(Name), Name =/= <<>>,
     Res = bitcask_txn:transaction(
             Handle,
             fun(Tx) ->
-                    ok = bitcask_txn:lock_prefix(Tx, <<"t">>, write),
+                    TPrefix = << (graphdb_adj:prefix())/binary, "t" >>,
+                    ok = bitcask_txn:lock_prefix(Tx, TPrefix, write),
                     case txn_read(Tx, tnkey(Name), write) of
                         {ok, <<Id:32/big>>} ->
                             {ok, Id};
@@ -1009,7 +1030,8 @@ register_etype(Handle, Name) when is_binary(Name), Name =/= <<>>,
                             {error, invalid_etype_record};
                         not_found ->
                             Next = next_etype_id_txn(Tx),
-                            ok = bitcask_txn:write(Tx, <<"t", Next:32/big>>, Name),
+                            ok = bitcask_txn:write(
+                                   Tx, << TPrefix/binary, Next:32/big >>, Name),
                             ok = bitcask_txn:write(Tx, tnkey(Name), <<Next:32/big>>),
                             {ok, Next}
                     end
@@ -1031,19 +1053,24 @@ etype_id(Handle, Name) when is_binary(Name) ->
 
 etype_name(Handle, Id) ->
     ok = v_t32(Id),
-    case bitcask:get(Handle, <<"t", Id:32/big>>) of
+    case bitcask:get(
+           Handle, << (graphdb_adj:prefix())/binary, "t", Id:32/big >>) of
         {ok, Name} when is_binary(Name) -> {ok, Name};
         {ok, _}                         -> {error, invalid_etype_record};
         not_found                       -> {error, not_found};
         {error, _} = E                  -> E
     end.
 
-tnkey(Name) -> <<"tn", (byte_size(Name)):16/big, Name/binary>>.
+tnkey(Name) ->
+    << (graphdb_adj:prefix())/binary, "tn", (byte_size(Name)):16/big,
+       Name/binary >>.
 
-%% t 家族扫描：前缀 "t"（= ["t", "u")）。同区间里会混进 "tn…" 更长的 key，
-%% strict 5 字节解析过滤。id 从 1 起。前缀写锁已在调用方持有。
+%% t 家族扫描：前缀 <<1, "_g:t">>。同区间里会混进 "tn…" 更长的 key，
+%% strict 9 字节解析过滤。id 从 1 起。前缀写锁已在调用方持有。
 next_etype_id_txn(Tx) ->
-    Ids = [Id || {<<"t", Id:32/big>>, _V} <- txn_prefix_range(Tx, <<"t">>, write)],
+    Ids = [Id || {<< _P:4/binary, "t", Id:32/big >>, _V}
+                   <- txn_prefix_range(Tx, << (graphdb_adj:prefix())/binary, "t" >>,
+                                     write)],
     lists:max([0 | Ids]) + 1.
 
 

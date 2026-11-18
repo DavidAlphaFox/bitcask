@@ -3,19 +3,46 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [8.1.0] — 2026-11-19
+
+Upgrades libbitcask **8.0.0 → 8.1.0** (spanning upstream 8.0.1 / 8.0.2 / 8.1.0; C API
+signatures, C ABI and on-disk container formats are unchanged, and `SOVERSION` stays 8).
+The submodule moves from `eade59e` (`8.0.0`) to upstream `13322bd` (`8.1.0`). NIF / Erlang
+code is unchanged; rebuild to pick up the new library.
+
+> ⚠️ **Search upgrade note**: upstream changes the default-field sentinel to
+> `<<1, "_bitcask:default">>`. Search checkpoints / sealed indexes written by 8.0.x or
+> earlier cannot be reused losslessly under 8.1.0; rebuild the search index or read them
+> with the old version temporarily. KV-only data is unaffected.
+
+### Changed (via libbitcask 8.1.0)
+
+- **Default-field sentinel changed to `<<1, "_bitcask:default">>`**: an invisible first byte
+  avoids user-field collisions while keeping the marker readable. KV-only paths and the C API
+  are unchanged; persisted default-field identifiers in old search data are not migrated.
+- Windows / MSVC fixes (8.0.1 / 8.0.2): TBB finalize uses the nothrow two-argument overload;
+  MSVC explicitly enables `/EHsc` so RAII unwinds correctly across exceptions.
+
+### Fixed — graph layer
+
+- When a chunked adjacency group sees a chunk listed by the head but absent on disk, the
+  repaired empty chunk is now committed in the same head-conditioned batch. Repairs triggered
+  by the read-only first scan in `del_vertex` are no longer skipped. A randomized concurrent
+  invariant test exposed the issue.
+
 ## [8.0.0] — 2026-11-18
 
 Upgrades libbitcask **7.0.3 → 8.0.0** (an upstream MAJOR, S46 conditional atomic batches:
 the C API is purely additive; the C++ headers append members and defaulted parameters —
 source-compatible but the C++ ABI changes, `SOVERSION` 7→8; on-disk format unchanged). The
 submodule moves from `ce7ce13` (`7.0.3`) to upstream `eade59e` (`8.0.0`). On top of it the
-graph layer switches to the **v2 layout** (an on-disk breaking change; existing graph stores
-need an offline migration, see below).
+graph layer switches to **layout version 1** (an on-disk breaking change; old graph stores
+are rejected, see below).
 
 > ⚠️ **Upgrade note**: directories written by `graphdb` 6.5.0–7.0.3 make `graphdb:open/2`
-> return `{error, graph_layout_v1}` in this release; run
-> `graphdb_migrate:v1_to_v2(SrcDir, DstDir)` into a new directory first. Plain KV / search
-> directories are unaffected.
+> return `{error, graph_layout_v1}` in this release. A directory holding only the
+> unprefixed `g` configuration from an interim build is rejected
+> with `{error, graph_layout_unprefixed_v2}`. Plain KV / search directories are unaffected.
 
 ### Added (with libbitcask 8.0.0)
 
@@ -37,13 +64,14 @@ need an offline migration, see below).
 - NIF: `cask_get_ord/2`, `cask_put_batch_atomic/3`; `CaskError::kConditionFailed` without
   an op index falls back to `{error, condition_failed}`.
 
-### Changed — graph layer v2 (`doc/graph-adjacency-pack-design-en.md`)
+### Changed — graph layout version 1 (`doc/graph-adjacency-pack-design-en.md`)
 
-- **Two KVs per vertex**: `n<vid>` (vertex, unchanged) + `a<vid>` (adjacency head: out / in
-  groups with per-group degree). Hubs whose adjacency exceeds `adj_inline_max` (default
-  4 KiB) split their largest group into chunks (`a<vid><dir><etype><o><r>`, each ≤
-  `adj_chunk_max`); edge properties over `props_inline_max` (default 128 B) go to the `p`
-  family. `e` / `ei` / `et` / `deg` / `degi` are retired. The key count drops from
+- **Two KVs per vertex**: all graph keys use the global `<<1,"_g:">>` namespace.
+  `n<vid>` (vertex, unchanged) + `a<vid>` (adjacency head: out / in groups with per-group
+  degree). Hubs whose adjacency exceeds `adj_inline_max` (default 4 KiB) split their largest
+  group into chunks (`a<vid><dir><etype><o><r>`, each ≤ `adj_chunk_max`); edge properties
+  over `props_inline_max` (default 128 B) go to the `p` family. `e` / `ei` / `et` / `deg` /
+  `degi` are retired. The key count drops from
   "3 × edges + counter keys" to "2 × vertices + chunks" — 17× fewer in the low-degree
   benchmark, 145× fewer at average degree 50.
 - **An edge write is a conditional write on both endpoint heads with conflict retry**
@@ -58,9 +86,9 @@ need an offline migration, see below).
   `graphdb_analytics:materialize` reads the `a` family.
 - **Transactional API**: locks are taken on the vertices' adjacency heads (no prefix locks)
   and heads are read via `read_guarded` — **direct and transactional writes can be mixed**.
-- **Layout version**: `graphdb:open/2` writes a `g` key on creation (layout 2 + chunking
-  parameters, authoritative afterwards); opening a v1 store returns
-  `{error, graph_layout_v1}`.
+- **Layout version**: `graphdb:open/2` writes a `g` key on creation (layout 1 + chunking
+  parameters, authoritative afterwards); old graph stores return
+  `{error, graph_layout_v1}` or `{error, graph_layout_unprefixed_v2}`.
 
 ### Added — graph layer
 
@@ -70,14 +98,14 @@ need an offline migration, see below).
   253k edges/s with the whole graph in one batch), `in_degree/2,3`, `del_vertex/3` (`retries`, `batch_neighbors => N | infinity`), `akey/1`, `pkey/4`, `graph_config/1`,
   `check_invariants/1` (scans the `a` / `p` families checking symmetry, degrees, chunk
   directories and external properties).
-- `graphdb_migrate:v1_to_v2/2,3`, `verify/2,3`: streaming v1 → v2 offline migration (two
-  range cursors merged by vid), read-only on the source, per-vertex verification afterwards.
-- `test/graphdb_bench` reworked for v2 with a v1 reference (key count, bytes, migration time).
+- `test/graphdb_bench` reworked for the current layout with an old per-edge reference
+  (key count and bytes).
 
 ### Removed
 
-- `graphdb:ekey/3,4`, `eikey/3,4` (v1 key codec). The v1 counter fallback path and the
-  prefix-lock versions of `out_edges_txn` / `del_vertex_txn` are retired with the layout.
+- `graphdb:ekey/3,4`, `eikey/3,4` (old key codec). The old counter fallback path and the
+  prefix-lock versions of `out_edges_txn` / `del_vertex_txn` are retired with the layout;
+  no automatic migration tool is provided.
 
 ## [7.0.3] — 2026-11-17
 
