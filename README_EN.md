@@ -129,9 +129,14 @@ ok
 > `txn_commit` adds validation on top of `put_batch_atomic` (non-empty, non-empty
 > keys, no duplicates, no `_txn:` prefix); its optional third argument is
 > `sync_on_commit` (default) or `no_sync`.
-> ⚠️ Neither provides **isolation or CAS** — intermediate state is visible to
-> concurrent readers, and concurrent commits with overlapping key sets must be
-> serialized by the application. ⚠️ **The first call lazily upgrades the
+> ⚠️ Neither provides **isolation** — intermediate state is visible to
+> concurrent readers.
+> **Preconditions (optimistic concurrency, libbitcask 8.0.0)**: an op may carry
+> `Cond :: absent | {ord, N}` — `{put, K, V, Cond}` / `{remove, K, Cond}` /
+> `{check, K, Cond}` (validate only), with `N` from `bitcask:get_with_ord/2`.
+> Conditions are checked under the engine write lock against the pre-batch state;
+> any failure → `{error, {conflict, OpIndex}}` with zero side effects (re-read and
+> retry); `put_batch_atomic(H, Ops, [return_ords])` returns each op's LSN. ⚠️ **The first call lazily upgrades the
 > directory's meta to v6**, after which readers older than upstream 5.1.0 cannot
 > open it.
 
@@ -169,11 +174,13 @@ single-node version of Mnesia's trio), zero engine changes, pure OTP:
 > `{aborted, {retry_limit, N}}`); `{timeout, Ms}` is the total budget across
 > restarts. ⚠️ **Fun must be side-effect free** (it may run more than once);
 > ⚠️ the direct `bitcask:put/get` API bypasses the locks — mixing it with
-> transactions on the same keys is undefined. Design: `doc/txn-layer-design-zh.md`.
-> Same thing for the graph layer:
-> `graphdb:transaction(R, fun(Tx) -> graphdb:put_edge_txn(Tx, 1, 7, 2) end)` — an
-> edge's five keys (forward/reverse/et/deg/degi) commit in one locked batch, so
-> concurrent edge inserts keep exact counts.
+> transactions that read via `read/2,3` is undefined; use
+> `bitcask_txn:read_guarded/3` to mix safely (the version read becomes a commit
+> condition, so a direct writer slipping in only makes the transaction re-run).
+> Design: `doc/txn-layer-design-zh.md`. Same thing for the graph layer:
+> `graphdb:transaction(R, fun(Tx) -> graphdb:put_edge_txn(Tx, 1, 7, 2) end)` — both
+> endpoint adjacency heads are locked and committed in one batch; the graph's
+> direct writes are conditional themselves, so the two can be mixed.
 
 **Idempotency keys** (`{idem_key, K}`) — when the caller is killed mid-commit and
 never sees the result, retrying with the same key is safe: a given K commits at
@@ -354,13 +361,15 @@ ok
 | `get/2`, `get_doc/2`, `put/3`, `delete/2`, `sync/1` | Core KV operations; `get_doc` reads back a structured document's named fields |
 | `fold/3,6`, `fold_keys/3,6`, `list_keys/1` | Iteration (**snapshot-consistent**, costs O(whole table)) |
 | `range/2,3`, `range_fold/5` | Ordered range query over `[Lo, Hi)`, costs **O(range)**; per-key weak consistency (not a snapshot); `{prefetch, N}` fetches values concurrently |
-| `put_batch_atomic/2`, `txn_commit/2,3` | Crash-atomic batch / multi-key transaction; `Ops :: [{put,K,V} \| {remove,K}]`; ⚠️ the first call lazily upgrades the directory's meta to v6 |
-| `bitcask_txn:transaction/2,3`, `read/2,3`, `write/3`, `delete/2`, `abort/1` | **Isolated transactions** (6.5.1): pessimistic 2PL point locks + deadlock detection + automatic restart, Mnesia-style; `{atomic,R} \| {aborted,Why}`; options `retries`/`timeout`/`lock_wait_timeout`/`sync`/`index_fun`; `read/3` with `write` takes the write lock up front for read-modify-write; Fun must be side-effect free (may run more than once) |
+| `put_batch_atomic/2,3`, `txn_commit/2,3` | Crash-atomic batch / multi-key transaction; `Ops :: [{put,K,V} \| {remove,K}]`, optionally with preconditions `{put,K,V,Cond}` / `{remove,K,Cond}` / `{check,K,Cond}` (`Cond :: absent \| {ord,N}`; failure → `{error,{conflict,I}}`); `/3` with `[return_ords]` returns each op's LSN; ⚠️ the first call lazily upgrades the directory's meta to v6 |
+| `get_with_ord/2` | Reads the value plus the key's current LSN (`{ok, V, Ord}`), for `{ord, Ord}` preconditions |
+| `bitcask_txn:transaction/2,3`, `read/2,3`, `read_guarded/3`, `write/3`, `delete/2`, `abort/1` | **Isolated transactions** (6.5.1): pessimistic 2PL point locks + deadlock detection + automatic restart, Mnesia-style; `{atomic,R} \| {aborted,Why}`; options `retries`/`timeout`/`lock_wait_timeout`/`sync`/`index_fun`; `read/3` with `write` takes the write lock up front for read-modify-write; Fun must be side-effect free (may run more than once); `read_guarded/3` turns the version read into a commit condition (safe to mix with direct writes) |
 | `bitcask:put_docs/2` | **Batch document write**: `[{Key, Doc}]`, texts needing embedding go through **one** `embed_batch` call; nothing is written if embedding fails, a failing put returns `{error, {Key, Reason}}` (not atomic) |
 | `bitcask_txn:idem_lookup/2`, `idem_purge/2,3` | **Idempotency keys** (`transaction/3` option `{idem_key, K}`; `{idem_result, false}` skips storing the result): a key commits at most once, repeats return the first result; `idem_lookup` is a lock-free check, `idem_purge(H, MaxAgeSec [, [{chunk, N}]])` removes old markers in streamed chunks |
 | `bitcask_txn:lock_key/3` | **Point lock**: takes the lock without reading or writing (like `mnesia:lock`), for callers that act on the engine directly under the lock |
 | `bitcask_txn:lock_prefix/3`, `prefix_range/2,3` | **Prefix locks**: cover every key starting with Prefix (existing and future); `prefix_range` = prefix lock + range + merge with the txn's own buffer — phantom-free scans inside a transaction |
-| `graphdb:transaction/2,3`, `put_edge_txn/4,5`, `del_edge_txn/4,5`, `edge_txn/4,5`, `degree_txn/2,3`, `put_vertex_txn/3`, `get_vertex_txn/2`, `out_edges_txn/2,3`, `in_edges_txn/2,3`, `del_vertex_txn/2` | Transactional graph reads/writes: an edge's five keys + degree counters commit in one locked batch (exact counts under concurrency); adjacency scans take a prefix lock (no phantoms); `del_vertex_txn` cascades in one batch; do not mix with direct `put_edge` on the same graph |
+| `graphdb:put_edge/4,5`, `del_edge/4,5`, `put_edges/2,3`, `del_edges/2,3`, `out_edges/2,3`, `in_edges/2,3`, `degree/2,3`, `in_degree/2,3`, `del_vertex/2`, `check_invariants/1` | **Graph layer v2**: two KVs per vertex (vertex + packed adjacency list, hubs chunked); an edge write is a conditional write on both endpoint heads with conflict retry (`retries => N \| infinity`), so concurrent writers lose no edges; neighbors / degree are one point read; `consistent => true` gives chunked vertices an atomic snapshot; `graphdb_migrate:v1_to_v2/2,3` migrates v1 stores offline |
+| `graphdb:transaction/2,3`, `put_edge_txn/4,5`, `del_edge_txn/4,5`, `edge_txn/4,5`, `degree_txn/2,3`, `put_vertex_txn/3`, `get_vertex_txn/2`, `out_edges_txn/2,3`, `in_edges_txn/2,3`, `del_vertex_txn/2` | Transactional graph reads/writes: both endpoint adjacency heads locked and committed in one batch; heads are read via `read_guarded`, so mixing with direct writes is safe; `del_vertex_txn` cascades in one batch |
 | `stream/1`, `next/1`, `stop/1`, `with_stream/2` | Streaming iteration |
 | `merge/1,2,3`, `needs_merge/1,2`, `status/1` | Merge management |
 | `search_text/2,3,4`, `search_phrase/2,3,4`, `search_fields/2,3,4`, `search_fields_attributed/2,3,4` | BM25 search (full-text / phrase / `field:term^boost`; the attributed variant reports matched fields); the last arity takes a meta filter |
@@ -385,7 +394,8 @@ ok
 | `doc/put-flow-zh.md` | put(K,V) 完整调用链 |
 | `doc/vector-db-design-zh.md` | 向量库设计方案（V1–V6 蓝图） |
 | `doc/vector-search-extension-zh.md` | 向量搜索扩展：HNSW + RRF 混合检索 |
-| `doc/graph-layer-design-en.md` / `-zh.md` | **Graph layer design** (KV per-key: k = vertex, OKI range traversal + OLAP materialization layer; shipped as `graphdb`/`graphdb_analytics`) (EN/中) |
+| `doc/graph-adjacency-pack-design-en.md` / `-zh.md` | **Graph layer v2**: two KVs per vertex (packed adjacency + hub chunks) + LSN-conditional writes; on-disk contract, write path, migration, benchmarks |
+| `doc/graph-layer-design-en.md` / `-zh.md` | **Graph layer design v1** (KV per-key; on-disk layout superseded by v2, traversal / OLAP materialization / etype registry still apply) (EN/中) |
 | `doc/txn-layer-design-zh.md` | **Transaction layer design** (2PL + deadlock detection + restart on top of atomic batches; §11 implementation deviations, §12 prefix locks, §13 sharded lock manager) (中) |
 | `doc/hnsw-design-zh.md` | HNSW 向量索引设计（并发/持久化/RRF/实施表） |
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
@@ -410,7 +420,8 @@ ok
 - **3.1.0** (2026-07-01) — libbitcask v3.1.0 upgrade (ABI unbroken): `{max_read_handles, unlimited}` / `{auto_compact_dead_ratio, R}` options, `closed` error atom; ships with default read-handle cap (auto-derived from `RLIMIT_NOFILE`), `bitcask.meta` v3 with CRC32, field.schema FSCH v1 header + CRC
 - **4.0.0** (2026-07-13) — libbitcask v4.0.0 upgrade (ABI break, `SOVERSION` 3→4, source-compatible): `{vector_engine, hnsw|ivfrq|diskann}` vector dual-engine + tuning options, `{auto_checkpoint_min_docs, N}` bounded crash-recovery replay; ships with IVF-RaBitQ-lite engine, DiskANN engine (experimental), AVX2 int8 kernels, HNSW `.qc8` codeword mmap; `examples/` Wikipedia search-database example
 - **4.1.0** (2026-07-15) — libbitcask v4.1.0 upgrade (ABI unbroken, `SOVERSION` stays 4, on-disk format unchanged): **no API change** for Erlang callers — just rebuild; ships with the Phase 5/6 deep audit — fixes a process-wide permanent hang on the `close/1` teardown path (`IndexPool` count leak + unbounded `flush` in `unregister_lib`), adds `fdatasync` before `rename` to hnsw's three atomic writes (previously a crash left a truncated file), closes `RowChunks`/`MmapSegment` resource leaks; `file_util` consolidation converges fsync discipline from 4 variants to 1
-- **7.0.3** (2026-11-17, current) — libbitcask 7.0.2 → **7.0.3** upgrade (PATCH: the index pipeline removes global ordering—key + LSN arbitration and sharded concurrent application—and fixes the large-`put_batch` deadlock, the `close()` escape hatch, overestimated checkpoint coverage watermarks, and BM25 score drift from legacy OKI indexes; C API signatures, on-disk format and `SOVERSION` 7 are unchanged, while C++ headers require a same-version NIF rebuild). Adds the `index_stale_dropped/1` Erlang diagnostic
+- **8.0.0** (2026-11-18, current) — libbitcask 7.0.3 → **8.0.0** upgrade (MAJOR, S46 conditional atomic batches: C API purely additive, C++ ABI changes, `SOVERSION` 7→8, on-disk format unchanged). The facade gains `get_with_ord/2`, conditional batch ops (`absent | {ord, N}`, `check`; conflicts return `{error, {conflict, I}}`) and `put_batch_atomic/3`; the transaction layer gains `read_guarded/3`. **Graph layer v2**: two KVs per vertex (packed adjacency, chunked hubs); an edge write is a conditional write on both endpoint heads with conflict retry, so concurrent writers lose no edges; 17×–145× fewer keys and 2–10× faster one-hop reads, at the cost of ~3× write amplification at high degree. ⚠️ On-disk breaking change: old graph stores make `graphdb:open/2` return `{error, graph_layout_v1}` — migrate with `graphdb_migrate:v1_to_v2/2` first
+- **7.0.3** (2026-11-17) — libbitcask 7.0.2 → **7.0.3** upgrade (PATCH: the index pipeline removes global ordering—key + LSN arbitration and sharded concurrent application—and fixes the large-`put_batch` deadlock, the `close()` escape hatch, overestimated checkpoint coverage watermarks, and BM25 score drift from legacy OKI indexes; C API signatures, on-disk format and `SOVERSION` 7 are unchanged, while C++ headers require a same-version NIF rebuild). Adds the `index_stale_dropped/1` Erlang diagnostic
 - **7.0.2** (2026-11-16) — libbitcask 7.0.1 → **7.0.2** upgrade (PATCH, bug fixes only: Windows `atomic_rename` retries sharing conflicts with bounded backoff, and the MSVC big-endian read uses standard `std::byteswap`; C API signatures, on-disk format and `SOVERSION` 7 are unchanged). Linux / macOS behavior is unchanged; no NIF / Erlang code changes are required — just rebuild
 - **7.0.1** (2026-11-16) — libbitcask 7.0.0 → **7.0.1** upgrade (PATCH, bug fixes only: writing once after using an iterator no longer makes `flush_index` hang forever; C API signatures, on-disk format and `SOVERSION` 7 are unchanged). No NIF / Erlang code changes are required — just rebuild; a store already stuck by the bug recovers on reopen
 - **7.0.0** (2026-11-16) — libbitcask 6.9.1 → **7.0.0** upgrade (breaking C++ ABI, `SOVERSION` 6→7; existing C API signatures unchanged and the on-disk format is unchanged). OKI compaction now runs in the background with size-tiered suffix merges and immutable read views; point lookups use larger blooms. The core NIF does not touch the changed internal C++ interfaces, so no NIF / Erlang source changes are required — just rebuild. The local embedding backend moves to llama.cpp **`v1.0.0`** (ggml 1.0.0)

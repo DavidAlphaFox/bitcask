@@ -111,6 +111,12 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     remove             = a("remove");
     sync_on_commit     = a("sync_on_commit");
     no_sync            = a("no_sync");
+    check              = a("check");
+    absent             = a("absent");
+    ord                = a("ord");
+    conflict           = a("conflict");
+    condition_failed   = a("condition_failed");
+    return_ords        = a("return_ords");
 
     key                = a("key");
     op                 = a("op");

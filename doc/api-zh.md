@@ -237,8 +237,9 @@ embedder 生成并写入向量；显式传 `vector` 则跳过。
 即整批截断）。
 
 > ⚠️ 原子性与持久性**正交**：没 fsync 就掉电仍可能整批丢失，但绝不半批。
-> ⚠️ **不提供隔离性（I）与 CAS**：中间态对并发读者可见；键集重叠的并发提交无
-> 定序保证，需应用层串行化。键集不相交则并发安全。
+> ⚠️ **不提供隔离性（I）**：中间态对并发读者可见；不带条件时键集重叠的并发提交
+> 无定序保证（后写覆盖）。键集不相交则并发安全。要「读了再写」不丢更新，用下面的
+> 前置条件（libbitcask 8.0.0）。
 > ⚠️ **首次调用把目录 `bitcask.meta` 懒升级为 v6**，此后不能被早于上游 5.1.0 的
 > 读端打开。从不调用的目录停留在 v5。
 
@@ -251,6 +252,33 @@ embedder 生成并写入向量；显式传 `vector` 则跳过。
 `txn_commit` 比 `put_batch_atomic` 多一层校验：批非空、key 非空、key 互不重复、
 不占用 `"_txn:"` 保留前缀。违反任一条 → `{error, {invalid_option, Msg}}` 且
 **零副作用**。`Sync` 取值非法 → `function_clause`（Erlang 层就挡掉）。
+
+#### 前置条件（乐观并发，libbitcask 8.0.0）
+
+| 函数 / 形态 | 说明 |
+|------|------|
+| `get_with_ord(Handle, Key) -> {ok, Value, Ord} \| not_found \| {error,_}` | 读值并带回 key 当前记录的 LSN。LSN 只在 key 被写入时改变（merge 搬迁、重开、索引重建都原样保留），可当版本号用 |
+| `{put, Key, Value, Cond}` · `{remove, Key, Cond}` | 带条件的写 / 删；`Value` 也可以是 doc map |
+| `{check, Key, Cond}` | 只校验不写 |
+| `Cond :: absent \| {ord, N}` | `absent`：key 不存在（从未写过 / 已删 / 已过期，口径同 `get` 的 `not_found`）；`{ord, N}`：key 当前 LSN = N |
+| `put_batch_atomic(Handle, Ops, [return_ords]) -> {ok, [Ord]}` | 成功时带回每个 op 落盘记录的 LSN（与 `Ops` 等长，check 为 0），可直接当下一轮 `{ord, N}` |
+
+全部条件在引擎写锁内、任何字节落盘前，对照**批开始前**的状态判断（批内同 key 多次
+也一样）。任一不成立 → `{error, {conflict, OpIndex}}`（`OpIndex` 从 1 起，是 `Ops`
+里的位置），**整批零副作用**，调用方重读重试。`put_batch_atomic` 与 `txn_commit` 都认；
+`txn_commit` 的 key 互不重复规则照旧（check 的 key 不能再出现在别的 op 里）。
+
+```erlang
+incr(H, K) ->
+    {ok, <<N:64>>, Ord} = bitcask:get_with_ord(H, K),
+    case bitcask:put_batch_atomic(H, [{put, K, <<(N + 1):64>>, {ord, Ord}}]) of
+        ok                     -> ok;
+        {error, {conflict, 1}} -> incr(H, K)          % 有人先改了：重读重试
+    end.
+```
+
+事务层对应的是 `bitcask_txn:read_guarded/3`（`doc/txn-layer-design-zh.md` §4.8）：读的同时登记版本，提交时
+自动带条件——直通写者插进来只会让事务重跑。
 
 ---
 

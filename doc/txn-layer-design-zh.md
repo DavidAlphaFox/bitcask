@@ -257,10 +257,18 @@ commit(Tx):
 
 ### 4.8 与脏写的关系（契约声明）
 
-`bitcask:put/3`、`graphdb:put_edge/4` 等直通 API 与事务锁**完全无
-交互**——绕过锁的事务外写入，与事务并发时的行为未定义（等价 Mnesia
-dirty op）。同一批 key 要么全走事务、要么全走直通，混用自担。
-未来引擎级条件批（§9）落地后可作为热 key 的兜底校验。
+`bitcask:put/3` 等直通 API 与事务锁**完全无交互**——绕过锁的事务外写入，
+与经 `read/2,3` 读的事务并发时，行为未定义（等价 Mnesia dirty op）。
+
+**版本守卫（libbitcask 8.0.0 条件批落地后）**：`read_guarded/3` = `read/3` +
+记下读到的版本（key 的 LSN，或「不存在」）。提交时这些版本作为前置条件进
+同一条提交批：写过的 key 条件挂在它的 put / remove 上，只读过的 key 变成
+`{check, K, Cond}`。直通写者在读与提交之间改了守卫 key → 引擎拒批
+（`{error, {conflict, _}}`）→ 按 `{?RESTART, {conflict, _}}` 走与死锁相同的重跑
+路径、消耗同一份 `{retries, N}` 预算。于是**经 `read_guarded` 读的 key 可以与
+直通写混用**：直通写者插进来只会让事务重跑，不会被事务覆盖。
+只在第一次从引擎读到时登记（缓冲命中不登记、再读不覆盖）；只读事务（缓冲为空）
+不提交，也就不校验。`graphdb` v2 的邻接表头一律经它读。
 
 ## 5. API 设计
 
@@ -431,6 +439,10 @@ DB 教科书做法是层级锁 + IS/IX 意向锁。这里 key 空间是扁平的
 - `#txn.waiting` 语义不变（同一时刻最多等一把）。
 
 ### 12.3 graphdb 消费
+
+> 图层 v2（2026-11-18，`doc/graph-adjacency-pack-design-zh.md` §8）起不再用前缀锁：
+> 锁粒度是顶点的邻接表头（点锁，经 `read_guarded/3` 读），持有头的锁即覆盖它名下
+> 全部块。下面是 v1 时期的记录。
 
 `out_edges_txn` / `in_edges_txn`（前缀读锁 + 合并缓冲，etype/limit 同直通版）、
 `degree_txn/2`、`del_vertex_txn`（`e<vid>` / `ei<vid>` 前缀**写**锁下级联：

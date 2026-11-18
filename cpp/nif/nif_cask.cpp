@@ -75,6 +75,35 @@ ERL_NIF_TERM nif_cask_get(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[
     return make_ok(env, val_bin);
 }
 
+// libbitcask 8.0.0（S46）：cask_get_ord(Ref, Key) -> {ok, Value, Ord} | not_found
+// | {error, _}。Value 形态同 cask_get（KV 模式 binary、索引模式 #{text, meta}）；
+// Ord 是该 key 当前记录的 LSN——只在 key 被写入时改变（merge 搬迁、重开、
+// OKI 重建都原样保留），可直接作为原子批前置条件 {ord, Ord}。
+ERL_NIF_TERM nif_cask_get_ord(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {
+    auto h = lock_cask_checked(env, argv[0]);
+    ErlNifBinary key{};
+    if (!h || !h->cask || !ensure_binary(env, argv[1], key)) {
+        return enif_make_badarg(env);
+    }
+    auto r = h->cask->get(as_bytes(key));
+    if (!r) return fault_to_term(env, r.error());
+    ERL_NIF_TERM value;
+    if (h->cask->has_search()) {
+        value = enif_make_new_map(env);
+        ERL_NIF_TERM text_val = make_binary_checked(env, r->value);
+        if (!text_val) return make_error(env, atoms().allocation_error);
+        enif_make_map_put(env, value, atoms().text, text_val, &value);
+        ERL_NIF_TERM meta_val = r->meta.empty() ? atoms().undefined
+                                               : make_binary_checked(env, r->meta);
+        if (!meta_val) return make_error(env, atoms().allocation_error);
+        enif_make_map_put(env, value, atoms().meta, meta_val, &value);
+    } else {
+        value = make_binary_checked(env, r->value);
+        if (!value) return make_error(env, atoms().allocation_error);
+    }
+    return enif_make_tuple3(env, atoms().ok, value, enif_make_uint64(env, r->ord));
+}
+
 // libbitcask 6.8.0：结构化文档读回。get/2 保持 KV 热路径不变；调用方显式
 // 要求 fields 时才用 get_doc_owned，field id 由 field.schema 翻回原名。
 ERL_NIF_TERM nif_cask_get_doc(ErlNifEnv* env, int /*argc*/, const ERL_NIF_TERM argv[]) {

@@ -190,6 +190,10 @@ ERL_NIF_TERM fault_to_term(ErlNifEnv* env, const CaskFault& f) noexcept {
         // 出来。按 6.1.0 的纪律：新错误码直接给 `{error, Tag}`，不带常量
         // detail；破坏证据本身就是调用方该处理的语义。
         case CaskError::kIndexCorrupt:   tag = atoms().index_corrupt; break;
+        // libbitcask 8.0.0：原子批前置条件不成立。批 NIF 自己拿 BatchOutcome
+        // 拼 {error, {conflict, OpIndex}}，走不到这里；这里是没有 op 下标时
+        // 的兜底形态。
+        case CaskError::kConditionFailed: tag = atoms().condition_failed; break;
         case CaskError::kModeMismatch:   return atoms().mode_mismatch;
         case CaskError::kClosed:         return atoms().closed;
         default:                         tag = atoms().error; break;

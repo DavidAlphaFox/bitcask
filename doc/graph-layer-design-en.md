@@ -4,6 +4,12 @@
 graph storage scheme built on libbitcask as the sole storage engine with Erlang as the
 execution layer.
 
+> ⚠️ **The on-disk layout and write path are superseded by v2** (2026-11-18): two KVs
+> per vertex (vertex + packed adjacency list) plus LSN-conditional writes — see
+> [graph-adjacency-pack-design-en.md](graph-adjacency-pack-design-en.md). The `e` / `ei` / `et` / `deg` / `degi` families described here are only read
+> by the `graphdb_migrate` tool; the traversal algorithms, OLAP materialization and
+> etype registry still apply.
+
 Status: 📐 Design. **This document supersedes the 2.2.1 "whole graph as one CSR value"
 scheme**: its core constraint (hash keydir → no prefix scans, range degrades to
 O(all keys)) was invalidated by the OKI ordered-range capability shipped in 6.0.0.

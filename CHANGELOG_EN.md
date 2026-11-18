@@ -3,6 +3,82 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [8.0.0] — 2026-11-18
+
+Upgrades libbitcask **7.0.3 → 8.0.0** (an upstream MAJOR, S46 conditional atomic batches:
+the C API is purely additive; the C++ headers append members and defaulted parameters —
+source-compatible but the C++ ABI changes, `SOVERSION` 7→8; on-disk format unchanged). The
+submodule moves from `ce7ce13` (`7.0.3`) to upstream `eade59e` (`8.0.0`). On top of it the
+graph layer switches to the **v2 layout** (an on-disk breaking change; existing graph stores
+need an offline migration, see below).
+
+> ⚠️ **Upgrade note**: directories written by `graphdb` 6.5.0–7.0.3 make `graphdb:open/2`
+> return `{error, graph_layout_v1}` in this release; run
+> `graphdb_migrate:v1_to_v2(SrcDir, DstDir)` into a new directory first. Plain KV / search
+> directories are unaffected.
+
+### Added (with libbitcask 8.0.0)
+
+- **Atomic-batch preconditions (optimistic concurrency)**: ops in `put_batch_atomic` /
+  `txn_commit` may carry `Cond :: absent | {ord, N}` — `{put, K, V, Cond}` (V may be a doc
+  map), `{remove, K, Cond}`, `{check, K, Cond}` (validate only). Conditions are checked
+  under the engine write lock, before anything is written, against the pre-batch state;
+  any failure → `{error, {conflict, OpIndex}}` (1-based) with zero side effects.
+  Unrecognized shapes raise `badarg`.
+- **`bitcask:get_with_ord/2`**: `{ok, Value, Ord}`, where Ord is the LSN of the key's
+  current record (changes only on write; preserved by merge / reopen / index rebuild), for
+  `{ord, Ord}` conditions.
+- **`bitcask:put_batch_atomic/3`**: with `[return_ords]` a success returns `{ok, [Ord]}`
+  (each op's record LSN, 0 for checks).
+- **`bitcask_txn:read_guarded/3`**: records the version it reads; at commit, written keys
+  carry the condition on their op and read-only keys become checks. A direct writer
+  slipping in makes the transaction conflict and re-run through the deadlock restart path,
+  so keys read this way can be mixed with direct writes without lost updates.
+- NIF: `cask_get_ord/2`, `cask_put_batch_atomic/3`; `CaskError::kConditionFailed` without
+  an op index falls back to `{error, condition_failed}`.
+
+### Changed — graph layer v2 (`doc/graph-adjacency-pack-design-en.md`)
+
+- **Two KVs per vertex**: `n<vid>` (vertex, unchanged) + `a<vid>` (adjacency head: out / in
+  groups with per-group degree). Hubs whose adjacency exceeds `adj_inline_max` (default
+  4 KiB) split their largest group into chunks (`a<vid><dir><etype><o><r>`, each ≤
+  `adj_chunk_max`); edge properties over `props_inline_max` (default 128 B) go to the `p`
+  family. `e` / `ei` / `et` / `deg` / `degi` are retired. The key count drops from
+  "3 × edges + counter keys" to "2 × vertices + chunks" — 17× fewer in the low-degree
+  benchmark, 145× fewer at average degree 50.
+- **An edge write is a conditional write on both endpoint heads with conflict retry**
+  (8 attempts with exponential jitter by default, `retries => N | infinity`, exhausted →
+  `{error, conflict}`): concurrent direct writers lose no edges, degrees stay exact and both
+  sides stay symmetric — **no more single-writer rule**. The cost is write amplification: at
+  average degree 50 about 3× log bytes per edge and ~0.36× single-edge write throughput
+  (on par with v1 at low degree).
+- **Reads**: neighbors / degree are one point read (one hop 2–10× faster); `out_edges` /
+  `in_edges` gain `consistent => true` (head LSN compared before and after reading chunks).
+  `edges_by_type` now scans the `a` family (O(V + E)) and returns properties.
+  `graphdb_analytics:materialize` reads the `a` family.
+- **Transactional API**: locks are taken on the vertices' adjacency heads (no prefix locks)
+  and heads are read via `read_guarded` — **direct and transactional writes can be mixed**.
+- **Layout version**: `graphdb:open/2` writes a `g` key on creation (layout 2 + chunking
+  parameters, authoritative afterwards); opening a v1 store returns
+  `{error, graph_layout_v1}`.
+
+### Added — graph layer
+
+- `graphdb:put_edges/2,3`, `del_edges/2,3` (stably sorted by src, then aggregated per
+  vertex into independently atomic batches of ≤ `batch_vids` vertices, default 256;
+  `sort => false` keeps input order. Degree-50 bulk load runs at 88.6k edges/s, 1.05× v1;
+  253k edges/s with the whole graph in one batch), `in_degree/2,3`, `del_vertex/3` (`retries`, `batch_neighbors => N | infinity`), `akey/1`, `pkey/4`, `graph_config/1`,
+  `check_invariants/1` (scans the `a` / `p` families checking symmetry, degrees, chunk
+  directories and external properties).
+- `graphdb_migrate:v1_to_v2/2,3`, `verify/2,3`: streaming v1 → v2 offline migration (two
+  range cursors merged by vid), read-only on the source, per-vertex verification afterwards.
+- `test/graphdb_bench` reworked for v2 with a v1 reference (key count, bytes, migration time).
+
+### Removed
+
+- `graphdb:ekey/3,4`, `eikey/3,4` (v1 key codec). The v1 counter fallback path and the
+  prefix-lock versions of `out_edges_txn` / `del_vertex_txn` are retired with the layout.
+
 ## [7.0.3] — 2026-11-17
 
 Upgrades libbitcask **7.0.2 → 7.0.3** (an upstream PATCH: the index pipeline removes global

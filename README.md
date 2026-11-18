@@ -120,9 +120,14 @@ ok
 
 > `txn_commit` 比 `put_batch_atomic` 多一层校验（非空 / key 非空 / key 不重复 /
 > 不占用 `_txn:` 前缀），第三参可选 `sync_on_commit`（默认）或 `no_sync`。
-> ⚠️ 两者**不提供隔离性与 CAS**——中间态对并发读者可见，键集重叠的并发提交
-> 需应用层串行化。⚠️ **首次调用把目录 meta 懒升级为 v6**，此后不能被早于
-> 上游 5.1.0 的读端打开。
+> ⚠️ 两者**不提供隔离性**——中间态对并发读者可见。⚠️ **首次调用把目录 meta
+> 懒升级为 v6**，此后不能被早于上游 5.1.0 的读端打开。
+>
+> **前置条件（乐观并发，libbitcask 8.0.0）**：op 可以多带一个
+> `Cond :: absent | {ord, N}`——`{put, K, V, Cond}` / `{remove, K, Cond}` /
+> `{check, K, Cond}`（只校验）。`N` 来自 `bitcask:get_with_ord/2`。条件在引擎写锁内
+> 对照批前状态判断，任一不成立 → `{error, {conflict, OpIndex}}`、整批零副作用，重读
+> 重试即可；`put_batch_atomic(H, Ops, [return_ords])` 成功时带回各 op 的 LSN。
 
 **事务（隔离性）**（`bitcask_txn`，6.5.1）— 在原子批之上补齐隔离：悲观 2PL +
 死锁检测 + 自动重跑（Mnesia 三件套的单节点版），引擎零改动、纯 OTP：
@@ -155,9 +160,11 @@ ok
 > 死锁 / 单锁等待超时 → 丢缓冲**原样重跑 Fun**（`{retries, N}` 默认 10，耗尽
 > `{aborted, {retry_limit, N}}`）；`{timeout, Ms}` 是跨重跑的总预算。
 > ⚠️ **Fun 必须无副作用**（可能执行多次）；⚠️ `bitcask:put/get` 直通 API 绕过锁，
-> 与事务混用同一批 key 的行为未定义。设计：`doc/txn-layer-design-zh.md`。
+> 与经 `read/2,3` 读的事务混用同一批 key 的行为未定义——要混用就改用
+> `bitcask_txn:read_guarded/3`：读到的版本在提交时作为条件带上，直通写者插进来
+> 只会让事务重跑。设计：`doc/txn-layer-design-zh.md`。
 > 图层同款：`graphdb:transaction(R, fun(Tx) -> graphdb:put_edge_txn(Tx, 1, 7, 2) end)`
-> ——边的五个键（正向/反向/et/deg/degi）锁下同批提交，并发加边计数精确。
+> ——两端邻接表头锁下同批提交；图层的直通写本身就是条件写，两者可以混用。
 
 **幂等键**（`{idem_key, K}`）— 调用方在提交途中被 kill 拿不到结果时，用同一个
 键重试是安全的：同一个 K 至多提交一次，重来直接返回首次结果、不再跑 Fun：
@@ -311,13 +318,15 @@ ok
 | `get/2`, `get_doc/2`, `put/3`, `delete/2`, `sync/1` | 核心 KV 操作；`get_doc` 读回结构化文档命名字段 |
 | `fold/3,6`, `fold_keys/3,6`, `list_keys/1` | 迭代（**快照一致**，代价 O(全表)） |
 | `range/2,3`, `range_fold/5` | 有序范围查询 `[Lo, Hi)`，代价 **O(range)**；per-key 弱一致（非快照）；`{prefetch, N}` 可批量并发取值 |
-| `put_batch_atomic/2`, `txn_commit/2,3` | 跨崩溃原子批 / 多键事务；`Ops :: [{put,K,V} \| {remove,K}]`；⚠️ 首次调用把目录 meta 懒升级为 v6 |
-| `bitcask_txn:transaction/2,3`, `read/2,3`, `write/3`, `delete/2`, `abort/1` | **隔离事务**：2PL 点锁 + 死锁检测 + 重跑；`{atomic,R} \| {aborted,Why}`；选项 `retries`/`timeout`/`lock_wait_timeout`/`sync`/`index_fun`；`read/3` 的 `write` 模式给读-改-写用 |
+| `put_batch_atomic/2,3`, `txn_commit/2,3` | 跨崩溃原子批 / 多键事务；`Ops :: [{put,K,V} \| {remove,K}]`，可带前置条件 `{put,K,V,Cond}` / `{remove,K,Cond}` / `{check,K,Cond}`（`Cond :: absent \| {ord,N}`，不成立 → `{error,{conflict,I}}`）；`/3` 的 `[return_ords]` 带回各 op 的 LSN；⚠️ 首次调用把目录 meta 懒升级为 v6 |
+| `get_with_ord/2` | 读值并带回 key 当前 LSN（`{ok, V, Ord}`），给前置条件 `{ord, Ord}` 用 |
+| `bitcask_txn:transaction/2,3`, `read/2,3`, `read_guarded/3`, `write/3`, `delete/2`, `abort/1` | **隔离事务**：2PL 点锁 + 死锁检测 + 重跑；`{atomic,R} \| {aborted,Why}`；选项 `retries`/`timeout`/`lock_wait_timeout`/`sync`/`index_fun`；`read/3` 的 `write` 模式给读-改-写用；`read_guarded/3` 把读到的版本带进提交条件（与直通写混用不丢更新） |
 | `bitcask:put_docs/2` | **批量写文档**：`[{Key, Doc}]`，需要嵌入的文本**一次** `embed_batch` 完成；嵌入失败不写任何一条，某条 put 失败返回 `{error, {Key, Reason}}`（非原子） |
 | `bitcask_txn:idem_lookup/2`, `idem_purge/2,3` | **幂等键**（`transaction/3` 选项 `{idem_key, K}`，`{idem_result, false}` 不存结果）：同键至多提交一次，重来返回首次结果；`idem_lookup` 不上锁自查，`idem_purge(H, MaxAgeSec [, [{chunk, N}]])` 流式按块清理旧标记 |
 | `bitcask_txn:lock_key/3` | **点锁**：只拿锁不读写（同 `mnesia:lock`），给锁下直接操作引擎的调用方 |
 | `bitcask_txn:lock_prefix/3`, `prefix_range/2,3` | **前缀锁**：罩住以 Prefix 开头的全部 key（含将来的）；`prefix_range` = 前缀锁 + range + 合并本事务缓冲，事务内扫描无幻读 |
-| `graphdb:transaction/2,3`, `put_edge_txn/4,5`, `del_edge_txn/4,5`, `edge_txn/4,5`, `degree_txn/2,3`, `put_vertex_txn/3`, `get_vertex_txn/2`, `out_edges_txn/2,3`, `in_edges_txn/2,3`, `del_vertex_txn/2` | 图层事务式读写：边五键 + 计数器锁下同批提交，并发计数精确；邻接扫描前缀锁无幻读；`del_vertex_txn` 级联一批提交；与直通 `put_edge` 不要混用于同一图 |
+| `graphdb:put_edge/4,5`, `del_edge/4,5`, `put_edges/2,3`, `del_edges/2,3`, `out_edges/2,3`, `in_edges/2,3`, `degree/2,3`, `in_degree/2,3`, `del_vertex/2`, `check_invariants/1` | **图层 v2**：一个顶点两个 KV（顶点 + 邻接表打包，hub 分块）；写边 = 两端头的条件写 + 冲突重试（`retries => N \| infinity`），并发不丢边；取邻居 / 度数一次点查；`consistent => true` 给分块顶点原子快照；`graphdb_migrate:v1_to_v2/2,3` 离线迁移 v1 库 |
+| `graphdb:transaction/2,3`, `put_edge_txn/4,5`, `del_edge_txn/4,5`, `edge_txn/4,5`, `degree_txn/2,3`, `put_vertex_txn/3`, `get_vertex_txn/2`, `out_edges_txn/2,3`, `in_edges_txn/2,3`, `del_vertex_txn/2` | 图层事务式读写：锁两端邻接表头、同批提交；头经 `read_guarded` 读，可与直通写混用；`del_vertex_txn` 级联一批提交 |
 | `stream/1`, `next/1`, `stop/1`, `with_stream/2` | 流式迭代 |
 | `merge/1,2,3`, `needs_merge/1,2`, `status/1` | 合并管理 |
 | `search_text/2,3,4`, `search_phrase/2,3,4`, `search_fields/2,3,4`, `search_fields_attributed/2,3,4` | BM25 检索（全文 / 短语 / `field:term^boost`；归属版附命中字段）；末参为 meta filter |
@@ -342,7 +351,8 @@ ok
 | `doc/put-flow-zh.md` | put(K,V) 完整调用链 |
 | `doc/vector-db-design-zh.md` | 向量库设计方案（V1–V6 蓝图） |
 | `doc/vector-search-extension-zh.md` | 向量搜索扩展：HNSW + RRF 混合检索 |
-| `doc/graph-layer-design-zh.md` / `-en.md` | **图处理层设计**（KV per-key：k=顶点、OKI range 遍历 + OLAP 物化层；已落地 `graphdb`/`graphdb_analytics`） |
+| `doc/graph-adjacency-pack-design-zh.md` / `-en.md` | **图层 v2**：一个顶点两个 KV（邻接表打包 + hub 分块）+ 按 LSN 的条件写；盘上契约、写路径、迁移、基准 |
+| `doc/graph-layer-design-zh.md` / `-en.md` | **图处理层设计 v1**（KV per-key；盘上布局已被 v2 取代，遍历 / OLAP 物化 / etype 注册仍有效） |
 | `doc/txn-layer-design-zh.md` | **事务协调层设计**（原子批之上的 2PL + 死锁检测 + 重跑；§11 实现对账、§12 前缀锁、§13 锁管理器分片） |
 | `doc/hnsw-design-zh.md` | HNSW 向量索引设计（并发/持久化/RRF/实施表） |
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
@@ -367,7 +377,8 @@ ok
 - **3.1.0**（2026-07-01）— 升级 libbitcask v3.1.0（ABI 不破坏）：`{max_read_handles, unlimited}` / `{auto_compact_dead_ratio, R}` 选项、错误原子 `closed`；随库引入 read 句柄默认上限（按 `RLIMIT_NOFILE` 自动推导）、`bitcask.meta` v3 加 CRC32、field.schema FSCH v1 头 + CRC
 - **4.0.0**（2026-07-13）— 升级 libbitcask v4.0.0（ABI 破坏，`SOVERSION` 3→4，源码级兼容）：`{vector_engine, hnsw|ivfrq|diskann}` 向量双引擎 + 调优选项、`{auto_checkpoint_min_docs, N}` 崩溃恢复重放有界；随库引入 IVF-RaBitQ-lite 引擎、DiskANN 引擎（实验性）、AVX2 int8 内核、HNSW `.qc8` mmap 化；`examples/` Wikipedia 检索库示例
 - **4.1.0**（2026-07-15）— 升级 libbitcask v4.1.0（ABI 不破坏，`SOVERSION` 保持 4，盘上格式不变）：对 Erlang 调用方**无 API 变更**，重编即得；随库引入 Phase 5/6 深度审计成果——修复 `close/1` 拆卸路径的进程级永久挂死（`IndexPool` 计数泄漏 + `unregister_lib` 无界 `flush`）、hnsw 三处原子写 rename 前补 `fdatasync`（此前崩溃即半截文件）、`RowChunks`/`MmapSegment` 资源泄漏；`file_util` 归并使 fsync 纪律 4 套收敛为 1 套
-- **7.0.3**（2026-11-17，当前版本）— 升级 libbitcask 7.0.2 → **7.0.3**（PATCH，索引管线去全局顺序化：key + LSN 裁决、分片并发应用；修复大 `put_batch` 死锁、`close()` 逃生门、checkpoint 覆盖水位高估和旧 OKI BM25 分数漂移；C API 签名、盘上格式与 `SOVERSION` 7 不变，C++ 头面须同版重编）。Erlang 新增 `index_stale_dropped/1` 诊断
+- **8.0.0**（2026-11-18，当前版本）— 升级 libbitcask 7.0.3 → **8.0.0**（MAJOR，S46 原子批条件写：C API 纯加法，C++ ABI 变化，`SOVERSION` 7→8，盘上格式不变）。门面新增 `get_with_ord/2`、带条件的批 op（`absent | {ord, N}`、`check`，冲突 `{error, {conflict, I}}`）、`put_batch_atomic/3`；事务层新增 `read_guarded/3`。**图层 v2**：一个顶点两个 KV（邻接表打包、hub 分块），写边是两端头的条件写 + 冲突重试，并发不丢边；key 数降 17×–145×、一跳快 2–10×，代价是高度数下写放大约 3×。⚠️ 盘上破坏性变更：旧图库 `graphdb:open/2` 返回 `{error, graph_layout_v1}`，先用 `graphdb_migrate:v1_to_v2/2` 迁移
+- **7.0.3**（2026-11-17）— 升级 libbitcask 7.0.2 → **7.0.3**（PATCH，索引管线去全局顺序化：key + LSN 裁决、分片并发应用；修复大 `put_batch` 死锁、`close()` 逃生门、checkpoint 覆盖水位高估和旧 OKI BM25 分数漂移；C API 签名、盘上格式与 `SOVERSION` 7 不变，C++ 头面须同版重编）。Erlang 新增 `index_stale_dropped/1` 诊断
 - **7.0.2**（2026-11-16）— 升级 libbitcask 7.0.1 → **7.0.2**（PATCH，纯缺陷修复：Windows `atomic_rename` 对共享冲突做有界重试；MSVC 大端读取改用标准 `std::byteswap`；C API 签名、盘上格式与 `SOVERSION` 7 不变）。Linux / macOS 行为不变，NIF / Erlang 代码零改动，重编即得
 - **7.0.1**（2026-11-16）— 升级 libbitcask 7.0.0 → **7.0.1**（PATCH，纯缺陷修复：迭代器用过之后再写一次不再让 `flush_index` 永久阻塞；C API 签名、盘上格式与 `SOVERSION` 7 不变）。NIF / Erlang 代码零改动，重编即得；曾被卡住的库重开即恢复
 - **7.0.0**（2026-11-16）— 升级 libbitcask 6.9.1 → **7.0.0**（C++ ABI 破坏，`SOVERSION` 6→7；C API 既有签名零增删改，盘上格式不变）。OKI 改为分级后台归并与不可变读视图，点查换更大 bloom；核心 NIF 不直接触及其变更的内部 C++ 接口，NIF / Erlang 代码零改动，重编即得。本地嵌入后端 llama.cpp 升至 **`v1.0.0`**（ggml 1.0.0）

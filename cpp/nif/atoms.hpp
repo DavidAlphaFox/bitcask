@@ -145,6 +145,18 @@ struct Atoms {
     ERL_NIF_TERM remove;
     ERL_NIF_TERM sync_on_commit;
     ERL_NIF_TERM no_sync;
+    // libbitcask 8.0.0 S46：批内前置条件。
+    //   check = 只校验不写的 op（{check, K, Cond}）；
+    //   absent / ord = Cond 取值（absent | {ord, N}）；
+    //   conflict = 条件不成立时的错误标签 {error, {conflict, OpIndex}}；
+    //   condition_failed = 拿不到 op 下标时的兜底（fault_to_term 直译）；
+    //   return_ords = put_batch_atomic/3 的选项：成功时带回各 op 的 LSN。
+    ERL_NIF_TERM check;
+    ERL_NIF_TERM absent;
+    ERL_NIF_TERM ord;
+    ERL_NIF_TERM conflict;
+    ERL_NIF_TERM condition_failed;
+    ERL_NIF_TERM return_ords;
 
     // V5:metadata filter 解析所需的 atom。
     //   conditions/children = 嵌套 MetaFilter 的 map 字段;

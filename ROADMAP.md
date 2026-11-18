@@ -6,6 +6,22 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 8.0.0 落地
+
+### libbitcask 升级 7.0.3 → 8.0.0 ✅
+
+上游 MAJOR（S46 原子批条件写）：C API 纯加法，C++ 头面追加成员与带缺省值的形参，
+`SOVERSION` 7→8，盘上格式零改动。门面新增 `get_with_ord/2`、带条件的批 op
+（`absent | {ord, N}`、`check`）、`put_batch_atomic/3`（`return_ords`），事务层新增
+`read_guarded/3`（版本守卫，直通写与事务写可混用）。子模块切到上游 `8.0.0`（`eade59e`）。
+
+### 图层 v2：一个顶点两个 KV ✅
+
+设计 `doc/graph-adjacency-pack-design-zh.md`。邻接表打包进一个 value（hub 分块），
+key 数从「3 × 边数」降到「2 × 顶点数」；写边 = 两端头的条件写 + 冲突重试，并发不丢边、
+不再要求单写者；一跳读取一次点查。代价是写放大（度数 50 时每边日志约 3×）。盘上
+破坏性变更：`graphdb_migrate:v1_to_v2/2,3` 离线迁移。
+
 ## 7.0.3 落地
 
 ### libbitcask 升级 7.0.2 → 7.0.3 ✅

@@ -22,7 +22,7 @@ set(BITCASK_PRIV_DIR "${CMAKE_SOURCE_DIR}/priv")
 file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 
 # ---------------------------------------------------------------------------
-# libbitcask — git submodule at third_party/libbitcask (7.0.3, commit ce7ce13)。
+# libbitcask — git submodule at third_party/libbitcask (8.0.0, commit eade59e)。
 # 提供 C++ 核心库全部 target（bitcask_cask, bitcask_keydir, ...）。
 #
 # ⚠️ 6.2.1 起**不再需要 third_party 符号链接**。此前 libbitcask 的
@@ -146,6 +146,12 @@ file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 # 死锁、close 逃生门、checkpoint 水位高估与旧 OKI BM25 分数漂移。C API 签名、
 # 盘上格式与 SOVERSION 零改动；NIF 必须与头文件同版重编，Erlang 门面新增
 # index_stale_dropped/1 诊断。
+# 8.0.0：MAJOR（SOVERSION 7→8）——S46 原子批条件写。C API 纯加法（错误码 17 +
+# bitcask_cond_op_t + *_cond 函数）；C++ 头面 BatchOp / TxnOp 追加 expect /
+# expect_ord、新 op 型 kCheck、put_batch_atomic / TxnCask::commit 追加可空出参
+# BatchOutcome*——源码兼容、C++ ABI 变化，重编即可。盘上格式零改动。NIF 接入：
+# 批 op 认 {put,K,V,Cond} / {remove,K,Cond} / {check,K,Cond}，冲突映射为
+# {error, {conflict, OpIndex}}；新增 cask_get_ord/2、cask_put_batch_atomic/3。
 
 # ---------------------------------------------------------------------------
 add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/libbitcask"

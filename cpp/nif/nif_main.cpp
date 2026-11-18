@@ -40,6 +40,7 @@ ERL_NIF_TERM nif_cask_open              (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_close             (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_get               (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_get_doc           (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_get_ord           (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_put               (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_delete            (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_sync              (ErlNifEnv*, int, const ERL_NIF_TERM[]);
@@ -98,6 +99,7 @@ ErlNifFunc kNifFuncs[] = {
     {"cask_get",               2, guarded<nif_cask_get>,              0},
     // 6.8.0 get_doc 显式解码 fields；仍与 get 同档（单次定位 + 读记录）。
     {"cask_get_doc",           2, guarded<nif_cask_get_doc>,          0},
+    {"cask_get_ord",           2, guarded<nif_cask_get_ord>,          0},
     {"cask_put",               3, guarded<nif_cask_put>,              0},
     {"cask_delete",            2, guarded<nif_cask_delete>,           0},
     {"cask_sync",              1, guarded<nif_cask_sync>,             ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -155,6 +157,7 @@ ErlNifFunc kNifFuncs[] = {
     // --- v5.1.0 原子批 / 多键事务 ---
     // 批大小无上界 + 提交点可能 fsync，一律 dirty IO。
     {"cask_put_batch_atomic",  2, guarded<nif_cask_put_batch_atomic>, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"cask_put_batch_atomic",  3, guarded<nif_cask_put_batch_atomic>, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"cask_txn_commit",        3, guarded<nif_cask_txn_commit>,       ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"cask_txn_commit",        4, guarded<nif_cask_txn_commit>,       ERL_NIF_DIRTY_JOB_IO_BOUND},
     // 提交令牌：只分配 / 置位，主调度线程。

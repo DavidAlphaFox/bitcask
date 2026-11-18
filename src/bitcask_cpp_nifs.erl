@@ -13,6 +13,7 @@
          cask_close/1,
          cask_get/2,
          cask_get_doc/2,
+         cask_get_ord/2,
          cask_put/3,
          cask_delete/2,
          cask_sync/1,
@@ -49,6 +50,7 @@
          cask_range_release/1,
          %% v5.1.0 S34/S35：引擎原子批 + 多键事务
          cask_put_batch_atomic/2,
+         cask_put_batch_atomic/3,
          cask_txn_commit/3,
          cask_txn_commit/4,
          txn_commit_token/2,
@@ -88,6 +90,9 @@ cask_get(_Ref, _Key)          -> erlang:nif_error({error, not_loaded}).
 %% 返回 #{text => binary(), meta => binary() | undefined,
 %%        vector => binary() | undefined, fields => #{binary() => binary()}}。
 cask_get_doc(_Ref, _Key)      -> erlang:nif_error({error, not_loaded}).
+%% libbitcask 8.0.0（S46）：{ok, Value, Ord} | not_found | {error, _}。Value 同
+%% cask_get；Ord 是 key 当前记录的 LSN，作原子批前置条件 {ord, Ord} 用。
+cask_get_ord(_Ref, _Key)      -> erlang:nif_error({error, not_loaded}).
 cask_put(_Ref, _Key, _Val)    -> erlang:nif_error({error, not_loaded}).
 cask_delete(_Ref, _Key)       -> erlang:nif_error({error, not_loaded}).
 cask_sync(_Ref)               -> erlang:nif_error({error, not_loaded}).
@@ -197,12 +202,21 @@ cask_range_release(_IterRef)   -> erlang:nif_error({error, not_loaded}).
 %%                        空批是 no-op（不碰 meta 纪元）。
 %% cask_txn_commit：TxnCask.commit，多一层校验（非空 / key 非空 / key 互不
 %%                  重复 / 不占用 "_txn:" 保留前缀）+ 提交点 fsync 策略。
-%%                  不提供隔离性与 CAS——中间态对并发读者可见，键集重叠的
-%%                  并发 commit 需应用层串行化。
+%%                  不提供隔离性——中间态对并发读者可见。
+%%
+%% libbitcask 8.0.0（S46）：两者的 op 都可带前置条件——
+%%   {put, K, V, Cond} / {remove, K, Cond} / {check, K, Cond}
+%%   Cond :: absent | {ord, N}
+%% 条件在引擎写锁内对照批前状态判断，任一不成立 → {error, {conflict, I}}
+%%（I 从 1 起，是 Ops 里的位置），整批零副作用。cask_put_batch_atomic/3 的
+%% Opts 含 return_ords 时成功返回 {ok, [Ord]}（与 Ops 等长，check 为 0）。
 %% -----------------------------------------------------------------------
 %% 失败形态同上：可能是 `{error, _}`，也可能是裸 atom（如 `closed`）。
 -spec cask_put_batch_atomic(reference(), list()) -> ok | {error, term()} | atom().
 cask_put_batch_atomic(_Ref, _Ops) -> erlang:nif_error({error, not_loaded}).
+-spec cask_put_batch_atomic(reference(), list(), [return_ords]) ->
+    ok | {ok, [non_neg_integer()]} | {error, term()} | atom().
+cask_put_batch_atomic(_Ref, _Ops, _Opts) -> erlang:nif_error({error, not_loaded}).
 -spec cask_txn_commit(reference(), list(), sync_on_commit | no_sync) ->
     ok | {error, term()} | atom().
 cask_txn_commit(_Ref, _Ops, _Sync) -> erlang:nif_error({error, not_loaded}).

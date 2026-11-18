@@ -30,6 +30,7 @@
          close/1,
          close_write_file/1,
          get/2,
+         get_with_ord/2,
          get_doc/2,
          put/3,
          put_docs/2,
@@ -42,7 +43,7 @@
          stream/1, next/1, stop/1, with_stream/2,
          merge/1, merge/2, merge/3,
          range/2, range/3, range_fold/5, prefix_succ/1,
-         put_batch_atomic/2,
+         put_batch_atomic/2, put_batch_atomic/3,
          txn_commit/2, txn_commit/3, txn_commit/4,
          needs_merge/1,
          needs_merge/2,
@@ -354,6 +355,18 @@ close_write_file(Handle) ->
 get(Handle, Key) ->
     bitcask_cpp_nifs:cask_get(ref(Handle), Key).
 
+%% 读 Key 并带回它当前记录的 LSN（libbitcask 8.0.0）。
+%% 返回 {ok, Value, Ord} | not_found | {error, Reason}；Value 形态同 get/2。
+%% Ord 只在 key 被写入时改变——merge 搬迁、重开、索引重建都原样保留——所以
+%% 可以当版本号用：put_batch_atomic/2,3 / txn_commit 的 op 带 {ord, Ord} 前置
+%% 条件，提交时若有人改过这个 key 就整批不写、返回 {error, {conflict, I}}。
+get_with_ord(Handle, Key) ->
+    case bitcask_cpp_nifs:cask_get_ord(ref(Handle), Key) of
+        {ok, _V, _O} = Ok -> Ok;
+        not_found         -> not_found;
+        Other             -> normalize_error(Other)
+    end.
+
 %% 读结构化文档并取回命名字段（libbitcask 6.8.0）。与 get/2 不同，这条是
 %% 显式读文档入口；fields 是 #{FieldName => Value}，向量 / meta 缺省为
 %% undefined。覆盖写仍是全量 fields 替换。
@@ -450,7 +463,7 @@ fill_vectors({_Ref, Ctx}, Keys, Values) ->
 
 %% 批 ops 里 {put, K, DocMap} 的自动 embed：只动 doc map，顺序与形态不变。
 fill_batch_vectors(Handle, Ops) ->
-    Puts = [{K, V} || {put, K, V} <- Ops, is_map(V)],
+    Puts = [{K, V} || Op <- Ops, {put, K, V} <- [put_kv(Op)], is_map(V)],
     case Puts of
         [] -> {ok, Ops};
         _ ->
@@ -461,8 +474,14 @@ fill_batch_vectors(Handle, Ops) ->
     end.
 
 refill([{put, K, V} | Ops], [F | Fs]) when is_map(V) -> [{put, K, F} | refill(Ops, Fs)];
+refill([{put, K, V, C} | Ops], [F | Fs]) when is_map(V) -> [{put, K, F, C} | refill(Ops, Fs)];
 refill([Op | Ops], Fs)                               -> [Op | refill(Ops, Fs)];
 refill([], [])                                       -> [].
+
+%% 批里的写 op（带不带前置条件都算）→ {put, K, V}；别的形态 → none。
+put_kv({put, K, V})     -> {put, K, V};
+put_kv({put, K, V, _C}) -> {put, K, V};
+put_kv(_)               -> none.
 
 %% 逐条 put；到这里的 #{text} 文档要么已带 vector、要么没有 embedder，put/3
 %% 都不会再去 embed。
@@ -671,8 +690,16 @@ range_loop(IterRef, Fun, Acc) ->
 %% ⚠️ **首次调用把目录 bitcask.meta 懒升级为 v6**，此后不能被早于 5.1.0 的
 %% 读端打开。从不调这两个入口的目录停留在 v5，与旧读端双向互开。
 %%
-%% 不提供隔离性（I）与 CAS：事务中间态对并发读者可见；键集重叠的并发
-%% 提交无定序保证，需应用层自行串行化。键集不相交则并发安全。
+%% 不提供隔离性（I）：事务中间态对并发读者可见。
+%%
+%% 前置条件（libbitcask 8.0.0，乐观并发）——op 可以多带一个 Cond：
+%%   {put, Key, Value, Cond} | {remove, Key, Cond} | {check, Key, Cond}
+%%   Cond :: absent          —— 期望 key 不存在（从未写过 / 已删 / 已过期）
+%%         | {ord, N}        —— 期望 key 当前 LSN = N（N 来自 get_with_ord/2）
+%% check 只校验不写。全部条件在引擎写锁内、任何字节落盘前对照**批开始前**
+%% 的状态判断（批内同 key 多次也一样）；任一不成立 → 整批零副作用，返回
+%% {error, {conflict, OpIndex}}（OpIndex 从 1 起，是 Ops 里的位置），调用方
+%% 重读重试即可。不带条件的 op 行为不变：键集重叠的并发提交仍是后写覆盖。
 %% =========================================================================
 
 %% 裸原子批：允许批内同 key 多次（依序 apply = 批内 LWW），空批是 no-op。
@@ -681,6 +708,19 @@ put_batch_atomic(Handle, Ops0) ->
         case bitcask_cpp_nifs:cask_put_batch_atomic(ref(Handle), Ops) of
             ok    -> ok;
             Other -> normalize_error(Other)   % 裸 atom 故障归一，同 range_fold
+        end
+    end).
+
+%% 同 /2，Opts：
+%%   return_ords —— 成功时返回 {ok, [Ord]}：每个 op 落盘记录的 LSN（与 Ops
+%%                  等长，check op 为 0），可直接当下一轮 {ord, N} 条件，不必
+%%                  重读。不带这个选项时成功返回 ok。
+put_batch_atomic(Handle, Ops0, Opts) when is_list(Opts) ->
+    with_vectors(Handle, Ops0, fun(Ops) ->
+        case bitcask_cpp_nifs:cask_put_batch_atomic(ref(Handle), Ops, Opts) of
+            ok             -> ok;
+            {ok, _} = Ok   -> Ok;
+            Other          -> normalize_error(Other)
         end
     end).
 

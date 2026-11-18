@@ -260,9 +260,11 @@ truncates the whole batch at recovery).
 
 > ⚠️ Atomicity and durability are **orthogonal**: without an fsync, power loss can
 > still lose the entire batch — but never half of one.
-> ⚠️ **No isolation (I) and no CAS**: intermediate state is visible to concurrent
-> readers; concurrent commits with overlapping key sets have no ordering
-> guarantee and must be serialized by the application. Disjoint key sets are safe.
+> ⚠️ **No isolation (I)**: intermediate state is visible to concurrent readers;
+> without conditions, concurrent commits with overlapping key sets have no
+> ordering guarantee (last writer wins). Disjoint key sets are safe. For
+> read-modify-write without lost updates, use the preconditions below
+> (libbitcask 8.0.0).
 > ⚠️ **The first call lazily upgrades the directory's `bitcask.meta` to v6**,
 > after which readers older than upstream 5.1.0 cannot open it. Directories that
 > never call it stay at v5.
@@ -277,6 +279,36 @@ truncates the whole batch at recovery).
 keys, no duplicate keys, and no use of the reserved `"_txn:"` prefix. A violation
 returns `{error, {invalid_option, Msg}}` with **zero side effects**. An invalid
 `Sync` raises `function_clause` (rejected in the Erlang layer).
+
+#### Preconditions (optimistic concurrency, libbitcask 8.0.0)
+
+| Function / shape | Notes |
+|----------|-------|
+| `get_with_ord(Handle, Key) -> {ok, Value, Ord} \| not_found \| {error,_}` | Reads the value plus the LSN of the key's current record. The LSN changes only when the key is written (merge relocation, reopen and index rebuild all preserve it), so it works as a version |
+| `{put, Key, Value, Cond}` · `{remove, Key, Cond}` | Conditional write / delete; `Value` may also be a doc map |
+| `{check, Key, Cond}` | Validate only, write nothing |
+| `Cond :: absent \| {ord, N}` | `absent`: the key does not exist (never written / deleted / expired — same as `get` returning `not_found`); `{ord, N}`: the key's current LSN is N |
+| `put_batch_atomic(Handle, Ops, [return_ords]) -> {ok, [Ord]}` | On success returns each op's record LSN (same length as `Ops`, 0 for checks), usable directly as the next `{ord, N}` |
+
+All conditions are checked under the engine write lock, before any byte is
+written, against the state **before the batch** (also when a key repeats within
+the batch). If any fails → `{error, {conflict, OpIndex}}` (`OpIndex` is 1-based,
+the position in `Ops`) with **zero side effects**; re-read and retry. Both
+`put_batch_atomic` and `txn_commit` accept them; `txn_commit` still requires
+distinct keys (a check's key may not appear in another op).
+
+```erlang
+incr(H, K) ->
+    {ok, <<N:64>>, Ord} = bitcask:get_with_ord(H, K),
+    case bitcask:put_batch_atomic(H, [{put, K, <<(N + 1):64>>, {ord, Ord}}]) of
+        ok                     -> ok;
+        {error, {conflict, 1}} -> incr(H, K)          % someone got there first: retry
+    end.
+```
+
+The transaction-layer counterpart is `bitcask_txn:read_guarded/3`: it records the
+version it read and adds the condition at commit, so a direct writer slipping in
+only makes the transaction re-run.
 
 ---
 

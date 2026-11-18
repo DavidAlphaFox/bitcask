@@ -69,12 +69,20 @@
 %%
 %%   锁的粒度是 {CaskRef, Key}：不同 cask 的同名 key 互不干扰。
 %%
+%%   版本守卫（libbitcask 8.0.0 条件写）：read_guarded/3 = read/3 + 记下读到的
+%%   版本（key 的 LSN，或"不存在"）。提交时这些版本作为前置条件进同一条提交批：
+%%   写过的 key 条件挂在它的 put / remove 上，只读过的 key 变成 {check, K, Cond}。
+%%   绕过锁的直通写者在读与提交之间改了它 → 引擎拒批 → 事务按冲突**原样重跑**
+%%   （与死锁同一条重启路径、同一份 {retries, N} 预算）。于是直通写与事务写
+%%   可以混用于同一批 key：直通写者插进来只会让事务重跑，不会被事务覆盖。
+%%   只用 read/2,3 的 key 不受影响（仍是"直通写与事务并发行为未定义"）。
+%%
 %% Copyright (c) 2010 Basho Technologies, Inc. — Apache License 2.0.
 %% =========================================================================
 -module(bitcask_txn).
 
 -export([transaction/2, transaction/3,
-         read/2, read/3, write/3, delete/2, abort/1,
+         read/2, read/3, read_guarded/3, write/3, delete/2, abort/1,
          lock_key/3, lock_prefix/3, prefix_range/2, prefix_range/3,
          handle/1,
          idem_lookup/2, idem_purge/2, idem_purge/3]).
@@ -210,6 +218,7 @@ run_once(Handle, Fun, Cfg) ->
     BufKey = buf_key(TxnId),
     put(BufKey, #{}),
     put(locks_key(TxnId), {#{}, #{}}),        % {点锁 Key => Mode, 前缀锁 Prefix => Mode}
+    put(guards_key(TxnId), #{}),              % 版本守卫 Key => absent | {ord, N}
     try
         case idem_seen(Tx) of
             {ok, Prev} ->
@@ -231,7 +240,8 @@ run_once(Handle, Fun, Cfg) ->
             release(TxnId), {aborted, {Reason, Stack}}
     after
         erase(BufKey),
-        erase(locks_key(TxnId))
+        erase(locks_key(TxnId)),
+        erase(guards_key(TxnId))
     end.
 
 release(TxnId) ->
@@ -242,8 +252,9 @@ release(TxnId) ->
 handle_ref({Ref, _Ctx}) when is_reference(Ref) -> Ref;
 handle_ref(Bad) -> erlang:error({badarg, Bad}).
 
-buf_key(TxnId)   -> {?MODULE, TxnId}.
-locks_key(TxnId) -> {?MODULE, locks, TxnId}.
+buf_key(TxnId)    -> {?MODULE, TxnId}.
+locks_key(TxnId)  -> {?MODULE, locks, TxnId}.
+guards_key(TxnId) -> {?MODULE, guards, TxnId}.
 
 %% =========================================================================
 %% 事务内 API
@@ -267,6 +278,34 @@ read(#bitcask_txn_ctx{handle = Handle} = Tx, Key, Lock)
         {ok, {put, Val}} -> {ok, Val};
         {ok, delete}     -> not_found;
         error            -> bitcask:get(Handle, Key)
+    end.
+
+%% 同 read/3，另外把读到的版本登记为提交前置条件（模块头「版本守卫」）。
+%% 只在**第一次从引擎读到**时登记——缓冲命中（读自己的写）不登记，同一个
+%% key 再读也不覆盖首次读到的版本。
+-spec read_guarded(term(), binary(), read | write) ->
+          {ok, binary() | map()} | not_found | {error, term()}.
+read_guarded(#bitcask_txn_ctx{id = TxnId, handle = Handle} = Tx, Key, Lock)
+  when is_binary(Key), (Lock =:= read orelse Lock =:= write) ->
+    Buf = buffer(Tx),
+    lock(Tx, Key, Lock),
+    case maps:find(Key, Buf) of
+        {ok, {put, Val}} -> {ok, Val};
+        {ok, delete}     -> not_found;
+        error ->
+            case bitcask:get_with_ord(Handle, Key) of
+                {ok, Val, Ord} -> guard(TxnId, Key, {ord, Ord}), {ok, Val};
+                not_found      -> guard(TxnId, Key, absent), not_found;
+                {error, _} = E -> E
+            end
+    end.
+
+guard(TxnId, Key, Cond) ->
+    GK = guards_key(TxnId),
+    G = get(GK),
+    case maps:is_key(Key, G) of
+        true  -> ok;
+        false -> put(GK, G#{Key => Cond}), ok
     end.
 
 %% Val 是 binary，或 doc map（与 bitcask:put/3 同形；libbitcask 6.6.2 起提交批
@@ -415,16 +454,31 @@ commit(#bitcask_txn_ctx{id = TxnId, idem = Idem} = Tx, Result) ->
             {atomic, Result};
         false ->
             Sorted = lists:sort(maps:to_list(Buf)),
-            Main = [case Op of
-                        {put, V} -> {put, K, V};
-                        delete   -> {remove, K}
-                    end || {K, Op} <- Sorted],
-            Extra = index_ops(Tx, Sorted, Buf),
-            case commit_notified(Tx, Main ++ Extra ++ idem_ops(Tx, Result)) of
-                ok              -> {atomic, Result};
-                {error, Reason} -> {aborted, {commit_failed, Reason}}
+            Guards = get(guards_key(TxnId)),
+            Main = [guarded_op(K, Op, maps:find(K, Guards)) || {K, Op} <- Sorted],
+            Extra0 = index_ops(Tx, Sorted, Buf),
+            %% index_fun 写到的 key 若也被守卫过：条件挂在那条 op 上，不再另发
+            %% check（TxnCask 要求 key 互不重复）。
+            Extra = [guard_extra(Op, maps:find(extra_key(Op), Guards)) || Op <- Extra0],
+            Written = maps:merge(Buf, maps:from_list([{extra_key(Op), true} || Op <- Extra0])),
+            Checks = [{check, K, C} || {K, C} <- lists:sort(maps:to_list(Guards)),
+                                       not maps:is_key(K, Written)],
+            case commit_notified(Tx, Main ++ Checks ++ Extra ++ idem_ops(Tx, Result)) of
+                ok                         -> {atomic, Result};
+                {error, {conflict, _} = C} -> throw({?RESTART, C});
+                {error, Reason}            -> {aborted, {commit_failed, Reason}}
             end
     end.
+
+%% 缓冲项 → 提交批 op；登记过版本守卫的 key 把条件挂在 op 上。
+guarded_op(K, {put, V}, error)      -> {put, K, V};
+guarded_op(K, delete, error)        -> {remove, K};
+guarded_op(K, {put, V}, {ok, Cond}) -> {put, K, V, Cond};
+guarded_op(K, delete, {ok, Cond})   -> {remove, K, Cond}.
+
+guard_extra(Op, error)                    -> Op;
+guard_extra({put, K, V}, {ok, Cond})      -> {put, K, V, Cond};
+guard_extra({remove, K}, {ok, Cond})      -> {remove, K, Cond}.
 
 %% 带一个提交令牌进 NIF：调用方死在提交途中，locker 不按 DOWN 放锁，而是
 %% 等令牌析构的通知——锁一直持到这批不会再动盘（见 bitcask_txn_locker:

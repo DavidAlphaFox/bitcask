@@ -1,87 +1,133 @@
 #!/usr/bin/env escript
 
-%% graphdb_bench — 图存储层（graphdb / graphdb_analytics）手动基准。
+%% graphdb_bench — 图存储层 v2（graphdb / graphdb_analytics）手动基准。
 %%
 %% 用法：
-%%   test/graphdb_bench [n_vertices] [n_edges] [bfs_hops]
-%% 缺省：10000 顶点 / 50000 边 / BFS 3 跳。
+%%   test/graphdb_bench [n_vertices] [n_edges] [bfs_hops] [adj_inline_max]
+%% 缺省：10000 顶点 / 50000 边 / BFS 3 跳 / 4096（adj_chunk_max 取同值）。
 %%
-%% 口径（设计文档 P5）：
-%%   1. bulk load        — put_edge 逐条灌边（每条 = 原子批五键 + upsert 点查）
-%%   2. one-hop latency  — out_edges 单跳前缀扫描，随机顶点取平均
-%%   3. bfs K-hop        — 随机起点 K 跳 BFS 墙钟
-%%   4. materialize      — e 家族 → 内存 CSR
-%%   5. pagerank         — 20 轮迭代封顶
+%% 口径（doc/graph-adjacency-pack-design-zh.md §12）：
+%%   1. bulk load put_edge   — 逐条加边（每条 = 读两端头 + 一条带条件的原子批）
+%%   2. bulk load put_edges  — 同一份边走批量接口（默认：按 src 排序、每批 ≤ 256 顶点）；
+%%                             另记不排序（sort => false）与 batch_vids => 4096 两种对照
+%%   3. keys / bytes / bytes per edge — key 数、数据目录字节数（put_edges 那份）
+%%   4. one-hop latency      — out_edges 单跳，随机顶点取平均
+%%   5. bfs K-hop / materialize / pagerank
+%%   6. steady-state one-hop — reopen 后
+%%   7. v1 参照              — 同一份边按 v1 布局写（每边一条 5 记录的原子批：
+%%                             e / ei / et / deg / degi），记 key 数、字节数；
+%%                             再用 graphdb_migrate 迁到 v2，记迁移耗时
 %% 墙钟取 timer:tc；固定随机种子保证可复现。源为幂律近似（小 id 高频），
 %% 制造真实度分布（含 hub）。
 
 -mode(compile).
 
 main(Args) ->
-    [NV, NE, Hops] = case Args of
-                         [A, B, C] -> [list_to_integer(A), list_to_integer(B),
-                                       list_to_integer(C)];
-                         [A, B]    -> [list_to_integer(A), list_to_integer(B), 3];
-                         [A]       -> [list_to_integer(A), 50000, 3];
-                         _         -> [10000, 50000, 3]
-                     end,
-    run(NV, NE, Hops).
+    Ints = [list_to_integer(A) || A <- Args],
+    [NV, NE, Hops, Inline] = Ints ++ lists:nthtail(length(Ints), [10000, 50000, 3, 4096]),
+    run(NV, NE, Hops, Inline).
 
-run(NV, NE, Hops) ->
+run(NV, NE, Hops, Inline) ->
     code:add_pathsz(filelib:wildcard("_build/test/lib/*/ebin")
                     ++ filelib:wildcard("_build/default/lib/*/ebin")),
-    Dir = "/tmp/graphdb_bench_" ++ integer_to_list(erlang:unique_integer([positive])),
-    ok = filelib:ensure_path(Dir),
-    io:format("== graphdb bench: ~p vertices / ~p edges / BFS ~p hops ==~n",
-              [NV, NE, Hops]),
-    R = graphdb:open(Dir, [read_write]),
+    {ok, _} = application:ensure_all_started(bitcask),
+    Base = "/tmp/graphdb_bench_" ++ integer_to_list(erlang:unique_integer([positive])),
+    [D1, D2, DV1, DM] = [Base ++ S || S <- ["_edge", "_edges", "_v1", "_mig"]],
+    GOpts = [{adj_inline_max, Inline}, {adj_chunk_max, Inline}],
+    io:format("== graphdb v2 bench: ~p vertices / ~p edges / BFS ~p hops / inline ~p ==~n",
+              [NV, NE, Hops, Inline]),
     rand:seed(exsss, {42, 43, 44}),
+    Edges = [{src_vid(NV), 7, rand:uniform(NV)} || _ <- lists:seq(1, NE)],
 
-    {TLoad, ok} = timer:tc(fun() ->
-        [ok = graphdb:put_edge(R, src_vid(NV), 7, rand:uniform(NV))
-         || _ <- lists:seq(1, NE)],
-        ok
-    end),
-    report("bulk load (put_edge)", TLoad, NE, "edges"),
+    R1 = graphdb:open(D1, [read_write | GOpts]),
+    {TLoad1, ok} = timer:tc(fun() -> lists:foreach(fun({S, T, D}) -> ok = graphdb:put_edge(R1, S, T, D) end, Edges) end),
+    report("bulk load (put_edge)", TLoad1, NE, "edges"),
+    ok = graphdb:close(R1),
+
+    lists:foreach(
+      fun({Label, O}) ->
+              DX = Base ++ "_x",
+              RX = graphdb:open(DX, [read_write | GOpts]),
+              {TX, ok} = timer:tc(fun() -> graphdb:put_edges(RX, Edges, O) end),
+              ok = graphdb:close(RX),
+              io:format("~-24s ~10.1f ms total, ~10.1f edges/s, ~.1f B/edge~n",
+                        [Label, TX / 1000, NE / (TX / 1000000), dir_bytes(DX) / NE]),
+              os:cmd("rm -rf " ++ DX)
+      end, [{"put_edges unsorted", #{sort => false}},
+            {"put_edges batch 4096", #{batch_vids => 4096}}]),
+
+    R = graphdb:open(D2, [read_write | GOpts]),
+    {TLoad2, ok} = timer:tc(fun() -> graphdb:put_edges(R, Edges) end),
+    report("bulk load (put_edges)", TLoad2, NE, "edges"),
+    {ok, #{edges := NUniq, chunks := NChunks}} = graphdb:check_invariants(R),
+    NKeys = length(bitcask:list_keys(R)),
+    io:format("~-24s ~10w keys (~w distinct edges, ~w chunks)~n", ["keys", NKeys, NUniq, NChunks]),
 
     Probe = [rand:uniform(NV) || _ <- lists:seq(1, 1000)],
-    %% 预热：排除首次 iterator 打开的冷启动噪声
-    [graphdb:out_edges(R, V) || V <- lists:sublist(Probe, 50)],
-    {T1Hop, _} = timer:tc(fun() ->
-        [graphdb:out_edges(R, V) || V <- Probe]
-    end),
-    io:format("~-24s ~10.3f ms/op (~p ops)~n",
-              ["one-hop out_edges", T1Hop / 1000 / 1000, 1000]),
+    [graphdb:out_edges(R, V) || V <- lists:sublist(Probe, 50)],      %% 预热
+    {T1Hop, _} = timer:tc(fun() -> [graphdb:out_edges(R, V) || V <- Probe] end),
+    io:format("~-24s ~10.3f ms/op (~p ops)~n", ["one-hop out_edges", T1Hop / 1000 / 1000, 1000]),
 
-    {TBfs, _Reach} = timer:tc(fun() ->
-        graphdb:bfs(R, 1, #{depth => Hops})
-    end),
+    {TBfs, _} = timer:tc(fun() -> graphdb:bfs(R, 1, #{depth => Hops}) end),
     io:format("~-24s ~10.1f ms (~p hops)~n", ["bfs", TBfs / 1000, Hops]),
 
-    {TMat, MatRes} = timer:tc(fun() ->
-        graphdb_analytics:materialize(R, #{})
-    end),
-    {ok, Csr} = MatRes,
+    {TMat, {ok, Csr}} = timer:tc(fun() -> graphdb_analytics:materialize(R, #{}) end),
     io:format("~-24s ~10.1f ms (~p V, ~p E csr)~n",
-              ["materialize", TMat / 1000,
-               graphdb_analytics:vertex_count(Csr),
+              ["materialize", TMat / 1000, graphdb_analytics:vertex_count(Csr),
                graphdb_analytics:edge_count(Csr)]),
-
-    {TPr, _Ranks} = timer:tc(fun() ->
-        graphdb_analytics:pagerank(Csr, #{max_iter => 20})
-    end),
+    {TPr, _} = timer:tc(fun() -> graphdb_analytics:pagerank(Csr, #{max_iter => 20}) end),
     io:format("~-24s ~10.1f ms~n", ["pagerank (<=20 it)", TPr / 1000]),
 
-    %% 6. steady-state one-hop（reopen 后：memdelta 已 flush 成 sealed run）
     ok = graphdb:close(R),
-    R2 = graphdb:open(Dir, [read_write]),
-    {TSteady, _} = timer:tc(fun() ->
-        [graphdb:out_edges(R2, V) || V <- Probe]
-    end),
-    io:format("~-24s ~10.3f ms/op (~p ops, post-flush)~n",
+    io:format("~-24s ~10w bytes (~.1f B/edge)~n",
+              ["data bytes (put_edges)", dir_bytes(D2), dir_bytes(D2) / NE]),
+    io:format("~-24s ~10w bytes (~.1f B/edge)~n",
+              ["data bytes (put_edge)", dir_bytes(D1), dir_bytes(D1) / NE]),
+    R2 = graphdb:open(D2, [read_write]),
+    {TSteady, _} = timer:tc(fun() -> [graphdb:out_edges(R2, V) || V <- Probe] end),
+    io:format("~-24s ~10.3f ms/op (~p ops, post-reopen)~n",
               ["one-hop steady-state", TSteady / 1000 / 1000, 1000]),
     ok = graphdb:close(R2),
-    os:cmd("rm -rf " ++ Dir).
+
+    %% v1 参照：同一份边按 v1 的写法（每边一条 5 记录的原子批）
+    B = bitcask:open(DV1, [read_write]),
+    {TV1, ok} = timer:tc(fun() -> write_v1(B, Edges) end),
+    report("v1 layout load (ref)", TV1, NE, "edges"),
+    NKeysV1 = length(bitcask:list_keys(B)),
+    ok = bitcask:close(B),
+    io:format("~-24s ~10w keys / ~w bytes (~.1f B/edge)~n",
+              ["v1 keys / bytes", NKeysV1, dir_bytes(DV1), dir_bytes(DV1) / NE]),
+    {TMig, {ok, MStats}} = timer:tc(fun() -> graphdb_migrate:v1_to_v2(DV1, DM, GOpts) end),
+    io:format("~-24s ~10.1f ms (~p, verified)~n", ["migrate v1 -> v2", TMig / 1000, MStats]),
+    os:cmd("rm -rf " ++ Base ++ "_*").
+
+%% v1 put_edge 的盘上效果：e / ei / et 三键 + deg / degi 两个计数器（读-改-写）。
+write_v1(B, Edges) ->
+    lists:foreach(
+      fun({S, T, D}) ->
+              EK = <<"e", S:64/big, T:32/big, D:64/big, 0:64/big>>,
+              case bitcask:get(B, EK) of
+                  {ok, _} -> ok;
+                  not_found ->
+                      DK = <<"deg", S:64/big, T:32/big>>,
+                      DIK = <<"degi", D:64/big, T:32/big>>,
+                      ok = bitcask:put_batch_atomic(
+                             B, [{put, EK, <<>>},
+                                 {put, <<"ei", D:64/big, T:32/big, S:64/big, 0:64/big>>, <<>>},
+                                 {put, <<"et", T:32/big, S:64/big, D:64/big, 0:64/big>>, <<>>},
+                                 {put, DK, <<(bump(B, DK)):64>>},
+                                 {put, DIK, <<(bump(B, DIK)):64>>}])
+              end
+      end, Edges).
+
+bump(B, K) ->
+    case bitcask:get(B, K) of
+        {ok, <<N:64>>} -> N + 1;
+        not_found      -> 1
+    end.
+
+dir_bytes(Dir) ->
+    lists:sum([filelib:file_size(F) || F <- filelib:wildcard(Dir ++ "/*.data")]).
 
 %% 幂律近似：src = NV × U²（U 均匀）→ 小 id 高频，制造 hub。
 src_vid(NV) ->

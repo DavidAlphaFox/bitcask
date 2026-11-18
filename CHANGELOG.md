@@ -3,6 +3,70 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [8.0.0] — 2026-11-18
+
+升级 libbitcask **7.0.3 → 8.0.0**（上游 MAJOR，S46 原子批条件写：C API 纯加法，C++
+头面追加成员与带缺省值的形参——源码兼容、C++ ABI 变化，`SOVERSION` 7→8；盘上格式
+零改动）。子模块从 `ce7ce13`（`7.0.3`）切到上游 `eade59e`（`8.0.0`）。借这项引擎能力
+把图层换成 **v2 布局**（盘上破坏性变更，旧图库需离线迁移，见下）。
+
+> ⚠️ **升级须知**：用 6.5.0–7.0.3 的 `graphdb` 写过的目录，本版 `graphdb:open/2` 返回
+> `{error, graph_layout_v1}`；先 `graphdb_migrate:v1_to_v2(SrcDir, DstDir)` 迁到新目录。
+> 不用图层的 KV / 检索目录不受影响。
+
+### Added（随 libbitcask 8.0.0）
+
+- **原子批前置条件（乐观并发）**：`put_batch_atomic` / `txn_commit` 的 op 可带
+  `Cond :: absent | {ord, N}`——`{put, K, V, Cond}`（V 可为 doc map）、
+  `{remove, K, Cond}`、`{check, K, Cond}`（只校验不写）。条件在引擎写锁内、落盘前
+  对照批前状态判断，任一不成立 → `{error, {conflict, OpIndex}}`（从 1 起），整批零
+  副作用。形态不认一律 `badarg`。
+- **`bitcask:get_with_ord/2`**：`{ok, Value, Ord}`，Ord 是 key 当前记录的 LSN（只在
+  写入时改变，merge / 重开 / 索引重建都保留），作 `{ord, Ord}` 条件用。
+- **`bitcask:put_batch_atomic/3`**：`[return_ords]` 时成功返回 `{ok, [Ord]}`（各 op
+  落盘记录的 LSN，check 为 0）。
+- **`bitcask_txn:read_guarded/3`**：读的同时登记版本，提交时写过的 key 把条件挂在
+  op 上、只读过的 key 变成 check；直通写者插进来 → 事务冲突、按死锁同一路径重跑。
+  经它读的 key 可以与直通写混用而不丢更新。
+- NIF：`cask_get_ord/2`、`cask_put_batch_atomic/3`；`CaskError::kConditionFailed`
+  无 op 下标时兜底为 `{error, condition_failed}`。
+
+### Changed — 图层 v2（`doc/graph-adjacency-pack-design-zh.md`）
+
+- **一个顶点两个 KV**：`n<vid>`（顶点，不变）+ `a<vid>`（邻接表头：出 / 入边组、
+  组内度数）。邻接表超过 `adj_inline_max`（默认 4 KiB）的 hub 把最大的组拆成块
+  （`a<vid><dir><etype><o><r>`，单块 ≤ `adj_chunk_max`）；超过 `props_inline_max`
+  （默认 128 B）的边属性落 `p` 家族。`e` / `ei` / `et` / `deg` / `degi` 全部退役。
+  key 数从「3 × 边数 + 计数键」降到「2 × 顶点数 + 块数」——基准里低度数图降 17×、
+  平均度数 50 降 145×。
+- **写边 = 两端头的条件写 + 冲突重试**（默认 8 次、指数抖动，`retries => N | infinity`
+  可调，耗尽 `{error, conflict}`）：并发直通写不丢边、度数精确、两端对称，**不再有
+  「单写者」约定**。代价是写放大：平均度数 50 时每边日志字节约 3×、单边写吞吐约
+  0.36×（低度数时与 v1 同档）。
+- **读**：取邻居 / 度数一次点查（一跳快 2–10×）；`out_edges` / `in_edges` 新增
+  `consistent => true`（分块顶点读前读后比对头 LSN）。`edges_by_type` 改为扫 `a`
+  家族（O(V + E)），并带上属性。`graphdb_analytics:materialize` 改读 `a` 家族。
+- **事务式 API**：锁粒度改为顶点的邻接表头（不再用前缀锁），头经 `read_guarded`
+  读——**直通写与事务写可以混用**。
+- **布局版本**：`graphdb:open/2` 建库写 `g` 键（布局 2 + 分块参数，之后以它为准）；
+  打开 v1 库返回 `{error, graph_layout_v1}`。
+
+### Added — 图层
+
+- `graphdb:put_edges/2,3`、`del_edges/2,3`（先按 src 稳定排序、再按顶点聚合切批，每批
+  ≤ `batch_vids`（默认 256）个顶点、独立原子；`sort => false` 保持输入顺序。度数 50 的图
+  批量装载 88.6k 边/秒，为 v1 的 1.05×；整图一批时 253k 边/秒）、
+  `in_degree/2,3`、`del_vertex/3`（`retries`、`batch_neighbors => N | infinity`）、`akey/1`、`pkey/4`、`graph_config/1`、`check_invariants/1`（扫
+  `a` / `p` 家族核对对称、度数、块目录、外置属性）。
+- `graphdb_migrate:v1_to_v2/2,3`、`verify/2,3`：v1 → v2 离线迁移，流式（两路 range
+  游标按 vid 归并），源库只读，迁移后逐顶点核对。
+- `test/graphdb_bench` 改为 v2 口径并带 v1 参照（key 数、字节数、迁移耗时）。
+
+### Removed
+
+- `graphdb:ekey/3,4`、`eikey/3,4`（v1 key codec）。v1 的计数器回退路径、前缀锁版的
+  `out_edges_txn` / `del_vertex_txn` 随布局一起退役。
+
 ## [7.0.3] — 2026-11-17
 
 升级 libbitcask **7.0.2 → 7.0.3**（上游 PATCH：索引管线去全局顺序化，并修复大

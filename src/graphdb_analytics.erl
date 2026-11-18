@@ -1,8 +1,8 @@
 %% =========================================================================
 %% graphdb_analytics — 图 OLAP：CSR 物化缓存 + 样例算法（设计文档 P4 / §7）
 %%
-%% graphdb（KV per-key）负责图 OLTP；本模块把 `e` 家族（或单 etype 的 `et`
-%% 家族）流式物化为**进程内 CSR**（xadj/adjncy 双向：正向 + 转置），随后
+%% graphdb 负责图 OLTP；本模块把 `a` 家族（图层 v2 的邻接表，可按 etype
+%% 过滤）流式物化为**进程内 CSR**（xadj/adjncy 双向：正向 + 转置），随后
 %% PageRank / 连通分量 / SSSP 全部在内存索引上迭代——零 KV 访问。物化结果
 %% 是可再生缓存：底层图变更后丢弃重建即可（设计文档 §7「缓存语义，非真源」）。
 %%
@@ -40,11 +40,11 @@
 -export_type([csr/0]).
 
 %% =========================================================================
-%% materialize — e / et 家族 → 内存 CSR
+%% materialize — `a` 家族（邻接表）→ 内存 CSR
 %%
 %% Opts:
-%%   etype => T   只物化该类型的边（走 et 家族前缀扫描，O(该类型边数)）；
-%%                缺省物化全图（走 e 家族全扫，O(全表)）。
+%%   etype => T   只物化该类型的边；缺省物化全图。两种都是扫一遍 `a` 家族
+%%                （图层 v2 没有按类型的全局索引），只解出边组。
 %% 重边（同 (src,dst) 多 etype / 多 rank）物化时去重——邻接语义按简单图。
 %% =========================================================================
 
@@ -55,33 +55,40 @@ materialize(Handle, Opts) when is_map(Opts) ->
         {ok, Pairs}    -> {ok, build_csr(lists:usort(Pairs))}
     end.
 
-%% 收集 (Src, Dst) 对：只 cons 进列表，最后一次 usort 去重——range 按 key 序
-%% 出货，输入近乎有序，归并排序比逐边 gb_sets 插入便宜得多。
-collect_edges(Handle, undefined) ->
-    Fun = fun(K, _V, _T, _O, Acc) ->
-              case K of
-                  <<"e", S:64/big, _Tt:32/big, D:64/big, _Rr:64/big>> ->
-                      [{S, D} | Acc];
-                  _ -> Acc                                 %% 病理 vid 防御
-              end
-          end,
-    scan(Handle, <<"e">>, <<"f">>, Fun, []);
+%% 收集 (Src, Dst) 对：头里的内联出边组直接解；分块的出边组，它的块 key 以头
+%% key 为前缀，按 key 序紧跟在头后面出现，扫到时解块。range 按 key 序出货，
+%% 输入近乎有序，最后一次 usort 去重。
 collect_edges(Handle, Etype) ->
-    Fun = fun(K, _V, _T, _O, Acc) ->
-              case K of
-                  <<"et", Etype:32/big, S:64/big, D:64/big, _Rr:64/big>> ->
-                      [{S, D} | Acc];
-                  _ -> Acc
-              end
+    Want = fun(T) -> Etype =:= undefined orelse T =:= Etype end,
+    Fun = fun(<<"a", S:64/big>>, V, _T, _O, Acc) ->
+                  case graphdb_adj:groups_info(vbin(V)) of
+                      {ok, Gs} ->
+                          lists:foldl(fun({0, T, _C, {entries, Es}}, A) ->
+                                              case Want(T) of
+                                                  true  -> [{S, D} || {D, _R, _P} <- Es] ++ A;
+                                                  false -> A
+                                              end;
+                                         (_, A) -> A
+                                      end, Acc, Gs);
+                      error -> Acc
+                  end;
+             (<<"a", S:64/big, 0:8, T:32/big, _:128>>, V, _T, _O, Acc) ->
+                  case Want(T) andalso graphdb_adj:decode_chunk(vbin(V)) of
+                      {ok, Es} -> [{S, D} || {D, _R, _P} <- Es] ++ Acc;
+                      _        -> Acc
+                  end;
+             (_, _, _, _, Acc) -> Acc                     %% 非图层 key / 入边块
           end,
-    Lo = <<"et", Etype:32/big>>,
-    scan(Handle, Lo, graphdb:succ(Lo), Fun, []).
+    scan(Handle, <<"a">>, <<"b">>, Fun, []).
 
 scan(Handle, Lo, Hi, Fun, Acc0) ->
     case bitcask:range_fold(Handle, {Lo, Hi}, [], Fun, Acc0) of
         {error, _} = E -> E;
         Acc            -> {ok, Acc}
     end.
+
+vbin(#{text := T}) -> T;
+vbin(B) when is_binary(B) -> B.
 
 %% 排序去重后的边对 → 双向 CSR 二进制。
 build_csr(EdgeList) ->

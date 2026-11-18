@@ -636,6 +636,48 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## M18 — libbitcask 升级 7.0.3 → 8.0.0（8.0.0）
+
+> submodule `ce7ce13` → `eade59e`（tag `8.0.0`）。上游 MAJOR（S46 原子批条件写，本仓库
+> 的下游反馈 `libbitcask/feedbacks/2026-11-17-conditional-atomic-batch.md` 促成）：C API
+> 纯加法；C++ 头面 `BatchOp` / `TxnOp` 追加 `expect` / `expect_ord`、新 op 型 `kCheck`、
+> `put_batch_atomic` / `TxnCask::commit` 追加可空出参 `BatchOutcome*`——源码兼容、
+> C++ ABI 变化（`SOVERSION` 7→8）；盘上格式零改动。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M18-1** | 影响面核对：`git diff ce7ce13 eade59e -- include/` 只有上述追加；NIF 的 `BatchOp` / `TxnOp` 聚合初始化只用前 4 个成员 → 不改 NIF 也能编译通过（先验证过一次）。 | ✅ |
+| **M18-2** | submodule 从本机 libbitcask 仓库 fetch → checkout `eade59e`；rebar 的 pre_hook 只初始化空检出，不回卷（未 `git add` gitlink）。 | ✅ |
+| **M18-3** | NIF 接入条件写：批 op 解析认 `{put,K,V,Cond}`（V 可为 doc map）/ `{remove,K,Cond}` / `{check,K,Cond}`，`Cond :: absent \| {ord,N}`，形态不认 badarg；`BatchOutcome` → `{error, {conflict, OpIndex}}`（从 1 起）；新 NIF `cask_get_ord/2`、`cask_put_batch_atomic/3`（`[return_ords]` → `{ok, [Ord]}`）；`cask_txn_commit` 透传条件；`kConditionFailed` 兜底 `{error, condition_failed}`。 | ✅ |
+| **M18-4** | 门面：`bitcask:get_with_ord/2`、`put_batch_atomic/3`；`fill_batch_vectors` 认带条件的 4 元写 op（doc map 自动 embed 不漏）。`bitcask_txn:read_guarded/3`：读时登记版本（首次从引擎读到才登记），提交时写过的 key 把条件挂在 op 上、只读过的变 `{check, K, Cond}`；冲突 → `{?RESTART, {conflict, _}}`，与死锁同一重跑路径与预算。 | ✅ |
+| **M18-5** | 测试 `bitcask_cond_batch_tests` 10 例：get_with_ord、{ord,N} / absent / remove 带条件、check 只校验、批内同 key 对照批前、return_ords 链式、txn_commit 透传、badarg 形态、8 进程 CAS 自增精确、read_guarded 冲突重跑 / 只读守卫变 check / 普通 read 不守卫、直通 CAS 与守卫事务混合自增精确。 | ✅ |
+| **M18-6** | 文档：CHANGELOG / ROADMAP（中英）`[Unreleased]`、README（中英）原子批与事务段 + API 表、`doc/api-zh/en.md` 前置条件小节、`doc/txn-layer-design-zh.md` §4.8 版本守卫、`CMakeLists.txt` 版本注释。`bitcask.app.src` 的 `vsn` 7.0.3 → **8.0.0**（2026-11-18 用户定）。 | ✅ |
+
+---
+
+## G — 图层 v2：一个顶点两个 KV（8.0.0）
+
+> 设计 `doc/graph-adjacency-pack-design-zh.md`（§14 实现对账）。`n<vid>` 顶点 + `a<vid>`
+> 邻接表头（出 / 入边组 + 度数）；hub 分块 `a<vid><dir><etype><o><r>`（下界语义）；大属性
+> `p` 家族；`g` 键记布局版本与参数。写边 = 两端头的条件写 + 冲突重试。盘上破坏性变更。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **G1** | `graphdb_adj`：头 / 块 / 条目编解码（定宽 / rank / 属性 / 外置属性；畸形输入一律拒绝）；读原语 `entries` / `lookup` / `counts`；IO 抽象 `{direct, H}` / `{txn, Tx, Lock}`，直通与事务共用一套逻辑。 | ✅ |
+| **G2** | `graphdb_migrate:v1_to_v2/2,3` + `verify/2,3`：`e` / `ei` 两路 range 游标按 vid 归并、逐顶点 `build_vertex`、攒批写；拷贝 `n` / `t` / `tn`，丢 `et` / `deg` / `degi`；源库只读、目标非空拒绝、迁移后逐顶点核对 + 头数核对。`graphdb_analytics:materialize` 改扫 `a` 家族。 | ✅ |
+| **G3** | 写会话：`put_edge`（upsert，原样存在不写）/ `del_edge`（幂等）/ `all_entries` / `commit`（每个改过的头带 `absent \| {ord,N}`）；门面 `put_edge` / `del_edge` / `put_edges` / `del_edges`（每批 ≤ 256 顶点）/ `del_vertex`（每批 64 个邻居、最后一批删头 + 顶点键，无邻接时带 `{check, 头, absent}`）；冲突重试默认 8 次、指数抖动，`retries => N \| infinity`。 | ✅ |
+| **G4** | 分块：头超 `adj_inline_max` → 最大的内联组按字节装满切块（块 0 下界 (0,0)）；已有块超 `adj_chunk_max` → 切成约等大的 ⌈字节/上限⌉ 片；空块删（块 0 除外）、整组空连块 0 删；分块组缩到 `inline_max/4` 以下转回内联（滞回）；超大组块上限放宽到 组字节/1024。`consistent => true` 读：读前读后比头 LSN，撞写带抖动退避，32 次耗尽 `{error, inconsistent_read}`。 | ✅ |
+| **G5** | 事务 API 改锁邻接表头（不再前缀锁），头经 `read_guarded` 读，直通 / 事务可混用；`del_vertex_txn` 单批；`check_invariants/1`（对称、Count、块目录与区间、外置属性 ⟺ p 键）；布局 `g` 键与 v1 库拒开（`{error, graph_layout_v1}`，拒开时释放写锁）。 | ✅ |
+| **G6** | 测试：`graphdb_tests`（改写为 v2 + 新增 key 数、大属性生命周期、自环 / rank、批量接口、布局、16 进程直通打同一 hub、加删 + del_vertex 随机交错不变式、分块 hub 读写并发）、`graphdb_txn_tests`（直通 + 事务混写同一 hub）、`graphdb_adj_tests`（编解码往返 200 轮、字节布局、畸形输入、分块增长 / 分裂 / 回内联 / 滞回、分块顶点上的事务）、`graphdb_migrate_tests`（v1 夹具含病理 $i vid / 自环 / 平行边 / 大属性；hub 分块迁移与逐条 v2 写入逐顶点相同；守卫）。全量 `rebar3 eunit` **362/362**；`rebar3 as prod compile`（warnings_as_errors）零警告；`rebar3 do xref, dialyzer` 干净。基准 `test/graphdb_bench` 改 v2 口径 + v1 参照，结果见设计稿 §14.3：key 数降 17×（度数 5）/ 145×（度数 50），一跳 0.002–0.012 ms，度数 50 时每边日志约 3×、单边写约 0.36×。文档：设计稿状态 + §14、v1 设计稿（中英）加取代说明、README / CHANGELOG / ROADMAP（中英）。 | ✅ |
+| **G7** | `put_edges` / `del_edges` 按 src 稳定排序（`sort => false` 可关）+ `batch_vids` 可调（默认 256）。同一份边：度数 5 图 84.6k → 138.7k 边/秒、261 → 134 B/边；度数 50 图 42.7k → 88.6k 边/秒（v1 的 1.05×）、941 → 420 B/边；`batch_vids => 4096`（整图一批）253k 边/秒、17 B/边。测试 `put_edges_sort_and_batch_opts_test_`（跨 src 交错重复边仍是最后一次生效、四种选项结果相同、坏选项 badarg）；基准加两条对照。全量 eunit **363/363**。2026-11-18 用户定：默认 `batch_vids` 保持 256（离线装载按需调大）。 | ✅ |
+| **G8** | 自审修两处：① `encode_head` 的组数字段 16 位，超 65535 组原会静默截断写坏 → 改为报错（`finalize` 返回 `{error, {too_many_groups, Vid}}`）；② `read_guarded` 守卫过、但只由 `index_fun` 写的 key 会同时出 check 与 put，被 TxnCask 判重复 key → 条件改挂在 index op 上。各补一例测试；全量 eunit **365/365**，prod 编译、xref、dialyzer 干净。 | ✅ |
+| **G9** | 自审小问题全修：① 同一会话里新建又删掉的块不再发删除（只删读到时盘上已有的块）；② 图参数去掉 `persistent_term` 缓存，改为每次写会话读 `g`（低度数逐条加边约 −5–10%：68–77k → 65k 边/秒），`bitcask:close` 关库不留残留、绕过 `graphdb:open` 的句柄也按建库参数写；③ v1 探测要求出边 key 配对的 `ei` 也在（最多核对 64 条），应用的 29 字节 "e…" key 不再误判；④ `del_vertex/3`（`retries`、`batch_neighbors => N \| infinity`），`n<V>` 删除不带条件写进文档（后写胜出，同 `bitcask:delete`）；⑤ 事务读分块组改按块目录点读，不拿前缀锁。新增 3 例测试 + 1 处断言；全量 eunit **368/368**，prod 编译、xref、dialyzer 干净。2026-11-18 用户定：保持随用随读 `g`，不改回缓存。 | ✅ |
+
+> 2026-11-18 用户定：版本号 **8.0.0**；分块阈值默认 **4 KiB**；`edges_by_type` 降为全扫描
+> **接受**。英文版 v2 设计稿 `doc/graph-adjacency-pack-design-en.md` 已补（2026-11-18）。
+
+---
+
 ## 明确排除（V7+ 或永久取消）
 
 | 条目 | 决策 | 理由 |

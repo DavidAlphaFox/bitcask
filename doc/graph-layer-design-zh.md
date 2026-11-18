@@ -2,6 +2,11 @@
 
 English: 暂缺。本文档定义「以 libbitcask 为单一存储、Erlang 为执行层」的图存储方案。
 
+> ⚠️ **盘上布局与写路径已被 v2 取代**（2026-11-18）：一个顶点两个 KV（顶点 + 邻接表
+> 打包）+ 按 LSN 的条件写，见 [graph-adjacency-pack-design-zh.md](graph-adjacency-pack-design-zh.md)。
+> 本文的 `e` / `ei` / `et` / `deg` / `degi` 家族只剩迁移工具 `graphdb_migrate` 在读；
+> 遍历算法（§6）、OLAP 物化（§7）、etype 注册仍然有效。
+
 状态：**P1–P5 已落地**（2026-09：`src/graphdb.erl` + `src/graphdb_analytics.erl` +
 测试 + `test/graphdb_bench` 基准）。**本文档覆盖 2.2.1 规划的「CSR 整图一个 value」
 方案**：旧方案的核心约束（keydir 无序、前缀扫描退化 O(全部 key)）已被 6.0.0 的

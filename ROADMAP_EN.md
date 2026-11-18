@@ -6,6 +6,26 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 8.0.0 shipped
+
+### libbitcask upgrade 7.0.3 → 8.0.0 ✅
+
+An upstream MAJOR (S46 conditional atomic batches): the C API is purely additive, the C++
+headers append members and defaulted parameters, `SOVERSION` 7→8, on-disk format unchanged.
+The facade gains `get_with_ord/2`, conditional batch ops (`absent | {ord, N}`, `check`) and
+`put_batch_atomic/3` (`return_ords`); the transaction layer gains `read_guarded/3` (version
+guards, so direct and transactional writes can be mixed). Submodule moved to upstream
+`8.0.0` (`eade59e`).
+
+### Graph layer v2: two KVs per vertex ✅
+
+Design: `doc/graph-adjacency-pack-design-en.md`. The adjacency list is packed into one value
+(hubs are chunked), taking the key count from "3 × edges" to "2 × vertices"; an edge write is
+a conditional write on both endpoint heads with conflict retry, so concurrent writers lose no
+edges and the single-writer rule is gone; a one-hop read is a single point read. The cost is
+write amplification (about 3× log bytes per edge at degree 50). On-disk breaking change:
+`graphdb_migrate:v1_to_v2/2,3` migrates offline.
+
 ## 7.0.3 shipped
 
 ### libbitcask upgrade 7.0.2 → 7.0.3 ✅

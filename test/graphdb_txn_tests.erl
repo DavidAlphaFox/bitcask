@@ -1,12 +1,12 @@
 %% -------------------------------------------------------------------
 %% graphdb_txn_tests:
-%%   graphdb 事务式 API（X1-5，bitcask_txn 之上）覆盖：
-%%     - put_edge_txn   五键同批落地、提交前不可见、upsert 不动计数
-%%     - del_edge_txn   幂等、计数回落、同事务加删净零
-%%     - 并发计数       N 进程并发对同一 hub 加边 → 度数精确（直通 API 做
-%%                      不到的那件事）
+%%   graphdb 事务式 API（bitcask_txn 之上；图层 v2：锁邻接表头）覆盖：
+%%     - put_edge_txn   两端邻接表同批落地、提交前不可见、upsert 不动度数
+%%     - del_edge_txn   幂等、度数回落、同事务加删净零
+%%     - 并发度数       N 进程并发对同一 hub 加边 → 度数精确
 %%     - abort / 顶点   中止不落盘；put/get_vertex_txn
-%%     - degree 回退    计数键缺失时只数该 etype（顺手修的直通 degree/3）
+%%     - 混用           直通写与事务写同时打同一 hub：都不丢（版本守卫让事务
+%%                      冲突重跑）
 %% -------------------------------------------------------------------
 -module(graphdb_txn_tests).
 
@@ -44,7 +44,7 @@ wait_clean(N) ->
 srcs({ok, Edges}) -> [S || #{src := S} <- Edges].
 
 put_edge_txn_test_() ->
-    {"put_edge_txn：五键同批；提交前对直通读不可见；upsert 只改 props",
+    {"put_edge_txn：两端同批；提交前对直通读不可见；upsert 只改 props",
      fun() ->
         with_dir(fun(D) ->
             R = ?G:open(D, [read_write]),
@@ -137,7 +137,7 @@ abort_and_vertex_test_() ->
      end}.
 
 concurrent_hub_degree_exact_test_() ->
-    {"16 进程并发对同一 hub 加边（含同一端点的入度）→ deg/degi 精确",
+    {"16 进程并发对同一 hub 加边（含同一端点的入度）→ 出 / 入度精确",
      {timeout, 60, fun() ->
         with_dir(fun(D) ->
             R = ?G:open(D, [read_write]),
@@ -160,8 +160,9 @@ concurrent_hub_degree_exact_test_() ->
             All = lists:append([receive {P, Rs} -> Rs end || P <- Pids]),
             ?assertEqual([], [X || X <- All, X =/= {atomic, ok}]),
             N = NProc * PerProc,
-            ?assertEqual({ok, N}, ?G:degree(R, Hub, 7)),           %% 计数键
-            ?assertEqual({ok, N}, ?G:degree(R, Hub, undefined)),   %% 实扫
+            ?assertEqual({ok, N}, ?G:degree(R, Hub, 7)),
+            ?assertEqual({ok, N}, ?G:in_degree(R, Hub, 7)),
+            ?assertEqual(N, length(dsts(?G:out_edges(R, Hub)))),
             ?assertEqual(N, length(srcs(?G:in_edges(R, Hub)))),
             ?assertEqual(2 * N, length(element(2, ?G:edges_by_type(R, 7)))),
             ?assertMatch(#{locks := 0, txns := 0, waiting := 0}, wait_clean()),
@@ -169,29 +170,39 @@ concurrent_hub_degree_exact_test_() ->
         end)
      end}}.
 
-degree_fallback_per_etype_test_() ->
-    {"计数键缺失时 degree/3 与 degree_txn/3 只数该 etype",
-     fun() ->
+mixed_direct_and_txn_writers_test_() ->
+    {"8 个直通写进程 + 8 个事务写进程同时往同一 hub 加边：一条不丢、两端对称",
+     {timeout, 120, fun() ->
         with_dir(fun(D) ->
             R = ?G:open(D, [read_write]),
-            %% 手工造 P3 前的存量：只有边键，没有计数键
-            ok = bitcask:put_batch_atomic(R, [{put, ?G:ekey(1, 7, 2), <<>>},
-                                              {put, ?G:ekey(1, 7, 3), <<>>},
-                                              {put, ?G:ekey(1, 8, 4), <<>>}]),
-            ?assertEqual({ok, 2}, ?G:degree(R, 1, 7)),
-            ?assertEqual({ok, 1}, ?G:degree(R, 1, 8)),
-            ?assertEqual({ok, 0}, ?G:degree(R, 1, 9)),
-            ?assertEqual({ok, 3}, ?G:degree(R, 1, undefined)),
-            ?assertEqual({atomic, [{ok, 2}, {ok, 1}, {ok, 0}]},
-                         ?G:transaction(R, fun(Tx) ->
-                             [?G:degree_txn(Tx, 1, T) || T <- [7, 8, 9]]
-                         end)),
+            ?assertEqual({error, not_found}, ?G:get_vertex(R, 1)),
+            Hub = 1, PerProc = 25,
+            Parent = self(),
+            Direct = [spawn_link(fun() ->
+                          Rs = [?G:put_edge(R, Hub, 7, P * 1000 + I, #{retries => infinity})
+                                || I <- lists:seq(1, PerProc)],
+                          Parent ! {self(), Rs}
+                      end) || P <- lists:seq(1, 8)],
+            Txn = [spawn_link(fun() ->
+                       Rs = [case ?G:transaction(R, fun(Tx) ->
+                                       ?G:put_edge_txn(Tx, Hub, 7, P * 1000 + I)
+                                   end, [{retries, infinity} | ?FAST]) of
+                                 {atomic, ok} -> ok;
+                                 Other        -> Other
+                             end || I <- lists:seq(1, PerProc)],
+                       Parent ! {self(), Rs}
+                   end) || P <- lists:seq(11, 18)],
+            All = lists:append([receive {P, Rs} -> Rs end || P <- Direct ++ Txn]),
+            ?assertEqual([], [X || X <- All, X =/= ok]),
+            ?assertEqual({ok, 16 * PerProc}, ?G:degree(R, Hub, 7)),
+            ?assertMatch({ok, #{edges := E}} when E =:= 16 * PerProc, ?G:check_invariants(R)),
+            ?assertMatch(#{locks := 0, txns := 0, waiting := 0}, wait_clean()),
             ?G:close(R)
         end)
-     end}.
+     end}}.
 
 %% ===================================================================
-%% 前缀锁版本（X1-6）：out/in_edges_txn、degree_txn/2、del_vertex_txn
+%% 邻接读取 / 级联删除的事务版：out/in_edges_txn、degree_txn/2、del_vertex_txn
 %% ===================================================================
 
 out_edges_txn_merges_buffer_test_() ->
@@ -223,7 +234,7 @@ out_edges_txn_merges_buffer_test_() ->
      end}.
 
 del_vertex_txn_test_() ->
-    {"del_vertex_txn：级联删 incident 边三键、邻居计数回落、自身计数/顶点清空；自环",
+    {"del_vertex_txn：级联删 incident 边（两端）、邻居度数回落、自身头/顶点清空；自环",
      fun() ->
         with_dir(fun(D) ->
             R = ?G:open(D, [read_write]),
@@ -243,44 +254,25 @@ del_vertex_txn_test_() ->
             ?assertEqual([3], dsts(?G:out_edges(R, 2))),       % 无关边还在
             ?assertEqual([{2, 3}], [{S, Dd} || #{src := S, dst := Dd} <- element(2, ?G:edges_by_type(R, 7))]),
             ?assertEqual([], element(2, ?G:edges_by_type(R, 8))),
-            %% 邻居计数：3 的出度 7 → 0；2 的入度 7/8 → 0；2 的出度 7 仍 1
+            %% 邻居度数：3 的出度 7 → 0；2 的入度 → 0；2 的出度 7 仍 1
             ?assertEqual({ok, 0}, ?G:degree(R, 3, 7)),
+            ?assertEqual({ok, 0}, ?G:in_degree(R, 2)),
             ?assertEqual({ok, 1}, ?G:degree(R, 2, 7)),
-            %% 自身计数键全没了（不是归零，是删除）
-            ?assertEqual([], bitcask:range(R, {<<"deg", 1:64/big>>, <<"deg", 2:64/big>>})),
-            ?assertEqual([], bitcask:range(R, {<<"degi", 1:64/big>>, <<"degi", 2:64/big>>})),
+            %% 自身邻接表头删除（不是留个空头）
+            ?assertEqual(not_found, bitcask:get(R, ?G:akey(1))),
+            ?assertMatch({ok, _}, ?G:check_invariants(R)),
             ?assertMatch(#{locks := 0, prefix_locks := 0}, wait_locks_clean()),
             ?G:close(R)
         end)
      end}.
 
-%% 全图不变式：每个 (vid, etype) 的 deg/degi 计数 == 实际 e/ei 键数；
-%% 每条 e 键有配对的 ei 与 et，反之亦然。
+%% 全图不变式（对称、度数、块目录、p 键）交给 graphdb:check_invariants/1。
 check_invariants(R) ->
-    Es  = [{S, T, Dd, Rk} || {<<"e", S:64/big, T:32/big, Dd:64/big, Rk:64/big>>, _}
-                              <- bitcask:range(R, {<<"e">>, <<"f">>})],
-    Eis = [{S, T, Dd, Rk} || {<<"ei", Dd:64/big, T:32/big, S:64/big, Rk:64/big>>, _}
-                              <- bitcask:range(R, {<<"ei">>, <<"ej">>})],
-    Ets = [{S, T, Dd, Rk} || {<<"et", T:32/big, S:64/big, Dd:64/big, Rk:64/big>>, _}
-                              <- bitcask:range(R, {<<"et">>, <<"eu">>})],
-    ?assertEqual(lists:sort(Es), lists:sort(Eis)),
-    ?assertEqual(lists:sort(Es), lists:sort(Ets)),
-    Degs  = [{{V, T}, N} || {<<"deg", V:64/big, T:32/big>>, <<N:64/big>>}
-                             <- bitcask:range(R, {<<"deg">>, <<"deh">>})],
-    Degis = [{{V, T}, N} || {<<"degi", V:64/big, T:32/big>>, <<N:64/big>>}
-                             <- bitcask:range(R, {<<"degi">>, <<"degj">>})],
-    Count = fun(Pairs) -> lists:foldl(fun(K, M) -> M#{K => maps:get(K, M, 0) + 1} end, #{}, Pairs) end,
-    OutC = Count([{S, T} || {S, T, _, _} <- Es]),
-    InC  = Count([{Dd, T} || {_, T, Dd, _} <- Es]),
-    %% 计数键可以多（值为 0 的残留），但凡存在必须等于实际数；有边必有计数键
-    [?assertEqual({K, maps:get(K, OutC, 0)}, {K, N}) || {K, N} <- Degs],
-    [?assertEqual({K, maps:get(K, InC, 0)}, {K, N})  || {K, N} <- Degis],
-    [?assert(lists:keymember(K, 1, Degs))  || K <- maps:keys(OutC)],
-    [?assert(lists:keymember(K, 1, Degis)) || K <- maps:keys(InC)],
-    length(Es).
+    {ok, #{edges := N}} = ?G:check_invariants(R),
+    N.
 
 concurrent_insert_vs_del_vertex_test_() ->
-    {"8 个加边进程 vs 2 个 del_vertex_txn 进程随机交错 → 计数/三键不变式成立",
+    {"8 个加边进程 vs 2 个 del_vertex_txn 进程随机交错 → 对称 / 度数不变式成立",
      {timeout, 120, fun() ->
         with_dir(fun(D) ->
             R = ?G:open(D, [read_write]),
