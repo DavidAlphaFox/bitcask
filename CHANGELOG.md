@@ -3,6 +3,31 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [10.0.0] — 2026-11-19
+
+升级 libbitcask **9.0.0 → 10.0.0**（跨上游 9.1.0 / 10.0.0；C++ ABI 破坏：
+`MetaConfig` / `MetaError` / `SearchLayerConfig` 追加成员，`SOVERSION` 9→10；
+C API 纯加法、C ABI 兼容；`bitcask.meta` 新增可选 C2 尾段，盘上格式仍 v5/v6，
+既有数据直接可用）。submodule 从 `d164744`（`9.0.0`）切到上游 `46da576`
+（`10.0.0`）。NIF / Erlang 门面零改动，重编即得。
+
+### Fixed（随 libbitcask 10.0.0）
+
+- **ngram 分词的库高亮片段恒空**：`analyze_with_offsets` 返回真实字节偏移，
+  缺省 ngram 库的热 / 冷路径不再静默返回空片段。
+- **高亮器漏标多词与重叠 token**：片段内先按位置排序、合并重叠 / 相接区间
+  再插标签；「quick … fox」两词都标，ngram「着色器」标成一整段。
+- **打开旧版封段的检索库时新段写进进程当前目录**（9.1.0）：fallback 重建固定
+  落在库目录的段集，不再污染进程 CWD；旧段与旁车排进延迟删除。
+
+### Added（随 libbitcask 10.0.0）
+
+- **`bitcask.meta` 记录分析器配置本身**（C2）：可写建库 / 升级时记录，旧库
+  指纹相符时补记；`dict_path` 不记。上游 C / C++ 可按记录的分析器打开只读
+  查看工具；本仓库既有 `{analyzer, ...}` 显式配置语义不变。
+- **冷文档也给高亮片段**（9.1.0，上游 C API `BITCASK_HIGHLIGHT_LOAD_COLD`）；
+  本仓库门面尚未开放该开关。
+
 ## [9.0.0] — 2026-11-19
 
 升级 libbitcask **8.1.0 → 9.0.0**（上游 C++ ABI 破坏：`bm25::DocTable` 新增

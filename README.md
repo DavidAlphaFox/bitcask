@@ -358,7 +358,7 @@ ok
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
 | `doc/unified-architecture-plan-zh.md` | 统一架构计划（已实施） |
 | `doc/libcask-extraction-zh.md` | **libcask 独立库拆分可行性评估**（2.2.0 规划） |
-| `ROADMAP.md` / `ROADMAP_EN.md` | **路线图**：9.0.0 / 8.0.0 / 7.0.3 / 7.0.2 / 7.0.1 / 7.0.0 / 6.9.1 / 6.9.0 / 6.8.1 / 6.8.0 / 6.7.3 / 6.7.2 / 6.7.1 / 6.7.0 / 6.6.0 / 6.5.1 / 6.5.0 / 6.4.0 / 6.3.2 / 6.3.1 / 6.2.2 / 6.2.1 / 6.1.0 / 6.0.0 / 5.1.0 / 5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 落地 + 2.1.1 已落地（P5–P15）+ 2.2.0 规划（libcask 独立 / V7+ 向量优化）（中/英） |
+| `ROADMAP.md` / `ROADMAP_EN.md` | **路线图**：10.0.0 / 9.0.0 / 8.0.0 / 7.0.3 / 7.0.2 / 7.0.1 / 7.0.0 / 6.9.1 / 6.9.0 / 6.8.1 / 6.8.0 / 6.7.3 / 6.7.2 / 6.7.1 / 6.7.0 / 6.6.0 / 6.5.1 / 6.5.0 / 6.4.0 / 6.3.2 / 6.3.1 / 6.2.2 / 6.2.1 / 6.1.0 / 6.0.0 / 5.1.0 / 5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 落地 + 2.1.1 已落地（P5–P15）+ 2.2.0 规划（libcask 独立 / V7+ 向量优化）（中/英） |
 | `TASK.md` | 详细任务拆分与历史 |
 
 ## 项目状态
@@ -377,7 +377,8 @@ ok
 - **3.1.0**（2026-07-01）— 升级 libbitcask v3.1.0（ABI 不破坏）：`{max_read_handles, unlimited}` / `{auto_compact_dead_ratio, R}` 选项、错误原子 `closed`；随库引入 read 句柄默认上限（按 `RLIMIT_NOFILE` 自动推导）、`bitcask.meta` v3 加 CRC32、field.schema FSCH v1 头 + CRC
 - **4.0.0**（2026-07-13）— 升级 libbitcask v4.0.0（ABI 破坏，`SOVERSION` 3→4，源码级兼容）：`{vector_engine, hnsw|ivfrq|diskann}` 向量双引擎 + 调优选项、`{auto_checkpoint_min_docs, N}` 崩溃恢复重放有界；随库引入 IVF-RaBitQ-lite 引擎、DiskANN 引擎（实验性）、AVX2 int8 内核、HNSW `.qc8` mmap 化；`examples/` Wikipedia 检索库示例
 - **4.1.0**（2026-07-15）— 升级 libbitcask v4.1.0（ABI 不破坏，`SOVERSION` 保持 4，盘上格式不变）：对 Erlang 调用方**无 API 变更**，重编即得；随库引入 Phase 5/6 深度审计成果——修复 `close/1` 拆卸路径的进程级永久挂死（`IndexPool` 计数泄漏 + `unregister_lib` 无界 `flush`）、hnsw 三处原子写 rename 前补 `fdatasync`（此前崩溃即半截文件）、`RowChunks`/`MmapSegment` 资源泄漏；`file_util` 归并使 fsync 纪律 4 套收敛为 1 套
-- **9.0.0**（2026-11-19，当前版本）— 升级 libbitcask 8.1.0 → **9.0.0**（C++ ABI 破坏，`SOVERSION` 8→9；C API / C ABI / 盘上格式不变，数据直接可用）。修复 merge 后 HNSW 图断裂导致的静默错检索，并把向量 live / meta 过滤改为遍历期过滤，高死比 / 高选择性下不再少返回；代价是过滤耗时随通过率下降、高死比 merge 重建变慢。NIF / Erlang 门面零改动，重编即得
+- **10.0.0**（2026-11-19，当前版本）— 升级 libbitcask 9.0.0 → **10.0.0**（跨上游 9.1.0；C++ ABI 破坏，`SOVERSION` 9→10；C API 纯加法、C ABI 兼容；`bitcask.meta` 新增可选 C2 分析器记录，盘上格式仍 v5/v6，数据直接可用）。修复 ngram 库高亮片段恒空、多词 / 重叠 token 高亮漏标，以及旧封段 fallback 写进进程 CWD。NIF / Erlang 门面零改动，重编即得
+- **9.0.0**（2026-11-19）— 升级 libbitcask 8.1.0 → **9.0.0**（C++ ABI 破坏，`SOVERSION` 8→9；C API / C ABI / 盘上格式不变，数据直接可用）。修复 merge 后 HNSW 图断裂导致的静默错检索，并把向量 live / meta 过滤改为遍历期过滤，高死比 / 高选择性下不再少返回；代价是过滤耗时随通过率下降、高死比 merge 重建变慢。NIF / Erlang 门面零改动，重编即得
 - **8.1.0**（2026-11-19）— 升级 libbitcask 8.0.0 → **8.1.0**（跨 8.0.1 / 8.0.2；默认字段哨兵改为 `<<1,"_bitcask:default">>`，C API / ABI / 盘上容器格式不变，`SOVERSION` 8 不变）。⚠️ 旧 search checkpoint / 已封存索引需重建或用旧版读取；KV-only 不受影响。8.1.0 同时修复分块邻接组「目录有块、盘上缺失」的自愈提交（`del_vertex` 只读首扫也不再跳过）。**8.0.0**：升级 libbitcask 7.0.3 → 8.0.0（MAJOR，S46 原子批条件写，`SOVERSION` 7→8），门面新增 `get_with_ord/2`、带条件的批 op（`absent | {ord, N}`、`check`，冲突 `{error, {conflict, I}}`）、`put_batch_atomic/3`；事务层新增 `read_guarded/3`。**图层布局第 1 版**：key 带 `<<1,"_g:">>` 全局前缀，一个顶点两个 KV（邻接表打包、hub 分块），写边是两端头的条件写 + 冲突重试，并发不丢边；key 数降 17×–145×、一跳快 2–10×，代价是高度数下写放大约 3×。⚠️ 盘上破坏性变更：旧图库 `graphdb:open/2` 分别返回 `{error, graph_layout_v1}` / `{error, graph_layout_unprefixed_v2}`，需导出后重灌；无自动迁移工具
 - **7.0.3**（2026-11-17）— 升级 libbitcask 7.0.2 → **7.0.3**（PATCH，索引管线去全局顺序化：key + LSN 裁决、分片并发应用；修复大 `put_batch` 死锁、`close()` 逃生门、checkpoint 覆盖水位高估和旧 OKI BM25 分数漂移；C API 签名、盘上格式与 `SOVERSION` 7 不变，C++ 头面须同版重编）。Erlang 新增 `index_stale_dropped/1` 诊断
 - **7.0.2**（2026-11-16）— 升级 libbitcask 7.0.1 → **7.0.2**（PATCH，纯缺陷修复：Windows `atomic_rename` 对共享冲突做有界重试；MSVC 大端读取改用标准 `std::byteswap`；C API 签名、盘上格式与 `SOVERSION` 7 不变）。Linux / macOS 行为不变，NIF / Erlang 代码零改动，重编即得

@@ -22,7 +22,7 @@ set(BITCASK_PRIV_DIR "${CMAKE_SOURCE_DIR}/priv")
 file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 
 # ---------------------------------------------------------------------------
-# libbitcask — git submodule at third_party/libbitcask (9.0.0, commit d164744)。
+# libbitcask — git submodule at third_party/libbitcask (10.0.0, commit 46da576)。
 # 提供 C++ 核心库全部 target（bitcask_cask, bitcask_keydir, ...）。
 #
 # ⚠️ 6.2.1 起**不再需要 third_party 符号链接**。此前 libbitcask 的
@@ -156,6 +156,11 @@ file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 # fill_eval_meta() 虚函数，HNSW / DiskANN 过滤检索改遍历期过滤，merge 后
 # clone_live 做连通性重连。本仓库是源码级依赖，重编即可；C API 签名、C ABI、
 # 盘上格式零改动。NIF / Erlang 门面零改动。
+# 10.0.0：跨上游 9.1.0 + 10.0.0 两版。C++ ABI 破坏（SOVERSION 9→10）——
+# MetaConfig / MetaError / SearchLayerConfig 追加成员；bitcask.meta 新增可选
+# C2 分析器记录，ngram 高亮偏移与多词 / 重叠高亮修复，旧封段 fallback 不再写
+# 进进程 CWD。C API 纯加法、C ABI 兼容，盘上格式仍 v5/v6。本仓库 NIF /
+# Erlang 门面零改动，源码级依赖重编即可。
 
 # ---------------------------------------------------------------------------
 add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/libbitcask"

@@ -6,6 +6,16 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 10.0.0 落地
+
+### libbitcask 升级 9.0.0 → 10.0.0 ✅
+
+上游 C++ ABI 破坏：`MetaConfig` / `MetaError` / `SearchLayerConfig` 追加成员，
+`SOVERSION` 9→10；C API 纯加法、C ABI 兼容，`bitcask.meta` 新增可选 C2 分析器
+记录，盘上格式仍 v5/v6。修复 ngram 高亮恒空与多词 / 重叠 token 漏标；9.1.0 修复
+旧封段 fallback 写进进程 CWD。本仓库 NIF / Erlang 门面零改动，重编即得；子模块
+切到上游 `10.0.0`（`46da576`）。
+
 ## 9.0.0 落地
 
 ### libbitcask 升级 8.1.0 → 9.0.0 ✅

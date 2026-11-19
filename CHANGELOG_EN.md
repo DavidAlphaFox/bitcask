@@ -3,6 +3,35 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [10.0.0] — 2026-11-19
+
+Upgrades libbitcask **9.0.0 → 10.0.0** (spanning upstream 9.1.0 / 10.0.0; a breaking
+C++ ABI change because `MetaConfig` / `MetaError` / `SearchLayerConfig` gain members,
+`SOVERSION` moves 9→10; the C API is purely additive and the C ABI remains compatible;
+`bitcask.meta` gains an optional C2 trailer while the on-disk format stays v5/v6, so
+existing data opens directly). The submodule moves from `d164744` (`9.0.0`) to upstream
+`46da576` (`10.0.0`). NIF / Erlang code is unchanged; rebuild to pick up the new library.
+
+### Fixed (via libbitcask 10.0.0)
+
+- **ngram stores returned empty highlight snippets**: `analyze_with_offsets` now
+  reports real byte offsets, so hot and cold snippets work with the default analyzer.
+- **Multi-word and overlapping tokens were partially unhighlighted**: snippets sort
+  occurrences by position and merge overlapping / adjacent intervals before inserting
+  tags; "quick … fox" marks both words, and an ngram "shader" becomes one tag.
+- **Fallback segments for unreadable old sealed segments landed in the process CWD**
+  (9.1.0): rebuild now anchors to the library's segment directory and queues old
+  segments / sidecars for delayed deletion.
+
+### Added (via libbitcask 10.0.0)
+
+- **`bitcask.meta` records the analyzer configuration itself** (C2): written at
+  creation / KV-to-search upgrade, backfilled on writable open when the fingerprint
+  matches; `dict_path` is not stored. Upstream C / C++ readers can open using the
+  stored analyzer; this repository's explicit `{analyzer, ...}` semantics are unchanged.
+- **Cold documents can get highlight snippets** (9.1.0, upstream
+  `BITCASK_HIGHLIGHT_LOAD_COLD`); the Erlang facade does not expose the flag yet.
+
 ## [9.0.0] — 2026-11-19
 
 Upgrades libbitcask **8.1.0 → 9.0.0** (a breaking C++ ABI change: `bm25::DocTable`

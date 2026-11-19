@@ -6,6 +6,18 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 10.0.0 shipped
+
+### libbitcask upgrade 9.0.0 → 10.0.0 ✅
+
+An upstream breaking C++ ABI change: `MetaConfig` / `MetaError` / `SearchLayerConfig`
+gain members and `SOVERSION` moves 9→10; the C API is purely additive and the C ABI
+stays compatible. `bitcask.meta` records the analyzer configuration in an optional C2
+trailer while the on-disk format remains v5/v6. Fixes empty ngram snippets and partial
+highlighting of multi-word / overlapping tokens; 9.1.0 also stops segment rebuild
+fallbacks from writing to the process CWD. This repository needs no NIF / Erlang facade
+changes, only a rebuild; the submodule moves to upstream `10.0.0` (`46da576`).
+
 ## 9.0.0 shipped
 
 ### libbitcask upgrade 8.1.0 → 9.0.0 ✅

@@ -655,6 +655,22 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## M20 — libbitcask 升级 9.0.0 → 10.0.0（10.0.0）
+
+> submodule `d164744` → `46da576`（tag `10.0.0`，跨上游 9.1.0）。上游 C++ ABI
+> 破坏：`MetaConfig` / `MetaError` / `SearchLayerConfig` 追加成员，`SOVERSION`
+> 9→10。C API 纯加法、C ABI 兼容；`bitcask.meta` 新增可选 C2 分析器记录，
+> 盘上格式仍 v5/v6。NIF 不直接使用变更后的新接口，门面零改动。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M20-1** | 影响面核对：上游 9.1.0 + 10.0.0 只改 meta / 分析器 / 高亮 / 封段 fallback 与 C API 新增；既有 NIF 的 `SearchLayerConfig` 初始化路径随源码级依赖重编即可，Erlang 门面无需源码变更。 | ✅ |
+| **M20-2** | submodule fetch → checkout `10.0.0`；Release 重新配置 / 构建后复核产物 SONAME `libbitcask.so.10`、库 tag `10.0.0`。 | ✅ |
+| **M20-3** | 回归：`rebar3 eunit` **365/365**；上游 `BUILD_TESTING=ON` Release `ctest` 执行 **928/928** 全绿（另有 2 条保留禁用）；`rebar3 as prod compile`、`rebar3 do xref, dialyzer` 干净。 | ✅ |
+| **M20-4** | 文档：CHANGELOG / ROADMAP / README（中英）新增 10.0.0 记录，`CMakeLists.txt` 子模块注释更新；`bitcask.app.src` 的 `vsn` 9.0.0 → **10.0.0**。 | ✅ |
+
+---
+
 ## M19 — libbitcask 升级 8.1.0 → 9.0.0（9.0.0）
 
 > submodule `13322bd` → `d164744`（tag `9.0.0`）。上游 C++ ABI 破坏：
