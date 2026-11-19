@@ -3,6 +3,27 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [9.0.0] — 2026-11-19
+
+升级 libbitcask **8.1.0 → 9.0.0**（上游 C++ ABI 破坏：`bm25::DocTable` 新增
+`fill_eval_meta()` 虚函数，`SOVERSION` 8→9；C API 签名、C ABI、盘上格式零改动，
+8.1.0 数据直接可用）。submodule 从 `13322bd`（`8.1.0`）切到上游 `d164744`
+（`9.0.0`）。NIF / Erlang 门面零改动，重编即得。
+
+### Fixed（随 libbitcask 9.0.0）
+
+- **merge 后向量检索静默返回错结果**：HNSW `clone_live` 原来只做死邻过滤；
+  死比一高，0 层出度塌缩甚至图被撕裂。现在按死比分两路——低死比做全面路径
+  收缩，高死比做全量重连；收尾检查并修复 0 层强连通性。
+- **向量检索带过滤时少返回**：live / meta filter 从结果侧过滤改为遍历期过滤，
+  被拒节点仍参与导航、不进结果集，凑满 ef 个通过者才收敛；HNSW 与 DiskANN
+  同语义，极低通过率有距离计算预算，避免扫全图。
+
+### Changed（随 libbitcask 9.0.0）
+
+- 带过滤的向量检索耗时约随通过率倒数增长；高死比 merge 的向量重建由毫秒级
+  变为按活节点重建邻接，这是召回与正确性修复的代价。
+
 ## [8.1.0] — 2026-11-19
 
 升级 libbitcask **8.0.0 → 8.1.0**（跨上游 8.0.1 / 8.0.2 / 8.1.0；C API 签名、C ABI、

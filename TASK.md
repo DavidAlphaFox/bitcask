@@ -655,6 +655,21 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## M19 — libbitcask 升级 8.1.0 → 9.0.0（9.0.0）
+
+> submodule `13322bd` → `d164744`（tag `9.0.0`）。上游 C++ ABI 破坏：
+> `bm25::DocTable` 新增带默认实现的 `fill_eval_meta()` 虚函数，`SOVERSION` 8→9。
+> C API 签名 / C ABI / 盘上格式零改动；NIF 不直接使用新 C++ 接口，门面零改动。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M19-1** | 影响面核对：上游只改向量 / `DocTable` 内部实现与公开 C++ 头新增接口；NIF / Erlang 门面无需源码变更，本仓库随源码级依赖重编即可。 | ✅ |
+| **M19-2** | submodule fetch → checkout `9.0.0` → 先暂存 gitlink；Release 重新配置 / 构建后复核产物 SONAME `libbitcask.so.9`、库 tag `9.0.0`。 | ✅ |
+| **M19-3** | 回归：`rebar3 eunit` **365/365**；上游 `BUILD_TESTING=ON` Release `ctest` 执行 **907/907** 全绿（另有 1 条按环境跳过、2 条保留禁用）；`rebar3 xref` / `dialyzer` 干净。 | ✅ |
+| **M19-4** | 文档：CHANGELOG / ROADMAP / README（中英）新增 9.0.0 记录，`CMakeLists.txt` 子模块注释更新；`bitcask.app.src` 的 `vsn` 8.1.0 → **9.0.0**。 | ✅ |
+
+---
+
 ## G — 图层 v2：一个顶点两个 KV（8.0.0）
 
 > 设计 `doc/graph-adjacency-pack-design-zh.md`（§14 实现对账）。`n<vid>` 顶点 + `a<vid>`

@@ -6,6 +6,18 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 9.0.0 shipped
+
+### libbitcask upgrade 8.1.0 → 9.0.0 ✅
+
+An upstream breaking C++ ABI change: `bm25::DocTable` gains a defaulted
+`fill_eval_meta()` virtual function and `SOVERSION` moves 8→9; the C API, C ABI and
+on-disk format are unchanged. Vector search gets two silent-wrong-result fixes —
+`clone_live` relinks the layer-0 graph after merge, and live / meta filters become
+traversal-time filters for both HNSW and DiskANN. This repository needs no NIF /
+Erlang facade changes, only a rebuild; the submodule moves to upstream `9.0.0`
+(`d164744`).
+
 ## 8.0.0 shipped
 
 ### libbitcask upgrade 7.0.3 → 8.0.0 ✅

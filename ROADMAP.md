@@ -6,6 +6,16 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 9.0.0 落地
+
+### libbitcask 升级 8.1.0 → 9.0.0 ✅
+
+上游 C++ ABI 破坏：`bm25::DocTable` 新增带默认实现的 `fill_eval_meta()` 虚函数，
+`SOVERSION` 8→9；C API、盘上格式与 C ABI 零改动。向量检索的两处静默错误修复——
+merge 后 `clone_live` 重连 0 层图，live / meta filter 改为 HNSW 与 DiskANN 的遍历期
+过滤。本仓库 NIF / Erlang 门面零改动，重编即得；子模块切到上游 `9.0.0`
+（`d164744`）。
+
 ## 8.0.0 落地
 
 ### libbitcask 升级 7.0.3 → 8.0.0 ✅

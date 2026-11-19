@@ -3,6 +3,33 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [9.0.0] — 2026-11-19
+
+Upgrades libbitcask **8.1.0 → 9.0.0** (a breaking C++ ABI change: `bm25::DocTable`
+gains the `fill_eval_meta()` virtual function and `SOVERSION` moves 8→9; C API
+signatures, C ABI and on-disk format are unchanged, and data written by 8.1.0 opens
+directly). The submodule moves from `13322bd` (`8.1.0`) to upstream `d164744`
+(`9.0.0`). NIF / Erlang code is unchanged; rebuild to pick up the new library.
+
+### Fixed (via libbitcask 9.0.0)
+
+- **Vector search could silently return wrong results after merge**: HNSW
+  `clone_live` previously only filtered dead neighbors, so high dead ratios collapsed
+  layer-0 out-degree and could split the graph. `clone_live` now performs full path
+  contraction at low dead ratios and full re-linking at high dead ratios, followed by
+  a layer-0 strong-connectivity repair pass.
+- **Filtered vector search could return fewer than k results**: live / meta filters
+  move from result-side filtering to traversal-time filtering. Rejected nodes remain
+  navigation landmarks but no longer enter the result set; HNSW and DiskANN keep
+  searching until ef passing candidates are found. A distance-evaluation budget bounds
+  extremely selective filters.
+
+### Changed (via libbitcask 9.0.0)
+
+- Filtered vector-search latency grows roughly inversely with the pass rate, and
+  rebuilding vectors during high-dead-ratio merges takes per-live-node relinking time.
+  This is the cost of the correctness / recall fixes above.
+
 ## [8.1.0] — 2026-11-19
 
 Upgrades libbitcask **8.0.0 → 8.1.0** (spanning upstream 8.0.1 / 8.0.2 / 8.1.0; C API
