@@ -4,10 +4,14 @@
 //
 // 接受形式:#{Key :: binary() => Value} 或 [{Key, Value}]。Value 类型映射:
 // int -> int64, float -> double, binary -> string, true/false -> bool,
-// undefined/其它 atom -> null。失败 → badarg。
+// undefined/其它 atom -> null,[binary()] -> 字符串数组(libbitcask 12.0.0
+// 起,类型标记 5;[] = 空数组;元素必须全是 binary,charlist 不算)。失败 → badarg。
+// ⚠️ 目录里一旦 put_doc 了含数组的 meta,bitcask.meta 懒升 v7,libbitcask ≤ 11.2
+// 从此打不开该目录。
 //
 // decode_meta 是反方向:blob → #{Key :: binary() => Value}。null -> undefined,
-// bool -> true/false,int64 -> integer,double -> float,string -> binary。
+// bool -> true/false,int64 -> integer,double -> float,string -> binary,
+// 字符串数组 -> [binary()](保持写入顺序)。
 // 查询层(bitcask_query)拿 get 回来的 meta 在 BEAM 侧求值 where 用。
 
 #include <algorithm>
@@ -34,8 +38,8 @@ bool parse_meta_kv(ErlNifEnv* env, ERL_NIF_TERM key_term, ERL_NIF_TERM val_term,
     ErlNifBinary kb{};
     if (!enif_inspect_binary(env, key_term, &kb)) return false;
     out.key.assign(reinterpret_cast<const char*>(kb.data), kb.size);
-    if (!parse_meta_value(env, val_term, out.value, /*other_atoms_as_null=*/true)) return false;
-    return true;
+    // 字符串数组只有写入入口收（filter 字面值不收数组，引擎侧数组不参与比较）。
+    return parse_meta_entry_value(env, val_term, out.value, /*other_atoms_as_null=*/true);
 }
 
 }  // namespace
@@ -120,9 +124,22 @@ ERL_NIF_TERM nif_cask_decode_meta(ErlNifEnv* env, int /*argc*/,
                     return enif_make_int64(env, x);
                 } else if constexpr (std::is_same_v<T, double>) {
                     return enif_make_double(env, x);
-                } else {
+                } else if constexpr (std::is_same_v<T, std::string>) {
                     return make_binary_checked(env, std::as_bytes(
                         std::span<const char>(x.data(), x.size())));
+                } else {
+                    static_assert(std::is_same_v<T, bitcask::meta::StringArray>,
+                                  "MetaValue 新增了类型：补 decode 分支");
+                    std::vector<ERL_NIF_TERM> items;
+                    items.reserve(x.size());
+                    for (const auto& it : x) {
+                        ERL_NIF_TERM b = make_binary_checked(env, std::as_bytes(
+                            std::span<const char>(it.data(), it.size())));
+                        if (!b) return b;
+                        items.push_back(b);
+                    }
+                    return enif_make_list_from_array(env, items.data(),
+                                                     static_cast<unsigned>(items.size()));
                 }
             },
             e.value);

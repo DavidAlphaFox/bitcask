@@ -245,6 +245,23 @@ bool parse_meta_value(ErlNifEnv* env, ERL_NIF_TERM term,
     return false;
 }
 
+bool parse_meta_entry_value(ErlNifEnv* env, ERL_NIF_TERM term,
+                            bitcask::meta::MetaValue& out,
+                            bool other_atoms_as_null) {
+    if (parse_meta_value(env, term, out, other_atoms_as_null)) return true;
+    if (!enif_is_list(env, term)) return false;
+    bitcask::meta::StringArray arr;
+    ERL_NIF_TERM head, tail = term;
+    while (enif_get_list_cell(env, tail, &head, &tail)) {
+        ErlNifBinary eb{};
+        if (!enif_inspect_binary(env, head, &eb)) return false;
+        arr.emplace_back(reinterpret_cast<const char*>(eb.data), eb.size);
+    }
+    if (!enif_is_empty_list(env, tail)) return false;  // improper list
+    out = std::move(arr);
+    return true;
+}
+
 namespace {
 
 // op atom → MetaOp。不识别返回 false。
@@ -258,11 +275,14 @@ bool parse_meta_op(ErlNifEnv* /*env*/, ERL_NIF_TERM term,
     if (enif_is_identical(term, atoms().lte))    { out = bitcask::meta::MetaOp::Lte;    return true; }
     if (enif_is_identical(term, atoms().in_op))  { out = bitcask::meta::MetaOp::In;     return true; }
     if (enif_is_identical(term, atoms().exists)) { out = bitcask::meta::MetaOp::Exists; return true; }
+    if (enif_is_identical(term, atoms().contains))     { out = bitcask::meta::MetaOp::Contains;    return true; }
+    if (enif_is_identical(term, atoms().contains_any)) { out = bitcask::meta::MetaOp::ContainsAny; return true; }
     return false;
 }
 
 // 解析单条 condition map → MetaCondition。失败返回 nullptr。
-// key 必填;op 必填;value/values 按 op 类型决定;In 必带 values 列表。
+// key 必填;op 必填;value/values 按 op 类型决定;In / ContainsAny 必带非空 values 列表。
+// Contains / ContainsAny 的字面值只有 binary 有意义(引擎:非字符串字面值恒不命中)。
 std::unique_ptr<bitcask::meta::MetaCondition>
 parse_condition_map(ErlNifEnv* env, ERL_NIF_TERM map) {
     using bitcask::meta::MetaCondition;
@@ -284,7 +304,7 @@ parse_condition_map(ErlNifEnv* env, ERL_NIF_TERM map) {
     cond->key = std::move(key);
     cond->op = op;
 
-    if (op == MetaOp::In) {
+    if (op == MetaOp::In || op == MetaOp::ContainsAny) {
         ERL_NIF_TERM values_term;
         if (!enif_get_map_value(env, map, atoms().values, &values_term)) return nullptr;
         if (!enif_is_list(env, values_term)) return nullptr;

@@ -23,6 +23,9 @@
          cask_search_phrase/3, cask_search_phrase/4,
          cask_search_fields/3, cask_search_fields/4,
          cask_search_fields_attributed/3, cask_search_fields_attributed/4,
+         cask_search_fields_highlight/5,
+         cask_search_text_highlight/4,
+         cask_update_doc/3,
          cask_search_near/4, cask_search_near/5,
          cask_search_fuzzy/4, cask_search_fuzzy/5,
          cask_search_wildcard/3, cask_search_wildcard/4,
@@ -115,6 +118,17 @@ cask_search_fields_attributed(_Ref, _Q, _K) ->
     erlang:nif_error({error, not_loaded}).
 cask_search_fields_attributed(_Ref, _Q, _K, _F) ->
     erlang:nif_error({error, not_loaded}).
+%% libbitcask 11.2.0：归属版 + 逐字段片段。Filter = undefined | filter term，
+%% HlOpts = #{pre_tag, post_tag, fragment_size, max_fragments}。返回
+%% [{Key, Ord, Score, [Field], [{Field, [Snippet]}]}]。
+cask_search_fields_highlight(_Ref, _Q, _K, _F, _HlOpts) ->
+    erlang:nif_error({error, not_loaded}).
+%% libbitcask 11.2.0：文档部分更新。Patch = #{fields => #{F => Text | delete},
+%% meta => #{K => V | delete}}。{ok, Lsn} | not_found | {error, conflict} | {error, _}。
+cask_update_doc(_Ref, _Key, _Patch) -> erlang:nif_error({error, not_loaded}).
+%% 带高亮的全文检索。HlOpts 同上外加 cold => load | skip（缺省 load）。
+%% 返回 [{Key, Ord, Score, [Snippet]}]。
+cask_search_text_highlight(_Ref, _Q, _K, _HlOpts) -> erlang:nif_error({error, not_loaded}).
 cask_search_near(_Ref, _Q, _Slop, _K, _F) -> erlang:nif_error({error, not_loaded}).
 cask_search_fuzzy(_Ref, _Q, _MaxEdit, _K, _F) -> erlang:nif_error({error, not_loaded}).
 cask_search_wildcard(_Ref, _Pattern, _K, _F) -> erlang:nif_error({error, not_loaded}).

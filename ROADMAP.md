@@ -6,6 +6,40 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 12.0.0 落地
+
+### libbitcask 升级 11.0.0 → 12.0.0 ✅
+
+跨上游 11.1.0 / 11.1.1 / 11.2.0 / 12.0.0。上游 12.0.0（S62）给 meta 加了字符串数组（类型标记 5）和
+`Contains` / `ContainsAny` 过滤；`meta::MetaValue` 变体追加 `StringArray`，C++ ABI 破坏（`SOVERSION` 11→12）。
+本仓库 NIF 直接用 C++ 头面，这次不是「重编即可」：`decode_meta` 补数组分支，`encode_meta` 收 `[binary()]`，
+filter 认 `contains` / `contains_any`；`bitcask_query` 的 `where` 同步这两种条件，二级索引对数组字段整体编码
+（只服务 `exists`）。⚠️ 目录写入数组后 `bitcask.meta` 懒升 v7，本库 ≤ 11.x 打不开；不写数组的目录不受影响。
+submodule 切到上游 `12.0.0`（`62dd725`）。
+
+### merge_only 旁车合并检索库 ✅
+
+上游 11.1.1（S58 / S59）修好检索库经 `merge/2,3` 整次合并的永久挂死，以及跨进程旁车合并后写者读不到被搬走的
+key；M22 遗留的「合并后检索不变」端到端用例已补。同版并入 M22：`merge/2,3` 与 `open/2` 共用分词选项归一
+（jieba 缺省词典目录、字符串 `dict_path`）。
+
+### 文档部分更新与高亮 ✅
+
+接入上游 11.2.0（S60 / S61）：`update_doc/3`（补丁 `#{fields, meta}`，`delete` 标记删除，返回 `{ok, Lsn}`，
+冲突 `{error, conflict}`）与 `search_fields_highlight/2..5`（`search_fields_attributed` + `[{Field, [Snippet]}]`）；另接 `search_text_highlight/2..4`
+（上游 S13-D3 / S53，`cold => load | skip`，缺省 load）。
+
+## 11.0.0 落地
+
+### libbitcask 升级 10.0.0 → 11.0.0 ✅
+
+上游 S56 修复 `search_fields` 的两处打分口径：每字段统计改为跨段聚合、文档长度
+改取该字段自身词数，`search_fields` 与 `search_text` 分数逐位一致，重开前后排序
+不再漂移。这是 C++ ABI 破坏（`FieldSegmentView` / `SealedSegment` 布局变化，
+`SOVERSION` 10→11）；C API 与盘上格式零改动。⚠️ 既有库的 `search_fields` 分数
+与排序会变，不提供旧口径开关。本仓库 NIF / Erlang 门面零改动，源码级依赖重编
+即可；submodule 切到上游 `11.0.0`（`862d735`）。
+
 ## 10.0.0 落地
 
 ### libbitcask 升级 9.0.0 → 10.0.0 ✅

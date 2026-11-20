@@ -164,6 +164,31 @@ explicit `vector` skips embedding.
 Constraints: a `vector` whose byte size is not a multiple of 4 → `badarg`; wrong
 dimension → `{error, _}`; under `cosine`, a zero vector → `{error, _}`.
 
+### `update_doc(Handle, Key, Patch) -> {ok, Lsn} | {error, Reason}` (12.0.0)
+Partial document update: changes only some named fields and meta keys; the body text, vector and
+expiry stay as they are. The engine does an atomic read-modify-write (a conditional write-back that
+re-reads and retries up to 16 times when a concurrent write gets in between), so callers need no lock.
+
+```erlang
+{ok, Lsn} = bitcask:update_doc(H, <<"doc:1">>,
+    #{fields => #{<<"title">> => <<"New title">>, <<"draft">> => delete},
+      meta   => #{<<"status">> => <<"done">>, <<"tags">> => [<<"a">>, <<"b">>],
+                  <<"old">> => delete}}).
+```
+
+- `fields` and `meta` are both optional. A value of `delete` removes the entry (ignored if absent);
+  anything else sets or replaces it. New fields are appended after the existing ones.
+- Meta values are as in `encode_meta/1` (including `[binary()]` string arrays; `undefined` writes null).
+  Any other atom is `badarg`, so a misspelt `delete` is not silently written as null.
+- `Lsn` is the new version's LSN, the same as the `Ord` from `get_with_ord/2`.
+- Errors: a missing / deleted / expired key → `{error, not_found}`; still conflicting after 16 retries
+  → `{error, conflict}` (try again); an empty field name or non-UTF-8 field value →
+  `{error, {invalid_option, Msg}}`; a malformed patch (unknown key, not a map, non-binary name) → `badarg`.
+- ⚠️ It does not save disk: the new version is still a full record and the document is reindexed in
+  full; what it saves is the caller's round trip and race. It bypasses `bitcask_query:put`, so if it
+  changes a meta field that has a secondary index, old entries are filtered out by read-time checks and
+  the new value is not findable until `drop_index` + `create_index`.
+
 ### `delete(Handle, Key) -> ok`
 Write a tombstone. Space is reclaimed at the next merge.
 
@@ -359,6 +384,40 @@ smaller `K`'s result is a prefix of a larger `K`'s. The exception is `search_fie
 fields or boost groups: it approximates by taking each field's top-K and summing, so the prefix
 property does not hold there.
 
+### `search_text_highlight(H, Query[, K[, HlOpts]]) -> {ok, Hits} | {error, Reason}` (12.0.0)
+Full-text search with highlight snippets: hits and ordering are those of `search_text`, and
+`Hits :: [{Key, Ord, Score, [Snippet :: binary()]}]`. Snippets come from the body text, or from the
+first named field when the body is empty. Upstream takes no meta filter here.
+
+- `HlOpts` is as for `search_fields_highlight` (`pre_tag` / `post_tag` / `fragment_size` /
+  `max_fragments`), plus `cold => load | skip`:
+  - `load` (default): a "cold" hit that is not in the in-process source-text cache is read back from
+    storage and highlighted, one point read per cold hit; it is skipped if the version read back is no
+    longer the one that matched, and the text read back is not put into the cache.
+  - `skip`: use the cache only; cold hits get empty snippets (cheapest).
+- When hits are cold: the cache (1024 documents by default) is filled only on writes and index builds.
+  A large store reopened later loads sealed segments without replay, so their documents are cold; a
+  small store replays from data on reopen and its documents stay warm.
+- Unknown keys, any other `cold` value, etc. → `badarg`; KV mode → `{error, no_index}`.
+
+### `search_fields_highlight(H, Query[, K[, Filter[, HlOpts]]]) -> {ok, Hits} | {error, Reason}` (12.0.0)
+`search_fields_attributed` plus per-field highlight snippets: `Hits :: [{Key, Ord, Score, Fields,
+FieldSnippets}]`, where the first four elements are exactly those of `search_fields_attributed` and
+`FieldSnippets :: [{Field, [Snippet :: binary()]}]`.
+
+- Source text is read back from storage (cold documents after a reopen get snippets too), one point
+  read per hit.
+- Each field is highlighted only with the query terms that belong to it: for `title:rust body:memory`
+  the title snippets mark only rust. Unqualified terms belong to the default field (`<<>>`, snippets
+  from the body text). Synonym expansions are marked as well.
+- Snippet groups follow the order of `Fields` and list only fields that produced snippets. If the
+  version read back is no longer the one that matched (overwritten / deleted), the hit is still
+  returned without snippets.
+- `HlOpts`: `#{pre_tag => <<"<em>">>, post_tag => <<"</em>">>, fragment_size => 120, max_fragments => 3}`
+  (defaults shown; all optional; `max_fragments` is per field). Unknown keys, non-binary tags and
+  non-positive integers are `badarg`.
+- KV mode → `{error, no_index}`.
+
 ---
 
 ## Vector & hybrid search
@@ -445,7 +504,9 @@ A filter restricts results to documents whose `meta` matches. Documents with no
 **Condition:** `#{key => Key, op => Op, value => V}`, where `Op` is one of
 `eq | neq | gt | gte | lt | lte`. There are two other forms:
 - `#{key => Key, op => in, values => [V, ...]}` (the list must not be empty);
-- `#{key => Key, op => exists}` (no `value`).
+- `#{key => Key, op => exists}` (no `value`);
+- `#{key => Key, op => contains, value => Bin}` and `#{key => Key, op => contains_any, values => [Bin, ...]}`
+  (since libbitcask 12.0.0, for string-array meta; `values` must not be empty).
 
 `Key` must be a binary; an atom is `badarg`. `V` may be an integer (int64), a float, a
 binary, `true`/`false`, or `undefined` (null). Any other atom is `badarg`.
@@ -464,19 +525,27 @@ binary, `true`/`false`, or `undefined` (null). Any other atom is `badarg`.
 - `gt`, `gte`, `lt` and `lte` compare only integer with integer, or float with float. Any other
   pairing is false.
 - `exists` means the field is present and not null.
+- `contains` matches when any array element equals `Bin`; a stored single binary counts as a
+  one-element set. `contains_any` matches when any `Bin` is contained. A non-binary literal never matches.
+- A string array is a type mismatch for `eq`, `in` and the ordering operators (false) and for `neq` (true).
 - A filter with no conditions and no children is always true, even when `logic` is `'or'`.
 
-Malformed shapes (unknown `op`, `in` with missing or empty `values`, an atom `Key`, an
+Malformed shapes (unknown `op`, `in` / `contains_any` with missing or empty `values`, an atom `Key`, an
 unsupported value type) → `badarg`.
 
 ### `encode_meta(Entries) -> MetaBin`
 Encode a map (or proplist) into the `meta` blob for `put`. Value types: `integer`
 → int64, `float` → double, `binary` → string, `true`/`false` → bool, `undefined`
-→ null. Use the result as the `meta` key of a put doc map.
+→ null, `[binary()]` → string array (since libbitcask 12.0.0; `[]` is an empty array; every element
+must be a binary, charlists are rejected). Use the result as the `meta` key of a put doc map.
+
+> ⚠️ The first time a directory receives meta containing an array, `bitcask.meta` is raised to v7;
+> from then on libbitcask ≤ 11.2 (this library ≤ 11.x) refuses to open it (clean error). Directories
+> that never store arrays are unaffected and stay readable by older versions.
 
 ### `decode_meta(MetaBin) -> map()`
 Inverse of `encode_meta/1`: decodes the blob into `#{binary() => V}`, with null as
-`undefined`. An invalid blob → `badarg`. `get` returns `undefined` when a document has no meta.
+`undefined` and string arrays as `[binary()]` (in write order). An invalid blob → `badarg`. `get` returns `undefined` when a document has no meta.
 
 ---
 
@@ -575,6 +644,8 @@ picks the driver as follows:
 - `eq`, `neq` and `in` compare only values of the same type: `1` is not equal to `1.0`. A missing field reads as `undefined`.
 - `gt`, `gte`, `lt` and `lte` compare only integer with integer, or float with float.
 - `exists` means the field is present and not null.
+- `{F, contains, Bin}` and `{F, contains_any, [Bin, ...]}` mean the same as in the engine (see
+  "Meta filters" above); literals must be binaries. These conditions never use a secondary index.
 
 Field names may be binaries or atoms.
 

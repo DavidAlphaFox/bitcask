@@ -33,6 +33,7 @@
          get_with_ord/2,
          get_doc/2,
          put/3,
+         update_doc/3,
          put_docs/2,
          delete/2,
          sync/1,
@@ -58,6 +59,9 @@
            search_fields/2, search_fields/3, search_fields/4,
            search_fields_attributed/2, search_fields_attributed/3,
            search_fields_attributed/4,
+           search_fields_highlight/2, search_fields_highlight/3,
+           search_fields_highlight/4, search_fields_highlight/5,
+           search_text_highlight/2, search_text_highlight/3, search_text_highlight/4,
            search_near/3, search_near/4, search_near/5,
            search_fuzzy/3, search_fuzzy/4, search_fuzzy/5,
            search_wildcard/2, search_wildcard/3, search_wildcard/4,
@@ -119,7 +123,8 @@ open(Dirname) -> open(Dirname, []).
 %%
 %%   索引模式选项（传入即启用全文搜索）：
 %%     {analyzer, Type}     — ngram | whitespace | jieba（必填）
-%%     {dict_path, Path}    — jieba 分词词典路径（jieba 时必填）
+%%     {dict_path, Path}    — jieba 分词词典目录（binary 或字符串；不给则用
+%%                            priv/dict；open 与 merge/2,3 同一套缺省）
 %%     {enable_stop_words, true} — 启用停用词过滤
 %%     {synonym_file, Path} — 同义词词典文件路径（v3.0.0：open-time 不可变
 %%                            配置，取代已删除的运行期 set_synonym_map/2；
@@ -246,14 +251,16 @@ open_1(Dirname, Opts) ->
                          undefined -> Extra0;
                          _         -> [{vector_dim, VDim} | Extra0]
                      end,
-            Extra2 = maybe_default_dict_path(Extra1),
-            Extra = maybe_binarize_synonym_file(Extra2),
-            case bitcask_cpp_nifs:cask_open(Dirname, Base ++ Extra) of
-                {ok, CaskRef}  -> {CaskRef, EmbedderCtx};
-                {error, _} = E -> E;
-                %% 某些故障（如 mode_mismatch）NIF 以裸 atom 返回——归一成
-                %% {error, Reason}，与 open 的契约一致，避免 caller case_clause。
-                Reason         -> {error, Reason}
+            case normalize_text_opts(Extra1) of
+                {error, _} = E0 -> E0;
+                {ok, Extra} ->
+                    case bitcask_cpp_nifs:cask_open(Dirname, Base ++ Extra) of
+                        {ok, CaskRef}  -> {CaskRef, EmbedderCtx};
+                        {error, _} = E -> E;
+                        %% 某些故障（如 mode_mismatch）NIF 以裸 atom 返回——归一成
+                        %% {error, Reason}，与 open 的契约一致，避免 caller case_clause。
+                        Reason         -> {error, Reason}
+                    end
             end
     end.
 
@@ -291,6 +298,35 @@ new_embedder(Provider, Cfg) ->
         {error, _} = E -> E
     end.
 
+%% 分词相关选项的门面归一——open/2 与 merge/2,3 的临时 merge_only 打开**共用**
+%% （下游反馈 2026-11-19 jieba-missing-dict：merge 漏了这一步，带 {analyzer, jieba}
+%% 合并时 dict_path 为空，libbitcask 11.0.0 及以前直接 abort 进程）：
+%%   1. dict_path 收 binary / 字符串（chardata，按 UTF-8 转 binary）；别的类型
+%%      报 {error, {invalid_option, Msg}}——NIF 侧只认 binary，从前静默忽略，
+%%      于是退到「没给」；
+%%   2. jieba 且没给 dict_path ⇒ 补 priv/dict；
+%%   3. synonym_file 字符串转 binary（原样保留既有语义）。
+normalize_text_opts(Opts) ->
+    case binarize_dict_path(Opts) of
+        {error, _} = E -> E;
+        {ok, O1}       -> {ok, maybe_binarize_synonym_file(maybe_default_dict_path(O1))}
+    end.
+
+binarize_dict_path(Opts) ->
+    case proplists:get_value(dict_path, Opts) of
+        undefined -> {ok, Opts};
+        Bin when is_binary(Bin) -> {ok, Opts};
+        Path when is_list(Path) ->
+            case unicode:characters_to_binary(Path) of
+                B when is_binary(B) ->
+                    {ok, lists:keyreplace(dict_path, 1, Opts, {dict_path, B})};
+                _ ->
+                    {error, {invalid_option, <<"dict_path: not a valid UTF-8 string">>}}
+            end;
+        _Other ->
+            {error, {invalid_option, <<"dict_path must be a binary or a string">>}}
+    end.
+
 %% analyzer=jieba 且未显式指定 dict_path 时，默认指向 priv/dict
 %% （构建时由 CMake 把 cppjieba 词典拷到此处）。其它分词器或已显式
 %% 给了 dict_path 时原样返回。
@@ -305,7 +341,7 @@ maybe_default_dict_path(Opts) ->
                         Dir ->
                             %% NIF 侧 dict_path 走 enif_inspect_binary，必须是 binary。
                             Path = filename:join(Dir, "dict"),
-                            [{dict_path, list_to_binary(Path)} | Opts]
+                            [{dict_path, unicode:characters_to_binary(Path)} | Opts]
                     end
             end;
         _ -> Opts
@@ -360,6 +396,31 @@ get(Handle, Key) ->
 %% Ord 只在 key 被写入时改变——merge 搬迁、重开、索引重建都原样保留——所以
 %% 可以当版本号用：put_batch_atomic/2,3 / txn_commit 的 op 带 {ord, Ord} 前置
 %% 条件，提交时若有人改过这个 key 就整批不写、返回 {error, {conflict, I}}。
+%% 文档部分更新（libbitcask 11.2.0 / S61）：只改命名字段与 meta 的若干键，正文、向量、
+%% 过期时刻原样保留。引擎内原子读-改-写（条件写回，被并发写打断就重读重试，至多 16 次），
+%% 不必外部加锁。
+%%
+%%   Patch = #{fields => #{Name :: binary() => Text :: binary() | delete},
+%%             meta   => #{Key :: binary() => Value | delete}}
+%%   Value 同 encode_meta/1（integer / float / binary / boolean / undefined = null /
+%%   [binary()] 字符串数组）；其它 atom → badarg（防止拼错的 delete 被写成 null）。
+%%   两个键都可省；字段 / meta 键本来没有时 delete 忽略；新字段追加在原字段之后。
+%%
+%%   → {ok, Lsn}               新版本的 LSN（同 get_with_ord/2 的 Ord）
+%%   | {error, not_found}      key 不存在 / 已删 / 已过期
+%%   | {error, conflict}       16 次重试仍被并发写打断，调用方可再试
+%%   | {error, {invalid_option, Msg}}  如字段名为空、字段值不是 UTF-8
+%%   | {error, _}              只读句柄等
+%% ⚠️ 不省盘：新版本仍是整条记录、整篇重建索引。绕过 bitcask_query:put，若改动了
+%% 建过二级索引的 meta 字段，旧索引项由读校验挡掉、新值查不到（drop/create_index 修）。
+-spec update_doc(term(), binary(), map()) ->
+          {ok, non_neg_integer()} | {error, term()}.
+update_doc(Handle, Key, Patch) when is_binary(Key), is_map(Patch) ->
+    case bitcask_cpp_nifs:cask_update_doc(ref(Handle), Key, Patch) of
+        {ok, _Lsn} = Ok -> Ok;
+        Other           -> normalize_error(Other)
+    end.
+
 get_with_ord(Handle, Key) ->
     case bitcask_cpp_nifs:cask_get_ord(ref(Handle), Key) of
         {ok, _V, _O} = Ok -> Ok;
@@ -795,7 +856,12 @@ merge(Dirname, Opts, FilesToMerge) ->
     cask_merge_dir(Dirname, Opts, FilesToMerge).
 
 cask_merge_dir(Dirname, Opts, FilesArg) ->
-    OpenOpts = [merge_only | cask_open_opts(Opts)],
+    case cask_open_opts(Opts) of
+        {error, _} = E -> E;
+        {ok, OpenOpts0} -> cask_merge_dir_1(Dirname, [merge_only | OpenOpts0], FilesArg)
+    end.
+
+cask_merge_dir_1(Dirname, OpenOpts, FilesArg) ->
     case bitcask_cpp_nifs:cask_open(Dirname, OpenOpts) of
         {ok, R} ->
             try cask_merge_run(R, FilesArg)
@@ -833,12 +899,16 @@ cask_merge_call(R, Files) ->
     end.
 
 %% 给「临时 merge open」用的选项构造：强制 read_write，再带上调用方给的
-%% 阈值（frag_threshold 之类，用来决定要并什么）。
+%% 阈值（frag_threshold 之类，用来决定要并什么）。分词选项与 open/2 走同一个
+%% normalize_text_opts/1（缺省词典目录、路径转 binary）——合并要与建库时分词
+%% 一致，调用方带 {analyzer, jieba} 不必再自己补 dict_path。
 cask_open_opts(Opts) ->
-    Base = [read_write],
     Extra = [{K, V} || K <- ?CASK_PASSTHROUGH_OPTS,
                        (V = opt_value(K, Opts)) =/= undefined],
-    Base ++ Extra.
+    case normalize_text_opts(Extra) of
+        {error, _} = E -> E;
+        {ok, Extra1}   -> {ok, [read_write | Extra1]}
+    end.
 
 %% =========================================================================
 %% 杂项查询
@@ -1067,6 +1137,49 @@ search_fields_attributed(Handle, Query, K, Filter) ->
     bitcask_cpp_nifs:cask_search_fields_attributed(ref(Handle), Query, K,
                                                    Filter).
 
+%% 带高亮片段的全文检索（词袋，同 search_text 的命中与排序）。
+%%
+%%   HlOpts = #{pre_tag, post_tag, fragment_size, max_fragments}（同 search_fields_highlight）
+%%            外加 cold => load | skip：
+%%              load（缺省）—— 原文 LRU 里没有的「冷」命中（重开后、只读快照、超出
+%%                             原文缓存容量（缺省 1024 篇））从存储读回正文再切，每条冷命中一次点查；
+%%                             读回版本 ≠ 命中版本的不补；
+%%              skip       —— 只用原文 LRU，冷命中片段为空（最省）。
+%%   → {ok, [{Key, Ord, Score, [Snippet :: binary()]}]}
+%% 取哪段文字：正文非空取正文，否则取第一个命名字段。上游不收 meta filter。
+search_text_highlight(Handle, Query) ->
+    search_text_highlight(Handle, Query, 10).
+
+search_text_highlight(Handle, Query, K) ->
+    search_text_highlight(Handle, Query, K, #{}).
+
+search_text_highlight(Handle, Query, K, HlOpts) when is_map(HlOpts) ->
+    bitcask_cpp_nifs:cask_search_text_highlight(ref(Handle), Query, K, HlOpts).
+
+%% search_fields_attributed + 逐字段高亮片段（libbitcask 11.2.0 / S60）。命中、排序、
+%% 命中字段同 search_fields_attributed；每个命中字段一组片段，原文从存储读回（冷热
+%% 一样），每个字段只用查询里属于该字段的词切（`title:rust body:memory` 的 title
+%% 片段只标 rust），同义词展开后的词也标。读回版本 ≠ 命中版本（已被覆盖 / 删除）
+%% 的命中照常返回、不给片段。代价：每条命中一次点查。
+%%
+%%   Filter = undefined | meta filter（同 search_text/4）
+%%   HlOpts = #{pre_tag => binary(), post_tag => binary(),        % 默认 <<"<em>">> / <<"</em>">>
+%%              fragment_size => pos_integer(),                    % 默认 120（字节）
+%%              max_fragments => pos_integer()}                    % 每个字段默认 3 段
+%%   → {ok, [{Key, Ord, Score, [Field], [{Field, [Snippet :: binary()]}]}]}
+%% Field = <<>> 表示默认字段；片段组与 [Field] 同序，只列切出了片段的字段。
+search_fields_highlight(Handle, Query) ->
+    search_fields_highlight(Handle, Query, 10).
+
+search_fields_highlight(Handle, Query, K) ->
+    search_fields_highlight(Handle, Query, K, undefined).
+
+search_fields_highlight(Handle, Query, K, Filter) ->
+    search_fields_highlight(Handle, Query, K, Filter, #{}).
+
+search_fields_highlight(Handle, Query, K, Filter, HlOpts) when is_map(HlOpts) ->
+    bitcask_cpp_nifs:cask_search_fields_highlight(ref(Handle), Query, K, Filter, HlOpts).
+
 %% 近邻搜索（S8.7）：term 按 Query 词序出现且相邻间隙 ≤ Slop。Slop=0 即短语。
 search_near(Handle, Query, Slop) ->
     search_near(Handle, Query, Slop, 10).
@@ -1171,12 +1284,17 @@ search_hybrid(Handle, TextQuery, VecBin, K, Filter) when is_binary(VecBin) ->
 %% V5:把 map 或 proplist 编码成 put_doc 可用的 meta 二进制 blob。给
 %% 业务方 / 测试一个轻量入口,生产路径下通常自己编码更高效。Value 类型:
 %% integer -> int64, float -> double, binary -> string, true|false -> bool,
-%% undefined -> null。失败 → badarg。
+%% undefined -> null，[binary()] -> 字符串数组（libbitcask 12.0.0 起；[] 是空
+%% 数组，元素必须全是 binary）。失败 → badarg。
+%% ⚠️ 含数组的 meta 一经 put_doc，目录的 bitcask.meta 懒升 v7，libbitcask ≤ 11.2
+%% （本库 ≤ 11.x）从此打不开该目录；不写数组的目录不受影响。
+%% 数组配合 filter 的 `contains` / `contains_any` 用（见 doc/api-zh.md）。
 encode_meta(Entries) ->
     bitcask_cpp_nifs:cask_encode_meta(Entries).
 
 %% encode_meta 的反方向：blob → map。null 解回 undefined，其余类型原样对应
-%% （int64 → integer、double → float、string → binary、bool → true|false）。
+%% （int64 → integer、double → float、string → binary、bool → true|false、
+%% 字符串数组 → [binary()]，保持写入顺序）。
 %% 非法 blob → badarg。get 在无 meta 时给 undefined，调用方自己分支。
 -spec decode_meta(binary()) -> #{binary() => term()}.
 decode_meta(Bin) ->

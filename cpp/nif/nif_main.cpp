@@ -50,6 +50,9 @@ ERL_NIF_TERM nif_cask_search_text_4     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_phrase     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_fields     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_fields_attributed(ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_search_fields_highlight(ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_search_text_highlight(ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_update_doc        (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_near       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_fuzzy      (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_wildcard   (ErlNifEnv*, int, const ERL_NIF_TERM[]);
@@ -115,6 +118,13 @@ ErlNifFunc kNifFuncs[] = {
      guarded<nif_cask_search_fields_attributed>, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"cask_search_fields_attributed", 4,
      guarded<nif_cask_search_fields_attributed>, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    // libbitcask 11.2.0：每条命中要点查读回原文 ⇒ IO 型 dirty。
+    {"cask_search_fields_highlight", 5,
+     guarded<nif_cask_search_fields_highlight>, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    // 冷命中（cold => load）要点查读回正文 ⇒ 同样 IO 型 dirty。
+    {"cask_search_text_highlight", 4,
+     guarded<nif_cask_search_text_highlight>, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"cask_update_doc",         3, guarded<nif_cask_update_doc>,      ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"cask_search_near",        4, guarded<nif_cask_search_near>,     ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"cask_search_near",        5, guarded<nif_cask_search_near>,     ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"cask_search_fuzzy",       4, guarded<nif_cask_search_fuzzy>,    ERL_NIF_DIRTY_JOB_CPU_BOUND},

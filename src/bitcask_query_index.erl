@@ -22,6 +22,11 @@
 %%     integer <<2, (I + 2^63):64/big>>                 翻转符号位
 %%     float   <<3, X:64/big>>                          IEEE 保序变换（-0.0 归一成 0.0）
 %%     binary  <<4, 转义(0 → 0,255)..., 0, 0>>
+%%     [binary()]（字符串数组，libbitcask 12.0.0 起）
+%%             <<5, {1, 转义..., 0, 0}×N, 0>>   整个数组一项
+%%   数组只为 exists 进索引（引擎 exists 对数组为真）；eq/in/大小比较的区间
+%%   都落在别的类型标签上，碰不到数组项——与引擎「数组不参与比较」一致。
+%%   contains 不走索引（规划器不选）。
 %%   null 不进索引（exists 本来就排除 null）。类型标签不同的值互不相等、互不
 %%   比较，与引擎 MetaFilter 的语义一致（1 与 1.0 不等；大小比较只在同类型内）。
 %%
@@ -51,6 +56,7 @@
 -define(T_INT,   2).
 -define(T_FLOAT, 3).
 -define(T_BIN,   4).
+-define(T_ARR,   5).
 
 %% =========================================================================
 %% 定义
@@ -291,14 +297,23 @@ enc(F) when is_float(F) ->
         end,
     <<?T_FLOAT, X:64/big>>;
 enc(B) when is_binary(B) ->
-    <<?T_BIN, (escape(B))/binary, 0, 0>>.
+    <<?T_BIN, (escape(B))/binary, 0, 0>>;
+enc(L) when is_list(L) ->
+    <<?T_ARR, << <<1, (escape(E))/binary, 0, 0>> || E <- L >>/binary, 0>>.
 
 escape(B) -> binary:replace(B, <<0>>, <<0, 255>>, [global]).
 
 enc_len(<<?T_BOOL, _/binary>>)  -> 2;
 enc_len(<<?T_INT, _/binary>>)   -> 9;
 enc_len(<<?T_FLOAT, _/binary>>) -> 9;
-enc_len(<<?T_BIN, Rest/binary>>) -> 1 + str_len(Rest, 0).
+enc_len(<<?T_BIN, Rest/binary>>) -> 1 + str_len(Rest, 0);
+enc_len(<<?T_ARR, Rest/binary>>) -> 1 + arr_len(Rest, 0).
+
+arr_len(<<0, _/binary>>, N) -> N + 1;
+arr_len(<<1, R/binary>>, N) ->
+    L = str_len(R, 0),
+    <<_:L/binary, R2/binary>> = R,
+    arr_len(R2, N + 1 + L).
 
 %% 转义后的字符串在 <<0,0>> 处结束（<<0,255>> 是转义的 0）。
 str_len(<<0, 0, _/binary>>, N)   -> N + 2;

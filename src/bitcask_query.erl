@@ -49,6 +49,10 @@
 %%       所以 {F, eq, undefined} 命中缺失字段。in 对缺失字段恒假。
 %%     * gt/gte/lt/lte 只比 integer-integer、float-float，其它组合恒假。
 %%     * exists = 字段存在且非 null。
+%%     * 字符串数组（meta 值为 [binary()]，libbitcask 12.0.0 起）：eq/in/大小
+%%       比较一律按类型不匹配（假），neq 真；contains V = 数组任一元素等于 V，
+%%       存储值是单个 binary 时当作单元素集合；contains_any Vs = 任一 V 被
+%%       contains。字面值只收 binary。contains 不走二级索引。
 %%
 %%   一致性：range 是 per-key 弱一致（非快照），查询期间的并发写可能部分可见；
 %%   扫描路径同一行的 text 与 meta 出自同一次读。text 驱动时命中只带 key，
@@ -102,6 +106,8 @@
 -type value()     :: integer() | float() | binary() | boolean() | undefined.
 -type where()     :: {field(), eq | neq | gt | gte | lt | lte, value()}
                    | {field(), in, [value(), ...]}
+                   | {field(), contains, binary()}
+                   | {field(), contains_any, [binary(), ...]}
                    | {field(), exists}
                    | {'and' | 'or', [where(), ...]}
                    | [where()].
@@ -113,7 +119,7 @@
                        limit  => pos_integer() | infinity,
                        select => [key | text | meta | score]}.
 -type row()       :: #{key => binary(), text => binary(),
-                       meta => #{binary() => value()} | undefined,
+                       meta => #{binary() => value() | [binary()]} | undefined,
                        score => float()}.
 
 -opaque cont()    :: done | {?MODULE, term(), tuple()}.
@@ -310,6 +316,10 @@ norm_where(L) when is_list(L)                       -> norm_where({'and', L});
 norm_where({Logic, [_ | _] = L}) when Logic =:= 'and'; Logic =:= 'or' ->
     {Logic, [norm_where(W) || W <- L]};
 norm_where({F, exists})                             -> {field(F), exists};
+norm_where({F, contains, V}) when is_binary(V)     -> {field(F), contains, V};
+norm_where({F, contains_any, [_ | _] = Vs} = W) ->
+    lists:all(fun is_binary/1, Vs) orelse throw({bad_query, {where, W}}),
+    {field(F), contains_any, Vs};
 norm_where({F, in, [_ | _] = Vs} = W) ->
     [value(V, W) || V <- Vs],
     {field(F), in, Vs};
@@ -694,6 +704,7 @@ is_leaf(_) -> true.
 
 leaf({F, exists})   -> #{key => F, op => exists};
 leaf({F, in, Vs})   -> #{key => F, op => in, values => Vs};
+leaf({F, contains_any, Vs}) -> #{key => F, op => contains_any, values => Vs};
 leaf({F, Op, V})    -> #{key => F, op => Op, value => V}.
 
 %% ---- BEAM 侧求值（与 meta_filter.hpp 对齐，见模块头）---------------------
@@ -707,6 +718,11 @@ eval({F, in, Vs}, M) ->
         undefined -> false;
         S         -> lists:any(fun(V) -> same(S, V) end, Vs)
     end;
+eval({F, contains, V}, M) ->
+    has(maps:get(F, M, undefined), V);
+eval({F, contains_any, Vs}, M) ->
+    S = maps:get(F, M, undefined),
+    lists:any(fun(V) -> has(S, V) end, Vs);
 eval({F, eq, V}, M)    -> same(maps:get(F, M, undefined), V);
 eval({F, neq, V}, M)   -> not same(maps:get(F, M, undefined), V);
 eval({F, Op, V}, M)    -> ordered(Op, maps:get(F, M, undefined), V).
@@ -717,6 +733,11 @@ same(A, B) when is_binary(A), is_binary(B)   -> A =:= B;
 same(A, B) when is_boolean(A), is_boolean(B) -> A =:= B;
 same(undefined, undefined)                   -> true;
 same(_, _)                                   -> false.
+
+%% contains：数组任一元素相等；单个 binary 当单元素集合；其它类型恒假。
+has(L, V) when is_list(L)   -> lists:member(V, L);
+has(B, V) when is_binary(B) -> B =:= V;
+has(_, _)                   -> false.
 
 ordered(Op, A, B) when (is_integer(A) andalso is_integer(B));
                        (is_float(A) andalso is_float(B)) ->

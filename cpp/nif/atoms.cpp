@@ -135,6 +135,16 @@ void Atoms::init(ErlNifEnv* env) noexcept {
     lte                = a("lte");
     in_op              = a("in");
     exists             = a("exists");
+    contains           = a("contains");
+    contains_any       = a("contains_any");
+    atom_delete        = a("delete");
+    pre_tag            = a("pre_tag");
+    post_tag           = a("post_tag");
+    fragment_size      = a("fragment_size");
+    max_fragments      = a("max_fragments");
+    cold               = a("cold");
+    load               = a("load");
+    skip               = a("skip");
 }
 
 Atoms& atoms() noexcept { return g_atoms; }

@@ -162,7 +162,8 @@ struct Atoms {
     //   conditions/children = 嵌套 MetaFilter 的 map 字段;
     //   key/op/value/values = 单条 MetaCondition 的字段;
     //   logic + and_op/or_op = MetaFilter::Logic 取值;
-    //   eq/neq/gt/gte/lt/lte/in_op/exists = MetaOp 取值。
+    //   eq/neq/gt/gte/lt/lte/in_op/exists/contains/contains_any = MetaOp 取值
+    //   （contains / contains_any 自 libbitcask 12.0.0）。
     // in_op/and_op/or_op 加 _op 后缀以避开 Erlang `in`/`and`/`or` 是
     // 关键字/保留字在 atom 字面量里写起来不直观——但 NIF 侧用字符串
     // 走 enif_make_atom 不受限制,这里只是 C++ 端字段名要避开关键字。
@@ -183,6 +184,17 @@ struct Atoms {
     ERL_NIF_TERM lte;
     ERL_NIF_TERM in_op;
     ERL_NIF_TERM exists;
+    ERL_NIF_TERM contains;
+    ERL_NIF_TERM contains_any;
+    // libbitcask 12.0.0 接入：update_doc 补丁的删除标记、高亮选项键。
+    ERL_NIF_TERM atom_delete;
+    ERL_NIF_TERM pre_tag;
+    ERL_NIF_TERM post_tag;
+    ERL_NIF_TERM fragment_size;
+    ERL_NIF_TERM max_fragments;
+    ERL_NIF_TERM cold;
+    ERL_NIF_TERM load;
+    ERL_NIF_TERM skip;
 
     // 线程安全: 否（写入静态状态）；仅 on_load 调用一次。
     void init(ErlNifEnv* env) noexcept;

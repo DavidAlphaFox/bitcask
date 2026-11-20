@@ -75,6 +75,13 @@ bool parse_meta_value(ErlNifEnv* env, ERL_NIF_TERM term,
                       bitcask::meta::MetaValue& out,
                       bool other_atoms_as_null = false);
 
+// meta 条目值（写入用：encode_meta / update_doc）：parse_meta_value 的标量，外加
+// [binary()] → 字符串数组（libbitcask 12.0.0；[] = 空数组；元素须全为 binary，
+// charlist / 混合 / improper list 返回 false）。filter 字面值不走这里（不收数组）。
+bool parse_meta_entry_value(ErlNifEnv* env, ERL_NIF_TERM term,
+                            bitcask::meta::MetaValue& out,
+                            bool other_atoms_as_null);
+
 // CaskFault → Erlang 错误 term。所有 NIF 入口共用这一份（6.7.0 前还有个
 // fault_to_term_detailed，只在 open / range / batch 上用，于是同一种故障从
 // 不同 NIF 出来形态不同——invalid_option 从 merge / hybrid 出来就是

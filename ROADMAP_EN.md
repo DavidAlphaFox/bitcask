@@ -6,6 +6,44 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 12.0.0 shipped
+
+### libbitcask upgrade 11.0.0 → 12.0.0 ✅
+
+Spans upstream 11.1.0 / 11.1.1 / 11.2.0 / 12.0.0. Upstream 12.0.0 (S62) adds string arrays to meta (type tag 5) and
+`Contains` / `ContainsAny` filters; `meta::MetaValue` gains a `StringArray` alternative, a breaking C++ ABI change
+(`SOVERSION` 11→12). This repository's NIF uses the C++ headers directly, so this was not a plain rebuild: `decode_meta`
+handles arrays, `encode_meta` accepts `[binary()]`, and filters accept `contains` / `contains_any`; `bitcask_query`
+`where` gains the same two conditions, and the secondary index encodes an array field as a whole (serving `exists` only).
+⚠️ Once a directory stores an array, `bitcask.meta` is lazily raised to v7 and this library ≤ 11.x refuses to open it;
+directories without arrays are unaffected. The submodule moves to upstream `12.0.0` (`62dd725`).
+
+### merge_only sidecar merges of search stores ✅
+
+Upstream 11.1.1 (S58 / S59) fixes the permanent hang when fully merging a search store through `merge/2,3`, and an open
+writer failing to read moved keys after a cross-process sidecar merge; the end-to-end "search unchanged after merge" tests
+left over from M22 are now in place. M22 ships in the same release: `merge/2,3` and `open/2` share text-option
+normalisation (default jieba dictionary directory, string `dict_path`).
+
+### Partial document updates and highlighting ✅
+
+Wires in upstream 11.2.0 (S60 / S61): `update_doc/3` (patch `#{fields, meta}`, `delete` marks removal, returns
+`{ok, Lsn}`, conflicts `{error, conflict}`) and `search_fields_highlight/2..5` (`search_fields_attributed` +
+`[{Field, [Snippet]}]`), plus `search_text_highlight/2..4` (upstream S13-D3 / S53, `cold => load | skip`, default load).
+
+## 11.0.0 shipped
+
+### libbitcask upgrade 10.0.0 → 11.0.0 ✅
+
+Upstream S56 fixes two `search_fields` scoring mismatches: per-field statistics now
+aggregate across segments and the document length is the field's own length, making
+`search_fields` and `search_text` agree bit-for-bit and removing score changes after
+reopen. This is a breaking C++ ABI change (`FieldSegmentView` / `SealedSegment`
+layout, `SOVERSION` 10→11); the C API and on-disk format are unchanged. ⚠️ Scores
+and ordering for `search_fields` change on existing stores, with no legacy-mode
+switch. This repository needs no NIF / Erlang facade changes, only a rebuild; the
+submodule moves to upstream `11.0.0` (`862d735`).
+
 ## 10.0.0 shipped
 
 ### libbitcask upgrade 9.0.0 → 10.0.0 ✅

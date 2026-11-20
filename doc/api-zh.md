@@ -151,6 +151,25 @@ embedder 生成并写入向量；显式传 `vector` 则跳过。
 限制：`vector` 字节数非 4 的倍数 → `badarg`；维度不符 → `{error, _}`；`cosine`
 下零向量 → `{error, _}`。
 
+### `update_doc(Handle, Key, Patch) -> {ok, Lsn} | {error, Reason}`（12.0.0）
+文档部分更新：只改命名字段与 meta 的若干键，正文、向量、过期时刻原样保留。引擎内原子读-改-写
+（条件写回，被并发写打断就重读重试，至多 16 次），调用方不必加锁。
+
+```erlang
+{ok, Lsn} = bitcask:update_doc(H, <<"doc:1">>,
+    #{fields => #{<<"title">> => <<"新标题">>, <<"draft">> => delete},
+      meta   => #{<<"status">> => <<"done">>, <<"tags">> => [<<"a">>, <<"b">>],
+                  <<"old">> => delete}}).
+```
+
+- `fields` / `meta` 都可省；值为 `delete` 表示删除（本来没有就忽略），否则设置或整值替换。新字段追加在原字段之后。
+- meta 值同 `encode_meta/1`（含 `[binary()]` 字符串数组，`undefined` 写 null）；其它 atom → `badarg`，免得拼错的 `delete` 被静默写成 null。
+- `Lsn` 是新版本的 LSN，同 `get_with_ord/2` 的 `Ord`。
+- 错误：key 不存在 / 已删 / 已过期 → `{error, not_found}`；16 次重试仍冲突 → `{error, conflict}`（可再试）；
+  空字段名、字段值不是 UTF-8 → `{error, {invalid_option, Msg}}`；形态错（未知键、非 map、非 binary 名字）→ `badarg`。
+- ⚠️ 不省盘：新版本仍是整条记录、整篇重建索引，省的是调用方读-改-写的往返与竞态。它绕过 `bitcask_query:put`，
+  改了建过二级索引的 meta 字段时，旧索引项会被读时校验挡掉、新值查不到，需 `drop_index` + `create_index`。
+
 ### `delete(Handle, Key) -> ok`
 写墓碑。空间在下次 merge 回收。
 
@@ -324,6 +343,29 @@ O(1) 估算；写过任何 key 后恒 `false`。
 同分命中按 (段次序, 段内写入序) 稳定排序：小 `K` 的结果是大 `K` 结果的前缀。
 例外：`search_fields` 有多个字段或多个 boost 组时，结果是逐字段取 top-K 再求和的近似值，不保证这种前缀关系。
 
+### `search_text_highlight(H, Query[, K[, HlOpts]]) -> {ok, Hits} | {error, Reason}`（12.0.0）
+带高亮片段的全文检索：命中与排序同 `search_text`，`Hits :: [{Key, Ord, Score, [Snippet :: binary()]}]`。
+片段取正文；正文为空时取第一个命名字段。上游不收 meta filter。
+
+- `HlOpts` 同 `search_fields_highlight`（`pre_tag` / `post_tag` / `fragment_size` / `max_fragments`），另收
+  `cold => load | skip`：
+  - `load`（缺省）：进程内原文缓存里没有的「冷」命中从存储读回正文再切，每条冷命中一次点查；读回的版本已不是命中的那一版则不补；读回的原文不回填缓存。
+  - `skip`：只用原文缓存，冷命中片段为空（最省）。
+- 什么时候会冷：原文缓存（缺省 1024 篇）只在写入和建索引时填。大库重开后直接载入封好的段、不重放，段里的文档都是冷的；小库重开会从 data 重放，文档仍是热的。
+- 未知键、`cold` 取其它值等 → `badarg`；KV 模式 → `{error, no_index}`。
+
+### `search_fields_highlight(H, Query[, K[, Filter[, HlOpts]]]) -> {ok, Hits} | {error, Reason}`（12.0.0）
+`search_fields_attributed` 加逐字段高亮片段：`Hits :: [{Key, Ord, Score, Fields, FieldSnippets}]`，前四项与
+`search_fields_attributed` 完全相同，`FieldSnippets :: [{Field, [Snippet :: binary()]}]`。
+
+- 原文从存储读回（重开后的冷文档也有片段），每条命中一次点查。
+- 每个字段只用查询里属于该字段的词切：`title:rust body:memory` 的 title 片段只标 rust；无字段限定的词归默认字段
+  （`<<>>`，片段取正文）；同义词展开后的词也标。
+- 片段组与 `Fields` 同序，只列切出了片段的字段；读回的版本已不是命中的那一版（被覆盖 / 删除）→ 该条照常返回、不给片段。
+- `HlOpts`：`#{pre_tag => <<"<em>">>, post_tag => <<"</em>">>, fragment_size => 120, max_fragments => 3}`（括号内为默认值，
+  都可省；`max_fragments` 按字段计）。未知键、非 binary 标签、非正整数 → `badarg`。
+- KV 模式 → `{error, no_index}`。
+
 ---
 
 ## 向量 / 混合检索
@@ -405,7 +447,9 @@ filter 只返回 `meta` 命中的文档。没有 meta 的文档一律不通过�
 **单条件：** `#{key => Key, op => Op, value => V}`，其中 `Op` 是 `eq | neq | gt | gte | lt | lte` 之一；
 另有两种特殊形态：
 - `#{key => Key, op => in, values => [V, ...]}`（列表不能为空）；
-- `#{key => Key, op => exists}`（不需要 `value`）。
+- `#{key => Key, op => exists}`（不需要 `value`）；
+- `#{key => Key, op => contains, value => Bin}`、`#{key => Key, op => contains_any, values => [Bin, ...]}`
+  （libbitcask 12.0.0 起，配合字符串数组 meta 用；`values` 不能为空）。
 
 `Key` 必须是 binary，传 atom 会报 `badarg`。`V` 可以是 integer（int64）、float、binary、`true`/`false`，或者 `undefined`（表示 null）。传其它 atom 会报 `badarg`。
 
@@ -419,17 +463,24 @@ filter 只返回 `meta` 命中的文档。没有 meta 的文档一律不通过�
 - 缺失的字段读作 null，所以 `{eq, undefined}` 能命中缺失字段。`in` 遇到缺失字段一律为假。
 - `gt`、`gte`、`lt`、`lte` 只比较 integer 与 integer、float 与 float，其它组合一律为假。
 - `exists` 表示字段存在且值不是 null。
+- `{F, contains, Bin}`、`{F, contains_any, [Bin, ...]}` 与引擎同义（见上面「Meta 过滤」），字面值只收 binary；这两种条件不走二级索引。
+- `contains`：数组里任一元素等于 `Bin` 即命中；存储值是单个 binary 时当作只有一个元素的集合。`contains_any`：任一 `Bin` 被 `contains` 即命中。字面值不是 binary 时恒不命中。
+- 字符串数组碰到 `eq`、`in`、大小比较一律为假，碰到 `neq` 为真（类型不匹配）。
 - 不含任何条件、也不含子 filter 的 filter 恒为真（即使 `logic` 是 `'or'` 也一样）。
 
-形态非法（未知 `op`、`in` 缺 `values` 或列表为空、atom 当 `Key`、不支持的值类型）→ `badarg`。
+形态非法（未知 `op`、`in` / `contains_any` 缺 `values` 或列表为空、atom 当 `Key`、不支持的值类型）→ `badarg`。
 
 ### `encode_meta(Entries) -> MetaBin`
 把 map（或 proplist）编码成 `put` 用的 `meta` blob。值类型：`integer` → int64，
-`float` → double，`binary` → string，`true`/`false` → bool，`undefined` → null。
+`float` → double，`binary` → string，`true`/`false` → bool，`undefined` → null，
+`[binary()]` → 字符串数组（libbitcask 12.0.0 起；`[]` 是空数组；元素必须全是 binary，charlist 不行）。
 结果作为 put doc map 的 `meta` 键。
 
+> ⚠️ 目录里第一次写入含数组的 meta 时，`bitcask.meta` 会升到 v7，此后 libbitcask ≤ 11.2（本库 ≤ 11.x）
+> 打不开这个目录（干净报错）。从不写数组的目录不受影响，可以和旧版本互通。
+
 ### `decode_meta(MetaBin) -> map()`
-`encode_meta/1` 的反方向：把 meta blob 解码成 `#{binary() => V}`，null 解回 `undefined`。
+`encode_meta/1` 的反方向：把 meta blob 解码成 `#{binary() => V}`，null 解回 `undefined`，字符串数组解回 `[binary()]`（保持写入顺序）。
 blob 非法会报 `badarg`。`get` 在没有 meta 时返回 `undefined`，由调用方自己判断。
 
 ---

@@ -22,7 +22,7 @@ set(BITCASK_PRIV_DIR "${CMAKE_SOURCE_DIR}/priv")
 file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 
 # ---------------------------------------------------------------------------
-# libbitcask — git submodule at third_party/libbitcask (10.0.0, commit 46da576)。
+# libbitcask — git submodule at third_party/libbitcask (12.0.0, commit 62dd725)。
 # 提供 C++ 核心库全部 target（bitcask_cask, bitcask_keydir, ...）。
 #
 # ⚠️ 6.2.1 起**不再需要 third_party 符号链接**。此前 libbitcask 的
@@ -161,6 +161,19 @@ file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 # C2 分析器记录，ngram 高亮偏移与多词 / 重叠高亮修复，旧封段 fallback 不再写
 # 进进程 CWD。C API 纯加法、C ABI 兼容，盘上格式仍 v5/v6。本仓库 NIF /
 # Erlang 门面零改动，源码级依赖重编即可。
+# 11.0.0：C++ ABI 破坏（SOVERSION 10→11）——`FieldSegmentView` 追加 `live`、
+# `SealedSegment` 追加字段级打分状态，`search_fields` 改用每字段跨段统计与
+# 字段自身 dl；结果修成与 `search_text` 同口径，既有库分数 / 排序可能变化，
+# 无旧口径开关。C API 与盘上格式零改动。本仓库 NIF / Erlang 门面零改动，
+# 源码级依赖重编即可。
+# 11.1.0 / 11.1.1 / 11.2.0：ABI 兼容（SOVERSION 11）——jieba 缺词典报错不 abort、
+# needs_merge 用实时账本；检索库 merge_only 旁车合并不再挂死、跨进程旁车合并后
+# 写者自愈；新增逐字段片段与 update_doc（12.0.0 起 NIF 已接：cask_update_doc /
+# cask_search_fields_highlight，见 cpp/nif/nif_cask_doc.cpp）。
+# 12.0.0：C++ ABI 破坏（SOVERSION 11→12）——meta::MetaValue 变体追加
+# StringArray；meta 新类型标记 5、MetaOp::Contains / ContainsAny；目录写入数组
+# 后 bitcask.meta 懒升 v7（≤ 11.2 打不开）。NIF 的 decode_meta visitor 补了数组
+# 分支（不补编译不过），encode_meta / filter 接入数组与 contains / contains_any。
 
 # ---------------------------------------------------------------------------
 add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/libbitcask"

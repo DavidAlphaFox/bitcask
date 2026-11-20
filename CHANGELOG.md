@@ -3,6 +3,59 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [12.0.0] — 2026-11-20
+
+升级 libbitcask **11.0.0 → 12.0.0**（跨上游 11.1.0 / 11.1.1 / 11.2.0 / 12.0.0）。submodule 从 `862d735` 切到 `62dd725`（`12.0.0`）。
+⚠️ 上游 12.0.0 是 C++ ABI 破坏（`meta::MetaValue` 变体追加 `StringArray`，`SOVERSION` 11→12），NIF 已随之修改，须重编。
+⚠️ 目录里一旦写入含字符串数组的 meta，`bitcask.meta` 懒升 v7，此后 libbitcask ≤ 11.2（本库 ≤ 11.x）打不开该目录（干净报错）；
+不写数组的目录停在 v5 / v6，与旧版本互通不受影响。
+
+### Added
+
+- **meta 字符串数组**（随 libbitcask 12.0.0）：`encode_meta/1` 收 `[binary()]`（`[]` 为空数组，元素须全为 binary，
+  charlist 报 `badarg`），`decode_meta/1` 解回 `[binary()]`（保持写入顺序）。
+- **filter 新操作符 `contains` / `contains_any`**：`#{key => K, op => contains, value => Bin}`、
+  `#{key => K, op => contains_any, values => [Bin, ...]}`。数组任一元素命中即过；存储值是单个 binary 时当作单元素集合。
+  检索、向量检索、`range` 的 filter 都能用。既有 `eq` / `in` / 大小比较碰到数组为假、`neq` 为真（类型不匹配）。
+- **`bitcask_query` where 新增 `{F, contains, Bin}` / `{F, contains_any, [Bin, ...]}`**，下推与 BEAM 侧求值同义；
+  这两种条件不走二级索引。二级索引字段上存数组时整个数组为 `exists` 进索引。
+- **`update_doc/3` 文档部分更新**（随 libbitcask 11.2.0）：`#{fields => #{F => Text | delete}, meta => #{K => V | delete}}`，
+  只改给出的字段与 meta 键，正文、向量、过期时刻保留；引擎内原子读-改-写，返回 `{ok, Lsn}`；
+  `{error, not_found}` / `{error, conflict}`（16 次重试仍冲突）。⚠️ 不省盘，新版本仍整条写、整篇重建索引。
+- **`search_text_highlight/2..4` 带高亮的全文检索**（上游 S13-D3 / S53）：`{ok, [{Key, Ord, Score, [Snippet]}]}`；
+  `HlOpts` 另收 `cold => load | skip`，缺省 `load`——重开后的大库里命中不在原文缓存时从存储读回正文补片段（上游缺省是 skip）。
+- **`search_fields_highlight/2..5` 逐字段片段**（随 libbitcask 11.2.0）：`search_fields_attributed` 的结果再附
+  `[{Field, [Snippet]}]`，每个字段只用属于它的查询词切，原文从存储读回（冷热一样）；`HlOpts` 可设标签、片段长度与段数。
+
+### Fixed
+
+- **带 `{analyzer, jieba}` 的 `merge/2,3` 让节点整个退出**：merge 的临时 merge_only 打开漏了 `open/2` 的缺省词典目录
+  （`priv/dict`），`dict_path` 为空 ⇒ libbitcask ≤ 11.0.0 里 cppjieba abort。现 `open/2` 与 `merge/2,3` 共用同一段选项归一。
+- **`dict_path` 给成字符串被静默忽略**：现在字符串按 UTF-8 转 binary；别的类型返回 `{error, {invalid_option, Msg}}`。
+- （随 libbitcask 11.1.0）jieba 词典目录不对时 `open` / `merge` 返回 `{error, {invalid_option, Msg}}`（报文带缺失的文件），
+  不再 abort；`needs_merge` 能看见本次打开之后产生的死数据。
+- （随 libbitcask 11.1.1）**检索库经 `merge/2,3`（merge_only 旁车）的整次合并永久挂住**：11.1.0 起 `needs_merge` 不再漏报，
+  `merge/2` 对检索库会真的进入合并并挂在收尾的读屏障上。现旁车按纯 KV 合并，不再改写写者的检索 checkpoint，写者下次打开归正。
+- （随 libbitcask 11.1.1）跨进程旁车合并删掉输入文件后，开着的写者读被搬走的 key 报 I/O 错、迭代报 `fold location disappeared`；
+  现写者第一次碰到时从 data 重建一次再重试（代价：每次跨进程合并后一次整库重建）。同节点旁车（`bitcask_merge_worker`）本不受影响。
+
+## [11.0.0] — 2026-11-20
+
+升级 libbitcask **10.0.0 → 11.0.0**（上游 S56；C++ ABI 破坏：`FieldSegmentView`
+追加 `live`、`SealedSegment` 追加字段级打分状态，`SOVERSION` 10→11；C API 与
+盘上格式零改动，既有数据直接可用）。submodule 从 `46da576`（`10.0.0`）切到上游
+`862d735`（`11.0.0`）。NIF / Erlang 门面零改动，重编即得。⚠️ `search_fields`
+的分数与排序是行为变化，无旧口径开关。
+
+### Fixed（随 libbitcask 11.0.0）
+
+- **`search_fields` 分数与 `search_text` 对不上、重开前后排序变化**：逐段本地
+  N / df / sum_dl 改为每字段跨段聚合，刚写入与落盘后、字段查询与全文查询的
+  分数一致。
+- **命名字段打分的文档长度误用整篇总词数**：BM25 的 `dl` 改取该字段自身词数；
+  `index_catch_all = false` 的默认字段长度口径一并归正。短字段不再因整篇长度
+  被误罚。
+
 ## [10.0.0] — 2026-11-19
 
 升级 libbitcask **9.0.0 → 10.0.0**（跨上游 9.1.0 / 10.0.0；C++ ABI 破坏：

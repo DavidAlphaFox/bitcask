@@ -3,6 +3,73 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [12.0.0] — 2026-11-20
+
+Upgrades libbitcask **11.0.0 → 12.0.0** (spanning upstream 11.1.0 / 11.1.1 / 11.2.0 / 12.0.0). The submodule moves from
+`862d735` to `62dd725` (`12.0.0`).
+⚠️ Upstream 12.0.0 breaks the C++ ABI (`meta::MetaValue` gains a `StringArray` alternative, `SOVERSION` 11→12); the NIF has been
+updated accordingly and must be rebuilt.
+⚠️ Once a directory stores meta containing a string array, `bitcask.meta` is lazily raised to v7 and libbitcask ≤ 11.2 (this
+library ≤ 11.x) refuses to open it (clean error). Directories that never store arrays stay at v5 / v6 and remain readable by older versions.
+
+### Added
+
+- **String-array meta** (via libbitcask 12.0.0): `encode_meta/1` accepts `[binary()]` (`[]` is an empty array; every element
+  must be a binary, charlists are `badarg`), and `decode_meta/1` returns `[binary()]` in write order.
+- **New filter operators `contains` / `contains_any`**: `#{key => K, op => contains, value => Bin}` and
+  `#{key => K, op => contains_any, values => [Bin, ...]}`. A document passes when any array element matches; a stored single
+  binary counts as a one-element set. Works in text search, vector search and `range` filters. Existing `eq` / `in` / ordering
+  operators are false on arrays and `neq` is true (type mismatch).
+- **`bitcask_query` where gains `{F, contains, Bin}` / `{F, contains_any, [Bin, ...]}`**, with pushdown and BEAM evaluation
+  agreeing; these conditions never use a secondary index. On an indexed field, an array is indexed as a whole for `exists`.
+- **`update_doc/3` partial document updates** (via libbitcask 11.2.0): `#{fields => #{F => Text | delete}, meta => #{K => V | delete}}`
+  changes only the given fields and meta keys, keeping body text, vector and expiry; an atomic read-modify-write inside the
+  engine returning `{ok, Lsn}`, or `{error, not_found}` / `{error, conflict}` (still conflicting after 16 retries).
+  ⚠️ It does not save disk: the new version is a full record and the document is fully reindexed.
+- **`search_text_highlight/2..4` full-text search with highlights** (upstream S13-D3 / S53): `{ok, [{Key, Ord, Score, [Snippet]}]}`;
+  `HlOpts` also takes `cold => load | skip`, defaulting to `load`, so hits missing from the source-text cache (e.g. in a large
+  store after reopen) are read back from storage for snippets (upstream defaults to skip).
+- **`search_fields_highlight/2..5` per-field snippets** (via libbitcask 11.2.0): `search_fields_attributed` results plus
+  `[{Field, [Snippet]}]`, each field highlighted only with its own query terms, source text read back from storage (cold or
+  hot); `HlOpts` sets tags, fragment size and count.
+
+### Fixed
+
+- **`merge/2,3` with `{analyzer, jieba}` took the whole node down**: the temporary merge_only open used by merge skipped the
+  default dictionary directory (`priv/dict`) that `open/2` adds, so `dict_path` was empty and cppjieba aborted in
+  libbitcask ≤ 11.0.0. `open/2` and `merge/2,3` now share one option-normalisation step.
+- **A string `dict_path` was silently ignored**: strings are now converted to UTF-8 binaries; any other type returns
+  `{error, {invalid_option, Msg}}`.
+- (via libbitcask 11.1.0) A wrong jieba dictionary directory makes `open` / `merge` return `{error, {invalid_option, Msg}}`
+  naming the missing file instead of aborting; `needs_merge` now sees dead bytes produced since the handle was opened.
+- (via libbitcask 11.1.1) **A full merge of a search-enabled store through `merge/2,3` (the merge_only sidecar) hung forever**:
+  since 11.1.0 `needs_merge` no longer under-reports, so `merge/2` really merged search stores and blocked on the final read
+  barrier. The sidecar now merges as pure KV and no longer overwrites the writer's search checkpoints; the writer reconciles on
+  its next open.
+- (via libbitcask 11.1.1) After a cross-process sidecar merge deleted its input files, a writer that stayed open got I/O errors
+  reading moved keys and `fold location disappeared` while iterating; it now rebuilds once from data and retries (cost: one
+  full rebuild after each cross-process merge). Same-node sidecars (`bitcask_merge_worker`) were never affected.
+
+## [11.0.0] — 2026-11-20
+
+Upgrades libbitcask **10.0.0 → 11.0.0** (upstream S56; a breaking C++ ABI change
+because `FieldSegmentView` gains `live` and `SealedSegment` gains per-field scoring
+state, with `SOVERSION` moving 10→11; the C API and on-disk format are unchanged and
+existing data opens directly). The submodule moves from `46da576` (`10.0.0`) to
+upstream `862d735` (`11.0.0`). NIF / Erlang code is unchanged; rebuild to pick up
+the new library. ⚠️ `search_fields` scores and ordering are a behavior change with
+no legacy-mode switch.
+
+### Fixed (via libbitcask 11.0.0)
+
+- **`search_fields` scores disagreed with `search_text`, and ordering changed after
+  reopen**: segment-local N / df / sum_dl now aggregate per field across segments, so
+  fresh and sealed results and field versus full-text queries agree.
+- **Named-field scoring used the whole document's length**: BM25 `dl` now uses the
+  queried field's own length; the default field is also corrected when
+  `index_catch_all = false`. Short fields are no longer penalized by unrelated body
+  length.
+
 ## [10.0.0] — 2026-11-19
 
 Upgrades libbitcask **9.0.0 → 10.0.0** (spanning upstream 9.1.0 / 10.0.0; a breaking

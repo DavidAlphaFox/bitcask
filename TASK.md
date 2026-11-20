@@ -655,6 +655,61 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## M23 — libbitcask 升级 11.1.0 → 12.0.0 + meta 字符串数组（12.0.0）
+
+> submodule `967b5f7` → `62dd725`（tag `12.0.0`，跨上游 11.1.1 / 11.2.0）。11.1.1（S58/S59）修检索库 merge_only
+> 旁车合并挂死与跨进程旁车合并后写者读不到被搬走的 key（M22-4 的阻塞解除）；11.2.0（S60/S61）新增逐字段片段与
+> `update_doc`（M23-7 接入）；12.0.0（S62）meta 新增字符串数组（类型标记 5）+ `Contains` / `ContainsAny` 过滤，
+> C++ `meta::MetaValue` 变体追加 `StringArray` ⇒ C++ ABI 破坏（`SOVERSION` 11→12），目录写入数组后 `bitcask.meta`
+> 懒升 v7（≤ 11.2 打不开）。NIF 用的是 C++ 头面，`decode_meta` 的 `std::visit` 不补数组分支编译不过 ⇒ 本轮必须改 NIF。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M23-1** | submodule → `62dd725`（`12.0.0`）；重编后生成头 `BITCASK_VERSION_STRING "12.0.0"`。 | ✅ |
+| **M23-2** | NIF：`nif_cask_meta.cpp` encode 收 `[binary()]` → `StringArray`（`[]` = 空数组；元素须全为 binary，charlist / 混合 / improper list → badarg；只在 encode 入口收，filter 字面值不收数组），decode 数组 → `[binary()]`（保持写入顺序，visitor 末分支 `static_assert` 防再漏类型）；`atoms` 加 `contains` / `contains_any`，`parse_meta_op` 映射到 `MetaOp::Contains` / `ContainsAny`，`contains_any` 与 `in` 一样取非空 `values`。 | ✅ |
+| **M23-3** | `bitcask_query`：where 新增 `{F, contains, Bin}` / `{F, contains_any, [Bin, ...]}`（字面值只收 binary，否则 `bad_query`），下推成引擎 filter；BEAM 侧求值 `has/2` 与引擎同义（数组任一元素相等、单个 binary 当单元素集合、其它恒假）；既有 eq/neq/in/大小比较对数组本就按类型不匹配，无需改。`bitcask_query_index`：数组整体编码 `<<5, {1, 转义, 0, 0}×N, 0>>`（自定界）只为 `exists` 进索引，避免对数组字段 `enc/1` function_clause；contains 不选索引。 | ✅ |
+| **M23-4** | 文档：`bitcask.erl` encode/decode_meta 注释、`doc/api-zh.md` / `doc/api-en.md`（Meta 过滤、encode/decode_meta、where 语义、⚠️ v7 纪元）、`CMakeLists.txt` 子模块注释。 | ✅ |
+| **M23-5** | 回归：新增 `test/bitcask_meta_array_tests.erl`（7 项：往返 / 坏数组 badarg / 引擎 filter 真值表经 search_text 与 range 两路 + 重开 / 坏 filter 形态 / where 三路（range 下推、BEAM `{eq,K}`、检索下推）逐条一致 / 数组字段上的二级索引 auto 与 none 一致 + 改值 + 重建 / 索引编码自定界）；`test/bitcask_jieba_merge_tests.erl` 补 M22-4 的端到端用例 2 项：检索库 `merge/2` 整次合并返回、输入回收、重开分数逐一不变、值最新；写者开着同节点旁车合并后写者读写检索正常。全量 `rebar3 eunit` 378/378；`rebar3 as prod compile`、`xref`、`dialyzer` 干净。 | ✅ |
+| **M23-6** | 发版记录：`bitcask.app.src` 的 `vsn` 11.0.0 → **12.0.0**（2026-11-20 用户定，M22 一并并入）；CHANGELOG（中英）`[Unreleased]` → `[12.0.0]`；README（中英）项目状态与路线图索引、ROADMAP（中英）新增 12.0.0 节。 | ✅ |
+| **M23-7** | 接入上游 11.2.0（S60 / S61，2026-11-20 用户定形态、并入 12.0.0）：新文件 `cpp/nif/nif_cask_doc.cpp`——`cask_update_doc/3`（补丁 `#{fields => #{F => Text \| delete}, meta => #{K => V \| delete}}`，未知键 / 非 binary 名 / 除 `undefined` 外的 atom 值 → badarg；`kConditionFailed` → `{error, conflict}`；dirty IO）与 `cask_search_fields_highlight/5`（Filter + HlOpts `#{pre_tag, post_tag, fragment_size, max_fragments}`，返回 `{Key, Ord, Score, Fields, [{Field, [Snippet]}]}`；dirty IO）。meta 条目值解析抽成共用 `parse_meta_entry_value`（encode_meta 与 update_doc 共用，数组只在写入入口收）。门面 `bitcask:update_doc/3`（`not_found` 归一为 `{error, not_found}`）、`search_fields_highlight/2..5`。测试 `test/bitcask_doc_ops_tests.erl` 6 项：字段 / meta 设置删除、正文与向量保留、LSN = get_with_ord、索引跟随、空补丁、重开；错误形态；8 进程并发加键不丢更新；逐字段只标本字段词、与 attributed 一致、同序；自定义标签 + filter + 默认字段 + 冷读 + 坏选项；KV 模式 no_index。全量 eunit 384/384；prod / xref / dialyzer 干净。文档 api-zh/en、CHANGELOG / README / ROADMAP（中英）同步。 | ✅ |
+| **M23-8** | 接入 `search_text_highlight`（2026-11-20 用户要求，并入 12.0.0）：`cask_search_text_highlight/4`（同在 `nif_cask_doc.cpp`，dirty IO），HlOpts 复用 `parse_hl_opts` 并只在此入口多收 `cold => load \| skip`（缺省 load，上游缺省 skip——门面取更有用的那个；上游无 filter 参数，不收 Filter）；返回 `{Key, Ord, Score, [Snippet]}`。门面 `bitcask:search_text_highlight/2,3,4`。测试 `bitcask_doc_ops_tests` 加 3 项：与 search_text 命中排序一致、标签 / 段数、热文档 skip / load 都有片段、坏选项（含 `search_fields_highlight` 不收 `cold`）；冷文档（同上游做法：目标 + 1500 篇填充，重开载段不重放）skip 空、缺省 load 补出（含正文空取命名字段）、load 不回填缓存；KV 模式 no_index。全量 eunit 387/387；prod / xref / dialyzer 干净。文档 api-zh/en、CHANGELOG / README / ROADMAP（中英）同步。 | ✅ |
+
+---
+
+## M22 — libbitcask 升级 11.0.0 → 11.1.0 + merge 的 dict_path 修复（并入 12.0.0）
+
+> submodule `862d735` → `967b5f7`（`11.1.0`，上游 S57：jieba 缺词典 open 返回 `INVALID_OPTION` 不再 abort、
+> `needs_merge` 用实时账本；C ABI / C++ ABI 兼容，`SOVERSION` 仍 11）。本仓库侧修 bosun 反馈
+> （libbitcask `feedbacks/2026-11-19-jieba-missing-dict-aborts-process.md` 第 ②条）：`merge/2,3` 的临时
+> merge_only 打开漏了 `open/2` 的缺省词典目录，带 `{analyzer, jieba}` 合并时 `dict_path` 为空；
+> `dict_path` 给字符串被 NIF 静默当成没给。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M22-1** | `src/bitcask.erl`：新增 `normalize_text_opts/1`（`dict_path` 字符串按 UTF-8 转 binary、别的类型报 `{error, {invalid_option, <<"dict_path must be a binary or a string">>}}`；jieba 未给 `dict_path` 补 `priv/dict`；`synonym_file` 照旧转 binary），`open_1/2` 与 `cask_open_opts/1`（merge 用）共用；`cask_open_opts/1` 改返回 `{ok, Opts} \| {error, _}`；缺省词典路径改 `unicode:characters_to_binary`（非 ASCII 的 priv 路径不再 badarg）；`{dict_path, _}` 选项文档更新。 | ✅ |
+| **M22-2** | submodule → `967b5f7`（11.1.0）。 | ✅ |
+| **M22-3** | 回归 `test/bitcask_jieba_merge_tests.erl`（4 项）：jieba 库 `merge/3` 不带 `dict_path` 打开成功、检索不变；坏词典目录 open / merge 返回 `invalid_option` 且报文带缺失路径（需 11.1.0）；字符串 `dict_path` 可用；错误类型报类型错。旧门面上 4 项全红。全量 `rebar3 eunit` 369/369；`rebar3 as prod compile`、`xref`、`dialyzer` 干净。 | ✅ |
+| **M22-4** | 检索库的整次 merge_only 合并在 libbitcask 11.1.0（及 11.0.0）里永久挂住（`Cask::merge` → `flush_index` 的 `wait_lsn` 无界），已提上游反馈 `feedbacks/2026-11-20-merge-only-search-merge-hangs.md`。上游 11.1.1（S58）已修，随 M23 升级解除；端到端用例见 M23-5。 | ✅（M23） |
+
+---
+
+## M21 — libbitcask 升级 10.0.0 → 11.0.0（11.0.0）
+
+> submodule `46da576` → `862d735`（tag `11.0.0`）。上游 S56 是 C++ ABI
+> 破坏：`FieldSegmentView` / `SealedSegment` 布局变化，`SOVERSION` 10→11。
+> C API 与盘上格式零改动。`search_fields` 改为每字段跨段统计 + 字段自身
+> `dl`，结果与 `search_text` 同口径；既有库分数 / 排序会变。NIF 不直接使用
+> 变更后的新接口，门面零改动。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M21-1** | 影响面核对：上游只改检索段视图与 BM25 字段打分内部实现；既有 NIF 的 search 入口只透传 Cask 接口，Erlang 门面无需源码变更，本仓库随源码级依赖重编即可。 | ✅ |
+| **M21-2** | submodule fetch → checkout `11.0.0`；Release 重新配置 / 构建后复核产物 SONAME `libbitcask.so.11`、库 tag `11.0.0`。 | ✅ |
+| **M21-3** | 回归：`rebar3 eunit` 365/365；上游 `BUILD_TESTING=ON` Release `ctest` 933/933 通过（另 2 项默认 disabled）；`rebar3 as prod compile`、`rebar3 do xref, dialyzer` 干净。 | ✅ |
+| **M21-4** | 文档：CHANGELOG / ROADMAP / README（中英）新增 11.0.0 记录，`CMakeLists.txt` 子模块注释更新；`bitcask.app.src` 的 `vsn` 10.0.0 → **11.0.0**。 | ✅ |
+
+---
+
 ## M20 — libbitcask 升级 9.0.0 → 10.0.0（10.0.0）
 
 > submodule `d164744` → `46da576`（tag `10.0.0`，跨上游 9.1.0）。上游 C++ ABI
