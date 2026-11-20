@@ -216,7 +216,8 @@ cask_range_release(_IterRef)   -> erlang:nif_error({error, not_loaded}).
 %%                        空批是 no-op（不碰 meta 纪元）。
 %% cask_txn_commit：TxnCask.commit，多一层校验（非空 / key 非空 / key 互不
 %%                  重复 / 不占用 "_txn:" 保留前缀）+ 提交点 fsync 策略。
-%%                  不提供隔离性——中间态对并发读者可见。
+%%                  自 libbitcask 12.0.1 起整批对并发读者原子发布（不是快照
+%%                  隔离；不带条件的键集重叠提交仍是后写覆盖）。
 %%
 %% libbitcask 8.0.0（S46）：两者的 op 都可带前置条件——
 %%   {put, K, V, Cond} / {remove, K, Cond} / {check, K, Cond}

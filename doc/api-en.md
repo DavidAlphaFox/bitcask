@@ -285,11 +285,12 @@ truncates the whole batch at recovery).
 
 > ⚠️ Atomicity and durability are **orthogonal**: without an fsync, power loss can
 > still lose the entire batch — but never half of one.
-> ⚠️ **No isolation (I)**: intermediate state is visible to concurrent readers;
-> without conditions, concurrent commits with overlapping key sets have no
-> ordering guarantee (last writer wins). Disjoint key sets are safe. For
-> read-modify-write without lost updates, use the preconditions below
-> (libbitcask 8.0.0).
+> Since libbitcask **12.0.1**, a batch is published atomically to concurrent
+> readers: they see either the whole batch or none of it. ⚠️ **This is not
+> isolation (I)**: whole commits can interleave; without conditions, concurrent
+> commits with overlapping key sets have no ordering guarantee (last writer
+> wins). Disjoint key sets are safe. For read-modify-write without lost updates,
+> use the preconditions below (libbitcask 8.0.0).
 > ⚠️ **The first call lazily upgrades the directory's `bitcask.meta` to v6**,
 > after which readers older than upstream 5.1.0 cannot open it. Directories that
 > never call it stay at v5.

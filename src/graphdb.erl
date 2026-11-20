@@ -47,7 +47,11 @@
 %% === 一致性 ===
 %%   * 未分块顶点：取邻居 = 一次点查，得到该顶点邻接的原子快照。
 %%   * 分块顶点：头与块分次读；out_edges/in_edges 的 #{consistent => true}
-%%     在读前读后比对头的 LSN，不等则重扫（不变式「头即版本」保证正确）。
+%%     把头与块逐个带版本点读，再在引擎写锁下用只含 check 的原子批校验读集，
+%%     不过则重读。libbitcask 12.0.1 起原子批对读者整批可见；读集校验仍给
+%%     consistent 读一个在写锁下的显式确认，并挡住绕过图层协议直写块的写入者。
+%%   * 写会话同理：前置条件覆盖整个读集（头、读过的块、读过没改的顶点），
+%%     读到的东西在提交前变了就整批冲突重来（graphdb_adj 不变式 2）。
 %%   * 多跳遍历跨跳弱一致，与 v1 相同。
 %%
 %% === 布局版本 ===
@@ -593,7 +597,9 @@ txn_read(Tx, Key, Lock) ->
 %% Opts（map）：
 %%   etype => T          收窄到单一边类型
 %%   limit => N          最多返回 N 条（分块组提前停扫）
-%%   consistent => true  分块顶点也给原子快照（读前读后比对头的 LSN）
+%%   consistent => true  分块顶点也给原子快照：头与块逐个带版本点读，再在引擎写锁下
+%%                       用只含 check 的原子批校验读集仍是当前版本；校验还挡住绕过
+%%                       图层协议直写块的写入者
 %% =========================================================================
 
 out_edges(Handle, Vid) -> out_edges(Handle, Vid, #{}).
@@ -608,38 +614,40 @@ adj_edges(Io, Vid, Dir, Opts) ->
     _ = nkey(Vid),
     Etype = opt_etype(Opts),
     Limit = opt_limit(Opts),
-    Read = fun() -> graphdb_adj:entries(Io, Vid, Dir, Etype, Limit) end,
     Res = case maps:get(consistent, Opts, false) of
-              true  -> consistent_read(Io, Vid, Read, ?CONSISTENT_TRIES);
-              false -> Read()
+              true ->
+                  Read = fun() -> graphdb_adj:entries_guarded(Io, Vid, Dir, Etype, Limit) end,
+                  consistent_read(Io, Read, ?CONSISTENT_TRIES);
+              false ->
+                  graphdb_adj:entries(Io, Vid, Dir, Etype, Limit)
           end,
     case Res of
         {error, _} = E -> E;
         {ok, Es}       -> to_edges(Io, Vid, Dir, Es, [])
     end.
 
-%% 读前读后头的 LSN 不等 → 重扫；连续撞上写就带抖动退避（0..2^k ms），把
-%% 重扫挪进写与写之间的空当。@CONSISTENT_TRIES 次都撞上 → inconsistent_read。
-consistent_read(_Io, _Vid, _Read, 0) ->
+%% 读集（头 + 读过的块，各带版本）在引擎写锁下校验：只含 check 的原子批不写盘；
+%% 校验通过即读到的每个 key 仍同版本，且期间没有半个批发布（12.0.1 起在途批也
+%% 必然整批可见）。校验不过 → 重读；连续撞上写就带抖动退避（0..2^k ms），把重读
+%% 挪进写与写之间的空当。@CONSISTENT_TRIES 次都撞上 → inconsistent_read。只读
+%% 句柄（本句柄上没有写者）不做校验。
+consistent_read(_Io, _Read, 0) ->
     {error, inconsistent_read};
-consistent_read(Io, Vid, Read, N) when N < ?CONSISTENT_TRIES ->
+consistent_read(Io, Read, N) when N < ?CONSISTENT_TRIES ->
     timer:sleep(rand:uniform(1 bsl min(?CONSISTENT_TRIES - N, 5)) - 1),
-    consistent_read_once(Io, Vid, Read, N);
-consistent_read(Io, Vid, Read, N) ->
-    consistent_read_once(Io, Vid, Read, N).
+    consistent_read_once(Io, Read, N);
+consistent_read(Io, Read, N) ->
+    consistent_read_once(Io, Read, N).
 
-consistent_read_once(Io, Vid, Read, N) ->
-    case graphdb_adj:head_cond(Io, Vid) of
+consistent_read_once({direct, H} = Io, Read, N) ->
+    case Read() of
         {error, _} = E -> E;
-        {ok, C1} ->
-            case Read() of
-                {error, _} = E -> E;
-                {ok, _} = Ok ->
-                    case graphdb_adj:head_cond(Io, Vid) of
-                        {ok, C1}       -> Ok;
-                        {ok, _}        -> consistent_read(Io, Vid, Read, N - 1);
-                        {error, _} = E -> E
-                    end
+        {ok, Es, Checks} ->
+            case bitcask:put_batch_atomic(H, Checks) of
+                ok                     -> {ok, Es};
+                {error, read_only}     -> {ok, Es};
+                {error, {conflict, _}} -> consistent_read(Io, Read, N - 1);
+                {error, _} = E         -> E
             end
     end.
 

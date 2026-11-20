@@ -205,8 +205,22 @@ no separate rev in the value and uses the LSN as the version:
 4. Any condition fails → nothing is written, conflict returned → back to 1
 ```
 
-By invariant 2, conditions on the two heads suffice: any chunk change also changes the
-head's LSN. Chunk writes in the batch need no conditions of their own.
+~~By invariant 2, conditions on the two heads suffice: any chunk change also changes the
+head's LSN. Chunk writes in the batch need no conditions of their own.~~
+
+> **Correction (2026-11-20)**: that argument assumes a reader sees head and chunks from the same
+> committed state, but libbitcask ≤ 12.0.0's atomic batch is **not all-or-nothing for concurrent
+> readers**: its keys take effect one by one, in key byte order (a head key is a prefix of its chunk
+> keys, so a vertex's head always lands before its chunks). A reader can see "new head + old / missing
+> chunk", and a write-back guarded only by the head then succeeds and overwrites someone else's chunk.
+> Upstream 12.0.1 (S63) now publishes a batch inside one critical section. This layer still keeps the
+> rule as explicit defence: **conditions cover the whole read set** — modified heads, every chunk read
+> (on its put / remove if modified, as a `check` if not, `absent` if it was missing), and the heads of
+> vertices the session read but did not modify. Conditions are checked under the engine's write lock
+> against the pre-batch state, so if anything read by the session changes before commit, the whole
+> computation conflicts and retries — even if a caller bypasses the graph protocol and writes a chunk
+> directly. Upstream report: libbitcask
+> `feedbacks/2026-11-20-atomic-batch-no-read-isolation.md`.
 
 The check must be atomic with the write under the engine's write lock, so only the engine
 can provide it (§5.3).
@@ -330,9 +344,13 @@ range" to "one get". Frontier expansion no longer needs one iterator per vertex.
 ### 7.3 Consistency
 
 - Inline vertex: one get yields an atomic snapshot of the vertex's adjacency.
-- Chunked vertex: head and chunks are read separately. `#{consistent => true}` reads the
-  head's LSN before and after the scan and rescans if they differ (correct by invariant
-  2). Off by default, matching v1's weak consistency.
+- Chunked vertex: head and chunks are read separately. `#{consistent => true}` point-reads the
+  head and each chunk in the directory with their versions, then validates the read set under the
+  engine's write lock with a check-only atomic batch, rereading on failure (since 2026-11-20; comparing
+  the head's LSN before and after could not catch a chunk written by someone bypassing the graph
+  protocol, see the §5.1 correction). Since libbitcask 12.0.1 an in-flight batch is always wholly
+  visible; the check still gives the consistent read an explicit version confirmation under the write
+  lock. Read-only handles skip validation. Off by default, matching v1's weak consistency.
 - Across hops it stays weakly consistent, as in v1.
 
 ## 8. Transaction Layer

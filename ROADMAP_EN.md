@@ -6,6 +6,24 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 12.0.1 shipped
+
+### libbitcask upgrade 12.0.0 → 12.0.1 ✅
+
+Upstream S63: an atomic batch is arbitrated as a whole and then published in one index critical
+section, making it wholly visible to concurrent readers (previously keys applied one by one in key
+byte order, so a graph vertex's head landed before its chunks and a reader could see half a batch).
+The C API, existing C++ ABI (`SOVERSION` 12) and on-disk format are unchanged; merge conflicts retry
+the rejected batch as a whole; check-only batches write no bytes, allocate no LSN and do not raise
+`bitcask.meta`. The submodule moves to upstream `12.0.1` (`c364cd3`).
+
+### Graph write-path read-set validation ✅
+
+The upgrade removes the upstream flaw where a write session could overwrite a chunk based on half a
+batch. The graph layer also keeps explicit defence: write-session conditions cover the whole read set
+(modified heads, chunks read, vertices read but unmodified), and `#{consistent => true}` validates
+read-set versions before returning. Deterministic regression: `test/graphdb_batch_isolation_tests.erl`.
+
 ## 12.0.0 shipped
 
 ### libbitcask upgrade 11.0.0 → 12.0.0 ✅

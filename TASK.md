@@ -655,6 +655,38 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## G2 — 图层：写会话 / 一致性读的读集校验（12.0.1）
+
+> keelson 适配 libbitcask 时压测确认：≤ 12.0.0 的原子批对并发读者不是整批可见。核对上游：`put_batch_atomic` 在
+> `write_mu_` 内逐条 `apply_*`、读路径不拿锁；生效顺序是 key 字节序（`cask.cpp` 的 `std::map`），与 op 顺序无关 ⇒
+> 图层同一顶点总是头先于块生效，「只对头设条件」（设计稿 §5.1 原推理）不成立。上游反馈 libbitcask
+> `feedbacks/2026-11-20-atomic-batch-no-read-isolation.md`。上游 12.0.1（S63，见 M24）已修引擎缺陷；本图层仍把
+> 读集校验作为显式防护，确定性用例同时作为 12.0.0 缺陷的回归。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **G2-1** | 写会话读集校验（`graphdb_adj`）：块读改走 `io_head`（直通 `get_with_ord` 记进 `#vs.rconds`；事务 `read_guarded` 由 bitcask_txn 登记），提交时读过的块带读到时的版本——改了的挂在 put / remove 上，没改的发 `check`，读到缺失的用 `absent`；会话读过但没改的顶点发头 + 读过块的 `check`（`guard_ops/1`）；什么都不写的会话不提交批。缺块自愈保留，但改由 `absent` 条件守住（此前只靠头条件，读到半个批会把刚建好的块写空）。删掉不再使用的 `io_get/2`、`head_cond/2`。 | ✅ |
+| **G2-2** | 一致性读（`graphdb` `consistent_read`）：新增 `graphdb_adj:entries_guarded/5`（头 + 按块目录逐块带版本点读，返回读集 `check` op），读完用只含 `check` 的 `put_batch_atomic` 在写锁下校验（不写盘、等在途批整批应用完），冲突重读；只读句柄（`{error, read_only}`）不校验。替换原「读前读后比头的 LSN」。 | ✅ |
+| **G2-3** | 回归 `test/graphdb_batch_isolation_tests.erl`（4 项，用裸 `bitcask:put` / `delete` 确定性地造 12.0.0 那种「读到半个批，随后批的剩余部分生效」；12.0.1 后引擎自己的批不会这样交错，但裸写仍模拟同一版本迁移）：读到旧块后块变了 ⇒ 提交冲突；读到缺块后块落盘 ⇒ 冲突、一条边不丢；会话里读过没改的顶点的块变了 ⇒ 整批冲突，无人改时照常提交、无写会话不提交；一致性读的读集校验（含 limit、未分块 / 不存在顶点、只读句柄）。**修复前前三项的提交全部返回 `ok`（会覆盖别人的块），第四项接口不存在。** | ✅ |
+| **G2-4** | 文档：设计稿 §5.1 / §7.3（中英）加更正，`graphdb.erl` 一致性一节、`graphdb_adj.erl` 不变式 2 改写，CHANGELOG（中英）。 | ✅ |
+
+---
+
+## M24 — libbitcask 升级 12.0.0 → 12.0.1 + 原子批整批可见（12.0.1）
+
+> submodule `62dd725` → `c364cd3`（tag `12.0.1`，上游 S63）。修复 `put_batch_atomic` 对并发读者
+> 逐 key 生效的问题：现整批先裁决、再在一个索引临界区发布；merge 竞争拒批后整批重试；check-only
+> 批不写字节、不分配 LSN、不升级 `bitcask.meta`。C API、既有 C++ ABI（`SOVERSION` 12）与盘上格式
+> 均不变。NIF / Erlang 门面零改动，重编即得。上游实测 400 行大批 + 4 点查读者 p99 7.4 µs。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M24-1** | submodule checkout `c364cd3`（`12.0.1`）；复核实打 tag 指向该提交；NIF 全新重编，生成头 `BITCASK_VERSION_STRING "12.0.1"`。G2 的确定性 graph 回归 4/4；全量 `rebar3 eunit` 391/391。 | ✅ |
+| **M24-2** | 发版记录：`bitcask.app.src` 的 `vsn` 12.0.0 → **12.0.1**；CHANGELOG（中英）`[12.0.1]`；README（中英）项目状态与路线图索引、ROADMAP（中英）新增 12.0.1 节；`CMakeLists.txt` 子模块注释更新。 | ✅ |
+| **M24-3** | 同步原子批可见性语义：README / API 文档（中英）与 `bitcask` / NIF 注释改为「12.0.1 起并发读者要么整批可见、要么完全不可见；这不是快照隔离，重叠无条件提交仍后写覆盖」。 | ✅ |
+
+---
+
 ## M23 — libbitcask 升级 11.1.0 → 12.0.0 + meta 字符串数组（12.0.0）
 
 > submodule `967b5f7` → `62dd725`（tag `12.0.0`，跨上游 11.1.1 / 11.2.0）。11.1.1（S58/S59）修检索库 merge_only
@@ -673,6 +705,7 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 | **M23-6** | 发版记录：`bitcask.app.src` 的 `vsn` 11.0.0 → **12.0.0**（2026-11-20 用户定，M22 一并并入）；CHANGELOG（中英）`[Unreleased]` → `[12.0.0]`；README（中英）项目状态与路线图索引、ROADMAP（中英）新增 12.0.0 节。 | ✅ |
 | **M23-7** | 接入上游 11.2.0（S60 / S61，2026-11-20 用户定形态、并入 12.0.0）：新文件 `cpp/nif/nif_cask_doc.cpp`——`cask_update_doc/3`（补丁 `#{fields => #{F => Text \| delete}, meta => #{K => V \| delete}}`，未知键 / 非 binary 名 / 除 `undefined` 外的 atom 值 → badarg；`kConditionFailed` → `{error, conflict}`；dirty IO）与 `cask_search_fields_highlight/5`（Filter + HlOpts `#{pre_tag, post_tag, fragment_size, max_fragments}`，返回 `{Key, Ord, Score, Fields, [{Field, [Snippet]}]}`；dirty IO）。meta 条目值解析抽成共用 `parse_meta_entry_value`（encode_meta 与 update_doc 共用，数组只在写入入口收）。门面 `bitcask:update_doc/3`（`not_found` 归一为 `{error, not_found}`）、`search_fields_highlight/2..5`。测试 `test/bitcask_doc_ops_tests.erl` 6 项：字段 / meta 设置删除、正文与向量保留、LSN = get_with_ord、索引跟随、空补丁、重开；错误形态；8 进程并发加键不丢更新；逐字段只标本字段词、与 attributed 一致、同序；自定义标签 + filter + 默认字段 + 冷读 + 坏选项；KV 模式 no_index。全量 eunit 384/384；prod / xref / dialyzer 干净。文档 api-zh/en、CHANGELOG / README / ROADMAP（中英）同步。 | ✅ |
 | **M23-8** | 接入 `search_text_highlight`（2026-11-20 用户要求，并入 12.0.0）：`cask_search_text_highlight/4`（同在 `nif_cask_doc.cpp`，dirty IO），HlOpts 复用 `parse_hl_opts` 并只在此入口多收 `cold => load \| skip`（缺省 load，上游缺省 skip——门面取更有用的那个；上游无 filter 参数，不收 Filter）；返回 `{Key, Ord, Score, [Snippet]}`。门面 `bitcask:search_text_highlight/2,3,4`。测试 `bitcask_doc_ops_tests` 加 3 项：与 search_text 命中排序一致、标签 / 段数、热文档 skip / load 都有片段、坏选项（含 `search_fields_highlight` 不收 `cold`）；冷文档（同上游做法：目标 + 1500 篇填充，重开载段不重放）skip 空、缺省 load 补出（含正文空取命名字段）、load 不回填缓存；KV 模式 no_index。全量 eunit 387/387；prod / xref / dialyzer 干净。文档 api-zh/en、CHANGELOG / README / ROADMAP（中英）同步。 | ✅ |
+| **M23-9** | 补跑（发版后，2026-11-20）：上游 `BUILD_TESTING=ON` Release `ctest`（子模块 `62dd725`，独立构建目录）**960/960** 通过（另 1 项按环境跳过、2 项保留禁用）。`graphdb_bench` 未跑。 | ✅ |
 
 ---
 

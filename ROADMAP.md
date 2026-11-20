@@ -6,6 +6,22 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 12.0.1 落地
+
+### libbitcask 升级 12.0.0 → 12.0.1 ✅
+
+上游 S63：原子批先整体裁决、再在一个索引临界区发布，对并发读者整批可见（此前逐 key、
+按 key 字节序生效，graph 同一顶点会「头先于块」，读者可能读到半个批）。C API、既有
+C++ ABI（`SOVERSION` 12）与盘上格式均不变；merge 竞争拒批后整批重试；check-only 批
+不写字节、不分配 LSN、不升级 `bitcask.meta`。submodule 切到上游 `12.0.1`
+（`c364cd3`）。
+
+### 图层写路径的读集校验 ✅
+
+随升级解除「写会话可能基于半个批覆盖块」的上游缺陷；graph 层另保留显式防护：写会话
+条件覆盖整个读集（改过的头、读过的块、读过没改的顶点），`#{consistent => true}` 在读集
+版本校验后返回。确定性回归 `test/graphdb_batch_isolation_tests.erl`。
+
 ## 12.0.0 落地
 
 ### libbitcask 升级 11.0.0 → 12.0.0 ✅

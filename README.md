@@ -120,8 +120,10 @@ ok
 
 > `txn_commit` 比 `put_batch_atomic` 多一层校验（非空 / key 非空 / key 不重复 /
 > 不占用 `_txn:` 前缀），第三参可选 `sync_on_commit`（默认）或 `no_sync`。
-> ⚠️ 两者**不提供隔离性**——中间态对并发读者可见。⚠️ **首次调用把目录 meta
-> 懒升级为 v6**，此后不能被早于上游 5.1.0 的读端打开。
+> 自 libbitcask **12.0.1** 起，两者对并发读者**整批可见**：读者要么看到整批、
+> 要么一行都看不到。⚠️ 这仍不是快照隔离：整批提交之间可能交错，键集重叠且不
+> 带前置条件时仍是后写覆盖。⚠️ **首次调用把目录 meta 懒升级为 v6**，此后不能
+> 被早于上游 5.1.0 的读端打开。
 >
 > **前置条件（乐观并发，libbitcask 8.0.0）**：op 可以多带一个
 > `Cond :: absent | {ord, N}`——`{put, K, V, Cond}` / `{remove, K, Cond}` /
@@ -358,7 +360,7 @@ ok
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
 | `doc/unified-architecture-plan-zh.md` | 统一架构计划（已实施） |
 | `doc/libcask-extraction-zh.md` | **libcask 独立库拆分可行性评估**（2.2.0 规划） |
-| `ROADMAP.md` / `ROADMAP_EN.md` | **路线图**：12.0.0 / 11.0.0 / 10.0.0 / 9.0.0 / 8.0.0 / 7.0.3 / 7.0.2 / 7.0.1 / 7.0.0 / 6.9.1 / 6.9.0 / 6.8.1 / 6.8.0 / 6.7.3 / 6.7.2 / 6.7.1 / 6.7.0 / 6.6.0 / 6.5.1 / 6.5.0 / 6.4.0 / 6.3.2 / 6.3.1 / 6.2.2 / 6.2.1 / 6.1.0 / 6.0.0 / 5.1.0 / 5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 落地 + 2.1.1 已落地（P5–P15）+ 2.2.0 规划（libcask 独立 / V7+ 向量优化）（中/英） |
+| `ROADMAP.md` / `ROADMAP_EN.md` | **路线图**：12.0.1 / 12.0.0 / 11.0.0 / 10.0.0 / 9.0.0 / 8.0.0 / 7.0.3 / 7.0.2 / 7.0.1 / 7.0.0 / 6.9.1 / 6.9.0 / 6.8.1 / 6.8.0 / 6.7.3 / 6.7.2 / 6.7.1 / 6.7.0 / 6.6.0 / 6.5.1 / 6.5.0 / 6.4.0 / 6.3.2 / 6.3.1 / 6.2.2 / 6.2.1 / 6.1.0 / 6.0.0 / 5.1.0 / 5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 落地 + 2.1.1 已落地（P5–P15）+ 2.2.0 规划（libcask 独立 / V7+ 向量优化）（中/英） |
 | `TASK.md` | 详细任务拆分与历史 |
 
 ## 项目状态
@@ -377,7 +379,8 @@ ok
 - **3.1.0**（2026-07-01）— 升级 libbitcask v3.1.0（ABI 不破坏）：`{max_read_handles, unlimited}` / `{auto_compact_dead_ratio, R}` 选项、错误原子 `closed`；随库引入 read 句柄默认上限（按 `RLIMIT_NOFILE` 自动推导）、`bitcask.meta` v3 加 CRC32、field.schema FSCH v1 头 + CRC
 - **4.0.0**（2026-07-13）— 升级 libbitcask v4.0.0（ABI 破坏，`SOVERSION` 3→4，源码级兼容）：`{vector_engine, hnsw|ivfrq|diskann}` 向量双引擎 + 调优选项、`{auto_checkpoint_min_docs, N}` 崩溃恢复重放有界；随库引入 IVF-RaBitQ-lite 引擎、DiskANN 引擎（实验性）、AVX2 int8 内核、HNSW `.qc8` mmap 化；`examples/` Wikipedia 检索库示例
 - **4.1.0**（2026-07-15）— 升级 libbitcask v4.1.0（ABI 不破坏，`SOVERSION` 保持 4，盘上格式不变）：对 Erlang 调用方**无 API 变更**，重编即得；随库引入 Phase 5/6 深度审计成果——修复 `close/1` 拆卸路径的进程级永久挂死（`IndexPool` 计数泄漏 + `unregister_lib` 无界 `flush`）、hnsw 三处原子写 rename 前补 `fdatasync`（此前崩溃即半截文件）、`RowChunks`/`MmapSegment` 资源泄漏；`file_util` 归并使 fsync 纪律 4 套收敛为 1 套
-- **12.0.0**（2026-11-20，当前版本）— 升级 libbitcask 11.0.0 → **12.0.0**（跨上游 11.1.0 / 11.1.1 / 11.2.0；C++ ABI 破坏，`SOVERSION` 11→12，C API 纯加法）。新增 **meta 字符串数组**（`encode_meta` 收 `[binary()]`、`decode_meta` 解回列表）与 filter 操作符 **`contains` / `contains_any`**，检索、向量检索、`range` 与 `bitcask_query` 的 `where` 都能用；新增 **`update_doc/3`**（文档部分更新，引擎内原子读-改-写）、**`search_text_highlight`**（带高亮的全文检索，冷文档缺省从存储读回）与 **`search_fields_highlight`**（逐字段高亮片段）。修复：检索库经 `merge/2,3` 旁车整次合并永久挂住、跨进程旁车合并后开着的写者读不到被搬走的 key、带 jieba 的 `merge` 漏缺省词典目录让节点退出、字符串 `dict_path` 被静默忽略。⚠️ 目录一旦写入含数组的 meta，`bitcask.meta` 升 v7，本库 ≤ 11.x 打不开；不写数组的目录不受影响。NIF 已随 C++ 头面修改，须重编
+- **12.0.1**（2026-11-20，当前版本）— 升级 libbitcask 12.0.0 → **12.0.1**（PATCH；C API / ABI / 盘上格式不变，`SOVERSION` 保持 12）。上游 S63 修复原子批对并发读者不是整批可见的问题：graph 写会话此前可能基于「新头 + 旧块」覆盖别人刚写的块，缺块自愈也可能把刚建好的块写空；现引擎整批先裁决、再在一个索引临界区发布，读者要么看到整批、要么一行都看不到。本版同时把 graph 写会话条件扩展到整个读集（头、读过的块、读过没改的顶点），并让 `out_edges` / `in_edges` 的 `#{consistent => true}` 用只含 `check` 的原子批在读集版本校验后返回。
+- **12.0.0**（2026-11-20）— 升级 libbitcask 11.0.0 → **12.0.0**（跨上游 11.1.0 / 11.1.1 / 11.2.0；C++ ABI 破坏，`SOVERSION` 11→12，C API 纯加法）。新增 **meta 字符串数组**（`encode_meta` 收 `[binary()]`、`decode_meta` 解回列表）与 filter 操作符 **`contains` / `contains_any`**，检索、向量检索、`range` 与 `bitcask_query` 的 `where` 都能用；新增 **`update_doc/3`**（文档部分更新，引擎内原子读-改-写）、**`search_text_highlight`**（带高亮的全文检索，冷文档缺省从存储读回）与 **`search_fields_highlight`**（逐字段高亮片段）。修复：检索库经 `merge/2,3` 旁车整次合并永久挂住、跨进程旁车合并后开着的写者读不到被搬走的 key、带 jieba 的 `merge` 漏缺省词典目录让节点退出、字符串 `dict_path` 被静默忽略。⚠️ 目录一旦写入含数组的 meta，`bitcask.meta` 升 v7，本库 ≤ 11.x 打不开；不写数组的目录不受影响。NIF 已随 C++ 头面修改，须重编
 - **11.0.0**（2026-11-20）— 升级 libbitcask 10.0.0 → **11.0.0**（C++ ABI 破坏，`SOVERSION` 10→11；C API 与盘上格式不变，数据直接可用）。修复 `search_fields` 打分：字段统计跨段聚合、文档长度取该字段自身词数，`search_fields` 与 `search_text` 逐位一致，重开前后不再漂移。⚠️ 既有库的 `search_fields` 分数 / 排序会变，无旧口径开关。NIF / Erlang 门面零改动，重编即得
 - **10.0.0**（2026-11-19）— 升级 libbitcask 9.0.0 → **10.0.0**（跨上游 9.1.0；C++ ABI 破坏，`SOVERSION` 9→10；C API 纯加法、C ABI 兼容；`bitcask.meta` 新增可选 C2 分析器记录，盘上格式仍 v5/v6，数据直接可用）。修复 ngram 库高亮片段恒空、多词 / 重叠 token 高亮漏标，以及旧封段 fallback 写进进程 CWD。NIF / Erlang 门面零改动，重编即得
 - **9.0.0**（2026-11-19）— 升级 libbitcask 8.1.0 → **9.0.0**（C++ ABI 破坏，`SOVERSION` 8→9；C API / C ABI / 盘上格式不变，数据直接可用）。修复 merge 后 HNSW 图断裂导致的静默错检索，并把向量 live / meta 过滤改为遍历期过滤，高死比 / 高选择性下不再少返回；代价是过滤耗时随通过率下降、高死比 merge 重建变慢。NIF / Erlang 门面零改动，重编即得

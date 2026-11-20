@@ -22,7 +22,7 @@ set(BITCASK_PRIV_DIR "${CMAKE_SOURCE_DIR}/priv")
 file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 
 # ---------------------------------------------------------------------------
-# libbitcask — git submodule at third_party/libbitcask (12.0.0, commit 62dd725)。
+# libbitcask — git submodule at third_party/libbitcask (12.0.1, commit c364cd3)。
 # 提供 C++ 核心库全部 target（bitcask_cask, bitcask_keydir, ...）。
 #
 # ⚠️ 6.2.1 起**不再需要 third_party 符号链接**。此前 libbitcask 的
@@ -174,6 +174,9 @@ file(MAKE_DIRECTORY "${BITCASK_PRIV_DIR}")
 # StringArray；meta 新类型标记 5、MetaOp::Contains / ContainsAny；目录写入数组
 # 后 bitcask.meta 懒升 v7（≤ 11.2 打不开）。NIF 的 decode_meta visitor 补了数组
 # 分支（不补编译不过），encode_meta / filter 接入数组与 contains / contains_any。
+# 12.0.1：ABI / C API / 盘上格式不变（SOVERSION 12）——S63 原子批先裁决、再在一个
+# 索引临界区整批发布；并发读者不再看到半个批。merge 竞争拒批后整批重试；check-only
+# 批承诺不写字节、不分配 LSN、不升级 bitcask.meta。
 
 # ---------------------------------------------------------------------------
 add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/libbitcask"

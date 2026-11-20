@@ -31,7 +31,15 @@
 %% ---- 不变式 ----
 %%   1. 对称：(a, t, b, r) 在 a 的出边组 ⟺ 在 b 的入边组，同批写。
 %%   2. 头即版本：对一个顶点邻接的任何修改都重写它的头，所以头 key 的 LSN 就是
-%%      该顶点（含全部块）的版本——写会话只对头设前置条件。
+%%      该顶点（含全部块）的**已提交**版本。libbitcask ≤ 12.0.0 的原子批对读者
+%%      不提供读隔离——批内各 key 逐条生效，且按 key 字节序（头 key 是自己块 key 的
+%%      前缀 ⇒ 同一顶点总是头先生效、块后生效），并发读者可能读到「新头 + 旧块 /
+%%      缺块」；上游 12.0.1（S63）已把整批发布收进一个临界区。写会话仍把前置条件
+%%      覆盖整个读集：改过的头、读过的每个块（改了的挂在它的 put / remove 上，
+%%      没改的发 check，读到缺失的用 absent），以及会话读过但没改的顶点的头——
+%%      即使有人绕过图层协议直写块，读-改-写也不会静默覆盖。一致性读同理：读集
+%%      在写锁下用只含 check 的批校验（graphdb consistent_read）。上游反馈
+%%      libbitcask feedbacks/2026-11-20-atomic-batch-no-read-isolation.md。
 %%   3. Count = 实际条目数；块目录 = 实际存在的块 key。
 %%
 %% ---- IO 抽象 ----
@@ -47,7 +55,7 @@
          encode_head/1, decode_head/1, encode_chunk/1, decode_chunk/1,
          default_cfg/0, encode_cfg/1, decode_cfg/1,
          %% 读原语
-         entries/5, lookup/6, counts/2, head_cond/2,
+         entries/5, entries_guarded/5, lookup/6, counts/2,
          %% 写会话
          new_session/2, put_edge/6, del_edge/5, all_entries/2, commit/1, commit/2,
          %% 分析 / 校验用的纯函数
@@ -76,6 +84,8 @@
              dirty  = #{} :: #{binary() => true},      %% 要写的块
              dels   = #{} :: #{binary() => true},      %% 要删的块
              orig   = #{} :: #{binary() => true},      %% 读到时盘上已有的块（只给它们发删除）
+             rconds = #{} :: #{binary() => absent | {ord, non_neg_integer()}},
+                                                       %% 直通读过的块 → 读到时的版本（提交条件）
              extra  = [] :: [term()],                  %% p 家族 op（逆序）
              touched = false :: boolean()}).
 
@@ -295,18 +305,6 @@ io_head({txn, Tx, Lock}, K) ->
         {error, Reason} -> bitcask_txn:abort(Reason)
     end.
 
-io_get({direct, H}, K) ->
-    case bitcask:get(H, K) of
-        {ok, V} -> {ok, vbin(V)};
-        Other   -> Other
-    end;
-io_get({txn, Tx, Lock}, K) ->
-    case bitcask_txn:read(Tx, K, Lock) of
-        {ok, V}         -> {ok, vbin(V)};
-        not_found       -> not_found;
-        {error, Reason} -> bitcask_txn:abort(Reason)
-    end.
-
 %% 前缀扫描（只用于直通读分块组；事务里按块目录点读）：Fun(K, V, Acc) -> Acc；
 %% 可 throw({graphdb_adj_stop, Acc}) 提前停。
 io_fold({direct, H}, Prefix, Fun, Acc0) ->
@@ -379,6 +377,54 @@ collect_groups(Io, Vid, [#grp{dir = D, etype = T, body = {chunks, _}} | Gs], Lim
                            [[{T, O, R, P} || {O, R, P} <- Es] | Acc])
     end.
 
+%% 同 entries/5，但分块组按头的块目录逐块点读并记下每个读到的 key 的版本：
+%% {ok, Entries, Checks}，Checks = [{check, Key, Cond}]（头 + 读过的块）。调用方
+%% 在引擎写锁下用只含 check 的原子批校验 Checks 仍是当前版本，即得一致快照
+%% （graphdb consistent_read；读集校验还能挡住绕过图层协议直写块的写入者，
+%% 见不变式 2）。
+%% 只用于直通模式。
+entries_guarded({direct, _} = Io, Vid, Dir, Etype, Limit) ->
+    case load(Io, Vid) of
+        {error, _} = E -> E;
+        {ok, Vs0} ->
+            Gs = [G || #grp{dir = D, etype = T} = G <- Vs0#vs.groups,
+                       D =:= Dir, Etype =:= undefined orelse T =:= Etype],
+            case guarded_groups(Io, Vs0, Gs, Limit, []) of
+                {error, _} = E -> E;
+                {ok, Es, #vs{vid = V, hcond = HC, rconds = RC}} ->
+                    {ok, Es, [{check, head_key(V), HC} |
+                              [{check, K, C} || {K, C} <- lists:sort(maps:to_list(RC))]]}
+            end
+    end.
+
+guarded_groups(_Io, Vs, _Gs, 0, Acc) ->
+    {ok, lists:append(lists:reverse(Acc)), Vs};
+guarded_groups(_Io, Vs, [], _Limit, Acc) ->
+    {ok, lists:append(lists:reverse(Acc)), Vs};
+guarded_groups(Io, Vs, [#grp{etype = T, body = {entries, Es}} | Gs], Limit, Acc) ->
+    Taken = take(Es, Limit),
+    guarded_groups(Io, Vs, Gs, dec_limit(Limit, length(Taken)),
+                   [[{T, O, R, P} || {O, R, P} <- Taken] | Acc]);
+guarded_groups(Io, Vs, [#grp{dir = D, etype = T, body = {chunks, Lbs}} | Gs], Limit, Acc) ->
+    case guarded_chunks(Io, Vs, D, T, Lbs, Limit, []) of
+        {error, _} = E -> E;
+        {ok, Es, Vs1} ->
+            guarded_groups(Io, Vs1, Gs, dec_limit(Limit, length(Es)),
+                           [[{T, O, R, P} || {O, R, P} <- Es] | Acc])
+    end.
+
+guarded_chunks(_Io, Vs, _D, _T, _Lbs, 0, Acc) ->
+    {ok, lists:append(lists:reverse(Acc)), Vs};
+guarded_chunks(_Io, Vs, _D, _T, [], _Limit, Acc) ->
+    {ok, lists:append(lists:reverse(Acc)), Vs};
+guarded_chunks(Io, #vs{vid = Vid} = Vs, D, T, [Lb | Lbs], Limit, Acc) ->
+    case get_chunk(Io, Vs, chunk_key(Vid, D, T, Lb)) of
+        {error, _} = E -> E;
+        {ok, Es, Vs1}  ->
+            Taken = take(Es, Limit),
+            guarded_chunks(Io, Vs1, D, T, Lbs, dec_limit(Limit, length(Taken)), [Taken | Acc])
+    end.
+
 %% 一个分块组的全部条目（块按 key 序 = 下界序 = 条目序）。Limit 到了就停扫。
 read_chunks(Io, Vid, Dir, Etype, Limit) ->
     Prefix = group_prefix(Vid, Dir, Etype),
@@ -426,14 +472,6 @@ counts(Io, Vid) ->
     case load(Io, Vid) of
         {error, _} = E -> E;
         {ok, Vs}       -> {ok, [{D, T, C} || #grp{dir = D, etype = T, count = C} <- Vs#vs.groups]}
-    end.
-
-%% 头的版本：{ok, absent | {ord, N}} | {error, _}（consistent 读用）。
-head_cond(Io, Vid) ->
-    case io_head(Io, head_key(Vid)) of
-        {ok, _, Cond}   -> {ok, Cond};
-        {absent, Cond}  -> {ok, Cond};
-        {error, _} = E  -> E
     end.
 
 %% =========================================================================
@@ -501,26 +539,33 @@ locate_lb([Lb | Lbs], Key) -> locate_lb(Lbs, Key, Lb).
 locate_lb([Lb | Lbs], Key, _Cur) when Lb =< Key -> locate_lb(Lbs, Key, Lb);
 locate_lb(_, _Key, Cur) -> Cur.
 
-%% 读块（会话内缓存）。块 key 缺失按空块处理：只可能是读头之后有人改过
-%% 这个顶点——提交时头的条件必然不成立，这次计算整个作废；del_vertex 读
-%% 头时带回的条件也守住这类“目录缺失”修复 op。
+%% 读块（会话内缓存），带版本：直通记进 rconds（提交时作条件），事务经
+%% read_guarded 由 bitcask_txn 登记。块 key 缺失按空块处理并标脏（自愈成真实
+%% 空块）：真缺失时 absent 条件允许自愈写成真实空块；若块随后被任何人补上
+%% （例如绕过图层协议直写，或 libbitcask ≤ 12.0.0 那种「新头已生效、新块还没
+%% 生效」的交错），提交时 absent 条件必然不成立，这次计算整个作废重来，不会把
+%% 别人刚写的块覆盖成空。
 get_chunk(Io, #vs{chunks = Cs} = Vs, Key) ->
     case maps:find(Key, Cs) of
         {ok, Es} -> {ok, Es, Vs};
         error ->
-            case io_get(Io, Key) of
-                {ok, Bin} ->
+            case io_head(Io, Key) of
+                {ok, Bin, Cond} ->
                     case decode_chunk(Bin) of
-                        {ok, Es} -> {ok, Es, Vs#vs{chunks = Cs#{Key => Es}}};
+                        {ok, Es} -> {ok, Es, rcond(Vs#vs{chunks = Cs#{Key => Es}}, Key, Cond)};
                         error    -> {error, {bad_adj_chunk, Key}}
                     end;
-                not_found ->
-                    {ok, [], touch(Vs#vs{chunks = Cs#{Key => []},
-                                         dirty = (Vs#vs.dirty)#{Key => true}})};
+                {absent, Cond} ->
+                    Vs1 = rcond(Vs#vs{chunks = Cs#{Key => []},
+                                      dirty = (Vs#vs.dirty)#{Key => true}}, Key, Cond),
+                    {ok, [], touch(Vs1)};
                 {error, _} = E ->
                     E
             end
     end.
+
+rcond(Vs, _Key, txn) -> Vs;
+rcond(#vs{rconds = RC} = Vs, Key, Cond) -> Vs#vs{rconds = RC#{Key => Cond}}.
 
 set_chunk(#vs{chunks = Cs, dirty = Dy, dels = Ds} = Vs, Key, Es) ->
     Vs#vs{chunks = Cs#{Key => Es}, dirty = Dy#{Key => true}, dels = maps:remove(Key, Ds)}.
@@ -794,7 +839,7 @@ chunkify(#vs{vid = Vid} = Vs0, #grp{dir = D, etype = T, count = C, body = {entri
 
 %% 头 op（带条件）+ 块删除 + 块写入 + p 家族 op。
 emit_ops(#vs{vid = Vid, hcond = Cond, existed = Existed, groups = Gs,
-             chunks = Cs, dirty = Dy, dels = Ds, orig = Orig, extra = Extra}) ->
+             chunks = Cs, dirty = Dy, dels = Ds, orig = Orig, extra = Extra, rconds = RC}) ->
     HK = head_key(Vid),
     HeadOps = case Gs of
                   [] when Existed -> [cond_op({remove, HK}, Cond)];
@@ -802,9 +847,23 @@ emit_ops(#vs{vid = Vid, hcond = Cond, existed = Existed, groups = Gs,
                   _               -> [cond_op({put, HK, encode_head(Gs)}, Cond)]
               end,
     %% 本次会话里新建又删掉的块从没落过盘，不发删除（否则白写一条墓碑）。
-    Dels = [{remove, K} || K <- lists:sort(maps:keys(Ds)), maps:is_key(K, Orig)],
-    Puts = [{put, K, encode_chunk(maps:get(K, Cs))} || K <- lists:sort(maps:keys(Dy))],
-    HeadOps ++ Dels ++ Puts ++ lists:reverse(Extra).
+    %% 读过的块带读到时的版本作条件；读过没改的块发 check（读集校验，见不变式 2）。
+    Dels = [chunk_op({remove, K}, RC) || K <- lists:sort(maps:keys(Ds)), maps:is_key(K, Orig)],
+    Puts = [chunk_op({put, K, encode_chunk(maps:get(K, Cs))}, RC) || K <- lists:sort(maps:keys(Dy))],
+    HeadOps ++ Dels ++ Puts ++ read_checks(RC, Dy, Ds) ++ lists:reverse(Extra).
+
+chunk_op({put, K, _} = Op, RC) ->
+    case maps:find(K, RC) of {ok, C} -> cond_op(Op, C); error -> Op end;
+chunk_op({remove, K} = Op, RC) ->
+    case maps:find(K, RC) of {ok, C} -> cond_op(Op, C); error -> Op end.
+
+read_checks(RC, Dy, Ds) ->
+    [{check, K, C} || {K, C} <- lists:sort(maps:to_list(RC)),
+                      not maps:is_key(K, Dy), not maps:is_key(K, Ds)].
+
+%% 会话读过但不改的顶点：头 + 读过的块都发 check（它们参与了这次的决定）。
+guard_ops(#vs{vid = Vid, hcond = HC, rconds = RC, dirty = Dy, dels = Ds}) ->
+    [{check, head_key(Vid), HC} || HC =/= txn] ++ read_checks(RC, Dy, Ds).
 
 cond_op(Op, txn) -> Op;
 cond_op({put, K, V}, Cond) -> {put, K, V, Cond};
@@ -909,15 +968,20 @@ commit(S) -> commit(S, []).
 
 commit(#sess{io = Io, cfg = Cfg, vs = M}, ExtraOps) ->
     Res = lists:foldl(fun(_V, {error, _} = E) -> E;
-                         ({_Vid, Vs}, {ok, Acc}) ->
+                         ({_Vid, Vs}, {ok, Acc, Guards}) ->
                               case finalize(Io, Vs, Cfg) of
-                                  {ok, Ops, _} -> {ok, [Ops | Acc]};
+                                  {ok, [], Vs1}  -> {ok, Acc, [guard_ops(Vs1) | Guards]};
+                                  {ok, Ops, _}   -> {ok, [Ops | Acc], Guards};
                                   {error, _} = E -> E
                               end
-                      end, {ok, []}, lists:sort(maps:to_list(M))),
+                      end, {ok, [], []}, lists:sort(maps:to_list(M))),
     case Res of
         {error, _} = E -> E;
-        {ok, Acc}      -> io_commit(Io, lists:append(lists:reverse(Acc)) ++ ExtraOps)
+        {ok, [], _} when ExtraOps =:= [] ->
+            ok;                                   %% 什么都不写：只读的决定在读时即成立
+        {ok, Acc, Guards} ->
+            io_commit(Io, lists:append(lists:reverse(Acc)) ++ ExtraOps ++
+                          lists:append(lists:reverse(Guards)))
     end.
 
 %% =========================================================================

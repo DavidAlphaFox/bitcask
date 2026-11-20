@@ -3,6 +3,29 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [12.0.1] — 2026-11-20
+
+Upgrades libbitcask **12.0.0 → 12.0.1** (upstream S63). The submodule moves from `62dd725` to
+`c364cd3` (tag `12.0.1`). The C API, existing C++ ABI (`SOVERSION` 12) and on-disk format are
+unchanged; rebuild to pick it up.
+
+### Fixed
+
+- **(via libbitcask 12.0.1) Atomic batches are now wholly visible to concurrent readers**: 12.0.0 and
+  earlier applied keys one by one in key byte order (a vertex head before its chunks), so a reader could
+  see "new head + old / missing chunk". Graph write sessions conditioned only the heads they modified, so
+  a write-back based on half a batch silently overwrote a chunk someone had just written; the self-heal
+  for a chunk listed but absent could also write a freshly created chunk as empty. Upstream now arbitrates
+  the whole batch first and publishes it in one index critical section — a reader sees either the entire
+  batch or none of it. This is atomic visibility, not snapshot isolation. Upstream report:
+  `feedbacks/2026-11-20-atomic-batch-no-read-isolation.md`.
+- **Graph write sessions explicitly validate the whole read set**: in addition to modified heads, conditions
+  cover every chunk read (`check` if unmodified, `absent` if missing) and vertices read but not modified —
+  even a caller that bypasses the graph protocol and writes a chunk directly cannot be silently overwritten.
+- **`out_edges` / `in_edges` with `#{consistent => true}` confirm the read-set version under the write lock**:
+  the head and chunks are point-read with their versions, then validated with a check-only atomic batch and
+  reread on conflict. Cost: a consistent read of a chunked vertex takes the write lock once (no disk write).
+
 ## [12.0.0] — 2026-11-20
 
 Upgrades libbitcask **11.0.0 → 12.0.0** (spanning upstream 11.1.0 / 11.1.1 / 11.2.0 / 12.0.0). The submodule moves from
