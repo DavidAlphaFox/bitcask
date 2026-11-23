@@ -57,6 +57,10 @@ struct CaskHandle {
     std::unique_ptr<Cask> cask;
     mutable std::shared_mutex mu;
     std::atomic<bool> closed{false};
+    // 本句柄已经成功提交过带写入的原子批。目录的第一条原子批要把 bitcask.meta 懒升到
+    // v6（重写文件 + fsync 目录），不能放在普通调度器上跑；升过之后的小批才直接跑
+    // （见 nif_cask_batch.cpp 的调度说明）。
+    std::atomic<bool> batch_warm{false};
 
     explicit CaskHandle(std::unique_ptr<Cask> c) noexcept : cask(std::move(c)) {}
     CaskHandle(const CaskHandle&)            = delete;

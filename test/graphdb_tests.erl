@@ -642,30 +642,27 @@ extreme_vids_chunk_ranges_test_() ->
 %% shortest_path：大 frontier 并行展开、失败清理
 %% ===================================================================
 
-%% 0 →(7) 1..50 →(7) 101..150 →(7) 200。第二轮起两侧 frontier 都是 50 个顶点，
-%% 走并行分片展开；路径必须与逐点串行语义一致（frontier 序、邻居序）。
+%% 0 →(7) 1..300 →(7) 1001..1300 →(7) 5000。第二轮起两侧 frontier 都是 300 个顶点
+%% （超过串行阈值 256），走并行分片展开；路径必须与逐点串行语义一致（frontier 序、邻居序）。
 wide_graph(D) ->
     R = graphdb:open(D, [read_write]),
-    [begin
-         ok = graphdb:put_edge(R, 0, 7, I),
-         ok = graphdb:put_edge(R, I, 7, 100 + I),
-         ok = graphdb:put_edge(R, 100 + I, 7, 200)
-     end || I <- lists:seq(1, 50)],
+    ok = graphdb:put_edges(R, lists:append([[{0, 7, I}, {I, 7, 1000 + I}, {1000 + I, 7, 5000}]
+                                            || I <- lists:seq(1, 300)])),
     R.
 
 shortest_path_wide_frontier_test_() ->
-    {"两侧 frontier 各 50 个顶点：并行展开，路径 = 串行语义下的第一条",
+    {"两侧 frontier 各 300 个顶点：并行展开，路径 = 串行语义下的第一条",
      {timeout, 60, fun() ->
         with_dir(fun(D) ->
             R = wide_graph(D),
-            ?assertEqual({ok, [0, 1, 101, 200]}, graphdb:shortest_path(R, 0, 200)),
-            ?assertEqual({ok, [7, 107, 200]}, graphdb:shortest_path(R, 7, 200)),
-            ?assertEqual({error, no_path}, graphdb:shortest_path(R, 200, 0)),
+            ?assertEqual({ok, [0, 1, 1001, 5000]}, graphdb:shortest_path(R, 0, 5000)),
+            ?assertEqual({ok, [7, 1007, 5000]}, graphdb:shortest_path(R, 7, 5000)),
+            ?assertEqual({error, no_path}, graphdb:shortest_path(R, 5000, 0)),
             graphdb:close(R)
         end)
      end}}.
 
-%% 展开途中引擎报错：串行路径（frontier ≤ 4）与并行路径都返回 {error, _}，
+%% 展开途中引擎报错：串行路径（frontier ≤ 256）与并行路径都返回 {error, _}，
 %% 调用方信箱里不留 worker 的结果 / DOWN。
 shortest_path_expand_failure_test_() ->
     {"展开失败：串行 / 并行两条路径都返回 {error,{graphdb_expand,_}}，信箱干净",
@@ -680,9 +677,9 @@ shortest_path_expand_failure_test_() ->
                         end),
             try
                 %% 串行：起点就是 7，第一层 frontier = [7]
-                ?assertMatch({error, {graphdb_expand, _}}, graphdb:shortest_path(R, 7, 200)),
-                %% 并行：第二层 frontier = [1..50]，7 那片失败、其余片被 kill
-                ?assertMatch({error, {graphdb_expand, _}}, graphdb:shortest_path(R, 0, 200))
+                ?assertMatch({error, {graphdb_expand, _}}, graphdb:shortest_path(R, 7, 5000)),
+                %% 并行：第三轮展开 fwd frontier = [1..300]，7 那片失败、其余片被 kill
+                ?assertMatch({error, {graphdb_expand, _}}, graphdb:shortest_path(R, 0, 5000))
             after
                 meck:unload(bitcask)
             end,
@@ -694,7 +691,7 @@ shortest_path_expand_failure_test_() ->
                            orelse (is_tuple(M) andalso tuple_size(M) =:= 3
                                    andalso is_reference(element(1, M)))],
             ?assertEqual([], Leaked),
-            ?assertEqual({ok, [0, 1, 101, 200]}, graphdb:shortest_path(R, 0, 200)),
+            ?assertEqual({ok, [0, 1, 1001, 5000]}, graphdb:shortest_path(R, 0, 5000)),
             graphdb:close(R)
         end)
      end}}.
@@ -1394,3 +1391,58 @@ binary_entry_list_batch_ops_test_() ->
         ?assertEqual({OutB, BytesB}, Run(single)),
         ?assertEqual(lists:usort(lists:seq(200, 230) ++ (Ys -- lists:sublist(Ys, 25))), OutB)
      end}}.
+
+
+%% ===================================================================
+%% edges_by_type 带 limit：只解还差的条目、range 取小批；结果 = 全量结果的前缀
+%% ===================================================================
+
+edges_by_type_limit_prefix_test_() ->
+    {"edges_by_type limit：内联组 / 分块组 / 带属性 / 带 rank 混合，任意 limit 的结果都是全量结果的前缀",
+     {timeout, 120, fun() ->
+        with_dir(fun(D) ->
+            R = graphdb:open(D, [read_write, {adj_inline_max, 256}, {adj_chunk_max, 256}]),
+            %% 顶点 5：600 条无属性出边（分块）；顶点 9：带属性、带 rank 的内联边；
+            %% 顶点 20..60：每个 3 条；顶点 3 只有入边。别的类型夹在中间。
+            ok = graphdb:put_edges(R, [{5, 7, I} || I <- lists:seq(100, 699)]),
+            [ok = graphdb:put_edge(R, 9, 7, I, #{rank => Rk, props => <<"p", I:8, Rk:8>>})
+             || I <- lists:seq(1, 6), Rk <- [0, 2]],
+            ok = graphdb:put_edges(R, [{V, 7, V + K} || V <- lists:seq(20, 60), K <- [1, 2, 3]]),
+            ok = graphdb:put_edges(R, [{V, 8, 3} || V <- lists:seq(1, 80)]),
+            {ok, All} = graphdb:edges_by_type(R, 7),
+            ?assertEqual(600 + 12 + 41 * 3, length(All)),
+            ?assertEqual(lists:sort([{S, Dv, Rk} || #{src := S, dst := Dv, rank := Rk} <- All]),
+                         [{S, Dv, Rk} || #{src := S, dst := Dv, rank := Rk} <- All]),
+            lists:foreach(
+              fun(L) ->
+                      {ok, Got} = graphdb:edges_by_type(R, 7, #{limit => L}),
+                      ?assertEqual({L, lists:sublist(All, L)}, {L, Got})
+              end, [0, 1, 2, 5, 13, 100, 599, 600, 601, 612, 613, 700, length(All), length(All) + 5]),
+            graphdb:close(R),
+            %% 重开（行已落盘）结果相同
+            R2 = graphdb:open(D, [read_write, {adj_inline_max, 256}, {adj_chunk_max, 256}]),
+            ?assertEqual({ok, lists:sublist(All, 650)}, graphdb:edges_by_type(R2, 7, #{limit => 650})),
+            graphdb:close(R2)
+        end)
+     end}}.
+
+neighbors_where_many_test_() ->
+    {"neighbors_where：300 个邻居、一半悬挂，结果同逐个 get_vertex；无邻居 / 入边方向",
+     {timeout, 60, fun() ->
+        with_dir(fun(D) ->
+            R = graphdb:open(D, [read_write]),
+            ok = graphdb:put_edges(R, [{1, 7, I} || I <- lists:seq(2, 301)]),
+            %% 偶数有顶点值，奇数是悬挂邻居
+            [ok = graphdb:put_vertex(R, I, integer_to_binary(I)) || I <- lists:seq(2, 301, 2)],
+            Pred = fun(_N, undefined) -> true;
+                      (_N, V) -> binary_to_integer(V) rem 4 =:= 0
+                   end,
+            Expect = [N || N <- lists:seq(2, 301),
+                           Pred(N, case graphdb:get_vertex(R, N) of {ok, V} -> V; _ -> undefined end)],
+            ?assertEqual({ok, Expect}, graphdb:neighbors_where(R, 1, out, Pred)),
+            ?assertEqual({ok, []}, graphdb:neighbors_where(R, 999, out, Pred)),
+            ?assertEqual({ok, [1]}, graphdb:neighbors_where(R, 2, in, fun(_, undefined) -> true; (_, _) -> false end)),
+            graphdb:close(R)
+        end)
+     end}}.
+

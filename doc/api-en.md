@@ -236,6 +236,7 @@ filtering the whole table. Backed by the OKI ordered-key index.
 | `{prefetch_threads, N}` | `0` | `0` = `min(online cores, 4)`; narrowed to the key count when a batch is smaller |
 | `{want_meta, true}` | off | `V` becomes `#{text => Bin, meta => Bin \| undefined}`, the same shape `get` returns in index mode. The meta and text come from the same read |
 | `{filter, F}` | none | meta filter (same shape as `search_text/4`). It is evaluated per entry in C++, and entries that fail are not returned. Entries with no meta never pass |
+| `{batch, N}` | `256` | At most N entries per NIF round trip (1..1024, otherwise `badarg`). Callers that only want the first few entries and then `throw` out of `Fun` should use a small batch so they do not read hundreds of entries up front. Results are unchanged |
 
 The idiomatic prefix scan sets the upper bound to the **byte after** the prefix:
 `range(H, {<<"user:">>, <<"user;">>})`.
@@ -461,6 +462,28 @@ search_vector(H, {text, <<"machine learning">>}, 10, 0,
               #{key => <<"category">>, op => eq, value => <<"tech">>}). %% auto-embed + filter
 ```
 
+### `vector_rank(H, Query, Keys[, K])`
+**Exact** ranking by vector similarity among a given set of keys; returns the best `K` (default 10) as
+`{ok, [{Key, Ord, Score}]}`. Requires libbitcask ≥ 12.1.0.
+
+Use it when the candidates already come from somewhere else — a vertex's neighbours, full-text hits, a batch of keys from
+`range` — instead of translating the candidate condition into a meta filter for `search_vector`, or reading every
+candidate's vector back to compute scores yourself.
+
+- No vector index involved: each candidate is point-read and scored with its stored vector. Results are unaffected by HNSW
+  recall and do not depend on the index having been flushed.
+- Scores follow `search_vector` (cosine / dot: inner product; L2: negative squared distance), descending; ties keep the
+  order of `Keys`.
+- Missing / deleted / expired keys and documents without a vector are skipped; duplicate keys count once.
+- Cost is proportional to the number of candidates (one point read each).
+- `Query` as in `search_vector`: `VecBin` or `{text, Bin}`. `Keys` must be a list of binaries, otherwise `badarg`.
+  No vector config / dimension mismatch → `{error, _}`.
+
+```erlang
+%% CandidateKeys: keys of documents that carry a vector, obtained elsewhere
+vector_rank(H, QueryVec, CandidateKeys, 5).   %% the 5 most similar neighbours
+```
+
 ### `search_hybrid(H, Text[, VecOrAuto[, K[, Filter]]])`
 RRF fusion (`1/(60+rank)`, ties broken by smaller `ord`) of a BM25 leg (over `Text`)
 and a vector leg. The 3rd argument selects the vector source:
@@ -586,8 +609,9 @@ the row count divides evenly the last page is full and returns `done` directly.
   allowed there, and any other text kind returns `{bad_query, {hybrid_needs_match, _}}`.
 - `where` is still pushed down. `score` is the similarity for vector search and the RRF score for
   hybrid search.
-- With a filter, vector search can itself return fewer hits than requested (HNSW), so fewer than K
-  hits has to be treated as the end of the results.
+- With a filter, vector search fills K on the HNSW engine for graphs of up to 2^20 nodes
+  (libbitcask ≥ 12.1.0). Larger graphs and the IVF-RQ / DiskANN engines can still return fewer hits
+  than requested, so fewer than K hits has to be treated as the end of the results.
 
 ### Secondary indexes
 

@@ -655,7 +655,123 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
-## G12 — 图层：定宽条目表保持二进制、单条增删直接拼接（未发版）
+## M27 — libbitcask 升级 12.0.3 → 12.1.0 + `vector_rank`（12.1.0）
+
+> submodule `d995557` → `1caee1a`（tag `12.1.0`，上游 S66 + S67）。既有 C API、C++ ABI（`SOVERSION` 12）与盘上格式不变；
+> 上游有新增入口（`Cask::rank_by_vector`），本库接成 `bitcask:vector_rank/3,4`。对应本库提的三条上游反馈：
+> `2026-11-23-recovery-truncates-synced-data-on-bad-record-header.md`、
+> `2026-11-23-filtered-vector-search-incomplete-no-candidate-scoring.md`、
+> `2026-11-23-point-get-after-flush-scans-run-block-linearly.md`。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M27-1** | submodule checkout `1caee1a`（`12.1.0`）；NIF 重编。 | ✅ |
+| **M27-2** | `bitcask:vector_rank(H, Query, Keys[, K])`：NIF `cask_vector_rank/4`（dirty IO——每个候选一次点读）→ `Cask::rank_by_vector`。`Keys` 必须是 binary 的正规列表（否则 badarg）；`Query` 收 VecBin 或 `{text, Bin}`；不要求索引模式已 flush，无向量配置 / 维度不符 → `{error, _}`。 | ✅ |
+| **M27-3** | `bitcask_query` 模块头与翻页说明里「向量检索带 filter 时引擎可能少给」的口径改成 12.1.0 的现状（HNSW ≤ 2^20 节点回满；更大的图与 IVF-RQ / DiskANN 仍可能少给）。执行逻辑没有动。 | ✅ |
+| **M27-4** | 回归 `test/bitcask_vector_rank_tests.erl`：候选内排序与暴力结果逐条一致、与 `search_vector` 同口径、跳过不存在 / 无向量 / 已删 / 重复、重开后结果相同、坏参数；无向量配置的库；带 filter 的 `search_vector` 在通过率 0.15%（2 万篇里 30 篇）、K=10、Ef=16 下回满且与精确结果一致。 | ✅ |
+| **M27-5** | 测试修正（与升级无关，12.0.3 上同样偶发）：`bitcask_txn_tests:nif_commit_notify_test_` 的「NIF 执行中被 kill」一段用 `wait_in_commit` 判断进入 NIF，但那时进程可能还排在 dirty 队列里，kill 之后整批不落、断言失败（机器忙时 8 次里 1～2 次）。改用 `wait_running_in_commit`（再要求 `status = running`）。 | ✅ |
+| **M27-6** | 发版记录：`vsn` 12.0.3 → **12.1.0**；CHANGELOG（中英）、README（中英）、ROADMAP（中英）、`doc/api-zh.md` / `doc/api-en.md`、`CMakeLists.txt` 子模块注释。 | ✅ |
+
+注意（上游 12.1.0 的行为变化，对本库调用方可见）：
+- 正常关闭过的库，数据文件尾部的残缺不再被截掉，而是留在原处、读的时候跳过；只有上一个写者没有正常关闭（留下陈旧写锁）时，
+  它正在写的文件的尾巴才截断。本库测试里没有靠「正常关闭 + 掐文件」模拟掉电的用例，无需改。
+- 读索引里有、盘上已坏的记录统一是 `{error, bad_crc}`。
+- 带 filter 的向量检索在过滤全拒 / 极严时多一遍对全部节点的过滤求值（HNSW，≤ 2^20 个节点）。
+- 没做：`bitcask_query` 还没有用 `vector_rank`（「先 where 得到候选、再按向量排序」的执行路径）；Cypher 设计稿（`doc/cypher-query-design-zh.md`）
+  里 `<=>` 的候选排序可以直接落在它上面。重开之后的图读（行在 run 里）本库没有重新测。
+
+---
+
+## M26 — libbitcask 升级 12.0.2 → 12.0.3（12.0.3）
+
+> submodule `ab9b51f` → `d995557`（tag `12.0.3`，上游 S65）。点查命中提速：memdelta 点查索引由节点式哈希表换成开放寻址的
+> 平表；活跃文件的命中读走只读映射（零拷贝、无系统调用；仅 Linux / FreeBSD）。C API、既有 C++ ABI（`SOVERSION` 12）与盘上
+> 格式均不变。NIF / Erlang 门面零改动，重编即得。对应本库提的上游反馈
+> `feedbacks/2026-11-23-point-get-hit-cost-grows-with-unflushed-rows.md`。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M26-1** | submodule checkout `d995557`（`12.0.3`，已在上游 `origin/main`）；NIF 重编，生成头 `BITCASK_VERSION_STRING "12.0.3"`。全量 `rebar3 eunit` 401/401；`rebar3 as prod compile` 零警告；`rebar3 do xref, dialyzer` 干净。 | ✅ |
+| **M26-2** | 实测见下表（同一台机器；改前 = 12.0.2 + G11～G13）。 | ✅ |
+| **M26-3** | 发版记录：`bitcask.app.src` 的 `vsn` 12.0.2 → **12.0.3**（沿用「跟上游版本号」的惯例，G11～G13 一并并入）；CHANGELOG（中英）`[Unreleased]` → `[12.0.3]`；README（中英）项目状态与路线图索引、ROADMAP（中英）新增 12.0.3 节；`CMakeLists.txt` 子模块注释更新。 | ✅ |
+
+| 操作 | 12.0.2 | 12.0.3 |
+|---|---|---|
+| 点读命中（经 NIF，128 B），库里 1 千 / 10 万 / 40 万个未落盘 key | 1.29 / 1.84 / 2.00 µs | 0.26 / 0.62 / 0.73 µs |
+| `graphdb:out_edges` / `in_edges`（1 万顶点 / 5 万边） | 3.9 / 3.5 µs | 2.0 / 1.8 µs |
+| `graphdb:neighbors` out / both | 3.1 / 4.2 µs | 1.2 / 2.3 µs |
+| `graphdb:degree` / `edge` | 2.6 / 2.6 µs | 1.1 / 1.0 µs |
+| `graphdb:shortest_path` | 445 µs | 262 µs |
+| `graphdb:put_edge` / `del_edge`，度数 5 的顶点之间 | 12.6 / 13.3 µs | 7.9 / 7.3 µs |
+| `graphdb:put_edge`，度数 50 | 14.0 µs | 8.8 µs |
+| `graphdb:put_edge(hub → 新顶点)`（20 万度） | 24 µs | 20 µs |
+| `test/graphdb_bench` 度数 5：逐条 `put_edge` / 批量 `put_edges` | 7.8 万 / 13.0 万边/秒 | 13.1 万 / 17.6 万边/秒 |
+| `test/graphdb_bench` 度数 50：逐条 / 批量 | 5.7 万 / 13.9 万边/秒 | 9.8 万 / 20.2 万边/秒 |
+
+注意（上游 12.0.3 的行为变化，对本库调用方可见）：活跃文件被点读过的页计入进程 RSS（文件页，可回收）；映射读遇到底层 I/O
+错误是 SIGBUS 而不是 `{error, _}`——两点都与已封口文件既有的映射读相同。基准里重开之后的一跳读（行已落盘、走 run）仍是
+4～6 µs，上游这次没动那条路。
+
+---
+
+## G14 — 图层：小 frontier 串行展开、`edges_by_type` limit 提前截断（未发版）
+
+> 来源：12.1.0 之后的图层分析（2 万顶点 / 10 万条边幂律图，新写入与重开两种状态各测一遍）。原定三项，第 3 项实测无收益已撤回。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **G14-1** | `EXPAND_SEQ_MAX` 4 → 256：frontier 不超过 256 个顶点就地串行展开。阈值 4 / 32 / 64 / 128 / 256 / 无穷对比过：起进程 + 把邻居列表拷回调用方的开销在 frontier 上百时仍吃掉并行收益；1.5 万顶点的 hub 三层 BFS 完全串行与并行持平。`wide_graph` 测试扩到每层 300 个顶点，仍覆盖并行路径与失败清理。 | ✅ |
+| **G14-2** | `edges_by_type/3` 带 limit：`graphdb_adj:out_entries/3`、`decode_chunk/2` 只解还差的条数（定宽组取条目区前缀；带属性组逐条解到第 N 条，其后不再校验）；range 按 `max(16, min(256, limit div 2))` 取批。`bitcask:range_fold/5` 新增 `{batch, N}`（1..1024——NIF 一批最多 1024，再大「批未满即到尾」会判错）。回归 `graphdb_tests:edges_by_type_limit_prefix_test_`（内联 / 分块 / 带属性 / 带 rank，14 个 limit 取值逐个对全量前缀，重开再验）、`bitcask_range_batch_tests`。 | ✅ |
+| **G14-3** | ~~批量点读 NIF `bitcask:get_many/2`，`neighbors_where` 改用它~~：实现并测过后撤回。单次 `get` 经 NIF 实际只要约 0.21 µs/key，`get_many` 在 1～200 个 key 的批上都持平（分析时按 eprof 估的「每次 NIF + 门面约 0.9 µs」被 profile 开销放大了）；`neighbors_where` 6.5 → 7.3 µs，无改善。代码已还原，留下 `neighbors_where_many_test_`（300 个邻居、一半悬挂）作回归。 | ❌ 撤回 |
+
+实测（同机 A/B，旧 = HEAD 的 graphdb，两轮取值；单位 µs）：
+
+| 操作 | 新写入：旧 → 新 | 重开后：旧 → 新 |
+|---|---|---|
+| `shortest_path` 随机点对 | 278～286 → 149～152 | 324～328 → 192～196 |
+| `bfs` 两跳 | 23 → 11～13 | 27～29 → 14 |
+| `bfs` 双向两跳 | 95 → 46～54 | 108～110 → 53～56 |
+| `bfs` 四跳 | 381～418 → 326～341 | 428～442 → 367～397 |
+| `bfs` 三层，从 hub（1.5 万顶点） | 9471～9807 → 10215～10923 | 8870～10224 → 9424～9724 |
+| `edges_by_type` limit 10 / 100 | 见注 | 221 / 225 → 30 / 69 |
+| `edges_by_type` limit 1000 / 全量 | 持平 | 持平 |
+
+注：新写入状态下写完之后第一次 range 会一次性重建 memdelta 排序视图（10 万行约 40 ms），A/B 脚本里 `edges_by_type` 恰是第一个用 range
+的，两边都摊进了这笔，表里不列；扣掉之后 limit 10 约 25 µs。hub 三层 BFS 新版两轮都略高（约 +5%），在本机噪声范围内，没有再追。
+
+---
+
+## G13 — NIF：小原子批直接在普通调度器上跑（12.0.3）
+
+> 2026-11-23 第四轮排查：图层自己的开销已贴近 NIF 调用的下限，剩下的在图层之下。`put_batch_atomic` 的 NIF 原先一律挂
+> dirty IO，而图层的单条写边只是 2～3 条 op 的小批，转一次调度器的切换比批本身还贵。上游一条（点查命中耗时随未落盘
+> 行数涨）已提 libbitcask `feedbacks/2026-11-23-point-get-hit-cost-grows-with-unflushed-rows.md`。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **G13-1** | `cpp/nif/nif_cask_batch.cpp`：`cask_put_batch_atomic/2,3` 入口改为 flag 0，自己分流（同 `put` / `delete` 的做法）。轻批直接跑：op ≤ 16 条、value 合计 ≤ 64 KiB、没有 doc map / iolist、句柄没有 sync 策略，且批里有写入时本句柄已成功提交过带写入的原子批（`CaskHandle::batch_warm`——目录的第一条原子批要懒升 `bitcask.meta`，重写文件 + fsync 目录，不能在普通调度器上跑）；只含 `check` 的批不写盘，不看 `batch_warm`。其余 `enif_schedule_nif` 到 dirty IO。判轻重只扫表的前 17 个表元，不做完整解析。`txn_commit` 不变（恒 dirty）。 | ✅ |
+| **G13-2** | 测试 `bitcask_cond_batch_tests:batch_scheduling_paths_test_`：冷句柄上只含 check 的批、冷句柄第一条写批、小批的条件成立 / 冲突 / remove / 空批 / badarg、16 与 17 条、value 合计 64 KiB 整与多 1 字节、16 进程并发条件自增 3200 次不丢更新、带 `o_sync` 的句柄。全量 `rebar3 eunit` **401/401**；`rebar3 as prod compile` 零警告；`rebar3 do xref, dialyzer` 干净。 | ✅ |
+| **G13-3** | 文档：CHANGELOG（中英）`[Unreleased]`、NIF 文件头与 `nif_main.cpp` 表注释。 | ✅ |
+
+实测（同一台机器；改前数字取自 G12 当轮）：
+
+| 操作 | 改前 | 改后 |
+|---|---|---|
+| `put_batch_atomic`，2 条无条件小写入 | 4.84 µs | 3.14 µs |
+| `put_batch_atomic`，2 条带 `absent` 条件 | 5.33 µs | 3.26 µs |
+| `put_batch_atomic`，1 条 | 4.54 µs | 2.45 µs |
+| 只含 2 条 `check` 的批（一致性读的读集校验） | 2.41 µs | 0.72 µs |
+| `graphdb:put_edge` 度数 5 的顶点之间 | 17.3 µs | 12.6 µs |
+| `graphdb:del_edge` 度数 5 | 17.0 µs | 13.3 µs |
+| `graphdb:put_edge` 度数 50 | 20.5 µs | 14.0 µs |
+| `graphdb:put_edge(hub → 新顶点)`（20 万度） | 29 µs | 24 µs |
+| `test/graphdb_bench` 逐条 `put_edge` 装载 | 61.1k 边/秒 | 77.6k 边/秒 |
+
+批量 `put_edges`（每批 256 个顶点，走 dirty）不受影响。
+
+---
+
+## G12 — 图层：定宽条目表保持二进制、单条增删直接拼接（12.0.3）
 
 > 2026-11-23 第三轮排查（脚本在开发机 `/tmp/gprof/{r3,enc,r4}.escript`）。只改图层内部，盘上格式与 API 不变。
 
@@ -687,7 +803,7 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
-## G11 — 图层：读路径一遍解码、块目录二分、会话条目拉链（未发版）
+## G11 — 图层：读路径一遍解码、块目录二分、会话条目拉链（12.0.3）
 
 > 2026-11-23 第二轮排查（eprof + 原型，脚本在开发机 `/tmp/gprof/{ep2,proto,low,hub}.escript`）。只改 `graphdb_adj` / `graphdb`
 > 内部，盘上格式与 API 不变。

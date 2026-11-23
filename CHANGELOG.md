@@ -5,9 +5,66 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 
 ## [Unreleased]
 
-图层读写路径的内部优化。盘上格式、API 与 libbitcask 版本均不变。
+### Changed
+
+- **小 frontier 的图遍历不再起进程并行展开**：BFS / k-hop / 最短路此前 frontier 超过 4 个顶点就切片、起进程并行展开；起进程和把邻居列表
+  拷回调用方的开销在 frontier 上百时仍吃掉并行的收益。阈值改为 256。2 万顶点 / 10 万条边的幂律图上：`shortest_path` 278 → 152 µs
+  （重开后 328 → 196 µs），两跳 `bfs` 23 → 13 µs，双向两跳 `bfs` 95 → 54 µs，四跳 `bfs` 381 → 341 µs；从 hub 出发触达 1.5 万个
+  顶点的三层 BFS 在噪声范围内持平（9.5～10.9 ms）。结果与顺序不变。
+- **`graphdb:edges_by_type/3` 带 `limit` 时只读、只解够用的那部分**：此前把每个顶点的出边组整组解完再截取，range 每批固定取 256 条
+  记录；现在只解还差的条数，range 按 limit 取小批。同一张图重开后 limit 10 / 100：221 / 225 → 30 / 69 µs。结果是全量结果的前缀，
+  与此前相同；limit ≥ 1000 或不带 limit 时没有变化。
+
+### Added
+
+- `bitcask:range_fold/5` 与 `range/3` 的 `{batch, N}` 选项（1..1024，默认 256）：每次 NIF 往返最多取 N 条。只要开头几条就 `throw`
+  出来的调用方用小批。
+
+## [12.1.0] — 2026-11-23
+
+升级 libbitcask **12.0.3 → 12.1.0**（上游 S66、S67），新增 `bitcask:vector_rank/3,4`。submodule 从 `d995557` 切到 `1caee1a`
+（tag `12.1.0`）。既有 C API、C++ ABI（`SOVERSION` 12）、盘上格式与本库既有 API 均不变。
+
+### Added
+
+- **`bitcask:vector_rank(H, Query, Keys[, K])`**：在给定的一组 key 里按向量相似度精确排序，取前 K（缺省 10）。候选已经由别处给出时
+  用它——图上的邻居、全文检索的命中、range 扫出来的一批 key。不经向量索引（结果不受 HNSW 召回影响，也不用等索引 flush），
+  分数口径同 `search_vector`，返回 `{ok, [{Key, Ord, Score}]}`。不存在 / 已删 / 没有向量的 key 跳过，重复的只算一次。
+  代价与候选数成正比（每个候选一次点读）。`Query` 可以是 `{text, Bin}`（自动 embed）。上游反馈：
+  `feedbacks/2026-11-23-filtered-vector-search-incomplete-no-candidate-scoring.md`。
+
+### Fixed
+
+- **（随 libbitcask 12.1.0）数据文件中间的损坏不再让打开库时把文件截断**：索引从 data 重建时碰到一条读不出来的记录，此前一律当作
+  「没写完的尾巴」把文件截到那里，后面已经落盘的记录全部被删，`open` 照样成功。现在只有上一个写者没有正常关闭时它正在写的
+  文件才会被截断；其余文件一个字节不动，坏区跳过、从后面第一条完好的记录接着读（引擎打一条 warn 日志）。成员不全的原子批
+  仍然整批不可见。上游反馈：`feedbacks/2026-11-23-recovery-truncates-synced-data-on-bad-record-header.md`。
+- （随 libbitcask 12.1.0）读一条索引里有、盘上已坏的记录，统一报 `{error, bad_crc}`（此前坏在长度字段上时报成 I/O 错误）。
 
 ### Changed
+
+- **（随 libbitcask 12.1.0）带 filter 的 `search_vector` 不再悄悄少给**（HNSW 引擎）：过滤很严时图遍历在预算耗尽后带着不足 K 条
+  返回。现在退到精确扫描；图不超过 2^20 个节点时，返回不足 K 条就是满足 filter 的文档确实不足 K 篇。更大的图、以及
+  IVF-RQ / DiskANN 引擎没有变。⚠️ 过滤全拒 / 极严的查询多一遍对全部节点的过滤求值。
+- **（随 libbitcask 12.1.0）行落盘之后的点读提速**（上游 S66）：重开 / checkpoint 之后点读命中一次，上游基准 1 千 / 10 万 /
+  40 万个 key 由 3.0 / 3.4 / 3.6 µs 降到 0.37 / 0.70 / 1.0 µs（本库未另测）。上游反馈：
+  `feedbacks/2026-11-23-point-get-after-flush-scans-run-block-linearly.md`。
+- ⚠️ **行为变化**：正常关闭过的库，数据文件尾部的残缺不再被截掉，而是留在原处、读的时候跳过。
+
+## [12.0.3] — 2026-11-23
+
+升级 libbitcask **12.0.2 → 12.0.3**（上游 S65），并入图层读写路径与 NIF 调度的内部优化。submodule 从 `ab9b51f` 切到 `d995557`
+（tag `12.0.3`）。C API、既有 C++ ABI（`SOVERSION` 12）、盘上格式与本库 API 均不变，重编即得。
+
+### Changed
+
+- **（随 libbitcask 12.0.3）点读命中提速**：引擎内存里的点查索引换成平表，活跃文件的命中读走只读映射、不再每次一个系统调用
+  （仅 Linux / FreeBSD）。128 字节的值命中一次（经 NIF）：库里 1 千 / 10 万 / 40 万个未落盘 key 由 1.29 / 1.84 / 2.00 µs 降到
+  0.26 / 0.62 / 0.73 µs。带动 `graphdb:out_edges` 3.9 → 2.0 µs、`degree` 2.6 → 1.1 µs、`put_edge`（度数 5）12.6 → 7.9 µs，
+  基准里逐条 / 批量装载 7.8 万 / 13.0 万 → 13.1 万 / 17.6 万边/秒。上游反馈：
+  `feedbacks/2026-11-23-point-get-hit-cost-grows-with-unflushed-rows.md`。
+  ⚠️ 活跃文件被点读过的页现在计入进程 RSS（文件页，可回收）；映射读遇到底层 I/O 错误是 SIGBUS 而不是 `{error, _}`——
+  两点都与已封口文件既有的映射读相同。
 
 - **邻接读直接在头 / 块的二进制上解**：只解要的方向和类型，别的组按字节数跳过，一遍出结果。`neighbors` 直接出对端 id，结果只来自
   一个组时不再逐个去重，`both` 只读一次头：20 万度 hub 的 `neighbors` 102 ms → 9.0 ms，低度数 `neighbors(both)` 7.5 → 4.2 µs；
@@ -21,6 +78,9 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
   要把所在的块（约 500 条）整个解成列表再编回去。20 万度 hub 上 `put_edge` 56 → 29 µs、往 hub 的入边一侧加边 68 → 38 µs、
   `del_edge` 40 → 33 µs；度数 50 的顶点之间 `put_edge` 29.6 → 20.5 µs。度数 5 的图上没有变化。落盘字节与此前相同。
 - `graphdb_analytics:materialize` 只解出边组、直接出对端 id：2 万顶点 / 20 万条边 214 → 168 ms。
+- **小的原子批直接在普通调度器上跑**（`put_batch_atomic/2,3`）：op 不超过 16 条、value 合计不超过 64 KiB、没有 doc map、句柄没有
+  sync 策略、且本句柄已经提交过原子批时，不再转 dirty IO 调度器；其余照旧。2 条小写入的批 4.8 → 3.1 µs，只含 `check` 的批
+  2.4 → 0.7 µs；`graphdb:put_edge` 度数 5 的顶点之间 17.3 → 12.6 µs，逐条装载 61k → 78k 边/秒。语义不变。
 
 ## [12.0.2] — 2026-11-23
 

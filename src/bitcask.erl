@@ -66,6 +66,7 @@
            search_fuzzy/3, search_fuzzy/4, search_fuzzy/5,
            search_wildcard/2, search_wildcard/3, search_wildcard/4,
            search_vector/2, search_vector/3, search_vector/4, search_vector/5,
+           vector_rank/3, vector_rank/4,
            search_hybrid/2, search_hybrid/3, search_hybrid/4, search_hybrid/5,
            embed/2,
            encode_meta/1, decode_meta/1]).
@@ -651,6 +652,9 @@ with_stream(Handle, Fun) -> bitcask_stream:with_stream(ref(Handle), Fun).
 %%                          （与 get 的索引模式同形；meta 与 text 同一次读）。
 %%   {filter, F}            meta filter（形态同 search_text/4），在 C++ 侧逐条
 %%                          求值，不通过的条目不交出；无 meta 的不通过。
+%%   {batch, N}             每次 NIF 往返最多取 N 条（1..1024，默认 256）。只想要
+%%                          开头几条、随后从 Fun 里 throw 出来的调用方用小批，
+%%                          免得一次多读几百条；结果不变。
 %%
 %% OKI 不可用时按成因分两个码（6.1.0）——补救方式不同：
 %%   {error, no_index}             索引在本句柄上**本就不建**（只读 / merge_only
@@ -689,9 +693,10 @@ range(Handle, {Lo, Hi}, Opts) ->
 %% with_fold_iter 的契约一致。
 range_fold(Handle, {Lo, Hi}, Opts, Fun, Acc0) ->
     RangeOpts = range_opts(Lo, Hi, Opts),
+    Batch = range_batch(Opts),
     case bitcask_cpp_nifs:cask_range_start(ref(Handle), RangeOpts) of
         {ok, IterRef} ->
-            try range_loop(IterRef, Fun, Acc0)
+            try range_loop(IterRef, Fun, Acc0, Batch)
             after bitcask_cpp_nifs:cask_range_release(IterRef)
             end;
         Other -> normalize_error(Other)
@@ -719,8 +724,15 @@ range_opts(Lo, Hi, Opts) ->
 %% 数量级的往返。**批未满即到尾**（NIF 契约：C++ 侧只在 next() 没值时提前
 %% break），所以短批之后不必再打一次拿 done——graphdb 的小度数邻居 range
 %% 正是"一批 + 一次白打的 done"，那一次是 dirty 调度器上的往返。
-range_loop(IterRef, Fun, Acc) ->
-    case bitcask_cpp_nifs:cask_range_next_batch(IterRef, ?RANGE_BATCH) of
+range_batch(Opts) ->
+    case proplists:get_value(batch, Opts, ?RANGE_BATCH) of
+        %% NIF 一批最多 1024 条（再大会被它夹小，「批未满即到尾」就判错了）。
+        N when is_integer(N), N >= 1, N =< 1024 -> N;
+        Bad -> erlang:error(badarg, [{batch, Bad}])
+    end.
+
+range_loop(IterRef, Fun, Acc, Batch) ->
+    case bitcask_cpp_nifs:cask_range_next_batch(IterRef, Batch) of
         done -> Acc;
         {ok, Entries} ->
             {Acc1, N} = lists:foldl(fun({K, V, T, O}, {A, C}) ->
@@ -729,9 +741,9 @@ range_loop(IterRef, Fun, Acc) ->
                                             {Fun(K, #{text => V, meta => M}, T, O, A),
                                              C + 1}
                                     end, {Acc, 0}, Entries),
-            case N < ?RANGE_BATCH of
+            case N < Batch of
                 true  -> Acc1;
-                false -> range_loop(IterRef, Fun, Acc1)
+                false -> range_loop(IterRef, Fun, Acc1, Batch)
             end;
         Other -> normalize_error(Other)
     end.
@@ -1253,6 +1265,30 @@ search_vector(Handle, {text, Text}, K, Ef, Filter) ->
     end;
 search_vector(Handle, VecBin, K, Ef, Filter) ->
     bitcask_cpp_nifs:cask_search_vector(ref(Handle), VecBin, K, Ef, Filter).
+
+%% 在给定的一组 key 里按向量相似度**精确**排序，取最好的 K 个（缺省 10）。
+%% 候选已经由别处给出时用它——图上某个顶点的邻居、一次全文检索的命中、range
+%% 扫出来的一批 key——不必把候选条件翻译成 meta filter 去走 search_vector，也
+%% 不必把每个候选的向量读回来自己算。
+%%   - 不经向量索引：逐个点读候选、用它存的向量算分。结果不受 HNSW 召回影响，
+%%     也不依赖索引是否已 flush（读到的就是 get 读到的）。
+%%   - 分数口径同 search_vector（cosine / dot：内积；L2：负的平方距离），降序；
+%%     同分按候选在 Keys 里的先后。返回 {ok, [{Key, Ord, Score}]}。
+%%   - 不存在 / 已删 / 已过期的 key、没有向量的文档跳过；重复的 key 只算一次。
+%%   - 代价与候选数成正比（每个候选一次点读）。
+%% Query 同 search_vector：VecBin 或 {text, Bin}（自动 embed）。Keys 必须是
+%% binary 的列表，否则 badarg。集合没有向量配置 / 维度不符 → {error, _}。
+%% 需要 libbitcask ≥ 12.1.0。
+vector_rank(Handle, Query, Keys) ->
+    vector_rank(Handle, Query, Keys, 10).
+
+vector_rank(Handle, {text, Text}, Keys, K) ->
+    case embed(Handle, Text) of
+        {ok, V}        -> vector_rank(Handle, V, Keys, K);
+        {error, _} = E -> E
+    end;
+vector_rank(Handle, VecBin, Keys, K) ->
+    bitcask_cpp_nifs:cask_vector_rank(ref(Handle), VecBin, Keys, K).
 
 %% RRF 混合检索：BM25 与向量两路各取 K'=max(K×4,64)，按 1/(60+rank) 融合，
 %% 平局 ord 小者在前。TextQuery/VecBin 允许其一为 <<>>（单路退化），

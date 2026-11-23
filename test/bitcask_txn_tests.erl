@@ -1170,6 +1170,16 @@ wait_in_commit(Pid) ->
         _ -> erlang:yield(), wait_in_commit(Pid)
     end.
 
+%% 忙等 Pid 真正在 dirty 调度器上**执行** txn_commit（status = running）。
+%% wait_in_commit 在它还排在 dirty 队列里时就返回——那时 kill 得到的是「NIF
+%% 永不执行、整批不落」，机器忙的时候「执行中被 kill」那一段会因此偶发失败。
+wait_running_in_commit(Pid) ->
+    case erlang:process_info(Pid, [current_function, status]) of
+        undefined -> ok;
+        [{current_function, {bitcask_cpp_nifs, cask_txn_commit, _}}, {status, running}] -> ok;
+        _ -> erlang:yield(), wait_running_in_commit(Pid)
+    end.
+
 nif_commit_notify_test_() ->
     {"提交令牌：disarm 不发；不 disarm 进程一退就发；NIF 执行中 / 排队中被 kill 都发（后者整批不落）",
      {timeout, 120, fun() ->
@@ -1194,7 +1204,7 @@ nif_commit_notify_test_() ->
                  {A, M} = spawn_monitor(fun() ->
                               bitcask:txn_commit(R, Ops(<<"run">>), sync_on_commit, Tok(100 + N))
                           end),
-                 ok = wait_in_commit(A),
+                 ok = wait_running_in_commit(A),
                  exit(A, kill),
                  receive {'DOWN', M, _, _, _} -> ok end,
                  ?assertEqual(ok, Recv(100 + N, 5000)),

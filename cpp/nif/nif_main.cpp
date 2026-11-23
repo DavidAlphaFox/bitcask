@@ -58,6 +58,7 @@ ERL_NIF_TERM nif_cask_search_fuzzy      (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_wildcard   (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_vector     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_vector_5   (ErlNifEnv*, int, const ERL_NIF_TERM[]);
+ERL_NIF_TERM nif_cask_vector_rank       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_hybrid     (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_search_hybrid_5   (ErlNifEnv*, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM nif_cask_encode_meta       (ErlNifEnv*, int, const ERL_NIF_TERM[]);
@@ -133,6 +134,8 @@ ErlNifFunc kNifFuncs[] = {
     {"cask_search_wildcard",    4, guarded<nif_cask_search_wildcard>, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"cask_search_vector",      4, guarded<nif_cask_search_vector>,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"cask_search_vector",      5, guarded<nif_cask_search_vector_5>, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    // 每个候选一次点读（可能落到盘上）+ 一次距离计算：dirty IO。
+    {"cask_vector_rank",        4, guarded<nif_cask_vector_rank>,     ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"cask_search_hybrid",      4, guarded<nif_cask_search_hybrid>,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"cask_search_hybrid",      5, guarded<nif_cask_search_hybrid_5>, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"cask_encode_meta",        1, guarded<nif_cask_encode_meta>,     0},
@@ -165,9 +168,10 @@ ErlNifFunc kNifFuncs[] = {
     {"cask_range_release",     1, guarded<nif_cask_range_release>,    0},
 
     // --- v5.1.0 原子批 / 多键事务 ---
-    // 批大小无上界 + 提交点可能 fsync，一律 dirty IO。
-    {"cask_put_batch_atomic",  2, guarded<nif_cask_put_batch_atomic>, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"cask_put_batch_atomic",  3, guarded<nif_cask_put_batch_atomic>, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    // 批大小无上界 + 提交点可能 fsync：txn_commit 一律 dirty IO；put_batch_atomic 入口
+    // 自己分流（轻批直接跑，其余 enif_schedule_nif 到 dirty IO，见 nif_cask_batch.cpp）。
+    {"cask_put_batch_atomic",  2, guarded<nif_cask_put_batch_atomic>, 0},
+    {"cask_put_batch_atomic",  3, guarded<nif_cask_put_batch_atomic>, 0},
     {"cask_txn_commit",        3, guarded<nif_cask_txn_commit>,       ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"cask_txn_commit",        4, guarded<nif_cask_txn_commit>,       ERL_NIF_DIRTY_JOB_IO_BOUND},
     // 提交令牌：只分配 / 置位，主调度线程。

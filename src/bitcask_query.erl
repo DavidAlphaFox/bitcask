@@ -60,8 +60,10 @@
 %%   （可能已不满足 where）。
 %%
 %%   依赖 libbitcask ≥ 6.6.1：带 filter 的全文检索补取到 K（返回不足 K 即已
-%%   穷尽），同分命中前缀稳定。向量检索带 filter 时引擎本身可能少给（HNSW），
-%%   返回不足 K 也只能当作穷尽。引擎 topK 上限 100 万（cpp/nif/term_conv.hpp
+%%   穷尽），同分命中前缀稳定。向量检索带 filter：libbitcask ≥ 12.1.0 的 HNSW
+%%   在图不超过 2^20 个节点时回满（遍历预算耗尽后退到精确扫描），返回不足 K 即
+%%   已穷尽；更大的图、以及 IVF-RQ / DiskANN 引擎仍可能少给，返回不足 K 也只能
+%%   当作穷尽。引擎 topK 上限 100 万（cpp/nif/term_conv.hpp
 %%   kMaxTopK）：text 驱动在这个上限内凑不够 → {error, {too_many_hits, 1000000}}，
 %%   不静默截断。
 %% =========================================================================
@@ -594,8 +596,8 @@ in_bounds(K, Lo, Hi) ->
 %%   近似（向量 / 混合 / search_fields）：K 变了结果就会变（HNSW 近似、RRF
 %%       融合、多字段逐字段 top-K 求和），没有前缀关系——每次从头取，按已返回
 %%       的 key 去重。保证不重复，**可能漏**（翻页期间排名挤进前面的那些）。
-%%       向量检索带 filter 时引擎本身就可能少给（HNSW live callback），返回不足
-%%       K 也只能当作穷尽。
+%%       向量检索带 filter 时，超过 2^20 个节点的 HNSW 图与 IVF-RQ / DiskANN
+%%       引擎本身仍可能少给（见模块头），返回不足 K 也只能当作穷尽。
 
 approximate(#plan{vector = V}) when V =/= undefined -> true;
 approximate(#plan{text = {fields, _}})              -> true;

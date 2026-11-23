@@ -98,7 +98,11 @@
 -define(ETYPE_MAX, 16#FFFFFFFF).
 -define(RANK_MAX,  16#FFFFFFFFFFFFFFFF).
 -define(EXPAND_TIMEOUT_MS, 30000).
--define(EXPAND_SEQ_MAX, 4).                 % frontier 不超过它就串行展开
+%% frontier 不超过它就串行展开。展开一个顶点只要 1～3 µs，起进程 + 把邻居列表拷回
+%% 调用方的开销在 frontier 上百时仍吃掉并行的收益（2 万顶点 / 10 万边：阈值 4 → 256，
+%% 最短路 316 → 180 µs、两跳 BFS 25 → 13 µs；从 hub 出发触达 1.5 万顶点的三层 BFS
+%% 串行与并行持平）。只有很大的 frontier 才切片并行。
+-define(EXPAND_SEQ_MAX, 256).
 -define(ROOT, root).
 -define(V1_PROBE, 64).                      % v1 探测最多核对的候选数
 
@@ -721,33 +725,39 @@ edges_by_type(Handle, Etype) -> edges_by_type(Handle, Etype, #{}).
 edges_by_type(Handle, Etype, Opts) when is_map(Opts) ->
     ok = v_t32(Etype),
     Limit = opt_limit(Opts),
+    %% 有 limit 时只解还差的那几条（hub 的出边组可能有几十万条），
+    %% range 也按 limit 取小批——不再先拉满 256 条记录、整组解完再截。
+    Want = fun(N) -> case Limit of infinity -> infinity; _ -> Limit - N end end,
     Emit = fun(Src, Es, {N, Acc}) ->
-                   Taken = case Limit of infinity -> Es; _ -> lists:sublist(Es, Limit - N) end,
-                   N2 = N + length(Taken),
-                   Acc2 = lists:reverse([{Src, D, R, P} || {D, R, P} <- Taken], Acc),
+                   N2 = N + length(Es),
+                   Acc2 = lists:reverse([{Src, D, R, P} || {D, R, P} <- Es], Acc),
                    case Limit =/= infinity andalso N2 >= Limit of
                        true  -> throw({graphdb, limit, Acc2});
                        false -> {N2, Acc2}
                    end
            end,
-    Fun = fun(<< _P:4/binary, "a", Src:64/big >>, V, _T, _O, A) ->
+    Fun = fun(<< _P:4/binary, "a", Src:64/big >>, V, _T, _O, {N, _} = A) ->
                   %% 只解该类型内联的出边组；别的组按字节数跳过
-                  case graphdb_adj:out_entries(vbin(V), Etype) of
+                  case graphdb_adj:out_entries(vbin(V), Etype, Want(N)) of
                       {ok, [_ | _] = Es} -> Emit(Src, Es, A);
                       _                  -> A
                   end;
              (<< _P:4/binary, "a", Src:64/big, 0:8, T:32/big, _:128 >>,
-              V, _T, _O, A) when T =:= Etype ->
-                  case graphdb_adj:decode_chunk(vbin(V)) of
+              V, _T, _O, {N, _} = A) when T =:= Etype ->
+                  case graphdb_adj:decode_chunk(vbin(V), Want(N)) of
                       {ok, Es} -> Emit(Src, Es, A);
                       error    -> A
                   end;
              (_, _, _, _, A) -> A
           end,
+    RangeOpts = case Limit of
+                    infinity -> [];
+                    _        -> [{batch, max(16, min(256, Limit div 2))}]
+                end,
     Raw = case Limit of
               0 -> {ok, []};
               _ ->
-                  try bitcask:range_fold(Handle, graphdb_adj:range(<<"a">>), [],
+                  try bitcask:range_fold(Handle, graphdb_adj:range(<<"a">>), RangeOpts,
                                          Fun, {0, []}) of
                       {error, _} = Err -> Err;
                       {_, Acc}         -> {ok, lists:reverse(Acc)}
@@ -1112,8 +1122,8 @@ expand(Handle, Frontier, Dir, Etype) ->
     lists:append(expand_grouped(Handle, Frontier, Dir, Etype)).
 
 %% 与 Frontier 等长同序的 [[邻居]]——shortest_path 要按"谁发现的"记父指针，
-%% 不能用拍平的结果。小 frontier（≤ @EXPAND_SEQ_MAX）就地串行：双向搜索开头
-%% 两侧都只有 1 个顶点，起进程比那一两次 range 还贵。失败统一 raise
+%% 不能用拍平的结果。frontier 不超过 @EXPAND_SEQ_MAX 就地串行：起进程、拷回
+%% 邻居列表比那几百次点读还贵（见宏定义处的实测）。失败统一 raise
 %% {graphdb_expand, Reason}（并行路径是 worker 的退出原因）。
 expand_grouped(Handle, Frontier, Dir, Etype) when length(Frontier) =< ?EXPAND_SEQ_MAX ->
     try [neighbor_list(Handle, V, Dir, Etype) || V <- Frontier]

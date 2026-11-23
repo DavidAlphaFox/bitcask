@@ -31,6 +31,7 @@
          cask_search_wildcard/3, cask_search_wildcard/4,
          cask_search_vector/4,
          cask_search_vector/5,
+         cask_vector_rank/4,
          cask_search_hybrid/4,
          cask_search_hybrid/5,
          cask_encode_meta/1,
@@ -137,6 +138,9 @@ cask_search_wildcard(_Ref, _Pattern, _K, _F) -> erlang:nif_error({error, not_loa
 cask_search_vector(_Ref, _VecBin, _K, _Ef) -> erlang:nif_error({error, not_loaded}).
 %% V5:HNSW 向量检索 + metadata filter(undefined 视为无 filter)。
 cask_search_vector(_Ref, _VecBin, _K, _Ef, _Filter) -> erlang:nif_error({error, not_loaded}).
+%% 候选集内的精确向量排序（libbitcask 12.1.0）。Keys = [binary()]；返回形态同
+%% cask_search_vector。不经向量索引。
+cask_vector_rank(_Ref, _VecBin, _Keys, _K) -> erlang:nif_error({error, not_loaded}).
 %% V3.6:RRF 混合检索。TextBin/VecBin 允许其一为 <<>>(单路退化),都空 → {error, _}。
 cask_search_hybrid(_Ref, _TextBin, _VecBin, _K) -> erlang:nif_error({error, not_loaded}).
 %% V5:RRF 混合检索 + metadata filter(undefined 视为无 filter)。

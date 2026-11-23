@@ -28,7 +28,14 @@
 // {error, {conflict, OpIndex}}——读-改-写的调用方重读重试即可（乐观并发）。
 //
 // 线程模型见 nif_main.cpp 顶部的统一说明。两个入口都是线程安全的
-//（底层 write_mu_ 串行化），但都可能写很多字节 + fsync，故挂 dirty IO 调度。
+//（底层 write_mu_ 串行化）。txn_commit 恒挂 dirty IO（提交点可能 fsync）。
+// put_batch_atomic 按批的轻重分流（同 put / delete 的做法，nif_cask.cpp）：
+//   轻批直接在普通调度器上跑——op 不超过 kInlineBatchMaxOps 条、value 合计不超过
+//   kInlineBatchMaxBytes、没有 doc map、句柄没有 sync 策略，并且（批里有写入时）本
+//   句柄已经提交过原子批（第一条要懒升 bitcask.meta，见 resources.hpp batch_warm）；
+//   其余转 dirty IO。
+// 图层的单条写边是 2～3 条 op 的小批，转一次 dirty 调度器的切换比批本身还贵；
+// 只含 check 的批（一致性读的读集校验）不写盘，同样直接跑。
 
 #include <cstdint>
 #include <memory>
@@ -180,6 +187,60 @@ ERL_NIF_TERM batch_error(ErlNifEnv* env, const CaskFault& f,
     return fault_to_term(env, f);
 }
 
+constexpr int kInlineBatchMaxOps = 16;
+constexpr std::size_t kInlineBatchMaxBytes = 64 * 1024;
+
+bool handle_has_sync_policy(const Cask& c) noexcept {
+    const auto& o = c.options();
+    return o.o_sync || o.sync_every_n > 0;
+}
+
+// 只看批的大小与形态，不做完整解析（完整解析在 impl 里，轻批在哪跑都一样快，
+// 重批不该在普通调度器上逐条解析）。最多看 kInlineBatchMaxOps + 1 个表元。
+//   light  = 可以直接在普通调度器上跑的大小 / 形态
+//   writes = 批里有会落盘的 op（put / remove）
+struct BatchShape {
+    bool light = true;
+    bool writes = false;
+};
+
+BatchShape batch_shape(ErlNifEnv* env, ERL_NIF_TERM list) {
+    BatchShape s;
+    ERL_NIF_TERM head, tail = list;
+    int n = 0;
+    std::size_t bytes = 0;
+    while (enif_get_list_cell(env, tail, &head, &tail)) {
+        if (++n > kInlineBatchMaxOps) {
+            s.light = false;
+            s.writes = true;
+            return s;
+        }
+        int arity = 0;
+        const ERL_NIF_TERM* tup = nullptr;
+        // 形态不对的批 impl 一解析就 badarg，不值得转调度器。
+        if (!enif_get_tuple(env, head, &arity, &tup) || arity < 2) return s;
+        if (tup[0] == atoms().check) continue;
+        s.writes = true;
+        if (tup[0] == atoms().put && arity >= 3) {
+            ErlNifBinary v{};
+            // doc map（调用线程上编码整个 doc + 索引）与 iolist（要先拍平）都算重。
+            if (!enif_inspect_binary(env, tup[2], &v)) {
+                s.light = false;
+                return s;
+            }
+            bytes += v.size;
+            if (bytes > kInlineBatchMaxBytes) {
+                s.light = false;
+                return s;
+            }
+        }
+    }
+    return s;
+}
+
+ERL_NIF_TERM nif_cask_put_batch_atomic_impl(ErlNifEnv* env, int argc,
+                                            const ERL_NIF_TERM argv[]);
+
 ERL_NIF_TERM ords_list(ErlNifEnv* env, const std::vector<std::uint64_t>& ords) {
     ERL_NIF_TERM list = enif_make_list(env, 0);
     for (auto it = ords.rbegin(); it != ords.rend(); ++it) {
@@ -201,8 +262,28 @@ ERL_NIF_TERM ords_list(ErlNifEnv* env, const std::vector<std::uint64_t>& ords) {
 //   条件不成立 → {error, {conflict, OpIndex}}，整批零副作用。
 ERL_NIF_TERM nif_cask_put_batch_atomic(ErlNifEnv* env, int argc,
                                         const ERL_NIF_TERM argv[]) {
+    bool inline_ok = false;
+    {
+        // 只为看一眼句柄状态拿一下 shared 锁；impl 会再拿一次。
+        auto h = lock_cask_checked(env, argv[0]);
+        if (!h || !h->cask) return enif_make_badarg(env);
+        if (!handle_has_sync_policy(*h->cask)) {
+            const BatchShape shape = batch_shape(env, argv[1]);
+            inline_ok = shape.light &&
+                        (!shape.writes || h->batch_warm.load(std::memory_order_acquire));
+        }
+    }
+    if (inline_ok) return nif_cask_put_batch_atomic_impl(env, argc, argv);
+    return enif_schedule_nif(env, "cask_put_batch_atomic", ERL_NIF_DIRTY_JOB_IO_BOUND,
+                             guarded<nif_cask_put_batch_atomic_impl>, argc, argv);
+}
+
+namespace {
+
+ERL_NIF_TERM nif_cask_put_batch_atomic_impl(ErlNifEnv* env, int argc,
+                                            const ERL_NIF_TERM argv[]) {
     auto h = lock_cask_checked(env, argv[0]);
-    if (!h) return enif_make_badarg(env);
+    if (!h || !h->cask) return enif_make_badarg(env);
 
     bool want_ords = false;
     if (argc == 3) {
@@ -229,8 +310,20 @@ ERL_NIF_TERM nif_cask_put_batch_atomic(ErlNifEnv* env, int argc,
     Cask::BatchOutcome outcome;
     auto r = h->cask->put_batch_atomic(ops, 0, &outcome);
     if (!r) return batch_error(env, r.error(), outcome);
+    // 带写入的批成功过一次 ⇒ 目录的 meta 已升到 v6，此后本句柄的轻批可以直接跑。
+    // （只含 check 的批不升 meta，不算。）
+    if (!h->batch_warm.load(std::memory_order_relaxed)) {
+        for (const auto& p : parsed) {
+            if (p.kind != ParsedOp::Kind::kCheck) {
+                h->batch_warm.store(true, std::memory_order_release);
+                break;
+            }
+        }
+    }
     return want_ords ? make_ok(env, ords_list(env, outcome.ords)) : atoms().ok;
 }
+
+}  // namespace
 
 // cask_txn_commit(Ref, Ops, SyncPolicy) -> ok | {error, Reason}
 //   SyncPolicy :: sync_on_commit（默认，提交点显式 fsync）| no_sync

@@ -258,3 +258,79 @@ read_guarded_with_index_fun_test_() ->
             ?assertEqual({ok, <<"1">>}, bitcask:get(H, <<"idx">>))
         end)
      end}.
+
+%% 原子批按轻重分流（轻批直接在普通调度器上跑，其余转 dirty IO；nif_cask_batch.cpp）。
+%% 分流只影响在哪个调度器上执行；这里把分流边界两侧各种形态都走一遍，结果必须一样。
+batch_scheduling_paths_test_() ->
+    {"原子批轻 / 重两条路径结果一致：冷句柄第一批、只含 check 的批、16 / 17 条、"
+     "value 合计跨 64 KiB、doc map、冲突与 return_ords、带 sync 策略的句柄",
+     {timeout, 60, fun() ->
+        with_cask(fun(H) ->
+            %% 冷句柄上只含 check 的批（不写盘、不升 meta）
+            ?assertEqual(ok, bitcask:put_batch_atomic(H, [{check, <<"a">>, absent}])),
+            ?assertEqual({error, {conflict, 2}},
+                         bitcask:put_batch_atomic(H, [{check, <<"a">>, absent},
+                                                      {check, <<"a">>, {ord, 7}}])),
+            %% 冷句柄第一条带写入的批（懒升 meta）
+            {ok, [O1, OB]} = bitcask:put_batch_atomic(H, [{put, <<"a">>, <<"1">>, absent},
+                                                          {put, <<"b">>, <<"1">>}], [return_ords]),
+            ?assertEqual({ok, <<"1">>, OB}, bitcask:get_with_ord(H, <<"b">>)),
+            ?assertEqual({ok, <<"1">>, O1}, bitcask:get_with_ord(H, <<"a">>)),
+            %% 之后的小批：条件成立 / 不成立、remove、check
+            {ok, [O2, 0]} = bitcask:put_batch_atomic(H, [{put, <<"a">>, <<"2">>, {ord, O1}},
+                                                         {check, <<"b">>, {ord, OB}}],
+                                                     [return_ords]),
+            ?assert(O2 > O1),
+            ?assertEqual({error, {conflict, 1}},
+                         bitcask:put_batch_atomic(H, [{put, <<"a">>, <<"x">>, {ord, O1}},
+                                                      {put, <<"c">>, <<"x">>}])),
+            ?assertEqual(not_found, bitcask:get(H, <<"c">>)),
+            ?assertEqual(ok, bitcask:put_batch_atomic(H, [{remove, <<"b">>, {ord, OB}}])),
+            ?assertEqual(not_found, bitcask:get(H, <<"b">>)),
+            ?assertEqual(ok, bitcask:put_batch_atomic(H, [])),
+            ?assertError(badarg, bitcask:put_batch_atomic(H, [{put, <<"k">>}])),
+            ?assertError(badarg, bitcask:put_batch_atomic(H, [{put, <<"k">>, <<"v">>} | tail])),
+            %% 16 条（轻）与 17 条（重）
+            [begin
+                 Ops = [{put, <<"n", N:8, I:8>>, <<I>>} || I <- lists:seq(1, N)],
+                 {ok, Ords} = bitcask:put_batch_atomic(H, Ops, [return_ords]),
+                 ?assertEqual(N, length(Ords)),
+                 [?assertEqual({ok, <<I>>, lists:nth(I, Ords)},
+                               bitcask:get_with_ord(H, <<"n", N:8, I:8>>)) || I <- lists:seq(1, N)]
+             end || N <- [16, 17]],
+            %% value 合计 64 KiB 整（轻）与多 1 字节（重）
+            V32 = binary:copy(<<"v">>, 32 * 1024),
+            ?assertEqual(ok, bitcask:put_batch_atomic(H, [{put, <<"s1">>, V32}, {put, <<"s2">>, V32}])),
+            ?assertEqual(ok, bitcask:put_batch_atomic(H, [{put, <<"s3">>, V32},
+                                                          {put, <<"s4">>, <<V32/binary, "!">>}])),
+            ?assertEqual({ok, V32}, bitcask:get(H, <<"s2">>)),
+            ?assertEqual({ok, <<V32/binary, "!">>}, bitcask:get(H, <<"s4">>)),
+            %% 16 进程并发小批对同一计数器做条件自增：不丢更新（轻批在各调度器上直接跑）
+            ok = bitcask:put(H, <<"cnt">>, <<0:32>>),
+            Self = self(),
+            Pids = [spawn_link(fun() ->
+                        [inc(H) || _ <- lists:seq(1, 200)],
+                        Self ! {done, self()}
+                    end) || _ <- lists:seq(1, 16)],
+            [receive {done, P} -> ok after 30000 -> error(timeout) end || P <- Pids],
+            ?assertEqual({ok, <<3200:32>>}, bitcask:get(H, <<"cnt">>))
+        end),
+        %% 带 sync 策略的句柄：一律走 dirty，结果相同
+        bitcask_test_util:with_dir("bitcask_cond_batch_sync_", fun(D) ->
+            H = bitcask:open(D, [read_write, {sync_strategy, o_sync}]),
+            try
+                ?assertEqual(ok, bitcask:put_batch_atomic(H, [{put, <<"a">>, <<"1">>, absent}])),
+                ?assertEqual(ok, bitcask:put_batch_atomic(H, [{put, <<"b">>, <<"2">>, absent}])),
+                ?assertEqual({error, {conflict, 1}},
+                             bitcask:put_batch_atomic(H, [{put, <<"b">>, <<"3">>, absent}])),
+                ?assertEqual({ok, <<"2">>}, bitcask:get(H, <<"b">>))
+            after bitcask:close(H) end
+        end)
+     end}}.
+
+inc(H) ->
+    {ok, <<N:32>>, Ord} = bitcask:get_with_ord(H, <<"cnt">>),
+    case bitcask:put_batch_atomic(H, [{put, <<"cnt">>, <<(N + 1):32>>, {ord, Ord}}]) of
+        ok                     -> ok;
+        {error, {conflict, 1}} -> inc(H)
+    end.

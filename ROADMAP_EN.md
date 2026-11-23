@@ -6,6 +6,39 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 12.1.0 shipped
+
+### libbitcask upgrade 12.0.3 → 12.1.0 ✅
+
+Upstream S67: recovery no longer truncates sealed data files (damaged regions are skipped; only a crashed writer's active
+file can be truncated); filtered HNSW search falls back to an exact scan when its budget runs out (fills K for graphs of up
+to 2^20 nodes); exact vector ranking within a candidate set. Upstream S66: faster point reads once rows are in a run. The
+existing C API, C++ ABI (`SOVERSION` 12) and on-disk format are unchanged. The submodule moves to upstream `12.1.0`
+(`1caee1a`).
+
+### `bitcask:vector_rank/3,4` ✅
+
+Exact ranking by vector similarity among a given set of keys (NIF `cask_vector_rank` → `Cask::rank_by_vector`), for queries
+whose candidates come from elsewhere and are then ordered by vector (graph + vector, re-ranking full-text hits). Details in
+TASK.md M27.
+
+## 12.0.3 shipped
+
+### libbitcask upgrade 12.0.2 → 12.0.3 ✅
+
+Upstream S65: faster point-read hits — the memdelta point-lookup index becomes an open-addressing flat table, and hits in the
+active file are served from a read-only mapping (Linux / FreeBSD only). One hit through the NIF drops from 1.3–2.0 µs to
+0.26–0.73 µs (1k–400k unflushed keys). The C API, existing C++ ABI (`SOVERSION` 12) and on-disk format are unchanged. The
+submodule moves to upstream `12.0.3` (`d995557`).
+
+### Graph-layer read / write paths and NIF scheduling ✅
+
+Adjacency reads select groups by direction and type directly on the head / chunk binaries and decode in one pass; a hub's chunk
+directory stays binary and is binary-searched; fixed-width entry lists stay binary inside a session and single edits splice
+them; batch inserts resume from the previous position; small atomic batches run directly on a normal scheduler. Together with
+the upstream point-read speedup: `out_edges` about 4 → 2 µs, single `put_edge` about 17 → 8 µs, and on a 200k-degree hub
+`put_edge` 255 → 20 µs, `neighbors` 102 → 9 ms. On-disk format and API unchanged. Details in TASK.md G11–G13 and M26.
+
 ## 12.0.2 shipped
 
 ### libbitcask upgrade 12.0.1 → 12.0.2 ✅

@@ -216,6 +216,7 @@ embedder 生成并写入向量；显式传 `vector` 则跳过。
 | `{prefetch_threads, N}` | `0` | `0` = `min(在线核数, 4)`；批内 key 数不足时按 key 数收窄 |
 | `{want_meta, true}` | 关 | `V` 改为 `#{text => Bin, meta => Bin \| undefined}`，形态与 `get` 在索引模式下的返回一致。meta 和 text 出自同一次读 |
 | `{filter, F}` | 无 | meta filter（形态同 `search_text/4`），在 C++ 侧逐条判断，不通过的条目不返回；没有 meta 的条目一律不通过 |
+| `{batch, N}` | `256` | 每次 NIF 往返最多取 N 条（1..1024，越界 `badarg`）。只要开头几条、随后从 `Fun` 里 `throw` 出来的调用方用小批，免得一次多读几百条。结果不变 |
 
 前缀扫描的惯用写法是把上界设成前缀的**下一个字节**：
 `range(H, {<<"user:">>, <<"user;">>})`。
@@ -406,6 +407,25 @@ search_vector(H, {text, <<"机器学习">>}, 10, 0,
               #{key => <<"category">>, op => eq, value => <<"tech">>}). %% 文本自动 embed + 过滤
 ```
 
+### `vector_rank(H, Query, Keys[, K])`
+在给定的一组 key 里按向量相似度**精确**排序，返回最好的 `K` 个（缺省 10）：`{ok, [{Key, Ord, Score}]}`。
+需要 libbitcask ≥ 12.1.0。
+
+候选已经由别处给出时用它——图上某个顶点的邻居、一次全文检索的命中、`range` 扫出来的一批 key——不必把候选条件翻译成
+meta filter 去走 `search_vector`，也不必把每个候选的向量读回来自己算。
+
+- 不经向量索引：逐个点读候选、用它存的向量算分。结果不受 HNSW 召回影响，也不依赖索引是否已 flush。
+- 分数口径同 `search_vector`（cosine / dot：内积；L2：负的平方距离），降序；同分按候选在 `Keys` 里的先后。
+- 不存在 / 已删 / 已过期的 key、没有向量的文档跳过；重复的 key 只算一次。
+- 代价与候选数成正比（每个候选一次点读）。
+- `Query` 同 `search_vector`：`VecBin` 或 `{text, Bin}`。`Keys` 必须是 binary 的列表，否则 `badarg`。
+  集合没有向量配置 / 维度不符 → `{error, _}`。
+
+```erlang
+%% CandidateKeys：别处得到的一批带向量文档的 key
+vector_rank(H, QueryVec, CandidateKeys, 5).   %% 邻居里最像的 5 个
+```
+
 ### `search_hybrid(H, Text[, VecOrAuto[, K[, Filter]]])`
 对 BM25 文本路（基于 `Text`）与向量路做 RRF 融合（`1/(60+rank)`，平局 `ord` 小者
 在前）。第 3 个参数选向量来源：
@@ -516,7 +536,7 @@ blob 非法会报 `badarg`。`get` 在没有 meta 时返回 `undefined`，由调
 - 只给 `vector` 时走 `search_vector`，可以带 `ef`（默认 0，表示由引擎决定）。
 - 和 `text => {match, Q}` 同时给时走 `search_hybrid`（RRF 融合），这时不能带 `ef`；配其它全文检索类型会报 `{bad_query, {hybrid_needs_match, _}}`。
 - `where` 照样下推；`score` 在向量检索时是相似度，在混合检索时是 RRF 分数。
-- 向量检索带 filter 时，引擎本身就可能少返回结果（HNSW），这时返回不足 K 条也只能当作已经取完。
+- 向量检索带 filter 时，HNSW 引擎在图不超过 2^20 个节点时回满（libbitcask ≥ 12.1.0）；更大的图与 IVF-RQ / DiskANN 引擎仍可能少返回结果，这时返回不足 K 条也只能当作已经取完。
 
 ### 二级索引
 

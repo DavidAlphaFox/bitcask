@@ -52,7 +52,7 @@
 
 -export([prefix/0, range/1, head_key/1, chunk_key/4, group_prefix/3, pkey/4, gkey/0,
          parse_chunk_key/1,
-         encode_head/1, decode_head/1, encode_chunk/1, decode_chunk/1,
+         encode_head/1, decode_head/1, encode_chunk/1, decode_chunk/1, decode_chunk/2,
          default_cfg/0, encode_cfg/1, decode_cfg/1,
          %% 读原语
          entries/5, entries_guarded/5, edge_maps/6, neighbor_ids/4, lookup/6, counts/2,
@@ -60,7 +60,7 @@
          new_session/2, put_edge/6, del_edge/5, all_entries/2, first_entries/3,
          commit/1, commit/2,
          %% 分析 / 校验用的纯函数
-         build_vertex/3, groups_info/1, out_ids/2, out_entries/2, chunk_ids/1]).
+         build_vertex/3, groups_info/1, out_ids/2, out_entries/2, out_entries/3, chunk_ids/1]).
 
 -define(VER, 1).
 -define(F_RANK,    1).
@@ -336,6 +336,14 @@ decode_chunk(<<?VER:8, F:8, C:32/big, Rest/binary>>) ->
         _              -> error
     end;
 decode_chunk(_) ->
+    error.
+
+%% 同 decode_chunk/1，至多解 Limit 条（infinity = 全部）。
+decode_chunk(Bin, infinity) ->
+    decode_chunk(Bin);
+decode_chunk(<<?VER:8, F:8, C:32/big, Rest/binary>>, Limit) when is_integer(Limit), Limit >= 0 ->
+    dec_entries_lim(Rest, C, F, Limit);
+decode_chunk(_, _) ->
     error.
 
 %% =========================================================================
@@ -1456,6 +1464,48 @@ out_ids(HeadBin, Etype) ->
 
 out_entries(HeadBin, Etype) when is_integer(Etype) ->
     inline_out(HeadBin, Etype, raw).
+
+%% 同 out_entries/2，至多解 Limit 条（infinity = 全部）。截断时只解前 Limit 条：
+%% 定宽组取条目区的前 Limit × 宽度字节，带属性的组逐条解到第 Limit 条为止
+%% （其后的字节不再校验）。
+out_entries(HeadBin, Etype, infinity) ->
+    out_entries(HeadBin, Etype);
+out_entries(HeadBin, Etype, Limit) when is_integer(Etype), is_integer(Limit), Limit >= 0 ->
+    case sel_groups(HeadBin, 0, Etype) of
+        error     -> error;
+        {ok, Sel} -> inline_out_lim(Sel, Limit, [])
+    end.
+
+inline_out_lim(_Sel, 0, Acc) ->
+    {ok, lists:append(lists:reverse(Acc))};
+inline_out_lim([], _Limit, Acc) ->
+    {ok, lists:append(lists:reverse(Acc))};
+inline_out_lim([{_D, _T, F, C, {inline, Body}} | Sel], Limit, Acc) ->
+    case dec_entries_lim(Body, C, F, Limit) of
+        {ok, L} -> inline_out_lim(Sel, Limit - length(L), [L | Acc]);
+        error   -> error
+    end;
+inline_out_lim([{_D, _T, _F, _C, {chunks, _}} | Sel], Limit, Acc) ->
+    inline_out_lim(Sel, Limit, Acc).
+
+%% 条目区（Count 条）的前 min(Count, Limit) 条，raw 形态 {O, R, P}。
+%% Limit ≥ Count 时与整组解码同样做完整校验。
+dec_entries_lim(Body, Count, F, Limit) when Limit >= Count ->
+    case dec_entries(Body, Count, F) of
+        {ok, Es, <<>>} -> {ok, Es};
+        _              -> error
+    end;
+dec_entries_lim(Body, Count, F, Limit) when F band ?F_PROPS =:= 0 ->
+    W = entry_width(F),
+    case byte_size(Body) =:= Count * W of
+        false -> error;
+        true  -> {ok, dec_fixed(raw, 0, W, binary_part(Body, 0, Limit * W))}
+    end;
+dec_entries_lim(Body, _Count, F, Limit) ->
+    case dec_prop_entries(Body, Limit, F band ?F_RANK =/= 0, []) of
+        {ok, Es, _Rest} -> {ok, Es};
+        error           -> error
+    end.
 
 inline_out(HeadBin, Etype, Mode) ->
     case sel_groups(HeadBin, 0, Etype) of

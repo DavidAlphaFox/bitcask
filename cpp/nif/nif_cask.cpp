@@ -421,6 +421,38 @@ ERL_NIF_TERM nif_cask_search_vector(ErlNifEnv* env, int /*argc*/,
     return make_ok(env, hits);
 }
 
+// 候选集内的精确向量排序（ref, vec_bin, keys, k；libbitcask 12.1.0 的
+// Cask::rank_by_vector）。keys = binary 的正规列表（iolist 不收）。不经向量索引，
+// 所以不要求 has_search；无向量配置 / 维度不符 → 经 fault_to_term。
+// 命中项里的 key 是从候选拷出来的，返回形态同 search_vector。
+ERL_NIF_TERM nif_cask_vector_rank(ErlNifEnv* env, int /*argc*/,
+                                   const ERL_NIF_TERM argv[]) {
+    auto h = lock_cask_checked(env, argv[0]);
+    ErlNifBinary vec_bin{};
+    if (!h || !ensure_binary(env, argv[1], vec_bin)) {
+        return enif_make_badarg(env);
+    }
+    unsigned n_keys = 0;
+    if (!enif_get_list_length(env, argv[2], &n_keys)) return enif_make_badarg(env);
+    const auto k = static_cast<std::size_t>(get_topk(env, argv[3]));
+    std::vector<float> query;
+    if (!binary_to_f32vec(vec_bin, query)) return enif_make_badarg(env);
+    std::vector<std::span<const std::byte>> keys;
+    keys.reserve(n_keys);
+    ERL_NIF_TERM head = 0;
+    ERL_NIF_TERM tail = argv[2];
+    while (enif_get_list_cell(env, tail, &head, &tail)) {
+        ErlNifBinary kb{};
+        if (!enif_inspect_binary(env, head, &kb)) return enif_make_badarg(env);
+        keys.emplace_back(reinterpret_cast<const std::byte*>(kb.data), kb.size);
+    }
+    auto r = h->cask->rank_by_vector(query, keys, k);
+    if (!r) return fault_to_term(env, r.error());
+    ERL_NIF_TERM hits = make_search_hits(env, r->hits);
+    if (!hits) return make_error(env, atoms().allocation_error);
+    return make_ok(env, hits);
+}
+
 // V3.6:RRF 混合检索（ref, text_bin, vec_bin, k）。vec_bin 可为 <<>>
 // (纯文本退化),text_bin 可为 <<>>(纯向量退化);两者都空 →
 // {error, ...}(经 Cask 的 kInvalidOption)。score = RRF 分。

@@ -5,9 +5,79 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-Internal optimizations of the graph layer's read and write paths. On-disk format, API and the libbitcask version are unchanged.
+### Changed
+
+- **Graph traversal no longer spawns workers for small frontiers**: BFS / k-hop / shortest path used to slice the frontier and expand it in
+  parallel workers as soon as it had more than 4 vertices; spawning and copying neighbour lists back ate the gain even for frontiers of a few
+  hundred. The threshold is now 256. On a power-law graph with 20k vertices / 100k edges: `shortest_path` 278 → 152 µs (328 → 196 µs after
+  reopen), two-hop `bfs` 23 → 13 µs, two-hop `bfs` in both directions 95 → 54 µs, four-hop `bfs` 381 → 341 µs; a three-level BFS from a
+  hub reaching 15k vertices is unchanged within noise (9.5–10.9 ms). Results and order are unchanged.
+- **`graphdb:edges_by_type/3` with `limit` reads and decodes only what it needs**: it used to decode each vertex's whole out-edge group and
+  then truncate, with range fetching a fixed 256 records per batch; it now decodes only the remaining count and uses small range batches.
+  Limit 10 / 100 on the same graph after reopen: 221 / 225 → 30 / 69 µs. Results are a prefix of the full result, as before; no change
+  for limit ≥ 1000 or without a limit.
+
+### Added
+
+- `{batch, N}` option for `bitcask:range_fold/5` and `range/3` (1..1024, default 256): at most N entries per NIF round trip, for callers
+  that only want the first few entries and then `throw`.
+
+## [12.1.0] — 2026-11-23
+
+Upgrades libbitcask **12.0.3 → 12.1.0** (upstream S66, S67) and adds `bitcask:vector_rank/3,4`. The submodule moves from
+`d995557` to `1caee1a` (tag `12.1.0`). The existing C API, C++ ABI (`SOVERSION` 12), on-disk format and this library's
+existing API are unchanged.
+
+### Added
+
+- **`bitcask:vector_rank(H, Query, Keys[, K])`**: exact ranking by vector similarity among a given set of keys, returning the
+  top K (default 10). Use it when the candidates already come from somewhere else — a vertex's neighbours, full-text hits, a
+  batch of keys from a range scan. It does not go through the vector index (results are unaffected by HNSW recall and do not
+  wait for an index flush); scores use the same convention as `search_vector`; the result is `{ok, [{Key, Ord, Score}]}`.
+  Missing / deleted keys and documents without a vector are skipped; duplicates count once. Cost is proportional to the number
+  of candidates (one point read each). `Query` may be `{text, Bin}` (auto-embed). Upstream feedback:
+  `feedbacks/2026-11-23-filtered-vector-search-incomplete-no-candidate-scoring.md`.
+
+### Fixed
+
+- **(via libbitcask 12.1.0) Corruption in the middle of a data file no longer makes open truncate the file**: when the index
+  is rebuilt from data and a record cannot be read, the engine used to treat that point as an unfinished tail and truncate the
+  file there, deleting every later, already-durable record while `open` still succeeded. Now only the file a crashed writer
+  was writing can be truncated; every other file is left byte-for-byte intact, the damaged region is skipped and reading
+  resumes at the next intact record (the engine logs a warning). An incomplete atomic batch still stays invisible as a whole.
+  Upstream feedback: `feedbacks/2026-11-23-recovery-truncates-synced-data-on-bad-record-header.md`.
+- (via libbitcask 12.1.0) Reading a record that is indexed but damaged on disk consistently returns `{error, bad_crc}`
+  (damage in the length field used to surface as an I/O error).
 
 ### Changed
+
+- **(via libbitcask 12.1.0) Filtered `search_vector` no longer silently returns fewer results** (HNSW engine): with a very
+  selective filter the graph traversal used to return fewer than K hits once its budget ran out. It now falls back to an exact
+  scan; for graphs of up to 2^20 nodes, fewer than K results means fewer than K documents pass the filter. Larger graphs and
+  the IVF-RQ / DiskANN engines are unchanged. ⚠️ Queries whose filter rejects everything, or nearly everything, pay one extra
+  filter evaluation per node.
+- **(via libbitcask 12.1.0) Faster point reads once rows are on disk** (upstream S66): one hit after reopen / checkpoint in the
+  upstream benchmark drops from 3.0 / 3.4 / 3.6 µs to 0.37 / 0.70 / 1.0 µs at 1k / 100k / 400k keys (not re-measured here).
+  Upstream feedback: `feedbacks/2026-11-23-point-get-after-flush-scans-run-block-linearly.md`.
+- ⚠️ **Behaviour change**: for a cleanly closed store, a damaged tail of a data file is no longer truncated away; it stays in
+  place and is skipped when reading.
+
+## [12.0.3] — 2026-11-23
+
+Upgrades libbitcask **12.0.2 → 12.0.3** (upstream S65) and folds in internal optimizations of the graph layer's read / write
+paths and of NIF scheduling. The submodule moves from `ab9b51f` to `d995557` (tag `12.0.3`). The C API, existing C++ ABI
+(`SOVERSION` 12), on-disk format and this library's API are unchanged; rebuild to pick it up.
+
+### Changed
+
+- **(with libbitcask 12.0.3) Faster point-read hits**: the engine's in-memory point-lookup index is now a flat table, and hits
+  in the active file are served from a read-only mapping instead of one system call per read (Linux / FreeBSD only). One hit
+  on a 128-byte value (through the NIF) with 1k / 100k / 400k unflushed keys: 1.29 / 1.84 / 2.00 µs down to
+  0.26 / 0.62 / 0.73 µs. This lifts `graphdb:out_edges` 3.9 → 2.0 µs, `degree` 2.6 → 1.1 µs, `put_edge` (degree 5)
+  12.6 → 7.9 µs, and the benchmark's edge-by-edge / batch loads 78k / 130k → 131k / 176k edges/s. Upstream feedback:
+  `feedbacks/2026-11-23-point-get-hit-cost-grows-with-unflushed-rows.md`.
+  ⚠️ Pages of the active file touched by point reads now count toward process RSS (file pages, reclaimable), and a low-level
+  I/O error on a mapped read is a SIGBUS rather than `{error, _}` — both the same as the existing mapped reads of sealed files.
 
 - **Adjacency reads decode straight from the head / chunk binaries**: only the requested direction and type are decoded, other
   groups are skipped by byte count, and results are produced in one pass. `neighbors` emits peer ids directly, skips the
@@ -29,6 +99,11 @@ Internal optimizations of the graph layer's read and write paths. On-disk format
   29.6 → 20.5 µs. No change on degree-5 graphs. Bytes on disk are identical to before.
 - `graphdb_analytics:materialize` decodes only out-edge groups and emits peer ids directly: 20k vertices / 200k edges
   214 → 168 ms.
+- **Small atomic batches run directly on a normal scheduler** (`put_batch_atomic/2,3`): with at most 16 ops, at most 64 KiB of
+  values in total, no doc maps, no sync policy on the handle, and once the handle has committed an atomic batch, the call no
+  longer hops to a dirty IO scheduler; everything else is unchanged. A batch of two small writes 4.8 → 3.1 µs, a check-only
+  batch 2.4 → 0.7 µs; `graphdb:put_edge` between degree-5 vertices 17.3 → 12.6 µs, edge-by-edge load 61k → 78k edges/s.
+  Semantics are unchanged.
 
 ## [12.0.2] — 2026-11-23
 
