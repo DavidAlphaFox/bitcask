@@ -3,6 +3,32 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [12.0.2] — 2026-11-23
+
+升级 libbitcask **12.0.1 → 12.0.2**（上游 S64），并修正图层 hub 路径的性能。submodule 从 `c364cd3` 切到 `ab9b51f`
+（tag `12.0.2`）。C API、既有 C++ ABI（`SOVERSION` 12）、盘上格式与本库 API 均不变，重编即得。
+
+### Fixed
+
+- **（随 libbitcask 12.0.2）每次写之后的第一次 `range` / `range_fold` / 迭代不再整份重排未落盘的行**：此前引擎的排序视图缓存
+  被任何一次写整体作废，下一次开迭代器把全部未落盘行拷一遍再排一遍，耗时随未落盘行数线性涨，拷贝期间点查与写也被挡住。
+  现缓存增量维护。实测「写 1 条无关 key + 扫 1 行」：1 万 / 10 万 / 40 万未落盘行由 1.4 / 14.9 / 80.1 ms 降到 10 / 9 / 13 µs。
+  受益的有 `bitcask:range*`、`bitcask_query` 的范围查询、`bitcask_txn:prefix_range`、图层的全库扫描（`materialize` /
+  `edges_by_type` / `check_invariants`）。上游反馈：`feedbacks/2026-11-23-range-iter-after-write-resorts-memdelta.md`。
+
+### Changed
+
+- **`graphdb:del_vertex` 删 hub 顶点由 O(度数²) 降到线性**：每轮只读够一批邻居的那几个块，不再每轮把全部块读一遍。
+  20 万邻居 450 s → 2.1 s；2 万邻居 1.11 s → 0.12 s。
+- **分块顶点的邻接读按块目录逐块点读**，不再走前缀 range（`out_edges` / `in_edges` / `neighbors` / 遍历；事务读同一条路）。
+  `limit` 只读用到的块：20 万度 hub 上 `#{limit => 10}` 1133 µs → 30 µs（range 一次往返按批搬块，limit 10 也要搬一批）。
+  非 `consistent` 读仍是弱一致：读头之后被并发删掉 / 分裂的块按读到的样子返回；要原子快照用 `#{consistent => true}`。
+- **`put_edges` / `del_edges` 默认按 (src, etype, dst, rank) 稳定排序**（原为只按 src）：同一个 src 的一批边落在相邻的块里。
+  dst 乱序的 20 万度 hub 装载 15.3 s → 3.5 s。同一条边多次 upsert 仍是最后一次生效；`sort => false` 照旧保持输入顺序。
+- **hub 上的点操作不再为全部块 key 建表**：20 万度 hub 的 `degree` 345 µs → 18 µs、`edge` 939 µs → 32 µs、
+  `put_edge` 752 µs → 255 µs。
+- 事务里读分块 hub 的全部出边 646 ms → 55 ms（去掉逐块 `++` 的重复拷贝）。
+
 ## [12.0.1] — 2026-11-20
 
 升级 libbitcask **12.0.0 → 12.0.1**（上游 S63）。submodule 从 `62dd725` 切到 `c364cd3`

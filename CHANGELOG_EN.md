@@ -3,6 +3,38 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [12.0.2] — 2026-11-23
+
+Upgrades libbitcask **12.0.1 → 12.0.2** (upstream S64) and fixes hub-vertex performance in the graph layer. The submodule
+moves from `c364cd3` to `ab9b51f` (tag `12.0.2`). The C API, existing C++ ABI (`SOVERSION` 12), on-disk format and this
+library's API are unchanged; rebuild to pick it up.
+
+### Fixed
+
+- **(with libbitcask 12.0.2) The first `range` / `range_fold` / iteration after every write no longer re-sorts all unflushed
+  rows**: the engine's sorted-view cache used to be invalidated by any write, so the next iterator copied and re-sorted every
+  unflushed row — time grew linearly with the unflushed row count, and point reads and writes were blocked during the copy.
+  The cache is now maintained incrementally. Measured "write one unrelated key + scan one row": at 10k / 100k / 400k unflushed
+  rows, 1.4 / 14.9 / 80.1 ms down to 10 / 9 / 13 µs. This helps `bitcask:range*`, `bitcask_query` range queries,
+  `bitcask_txn:prefix_range` and the graph layer's full scans (`materialize` / `edges_by_type` / `check_invariants`).
+  Upstream feedback: `feedbacks/2026-11-23-range-iter-after-write-resorts-memdelta.md`.
+
+### Changed
+
+- **`graphdb:del_vertex` on a hub goes from O(degree²) to linear**: each round reads only the chunks needed for one batch of
+  neighbors instead of re-reading every chunk. 200k neighbors: 450 s → 2.1 s; 20k neighbors: 1.11 s → 0.12 s.
+- **Adjacency reads of chunked vertices use point reads driven by the head's chunk directory** instead of a prefix range
+  (`out_edges` / `in_edges` / `neighbors` / traversals; transactional reads share the path). `limit` reads only the chunks it
+  needs: `#{limit => 10}` on a 200k-degree hub 1133 µs → 30 µs (a range round trip moves chunks a batch at a time, even for
+  limit 10). Non-`consistent` reads stay weakly consistent: chunks
+  deleted or split after the head was read are returned as read; use `#{consistent => true}` for an atomic snapshot.
+- **`put_edges` / `del_edges` now stably sort by (src, etype, dst, rank)** (was src only): a batch of one src's edges lands in
+  adjacent chunks. Loading a 200k-degree hub with shuffled dsts: 15.3 s → 3.5 s. Repeated upserts of one edge still apply
+  last-wins; `sort => false` still keeps input order.
+- **Point operations on hubs no longer build a table of every chunk key**: on a 200k-degree hub `degree` 345 µs → 18 µs,
+  `edge` 939 µs → 32 µs, `put_edge` 752 µs → 255 µs.
+- Reading all out-edges of a chunked hub inside a transaction: 646 ms → 55 ms (no more per-chunk `++` copying).
+
 ## [12.0.1] — 2026-11-20
 
 Upgrades libbitcask **12.0.0 → 12.0.1** (upstream S63). The submodule moves from `62dd725` to

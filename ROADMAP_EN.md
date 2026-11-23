@@ -6,6 +6,23 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 12.0.2 shipped
+
+### libbitcask upgrade 12.0.1 → 12.0.2 ✅
+
+Upstream S64: the range iterator's sorted view of the memdelta is now maintained incrementally (immutable
+sorted segments plus a small tail), so the first range / iteration after every write no longer copies and
+re-sorts all unflushed rows (scanning one row with 400k unflushed rows: 80 ms → 13 µs). The C API, existing
+C++ ABI (`SOVERSION` 12) and on-disk format are unchanged. The submodule moves to upstream `12.0.2`
+(`ab9b51f`).
+
+### Graph-layer hub performance ✅
+
+`del_vertex` on a hub goes from O(degree²) to linear (200k neighbors: 450 s → 2.1 s); adjacency reads of
+chunked vertices use point reads from the chunk directory (`limit` reads only the chunks it needs); loading
+a head no longer builds a table of every chunk key; the `put_edges` / `del_edges` sort key now includes dst
+(hub load 15.3 s → 3.5 s). On-disk format and API unchanged. Details in TASK.md G10.
+
 ## 12.0.1 shipped
 
 ### libbitcask upgrade 12.0.0 → 12.0.1 ✅

@@ -655,6 +655,57 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## M25 — libbitcask 升级 12.0.1 → 12.0.2（12.0.2）
+
+> submodule `c364cd3` → `ab9b51f`（tag `12.0.2`，上游 S64）。范围迭代器的 memdelta 排序视图改增量维护：每次写之后的
+> 第一次 range / 迭代不再整份拷贝 + 重排未落盘的行。C API、既有 C++ ABI（`SOVERSION` 12）与盘上格式均不变。
+> NIF / Erlang 门面零改动，重编即得。对应本库提的上游反馈 `feedbacks/2026-11-23-range-iter-after-write-resorts-memdelta.md`。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M25-1** | submodule checkout `ab9b51f`（`12.0.2`，已在上游 `origin/main`）；NIF 重编，生成头 `BITCASK_VERSION_STRING "12.0.2"`。全量 `rebar3 eunit` 394/394；`rebar3 as prod compile` 零警告；`rebar3 do xref, dialyzer` 干净。 | ✅ |
+| **M25-2** | 实测（`/tmp/gprof/rng.escript`，纯 KV，「写 1 条无关 key + `range_fold` 扫 1 行」每轮）：1 千 / 1 万 / 10 万 / 40 万未落盘行，12.0.1 为 0.14 / 1.44 / 14.9 / 80.1 ms，12.0.2 为 **9.9 / 10.0 / 9.4 / 12.9 µs**；无写时的 range（5 µs）与写后点查（3 µs）不变。 | ✅ |
+| **M25-3** | 发版记录：`bitcask.app.src` 的 `vsn` 12.0.1 → **12.0.2**（沿用「跟上游版本号」的惯例，G10 一并并入）；CHANGELOG（中英）`[Unreleased]` → `[12.0.2]`；README（中英）项目状态与路线图索引、ROADMAP（中英）新增 12.0.2 节；`CMakeLists.txt` 子模块注释更新。 | ✅ |
+
+---
+
+## G10 — 图层：hub 路径性能（12.0.2）
+
+> 2026-11-23 排查（`test/graphdb_bench` 的低度数口径没有明显浪费，问题都在 hub 上）。基准：一个顶点 2 万 / 20 万条出边，
+> 4 KiB 阈值，脚本在开发机 `/tmp/gprof/hub.escript`；函数占比用 eprof。只改图层内部，盘上格式与 API 不变。
+> 上游一条：写后首次 range 重排整个未落盘 memdelta，已提 libbitcask `feedbacks/2026-11-23-range-iter-after-write-resorts-memdelta.md`，上游 12.0.2 已修（见 M25）。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **G10-1** | `del_vertex` 删 hub 由 O(度数²) 降到线性：原来每轮 `all_entries` 把顶点的全部块读一遍再挑 64 个邻居；新增 `graphdb_adj:first_entries/3`（按组序逐块读，够 `batch_neighbors` 个以上不同对端就停，返回是否已读完），每轮只碰当前几个块。同一邻居在没读到的块里的边留给后面的轮；最后一轮的判定改为「已读完且剩余邻居不超过一批」。`all_entries/2` 改为 `first_entries(…, infinity)`。 | ✅ |
+| **G10-2** | 分块组的直通读改按头的块目录逐块点读（`read_chunks/7`，直通与事务共用；事务读因此也在 limit 处停）。原来走前缀 `range_fold`：一次往返按批搬块（limit 10 也搬一批 4 KiB 的块），且受上游「写后首次 range 重排 memdelta」拖累。目录里有、盘上读不到的块按空处理（弱一致读；原子快照仍用 `consistent => true`）。删掉 `io_fold/4`。 | ✅ |
+| **G10-3** | 读头不再为全部块 key 建表：`#vs.orig` 改存读到时的组，盘上已有的块集合只在提交时真有块要删才算。eprof：20 万度 hub 上 `degree` / `edge` / `put_edge` 约 75% 的时间原先花在这张表上。 | ✅ |
+| **G10-4** | `put_edges` / `del_edges` 默认排序键由 src 改为 (src, etype, dst, rank)，仍是稳定排序（同一条边多次 upsert 最后一次生效）。只按 src 排时，hub 的一批 255 条边散在两百多个块上、每批全部重写。 | ✅ |
+| **G10-5** | 去掉两处 `Acc ++ Es`（`load_group_chunks`、`check_invariants` 的 `chunk_entries`）：块数 × 条目数的拷贝，改为逆序攒、最后拼一次。 | ✅ |
+| **G10-6** | 测试 `graphdb_tests` 加 3 项（用 meck 数门面调用次数 / 比写盘字节，不看墙钟）：删分块 hub 的读次数 ≤ 轮数 × (批大小 + 8)、不开 range、跨组 / 跨方向 / 自环删干净；分块组 `limit => 5` 恰好 2 次点读、`degree` 1 次、全量 / etype / 跨组 limit / 事务读结果不变、缺块跳过；dst 乱序的 hub 装载与 `sort => false` 结果相同、写盘量不到一半。全量 `rebar3 eunit` **394/394**；`rebar3 as prod compile` 零警告；`rebar3 do xref, dialyzer` 干净。 | ✅ |
+| **G10-7** | 文档：设计稿 §6.4 / §7.1 / §14（中英）、CHANGELOG（中英）`[Unreleased]`、模块注释。 | ✅ |
+
+实测（同一台机器，改前 → 改后；hub 装载的 dst 为乱序输入）：
+
+| 操作 | 2 万度 hub | 20 万度 hub |
+|---|---|---|
+| `del_vertex(hub)` | 1.11 s → 0.12 s | **450 s → 2.1 s** |
+| `put_edges` 装载 hub | 0.30 s → 0.22 s | 15.3 s → 3.5 s |
+| `out_edges(hub, #{limit => 10})` | 230 µs → 13 µs | 1133 µs → 30 µs |
+| `degree(hub)` | 32 µs → 5 µs | 345 µs → 18 µs |
+| `edge(hub, d)` | 48 µs → 12 µs | 939 µs → 32 µs |
+| `put_edge(hub → 新顶点)` | 106 µs → 67 µs | 752 µs → 255 µs |
+| `del_edge(hub)` | 95 µs → 52 µs | 786 µs → 240 µs |
+| `out_edges(hub)` 全量 | 2.7 ms → 2.5 ms | 66 ms → 57 ms |
+| 事务里 `out_edges_txn(hub)` 全量 | 11.1 ms → 4.8 ms | 646 ms → 55 ms |
+| BFS 从 hub 出发 1 跳 | 13.2 ms → 7.3 ms | 238 ms → 112 ms |
+
+`test/graphdb_bench` 两档（1 万顶点 / 5 万边、2000 顶点 / 10 万边）改前改后在噪声内：`put_edge` 54.8k → 60.6k 边/秒，`put_edges`
+128.5k → 125.7k；度数 50 那档 `put_edges` 76.3k、423 B/边（M24-4 同日基线 77.8k）。没做的：读一个方向也解两个方向 / `both`
+读两次头（低度数读估计 15%～25%，未实测）；大 hub 每次写边重写整个头（块目录两级化，属盘上格式变更）。
+
+---
+
 ## G2 — 图层：写会话 / 一致性读的读集校验（12.0.1）
 
 > keelson 适配 libbitcask 时压测确认：≤ 12.0.0 的原子批对并发读者不是整批可见。核对上游：`put_batch_atomic` 在
@@ -684,6 +735,7 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 | **M24-1** | submodule checkout `c364cd3`（`12.0.1`）；复核实打 tag 指向该提交；NIF 全新重编，生成头 `BITCASK_VERSION_STRING "12.0.1"`。G2 的确定性 graph 回归 4/4；全量 `rebar3 eunit` 391/391。 | ✅ |
 | **M24-2** | 发版记录：`bitcask.app.src` 的 `vsn` 12.0.0 → **12.0.1**；CHANGELOG（中英）`[12.0.1]`；README（中英）项目状态与路线图索引、ROADMAP（中英）新增 12.0.1 节；`CMakeLists.txt` 子模块注释更新。 | ✅ |
 | **M24-3** | 同步原子批可见性语义：README / API 文档（中英）与 `bitcask` / NIF 注释改为「12.0.1 起并发读者要么整批可见、要么完全不可见；这不是快照隔离，重叠无条件提交仍后写覆盖」。 | ✅ |
+| **M24-4** | `test/graphdb_bench` 对照（2026-11-23，8 vCPU）：12.0.0 基线（`c927fc2` + 子模块 `62dd725`，`git archive` 导出到 `/tmp` 独立构建）与 12.0.1（G2 + S63）用同一份脚本交替各跑 3 轮，取中位数（边/秒）。度数 5、4 KiB：`put_edge` 52.7k → 49.6k，`put_edges` 107.2k → 99.3k；度数 5、1 KiB：54.3k → 55.2k，107.3k → 111.4k；度数 50、4 KiB：`put_edge` 35.8k / 35.8k，`put_edges` 78.5k → 77.8k。一跳 0.003–0.005 ms（度数 50 约 0.01 ms）两边相同。轮间波动 ±15–30%（单轮最低 37k / 68k），两版差在噪声内：G2 的读集条件与 S63 的整批发布没有可测开销。注：本机当天整体比 §14.3（2026-11-18）慢约 20%（同轮 v1 参照也在 72–87k），绝对值不与 §14.3 直接比；基准不走 `#{consistent => true}`，一致性读的写锁校验开销未覆盖。 | ✅ |
 
 ---
 
@@ -705,7 +757,7 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 | **M23-6** | 发版记录：`bitcask.app.src` 的 `vsn` 11.0.0 → **12.0.0**（2026-11-20 用户定，M22 一并并入）；CHANGELOG（中英）`[Unreleased]` → `[12.0.0]`；README（中英）项目状态与路线图索引、ROADMAP（中英）新增 12.0.0 节。 | ✅ |
 | **M23-7** | 接入上游 11.2.0（S60 / S61，2026-11-20 用户定形态、并入 12.0.0）：新文件 `cpp/nif/nif_cask_doc.cpp`——`cask_update_doc/3`（补丁 `#{fields => #{F => Text \| delete}, meta => #{K => V \| delete}}`，未知键 / 非 binary 名 / 除 `undefined` 外的 atom 值 → badarg；`kConditionFailed` → `{error, conflict}`；dirty IO）与 `cask_search_fields_highlight/5`（Filter + HlOpts `#{pre_tag, post_tag, fragment_size, max_fragments}`，返回 `{Key, Ord, Score, Fields, [{Field, [Snippet]}]}`；dirty IO）。meta 条目值解析抽成共用 `parse_meta_entry_value`（encode_meta 与 update_doc 共用，数组只在写入入口收）。门面 `bitcask:update_doc/3`（`not_found` 归一为 `{error, not_found}`）、`search_fields_highlight/2..5`。测试 `test/bitcask_doc_ops_tests.erl` 6 项：字段 / meta 设置删除、正文与向量保留、LSN = get_with_ord、索引跟随、空补丁、重开；错误形态；8 进程并发加键不丢更新；逐字段只标本字段词、与 attributed 一致、同序；自定义标签 + filter + 默认字段 + 冷读 + 坏选项；KV 模式 no_index。全量 eunit 384/384；prod / xref / dialyzer 干净。文档 api-zh/en、CHANGELOG / README / ROADMAP（中英）同步。 | ✅ |
 | **M23-8** | 接入 `search_text_highlight`（2026-11-20 用户要求，并入 12.0.0）：`cask_search_text_highlight/4`（同在 `nif_cask_doc.cpp`，dirty IO），HlOpts 复用 `parse_hl_opts` 并只在此入口多收 `cold => load \| skip`（缺省 load，上游缺省 skip——门面取更有用的那个；上游无 filter 参数，不收 Filter）；返回 `{Key, Ord, Score, [Snippet]}`。门面 `bitcask:search_text_highlight/2,3,4`。测试 `bitcask_doc_ops_tests` 加 3 项：与 search_text 命中排序一致、标签 / 段数、热文档 skip / load 都有片段、坏选项（含 `search_fields_highlight` 不收 `cold`）；冷文档（同上游做法：目标 + 1500 篇填充，重开载段不重放）skip 空、缺省 load 补出（含正文空取命名字段）、load 不回填缓存；KV 模式 no_index。全量 eunit 387/387；prod / xref / dialyzer 干净。文档 api-zh/en、CHANGELOG / README / ROADMAP（中英）同步。 | ✅ |
-| **M23-9** | 补跑（发版后，2026-11-20）：上游 `BUILD_TESTING=ON` Release `ctest`（子模块 `62dd725`，独立构建目录）**960/960** 通过（另 1 项按环境跳过、2 项保留禁用）。`graphdb_bench` 未跑。 | ✅ |
+| **M23-9** | 补跑（发版后，2026-11-20）：上游 `BUILD_TESTING=ON` Release `ctest`（子模块 `62dd725`，独立构建目录）**960/960** 通过（另 1 项按环境跳过、2 项保留禁用）。`graphdb_bench` 见 M24-4（与 12.0.1 对照）。 | ✅ |
 
 ---
 

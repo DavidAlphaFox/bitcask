@@ -6,6 +6,20 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 12.0.2 落地
+
+### libbitcask 升级 12.0.1 → 12.0.2 ✅
+
+上游 S64：范围迭代器的 memdelta 排序视图改增量维护（不可变有序段 + 小尾巴），每次写之后的第一次
+range / 迭代不再把全部未落盘行拷一遍、排一遍（40 万未落盘行时扫 1 行 80 ms → 13 µs）。C API、既有
+C++ ABI（`SOVERSION` 12）与盘上格式均不变。submodule 切到上游 `12.0.2`（`ab9b51f`）。
+
+### 图层 hub 路径性能 ✅
+
+`del_vertex` 删 hub 由 O(度数²) 降到线性（20 万邻居 450 s → 2.1 s）；分块顶点的邻接读改按块目录逐块
+点读（`limit` 只读用到的块）；读头不再为全部块 key 建表；`put_edges` / `del_edges` 排序键加上 dst
+（hub 装载 15.3 s → 3.5 s）。盘上格式与 API 不变。明细见 TASK.md G10。
+
 ## 12.0.1 落地
 
 ### libbitcask 升级 12.0.0 → 12.0.1 ✅

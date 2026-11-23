@@ -906,7 +906,7 @@ retry_conflict(F) ->
     end.
 
 put_edges_sort_and_batch_opts_test_() ->
-    {"put_edges 按 src 稳定排序：跨 src 交错的重复边仍是最后一次生效；sort => false / "
+    {"put_edges 稳定排序：跨 src 交错的重复边仍是最后一次生效；sort => false / "
      "batch_vids 小批结果相同；坏选项 badarg",
      {timeout, 60, fun() ->
         Edges = [{S, 7, D, #{props => integer_to_binary(I)}}
@@ -991,4 +991,124 @@ del_vertex_opts_test_() ->
             ?assertError(badarg, graphdb:del_vertex(R, 1, #{batch_neighbors => 0})),
             graphdb:close(R)
         end)
+     end}}.
+
+%% ===================================================================
+%% G10：hub 路径的性能回归（读写次数 / 写盘量是确定的，不看墙钟）
+%% ===================================================================
+
+%% 统计 Fun 运行期间 bitcask 门面上若干函数的调用次数：#{Name => N}。
+count_calls(Names, Fun) ->
+    C = counters:new(length(Names), []),
+    Idx = maps:from_list(lists:zip(Names, lists:seq(1, length(Names)))),
+    meck:new(bitcask, [passthrough]),
+    [meck:expect(bitcask, N,
+                 case N of
+                     get_with_ord ->
+                         fun(H, K) -> counters:add(C, maps:get(N, Idx), 1), meck:passthrough([H, K]) end;
+                     put_batch_atomic ->
+                         fun(H, Ops) -> counters:add(C, maps:get(N, Idx), 1), meck:passthrough([H, Ops]) end;
+                     range_fold ->
+                         fun(H, Rg, O, F, A) -> counters:add(C, maps:get(N, Idx), 1),
+                                               meck:passthrough([H, Rg, O, F, A]) end
+                 end) || N <- Names],
+    Res = try Fun() after meck:unload(bitcask) end,
+    {Res, maps:map(fun(_N, I) -> counters:get(C, I) end, Idx)}.
+
+del_vertex_hub_reads_only_needed_chunks_test_() ->
+    {"del_vertex 删分块 hub：每轮只读够一批邻居的块，读次数与轮数成正比（不是每轮读全部块）；"
+     "同一邻居跨组 / 跨方向、自环都删干净",
+     {timeout, 120, fun() ->
+        with_dir(fun(D) ->
+            R = graphdb:open(D, [read_write, {adj_inline_max, 256}, {adj_chunk_max, 256}]),
+            Out7 = lists:seq(1001, 3000),                 %% 2000 条出边 → 几十个块
+            In8  = lists:seq(2501, 3300),                 %% 800 条入边，与 Out7 重叠 500 个邻居
+            ok = graphdb:put_edges(R, [{1, 7, Y} || Y <- Out7]),
+            ok = graphdb:put_edges(R, [{X, 8, 1} || X <- In8]),
+            ok = graphdb:put_edges(R, [{1, 9, Y, #{rank => 3}} || Y <- lists:seq(1001, 1100)]),
+            ok = graphdb:put_edge(R, 1, 7, 1),            %% 自环
+            {ok, #{chunks := NChunks}} = graphdb:check_invariants(R),
+            ?assert(NChunks > 60),
+            BatchN = 16,
+            {ok, #{get_with_ord := Gets, put_batch_atomic := Rounds, range_fold := Ranges}} =
+                count_calls([get_with_ord, put_batch_atomic, range_fold],
+                            fun() -> graphdb:del_vertex(R, 1, #{batch_neighbors => BatchN}) end),
+            ?assertEqual(0, Ranges),
+            ?assert(Rounds >= 2300 div BatchN),
+            %% 每轮：V 的头 + 至多几个块 + BatchN 个邻居的头。旧实现每轮另读全部 NChunks 个块。
+            ?assert(Gets =< Rounds * (BatchN + 8)),
+            ?assertEqual(not_found, bitcask:get(R, graphdb:akey(1))),
+            ?assertEqual([], bitcask:range(R, {graphdb:akey(1), graphdb:akey(2)})),
+            ?assertMatch({ok, #{edges := 0, chunks := 0}}, graphdb:check_invariants(R)),
+            [?assertEqual({ok, 0}, graphdb:in_degree(R, Y)) || Y <- [1001, 2000, 3000]],
+            [?assertEqual({ok, 0}, graphdb:degree(R, X)) || X <- [2501, 3300]],
+            graphdb:close(R)
+        end)
+     end}}.
+
+chunked_read_by_directory_test_() ->
+    {"分块组的直通读按块目录点读：limit 只读用到的块、不开 range；全量 / etype / 事务读结果"
+     "不变；目录里有、盘上没有的块按空处理；degree 只读头",
+     {timeout, 60, fun() ->
+        with_dir(fun(D) ->
+            R = graphdb:open(D, [read_write, {adj_inline_max, 256}, {adj_chunk_max, 256}]),
+            Dsts = lists:seq(1001, 3000),
+            ok = graphdb:put_edges(R, [{1, 7, Y} || Y <- Dsts]),
+            ok = graphdb:put_edges(R, [{1, 8, Y} || Y <- lists:seq(5001, 5010)]),
+            {Lim, #{get_with_ord := G1, range_fold := Rg1}} =
+                count_calls([get_with_ord, range_fold],
+                            fun() -> graphdb:out_edges(R, 1, #{limit => 5}) end),
+            ?assertEqual(lists:seq(1001, 1005), dsts_of(Lim)),
+            ?assertEqual({2, 0}, {G1, Rg1}),              %% 头 + 块 0
+            {Deg, #{get_with_ord := G2}} =
+                count_calls([get_with_ord], fun() -> graphdb:degree(R, 1, 7) end),
+            ?assertEqual({{ok, 2000}, 1}, {Deg, G2}),
+            {Full, #{range_fold := Rg3}} =
+                count_calls([range_fold], fun() -> graphdb:out_edges(R, 1) end),
+            ?assertEqual(Dsts ++ lists:seq(5001, 5010), dsts_of(Full)),
+            ?assertEqual(0, Rg3),
+            ?assertEqual(lists:seq(5001, 5010), dsts_of(graphdb:out_edges(R, 1, #{etype => 8}))),
+            %% limit 跨到下一个组
+            ?assertEqual(lists:seq(2996, 3000) ++ [5001, 5002],
+                         lists:nthtail(1995, dsts_of(graphdb:out_edges(R, 1, #{limit => 2002})))),
+            ?assertEqual({atomic, lists:seq(1001, 1005)},
+                         graphdb:transaction(
+                           R, fun(Tx) -> dsts_of(graphdb:out_edges_txn(Tx, 1, #{limit => 5})) end)),
+            ?assertEqual({atomic, 2010},
+                         graphdb:transaction(
+                           R, fun(Tx) -> length(dsts_of(graphdb:out_edges_txn(Tx, 1))) end)),
+            %% 绕过图层删掉一个中间块：弱一致读跳过它，不报错
+            [_, {K2, V2} | _] = [KV || {K, _} = KV <- bitcask:range(R, {graphdb:akey(1), graphdb:akey(2)}),
+                                       byte_size(K) =:= 34],
+            {ok, Gone} = graphdb_adj:decode_chunk(V2),
+            ok = bitcask:delete(R, K2),
+            ?assertEqual((Dsts -- [O || {O, _, _} <- Gone]) ++ lists:seq(5001, 5010),
+                         dsts_of(graphdb:out_edges(R, 1))),
+            graphdb:close(R)
+        end)
+     end}}.
+
+put_edges_sorts_by_dst_within_src_test_() ->
+    {"put_edges 默认按 (src, etype, dst, rank) 排序：hub 的 dst 乱序输入，结果与 sort => false "
+     "相同，写盘量少一半以上（一批边落在相邻的块里）",
+     {timeout, 120, fun() ->
+        N = 3000,
+        Edges = [{1, 7, 1000 + (I * 7919) rem 3001} || I <- lists:seq(1, N)],
+        Run = fun(O) ->
+                  with_dir(fun(D) ->
+                      R = graphdb:open(D, [read_write, {adj_inline_max, 256}, {adj_chunk_max, 256}]),
+                      ok = graphdb:put_edges(R, Edges, O#{batch_vids => 64}),
+                      ?assertMatch({ok, #{edges := N}}, graphdb:check_invariants(R)),
+                      Out = dsts_of(graphdb:out_edges(R, 1)),
+                      graphdb:close(R),
+                      Bytes = lists:sum([filelib:file_size(F)
+                                         || F <- filelib:wildcard(filename:join(D, "*.data"))]),
+                      {Out, Bytes}
+                  end)
+              end,
+        {OutS, BytesS} = Run(#{}),
+        {OutU, BytesU} = Run(#{sort => false}),
+        ?assertEqual(OutU, OutS),
+        ?assertEqual(lists:usort([D || {_, _, D} <- Edges]), OutS),
+        ?assert(BytesS * 2 < BytesU)
      end}}.

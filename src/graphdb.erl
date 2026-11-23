@@ -295,12 +295,14 @@ del_vertex_rounds(Handle, Vid, Batch, Retries) ->
 
 del_vertex_round(Handle, Vid, BatchN) ->
     S0 = graphdb_adj:new_session({direct, Handle}, cfg(Handle)),
-    case graphdb_adj:all_entries(S0, Vid) of
+    %% 只读够一批邻居的那几个块（Es 是 V 靠前的一段条目；Complete = 已是全部）。
+    %% 同一个邻居在没读到的块里还有别的边时，那些边留给后面的轮。
+    case graphdb_adj:first_entries(S0, Vid, BatchN) of
         {error, _} = E -> E;
-        {ok, Es, S1} ->
+        {ok, Es, Complete, S1} ->
             Others = lists:usort([O || {_, _, O, _, _} <- Es, O =/= Vid]),
             {Batch, Rest} = split_at(BatchN, Others),
-            Last = Rest =:= [],
+            Last = Complete andalso Rest =:= [],
             Sel = maps:from_list([{O, true} || O <- Batch] ++ [{Vid, true} || Last]),
             Mine = [E || {_, _, O, _, _} = E <- Es, maps:is_key(O, Sel)],
             case remove_incident(S1, Vid, Mine) of
@@ -369,7 +371,7 @@ edge(Handle, Src, Etype, Dst, Rank) ->
         {error, _} = E -> E
     end.
 
-%% 批量加边（§6.4）：[{S, T, D} | {S, T, D, Opts}]。先按 src 稳定排序，再按涉及的
+%% 批量加边（§6.4）：[{S, T, D} | {S, T, D, Opts}]。先按 (src, etype, dst, rank) 稳定排序，再按涉及的
 %% 顶点切批（每批 ≤ batch_vids 个顶点，默认 @BATCH_VIDS），批内每个顶点读一次、改
 %% 一次、写一次；每批独立原子、独立重试。批与批之间不原子——中途失败时前面的批
 %% 已经提交（排序后「前面」指 src 较小的批）。
@@ -391,14 +393,19 @@ del_edges(Handle, Edges, Opts) when is_list(Edges), is_map(Opts) ->
                 fun(S, {Src, T, Dst, R}) -> graphdb_adj:del_edge(S, Src, T, Dst, R) end,
                 opt_retries(Opts), opt_batch_vids(Opts)).
 
-%% sort => true（默认）：按 src 稳定排序再切批——同一个 src 的边落进同一批，src 的头
-%% 一批只写一次。稳定排序保证同一条边的多次 upsert 仍按调用方给的顺序生效。
+%% sort => true（默认）：按 (src, etype, dst, rank) 稳定排序再切批——同一个 src 的边
+%% 落进同一批，src 的头一批只写一次；同一个 src 下按 dst 有序，一批边落在相邻的
+%% 块里（只按 src 排时 hub 的一批 255 条边散在两百多个块上，每批把它们全部重写：
+%% 20 万度 hub 装载 15.3 s，按 dst 有序 3.9 s）。稳定排序保证同一条边的多次 upsert
+%% 仍按调用方给的顺序生效。
 maybe_sort(Items, Opts) ->
     case maps:get(sort, Opts, true) of
-        true  -> lists:keysort(1, Items);
+        true  -> [It || {_K, It} <- lists:keysort(1, [{edge_key(It), It} || It <- Items])];
         false -> Items;
         Bad   -> erlang:error(badarg, [Opts, Bad])
     end.
+
+edge_key(It) -> {element(1, It), element(2, It), element(3, It), element(4, It)}.
 
 opt_batch_vids(Opts) ->
     case maps:get(batch_vids, Opts, ?BATCH_VIDS) of
@@ -851,7 +858,7 @@ check_vertex(Vid, Gs, Chunks, Acc0) ->
 
 chunk_entries(Vid, D, T, Lbs, Chunks, Bad0, Used0) ->
     Bounds = lists:zip(Lbs, tl(Lbs) ++ [infinity]),
-    lists:foldl(
+    {Parts, Bad1, Used1} = lists:foldl(
       fun({Lb, Next}, {Es, Bad, Used}) ->
               Key = {Vid, D, T, Lb},
               case maps:find(Key, Chunks) of
@@ -862,15 +869,16 @@ chunk_entries(Vid, D, T, Lbs, Chunks, Bad0, Used0) ->
                                                       (Next =:= infinity orelse {O, R} < Next)
                                           end, CEs),
                       Bad2 = case InRange of true -> Bad; false -> [{chunk_range, Key} | Bad] end,
-                      {Es ++ CEs, Bad2, Used#{Key => true}}
+                      {[CEs | Es], Bad2, Used#{Key => true}}
               end
-      end, {[], Bad0, Used0}, Bounds).
+      end, {[], Bad0, Used0}, Bounds),
+    {lists:append(lists:reverse(Parts)), Bad1, Used1}.
 
 %% =========================================================================
 %% 遍历 — BFS / k-hop / 双向最短路（设计文档 §6.2–§6.4）
 %%
 %% frontier 展开按片并行（见 expand_grouped）；展开一个顶点 = 读它的邻接表头
-%%（分块组再加一次前缀 range），只取邻居 vid、不解析属性。
+%%（分块组再按块目录逐块点读），只取邻居 vid、不解析属性。
 %% 输出按「frontier 顺序 × 层序」确定。
 %% =========================================================================
 
@@ -1088,7 +1096,7 @@ next_etype_id_txn(Tx) ->
 
 %% 并行展开 frontier（设计文档 §6.2）；结果按 frontier 顺序拼接，输出确定。
 %%
-%% frontier 切成至多 dirty_io_schedulers 片（读头的 get 与分块组的 range 都
+%% frontier 切成至多 dirty_io_schedulers 片（读头与读块的 get 都
 %% 走 NIF，真正的并行度按 dirty IO 调度器数算），一片一个进程顺序展开——以前一顶点一
 %% 进程，一万个 frontier 就一万次 spawn + 结果拷贝，并行度却没多一分。
 %% 每片把 {Ref, Idx, [邻居列表]} 发回；调用方按 Idx 拼接。

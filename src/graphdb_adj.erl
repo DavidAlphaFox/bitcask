@@ -57,7 +57,8 @@
          %% 读原语
          entries/5, entries_guarded/5, lookup/6, counts/2,
          %% 写会话
-         new_session/2, put_edge/6, del_edge/5, all_entries/2, commit/1, commit/2,
+         new_session/2, put_edge/6, del_edge/5, all_entries/2, first_entries/3,
+         commit/1, commit/2,
          %% 分析 / 校验用的纯函数
          build_vertex/3, groups_info/1]).
 
@@ -83,7 +84,8 @@
              chunks = #{} :: #{binary() => [entry()]}, %% 已读入的块（key → 条目）
              dirty  = #{} :: #{binary() => true},      %% 要写的块
              dels   = #{} :: #{binary() => true},      %% 要删的块
-             orig   = #{} :: #{binary() => true},      %% 读到时盘上已有的块（只给它们发删除）
+             orig   = [] :: [#grp{}],                  %% 读到时的组（提交时由它算盘上已有的块，
+                                                       %% 只给它们发删除；读路径不为此建表）
              rconds = #{} :: #{binary() => absent | {ord, non_neg_integer()}},
                                                        %% 直通读过的块 → 读到时的版本（提交条件）
              extra  = [] :: [term()],                  %% p 家族 op（逆序）
@@ -305,14 +307,6 @@ io_head({txn, Tx, Lock}, K) ->
         {error, Reason} -> bitcask_txn:abort(Reason)
     end.
 
-%% 前缀扫描（只用于直通读分块组；事务里按块目录点读）：Fun(K, V, Acc) -> Acc；
-%% 可 throw({graphdb_adj_stop, Acc}) 提前停。
-io_fold({direct, H}, Prefix, Fun, Acc0) ->
-    Wrapped = fun(K, V, _T, _O, A) -> Fun(K, vbin(V), A) end,
-    try bitcask:range_fold(H, {Prefix, bitcask:prefix_succ(Prefix)}, [], Wrapped, Acc0)
-    catch throw:{graphdb_adj_stop, Acc} -> Acc
-    end.
-
 %% ok | conflict | {error, _}
 io_commit(_Io, []) ->
     ok;
@@ -358,21 +352,10 @@ collect_groups(Io, Vid, [#grp{etype = T, body = {entries, Es}} | Gs], Limit, Acc
     Taken = take(Es, Limit),
     collect_groups(Io, Vid, Gs, dec_limit(Limit, length(Taken)),
                    [[{T, O, R, P} || {O, R, P} <- Taken] | Acc]);
-collect_groups({txn, _, _} = Io, Vid, [#grp{dir = D, etype = T, body = {chunks, Lbs}} | Gs],
-               Limit, Acc) ->
-    %% 事务里按头的块目录逐块点读（经事务缓冲、点锁），不拿前缀锁：持有头的锁即
-    %% 覆盖它名下全部块（§8）。
-    case load_group_chunks(Io, #vs{vid = Vid, hcond = txn}, Vid, D, T, Lbs) of
+collect_groups(Io, Vid, [#grp{dir = D, etype = T, body = {chunks, Lbs}} | Gs], Limit, Acc) ->
+    case read_chunks(Io, Vid, D, T, Lbs, Limit, []) of
         {error, _} = E -> E;
-        {ok, All, _} ->
-            Es = take(All, Limit),
-            collect_groups(Io, Vid, Gs, dec_limit(Limit, length(Es)),
-                           [[{T, O, R, P} || {O, R, P} <- Es] | Acc])
-    end;
-collect_groups(Io, Vid, [#grp{dir = D, etype = T, body = {chunks, _}} | Gs], Limit, Acc) ->
-    case read_chunks(Io, Vid, D, T, Limit) of
-        {error, _} = E -> E;
-        Es ->
+        {ok, Es} ->
             collect_groups(Io, Vid, Gs, dec_limit(Limit, length(Es)),
                            [[{T, O, R, P} || {O, R, P} <- Es] | Acc])
     end.
@@ -425,28 +408,35 @@ guarded_chunks(Io, #vs{vid = Vid} = Vs, D, T, [Lb | Lbs], Limit, Acc) ->
             guarded_chunks(Io, Vs1, D, T, Lbs, dec_limit(Limit, length(Taken)), [Taken | Acc])
     end.
 
-%% 一个分块组的全部条目（块按 key 序 = 下界序 = 条目序）。Limit 到了就停扫。
-read_chunks(Io, Vid, Dir, Etype, Limit) ->
-    Prefix = group_prefix(Vid, Dir, Etype),
-    Fun = fun(K, V, {N, Acc}) ->
-                  case {byte_size(K), decode_chunk(V)} of
-                      {34, {ok, Es}} ->
-                          Taken = take(Es, dec_limit(Limit, N)),
-                          N2 = N + length(Taken),
-                          Acc2 = lists:reverse(Taken, Acc),
-                          case Limit =/= infinity andalso N2 >= Limit of
-                              true  -> throw({graphdb_adj_stop, {N2, Acc2}});
-                              false -> {N2, Acc2}
-                          end;
-                      {34, error} ->
-                          throw({graphdb_adj_stop, {error, {bad_adj_chunk, K}}});
-                      _ ->
-                          {N, Acc}
-                  end
-          end,
-    case io_fold(Io, Prefix, Fun, {0, []}) of
-        {error, _} = E -> E;
-        {_N, Acc}      -> lists:reverse(Acc)
+%% 一个分块组的条目：按头的块目录逐块点读（块序 = 下界序 = 条目序），Limit 到了
+%% 就停。直通与事务同一条路：事务里经事务缓冲、点锁（持有头的锁即覆盖它名下全部
+%% 块，§8），不拿前缀锁。
+%% 以前直通读走前缀 range：range 一次往返按批取块（limit 10 也要搬一批 4 KiB 的
+%% 块），而且 libbitcask ≤ 12.0.1 的范围迭代器在每次写之后要重排整个未落盘的内存
+%% 增量，耗时随库里未落盘的行数涨（libbitcask feedbacks/2026-11-23-range-iter-
+%% after-write-resorts-memdelta.md，12.0.2 已修）；点读与这两样都无关。
+%% 目录里有、盘上读不到的块按空处理：这条路是弱一致读（头与块分次读，中间可能
+%% 插进一次删块 / 分裂）；要原子快照用 entries_guarded/5。
+read_chunks(_Io, _Vid, _D, _T, _Lbs, 0, Acc) ->
+    {ok, lists:append(lists:reverse(Acc))};
+read_chunks(_Io, _Vid, _D, _T, [], _Limit, Acc) ->
+    {ok, lists:append(lists:reverse(Acc))};
+read_chunks(Io, Vid, D, T, [Lb | Lbs], Limit, Acc) ->
+    Key = chunk_key(Vid, D, T, Lb),
+    case io_head(Io, Key) of
+        {ok, Bin, _Cond} ->
+            case decode_chunk(Bin) of
+                {ok, Es} ->
+                    Taken = take(Es, Limit),
+                    read_chunks(Io, Vid, D, T, Lbs, dec_limit(Limit, length(Taken)),
+                                [Taken | Acc]);
+                error ->
+                    {error, {bad_adj_chunk, Key}}
+            end;
+        {absent, _Cond} ->
+            read_chunks(Io, Vid, D, T, Lbs, Limit, Acc);
+        {error, _} = E ->
+            E
     end.
 
 take(L, infinity) -> L;
@@ -483,7 +473,7 @@ load(Io, Vid) ->
         {ok, Bin, Cond} ->
             case decode_head(Bin) of
                 {ok, Gs} -> {ok, #vs{vid = Vid, hcond = Cond, existed = true, groups = Gs,
-                                     orig = chunk_keys_of(Vid, Gs)}};
+                                     orig = Gs}};
                 error    -> {error, {bad_adj, Vid}}
             end;
         {absent, Cond} ->
@@ -647,31 +637,48 @@ del_entry(Io, #vs{vid = Vid, groups = Gs} = Vs, Dir, T, O, R) ->
 
 touch(Vs) -> Vs#vs{touched = true}.
 
-%% 全部条目（读入全部块）：{ok, [{Dir, Etype, O, R, P}], Vs'} | {error, _}
-vs_all_entries(Io, #vs{vid = Vid, groups = Gs} = Vs0) ->
-    case lists:foldl(
-      fun(_G, {error, _} = E) -> E;
-         (#grp{dir = D, etype = T, body = {entries, Es}}, {ok, Acc, Vs}) ->
-              {ok, [[{D, T, O, R, P} || {O, R, P} <- Es] | Acc], Vs};
-         (#grp{dir = D, etype = T, body = {chunks, Lbs}}, {ok, Acc, Vs}) ->
-              case load_group_chunks(Io, Vs, Vid, D, T, Lbs) of
-                  {ok, Es, Vs2}  -> {ok, [[{D, T, O, R, P} || {O, R, P} <- Es] | Acc], Vs2};
-                  {error, _} = E -> E
-              end
-      end, {ok, [], Vs0}, Gs)
-    of
+%% 按组序（内联组整组、分块组逐块）读条目，直到「不同的对端顶点数 > MaxOthers」或
+%% 读完：{ok, [{Dir, Etype, O, R, P}], Complete, Vs'} | {error, _}。Complete = 该顶点
+%% 的条目已全部读到。MaxOthers = infinity 读全部。对端不计 Vid 自己（自环）。
+vs_first_entries(Io, #vs{vid = Vid, groups = Gs} = Vs, MaxOthers) ->
+    Units = lists:append([case Body of
+                              {entries, Es} -> [{D, T, {entries, Es}}];
+                              {chunks, Lbs} -> [{D, T, {chunk, Lb}} || Lb <- Lbs]
+                          end || #grp{dir = D, etype = T, body = Body} <- Gs]),
+    vs_first_units(Io, Vs, Vid, Units, MaxOthers, #{}, []).
+
+vs_first_units(_Io, Vs, _Vid, [], _Max, _Seen, Acc) ->
+    {ok, lists:append(lists:reverse(Acc)), true, Vs};
+vs_first_units(_Io, Vs, _Vid, _Units, Max, Seen, Acc) when is_integer(Max), map_size(Seen) > Max ->
+    {ok, lists:append(lists:reverse(Acc)), false, Vs};
+vs_first_units(Io, Vs, Vid, [{D, T, Unit} | Units], Max, Seen, Acc) ->
+    Res = case Unit of
+              {entries, Es0} -> {ok, Es0, Vs};
+              {chunk, Lb}    -> get_chunk(Io, Vs, chunk_key(Vid, D, T, Lb))
+          end,
+    case Res of
+        {error, _} = E -> E;
+        {ok, Es, Vs1} ->
+            Seen1 = lists:foldl(fun({O, _R, _P}, M) when O =/= Vid -> M#{O => true};
+                                   (_, M) -> M
+                                end, Seen, Es),
+            vs_first_units(Io, Vs1, Vid, Units, Max, Seen1,
+                           [[{D, T, O, R, P} || {O, R, P} <- Es] | Acc])
+    end.
+
+%% 各块逆序攒起来最后拼一次（以前每块 `Acc ++ Es`，块数 × 条目数的拷贝）。
+load_group_chunks(Io, Vs0, Vid, D, T, Lbs) ->
+    Res = lists:foldl(fun(_Lb, {error, _} = E) -> E;
+                         (Lb, {ok, Acc, Vs}) ->
+                              case get_chunk(Io, Vs, chunk_key(Vid, D, T, Lb)) of
+                                  {ok, Es, Vs2}  -> {ok, [Es | Acc], Vs2};
+                                  {error, _} = E -> E
+                              end
+                      end, {ok, [], Vs0}, Lbs),
+    case Res of
         {ok, Acc, Vs} -> {ok, lists:append(lists:reverse(Acc)), Vs};
         {error, _} = E -> E
     end.
-
-load_group_chunks(Io, Vs0, Vid, D, T, Lbs) ->
-    lists:foldl(fun(_Lb, {error, _} = E) -> E;
-                   (Lb, {ok, Acc, Vs}) ->
-                        case get_chunk(Io, Vs, chunk_key(Vid, D, T, Lb)) of
-                            {ok, Es, Vs2}  -> {ok, Acc ++ Es, Vs2};
-                            {error, _} = E -> E
-                        end
-                end, {ok, [], Vs0}, Lbs).
 
 %% =========================================================================
 %% 收尾：分块维护 + 生成 op
@@ -679,7 +686,7 @@ load_group_chunks(Io, Vs0, Vid, D, T, Lbs) ->
 
 %% {ok, Ops, Vs'} | {error, _}
 finalize(Io, #vs{touched = false} = Vs, Cfg) ->
-    %% all_entries/2 只读（用于 del_vertex）也可能修复过 chunk 状态：读非块 0
+    %% all_entries/2、first_entries/3 只读（用于 del_vertex）也可能修复过 chunk 状态：读非块 0
     %% 的空块时会把“头目录里有、盘上没有”的块补成真实空块并标脏。此时头尚未
     %% 被标 touched，仍必须把这类自愈块提交，否则下次读到坏块。
     case maps:size(Vs#vs.dirty) =/= 0 orelse maps:size(Vs#vs.dels) =/= 0 of
@@ -848,7 +855,15 @@ emit_ops(#vs{vid = Vid, hcond = Cond, existed = Existed, groups = Gs,
               end,
     %% 本次会话里新建又删掉的块从没落过盘，不发删除（否则白写一条墓碑）。
     %% 读过的块带读到时的版本作条件；读过没改的块发 check（读集校验，见不变式 2）。
-    Dels = [chunk_op({remove, K}, RC) || K <- lists:sort(maps:keys(Ds)), maps:is_key(K, Orig)],
+    %% 盘上已有的块集合只在真有块要删时才算：hub 的头有上千个块，每次读头都建这张
+    %% 表曾占 degree / edge / put_edge 约 3/4 的 CPU。
+    Dels = case map_size(Ds) of
+               0 -> [];
+               _ ->
+                   OnDisk = chunk_keys_of(Vid, Orig),
+                   [chunk_op({remove, K}, RC) || K <- lists:sort(maps:keys(Ds)),
+                                                 maps:is_key(K, OnDisk)]
+           end,
     Puts = [chunk_op({put, K, encode_chunk(maps:get(K, Cs))}, RC) || K <- lists:sort(maps:keys(Dy))],
     HeadOps ++ Dels ++ Puts ++ read_checks(RC, Dy, Ds) ++ lists:reverse(Extra).
 
@@ -951,13 +966,22 @@ del_edge(S0, Src, T, Dst, R) ->
 
 %% 顶点的全部条目：{ok, [{Dir, Etype, O, R, P}], S'} | {error, _}
 all_entries(S0, Vid) ->
+    case first_entries(S0, Vid, infinity) of
+        {ok, Es, true, S1} -> {ok, Es, S1};
+        {error, _} = E     -> E
+    end.
+
+%% 顶点靠前的一段条目，够 MaxOthers 个以上不同的对端就停：
+%% {ok, Entries, Complete, S'} | {error, _}。只读入用到的块——del_vertex 分轮删 hub
+%% 时每轮只碰当前这几个块，不再每轮把全部块读一遍（那是 O(度数²)：20 万邻居 450 s）。
+first_entries(S0, Vid, MaxOthers) ->
     #sess{io = Io} = S0,
     case sess_vs(S0, Vid) of
         {error, _} = E -> E;
         {ok, Vs, S1} ->
-            case vs_all_entries(Io, Vs) of
-                {ok, Es, Vs1}  -> {ok, Es, sess_store(S1, Vs1)};
-                {error, _} = E -> E
+            case vs_first_entries(Io, Vs, MaxOthers) of
+                {ok, Es, Complete, Vs1} -> {ok, Es, Complete, sess_store(S1, Vs1)};
+                {error, _} = E          -> E
             end
     end.
 

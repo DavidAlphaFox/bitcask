@@ -53,7 +53,7 @@ pay that.
 | | v1 | v2 |
 |---|---|---|
 | Key count | V + 3E + counter keys | 2V + hub chunks |
-| Neighbors of a vertex | OKI prefix range + per-row lookup | **one point read, one pread** (hub: one prefix range) |
+| Neighbors of a vertex | OKI prefix range + per-row lookup | **one point read, one pread** (hub: head + one point read per chunk in its directory) |
 | Consistency within a hop | per-key weak | **atomic snapshot** (hub: optional check, §7.3) |
 | Degree | extra counter keys, read-modify-write | in the adjacency head, updated atomically with edges |
 | Insert one edge | append 5 small records | rewrite both endpoints' adjacency lists (each ≤ ~4 KiB) |
@@ -310,8 +310,8 @@ graphdb:del_edges(H, [{S, T, D} | {S, T, D, Rank}])  -> ok | {error, _}.
 ```
 
 Aggregated per touched vertex: each vertex is read once, modified once, written once.
-Edges are first **stably sorted by src** (a src's edges land in the same batch, and repeated
-upserts of one edge still apply in the caller's order; `sort => false` turns it off), then
+Edges are first **stably sorted by (src, etype, dst, rank)** (a src's edges land in the same batch and in adjacent
+chunks, and repeated upserts of one edge still apply in the caller's order; `sort => false` turns it off), then
 cut by vertex set (at most `batch_vids` heads per batch, default 256); each batch is
 independently atomic and independently retried. Offline loads can raise `batch_vids`: with
 the whole graph in one batch every head is written once; the cost is that the larger a
@@ -326,7 +326,7 @@ loaders and hot-vertex writes should use this path.
 out_edges / in_edges / neighbors(V):
     get head(V)
     inline group  → decode entries directly
-    chunked group → prefix range "a" <V> <dir> [<etype>], read chunks in order
+    chunked group → point-read each chunk listed in the head's directory (stop at limit; a prefix range before G10)
 edge(S, T, D, R): get head(S) → search the group (chunked: one more chunk read) → if props live in p, one more read
 degree(V, T): get head(V) → read Count
 degree(V): get head(V) → sum the out groups' Counts (v1 was an O(out-degree) scan)
@@ -460,8 +460,8 @@ Benchmarks extend `test/graphdb_bench` with the earlier per-edge layout as a ref
 - `del_vertex`'s last batch carries `{check, head, absent}` when the vertex had no
   adjacency at all, so a concurrent edge insert interleaved with the delete cannot leave a
   dangling edge.
-- `put_edges` / `del_edges` stably sort by src before cutting batches (≤ `batch_vids`,
-  default 256). Unsorted random edges rarely repeat a vertex within a batch, so
+- `put_edges` / `del_edges` stably sort by (src, etype, dst, rank) before cutting batches (≤ `batch_vids`,
+  default 256; src only before G10). Unsorted random edges rarely repeat a vertex within a batch, so
   aggregation barely helps; sorted, each src head is written once per batch — about 2×
   throughput and half the bytes (§14.3).
 - `graph_layout_v1`: opening is refused only when an old per-edge out-edge key **and** its
@@ -545,3 +545,20 @@ side (each batch writes each of its dsts once). Bulk load at degree 50 goes from
 to **1.05×** of v1, so §12's "bulk load no lower than v1" is met; with the whole graph in
 one batch (2000 vertices < 4096) every head is written once — 3× v1 and 17 B per edge.
 Single-edge `put_edge` is unaffected (still about 0.36–0.46×).
+
+**Hub paths (added 2026-11-23, TASK G10)**: one vertex with 20k / 200k out-edges, 4 KiB, before → after:
+
+| Operation | degree 20k | degree 200k |
+|---|---|---|
+| `del_vertex` | 1.11 s → 0.12 s | 450 s → 2.1 s |
+| `put_edges` load (shuffled dsts) | 0.30 s → 0.22 s | 15.3 s → 3.5 s |
+| `out_edges(#{limit => 10})` | 230 µs → 13 µs | 1133 µs → 30 µs |
+| `degree` | 32 µs → 5 µs | 345 µs → 18 µs |
+| `edge` | 48 µs → 12 µs | 939 µs → 32 µs |
+| `put_edge` | 106 µs → 67 µs | 752 µs → 255 µs |
+
+Four changes: `del_vertex` reads only the chunks needed for one batch of neighbors per round (it used to read every chunk each
+round, O(degree²)); chunked groups are read by point reads from the chunk directory (the prefix range moved chunks a batch at a
+time, and the first range after every write made the engine re-sort its whole unflushed in-memory delta); loading a head no
+longer builds a table of every chunk key; the `put_edges` sort key now includes dst. What remains is inherent to the design: every
+edge write on a large hub rewrites the whole head (about 13 KiB of chunk directory at degree 200k).
