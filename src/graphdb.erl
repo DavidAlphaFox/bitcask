@@ -618,20 +618,41 @@ in_edges(Handle, Vid, Opts) when is_map(Opts) ->
     adj_edges({direct, Handle}, Vid, 1, Opts).
 
 adj_edges(Io, Vid, Dir, Opts) ->
-    _ = nkey(Vid),
+    ok = v_v64(Vid),
     Etype = opt_etype(Opts),
     Limit = opt_limit(Opts),
+    %% graphdb_adj:edge_maps 一遍把条目解成边 map；只有选中的组里带属性时才需要再过
+    %% 一遍，把外置属性（ext）换成 p 家族里的值。
     Res = case maps:get(consistent, Opts, false) of
               true ->
-                  Read = fun() -> graphdb_adj:entries_guarded(Io, Vid, Dir, Etype, Limit) end,
+                  Read = fun() ->
+                                 case graphdb_adj:edge_maps(Io, Vid, Dir, Etype, Limit, true) of
+                                     {ok, Ms, HasProps, Checks} -> {ok, {Ms, HasProps}, Checks};
+                                     {error, _} = E             -> E
+                                 end
+                         end,
                   consistent_read(Io, Read, ?CONSISTENT_TRIES);
               false ->
-                  graphdb_adj:entries(Io, Vid, Dir, Etype, Limit)
+                  case graphdb_adj:edge_maps(Io, Vid, Dir, Etype, Limit, false) of
+                      {ok, Ms, HasProps, _} -> {ok, {Ms, HasProps}};
+                      {error, _} = E        -> E
+                  end
           end,
     case Res of
-        {error, _} = E -> E;
-        {ok, Es}       -> to_edges(Io, Vid, Dir, Es, [])
+        {error, _} = Err      -> Err;
+        {ok, {Maps, false}}   -> {ok, Maps};
+        {ok, {Maps, true}}    -> resolve_ext(Io, Maps, [])
     end.
+
+resolve_ext(_Io, [], Acc) ->
+    {ok, lists:reverse(Acc)};
+resolve_ext(Io, [#{props := ext, src := S, etype := T, dst := D, rank := R} = M | Rest], Acc) ->
+    case resolve_props(Io, S, T, D, R, ext) of
+        {ok, Props}    -> resolve_ext(Io, Rest, [M#{props := Props} | Acc]);
+        {error, _} = E -> E
+    end;
+resolve_ext(Io, [M | Rest], Acc) ->
+    resolve_ext(Io, Rest, [M | Acc]).
 
 %% 读集（头 + 读过的块，各带版本）在引擎写锁下校验：只含 check 的原子批不写盘；
 %% 校验通过即读到的每个 key 仍同版本，且期间没有半个批发布（12.0.1 起在途批也
@@ -658,34 +679,13 @@ consistent_read_once({direct, H} = Io, Read, N) ->
             end
     end.
 
-to_edges(_Io, _Vid, _Dir, [], Acc) ->
-    {ok, lists:reverse(Acc)};
-to_edges(Io, Vid, 0, [{T, D, R, P} | Rest], Acc) ->
-    case resolve_props(Io, Vid, T, D, R, P) of
-        {ok, Props} ->
-            to_edges(Io, Vid, 0, Rest,
-                     [#{src => Vid, etype => T, dst => D, rank => R, props => Props} | Acc]);
-        {error, _} = E ->
-            E
-    end;
-to_edges(Io, Vid, 1, [{T, S, R, _P} | Rest], Acc) ->
-    to_edges(Io, Vid, 1, Rest,
-             [#{dst => Vid, etype => T, src => S, rank => R, props => <<>>} | Acc]).
-
-%% 双向邻居：out ++ in 去重保序（顶点自身/自环不特殊处理）。
-neighbors(Handle, Vid, Dir) when Dir =:= out; Dir =:= in ->
-    edge_endpoints(Handle, Vid, Dir);
-neighbors(Handle, Vid, both) ->
-    case {edge_endpoints(Handle, Vid, out), edge_endpoints(Handle, Vid, in)} of
-        {{error, _} = E, _} -> E;
-        {_, {error, _} = E} -> E;
-        {{ok, Out}, {ok, In}} -> {ok, dedupe(Out ++ In)}
-    end.
-
-edge_endpoints(Handle, Vid, Dir) ->
-    case graphdb_adj:entries({direct, Handle}, nvid(Vid), dir_code(Dir), undefined, infinity) of
-        {error, _} = E -> E;
-        {ok, Es}       -> {ok, dedupe([O || {_T, O, _R, _P} <- Es])}
+%% 邻居 vid，去重保序；both = 出边邻居在前、入边邻居在后（顶点自身/自环不特殊处理）。
+%% 只读一次头；结果只来自一个组时本来就不重复，不再逐个过一遍去重表。
+neighbors(Handle, Vid, Dir) when Dir =:= out; Dir =:= in; Dir =:= both ->
+    case graphdb_adj:neighbor_ids({direct, Handle}, nvid(Vid), dir_sel(Dir), undefined) of
+        {error, _} = E   -> E;
+        {ok, Ids, true}  -> {ok, Ids};
+        {ok, Ids, false} -> {ok, dedupe(Ids)}
     end.
 
 %% 出度（Etype = undefined：全部类型）。读头即得，O(1)。
@@ -1174,13 +1174,12 @@ slice([X | T], N, Left, Cur, Acc) -> slice(T, N, Left - 1, [X | Cur], Acc).
 
 ceil_div(A, B) -> (A + B - 1) div B.
 
-%% 展开只要邻居 vid：直接解邻接表条目，不解析属性（不碰 p 家族）。
-neighbor_list(Handle, V, both, Etype) ->
-    neighbor_list(Handle, V, out, Etype) ++ neighbor_list(Handle, V, in, Etype);
+%% 展开只要邻居 vid：直接从头 / 块的二进制解出对端 id，不解析属性（不碰 p 家族）；
+%% both 一次读头取两个方向。同一组里同一对端的多条 rank 只出一次。
 neighbor_list(Handle, V, Dir, Etype) ->
-    case graphdb_adj:entries({direct, Handle}, V, dir_code(Dir), Etype, infinity) of
-        {ok, Es}       -> [O || {_T, O, _R, _P} <- Es];
-        {error, _} = E -> erlang:error(E)
+    case graphdb_adj:neighbor_ids({direct, Handle}, V, dir_sel(Dir), Etype) of
+        {ok, Ids, _Unique} -> Ids;
+        {error, _} = E     -> erlang:error(E)
     end.
 
 maybe_visit(undefined, _Vid, _Depth) -> ok;
@@ -1207,8 +1206,9 @@ normalize_error(Reason)         -> {error, Reason}.
 vbin(#{text := T}) -> T;
 vbin(B) when is_binary(B) -> B.
 
-dir_code(out) -> 0;
-dir_code(in)  -> 1.
+dir_sel(out)  -> 0;
+dir_sel(in)   -> 1;
+dir_sel(both) -> both.
 
 nvid(Vid) -> _ = nkey(Vid), Vid.
 

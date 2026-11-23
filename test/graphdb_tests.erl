@@ -1112,3 +1112,179 @@ put_edges_sorts_by_dst_within_src_test_() ->
         ?assertEqual(lists:usort([D || {_, _, D} <- Edges]), OutS),
         ?assert(BytesS * 2 < BytesU)
      end}}.
+
+%% ===================================================================
+%% G11：读路径直接在二进制上解、块目录二分、会话里的条目拉链
+%% ===================================================================
+
+read_paths_select_groups_test_() ->
+    {"读只解要的组：按方向 / 类型挑组，跳过带属性、带 rank、外置属性、分块的组；"
+     "edge 点查内联 / rank / 属性 / 分块；limit 跨组；事务读同结果",
+     {timeout, 60, fun() ->
+        with_dir(fun(D) ->
+            R = graphdb:open(D, [read_write, {adj_inline_max, 256}, {adj_chunk_max, 256},
+                                 {props_inline_max, 8}]),
+            Big = binary:copy(<<"x">>, 40),                       %% > props_inline_max → 外置
+            ok = graphdb:put_edges(R, [{1, 3, Y, #{props => <<"p", (Y rem 7 + $0)>>}} || Y <- [10, 11, 12]]),
+            ok = graphdb:put_edge(R, 1, 3, 13, #{props => Big}),
+            ok = graphdb:put_edges(R, [{1, 4, 20, #{rank => K}} || K <- [0, 5, 9]]),
+            ok = graphdb:put_edges(R, [{1, 5, Y, #{rank => 2, props => <<"q">>}} || Y <- [30, 31]]),
+            ok = graphdb:put_edges(R, [{1, 6, Y} || Y <- [40, 41, 42]]),
+            ok = graphdb:put_edges(R, [{1, 7, Y} || Y <- lists:seq(1001, 1400)]),   %% 分块
+            ok = graphdb:put_edges(R, [{X, 8, 1} || X <- [50, 51]]),
+            ok = graphdb:put_edges(R, [{60, 9, 1, #{rank => K}} || K <- [1, 2]]),
+            {ok, #{chunks := NC}} = graphdb:check_invariants(R),
+            ?assert(NC >= 4),
+            %% etype 过滤：前面各种形态的组都被跳过
+            ?assertEqual([40, 41, 42], dsts_of(graphdb:out_edges(R, 1, #{etype => 6}))),
+            ?assertEqual(lists:seq(1001, 1400), dsts_of(graphdb:out_edges(R, 1, #{etype => 7}))),
+            {ok, E3} = graphdb:out_edges(R, 1, #{etype => 3}),
+            ?assertEqual([{10, <<"p3">>}, {11, <<"p4">>}, {12, <<"p5">>}, {13, Big}],
+                         [{Dv, P} || #{dst := Dv, props := P} <- E3]),
+            {ok, E4} = graphdb:out_edges(R, 1, #{etype => 4}),
+            ?assertEqual([{20, 0}, {20, 5}, {20, 9}], [{Dv, K} || #{dst := Dv, rank := K} <- E4]),
+            {ok, E5} = graphdb:out_edges(R, 1, #{etype => 5}),
+            ?assertEqual([#{src => 1, etype => 5, dst => 30, rank => 2, props => <<"q">>},
+                          #{src => 1, etype => 5, dst => 31, rank => 2, props => <<"q">>}], E5),
+            %% 全部出边：组序 × 条目序；limit 跨组
+            {ok, All} = graphdb:out_edges(R, 1),
+            ?assertEqual(4 + 3 + 2 + 3 + 400, length(All)),
+            ?assertEqual(lists:sublist(All, 9), element(2, graphdb:out_edges(R, 1, #{limit => 9}))),
+            ?assertEqual(lists:sublist(All, 15), element(2, graphdb:out_edges(R, 1, #{limit => 15}))),
+            ?assertEqual({ok, All}, graphdb:out_edges(R, 1, #{consistent => true})),
+            ?assertEqual({atomic, {ok, All}},
+                         graphdb:transaction(R, fun(Tx) -> graphdb:out_edges_txn(Tx, 1) end)),
+            %% 入边
+            {ok, In} = graphdb:in_edges(R, 1),
+            ?assertEqual([{50, 8, 0}, {51, 8, 0}, {60, 9, 1}, {60, 9, 2}],
+                         [{S, T, K} || #{src := S, etype := T, rank := K, dst := 1, props := <<>>} <- In]),
+            %% 度数：只读各组的头
+            ?assertEqual({ok, 412}, graphdb:degree(R, 1)),
+            ?assertEqual({ok, 3}, graphdb:degree(R, 1, 4)),
+            ?assertEqual({ok, 4}, graphdb:in_degree(R, 1)),
+            %% edge 点查
+            ?assertMatch({ok, #{props := <<"p4">>}}, graphdb:edge(R, 1, 3, 11)),
+            ?assertMatch({ok, #{props := Big}}, graphdb:edge(R, 1, 3, 13)),
+            ?assertMatch({ok, #{rank := 5}}, graphdb:edge(R, 1, 4, 20, 5)),
+            ?assertEqual({error, not_found}, graphdb:edge(R, 1, 4, 20, 6)),
+            ?assertEqual({error, not_found}, graphdb:edge(R, 1, 6, 41, 1)),   %% 无 rank 的组问 rank
+            ?assertMatch({ok, #{props := <<>>}}, graphdb:edge(R, 1, 6, 42)),
+            ?assertEqual({error, not_found}, graphdb:edge(R, 1, 6, 43)),
+            ?assertMatch({ok, _}, graphdb:edge(R, 1, 7, 1001)),
+            ?assertMatch({ok, _}, graphdb:edge(R, 1, 7, 1400)),
+            [?assertMatch({ok, _}, graphdb:edge(R, 1, 7, Y)) || Y <- lists:seq(1001, 1400, 13)],
+            ?assertEqual({error, not_found}, graphdb:edge(R, 1, 7, 1401)),
+            ?assertEqual({error, not_found}, graphdb:edge(R, 1, 7, 5)),
+            ?assertEqual({error, not_found}, graphdb:edge(R, 1, 99, 5)),
+            ?assertEqual({error, not_found}, graphdb:edge(R, 777, 7, 5)),
+            ?assertEqual({atomic, {ok, 5}},
+                         graphdb:transaction(
+                           R, fun(Tx) -> {ok, #{rank := K}} = graphdb:edge_txn(Tx, 1, 4, 20, 5), {ok, K} end)),
+            graphdb:close(R)
+        end)
+     end}}.
+
+neighbor_ids_test_() ->
+    {"邻居 id：同一对端的多条 rank / 多个类型只出一次、保序；both 只读一次头；"
+     "单组结果不再去重也无重复；BFS / 最短路结果不变",
+     {timeout, 60, fun() ->
+        with_dir(fun(D) ->
+            R = graphdb:open(D, [read_write, {adj_inline_max, 256}, {adj_chunk_max, 256}]),
+            ok = graphdb:put_edges(R, [{1, 4, 20, #{rank => K}} || K <- [0, 5, 9]]),
+            ok = graphdb:put_edges(R, [{1, 4, 21, #{rank => 1}}, {1, 5, 20}, {1, 5, 22}]),
+            ok = graphdb:put_edges(R, [{22, 6, 1}, {23, 6, 1}, {1, 6, 1}]),
+            ?assertEqual({ok, [20, 21, 22, 1]}, graphdb:neighbors(R, 1, out)),
+            ?assertEqual({ok, [1, 22, 23]}, graphdb:neighbors(R, 1, in)),
+            {Both, #{get_with_ord := G}} =
+                count_calls([get_with_ord], fun() -> graphdb:neighbors(R, 1, both) end),
+            ?assertEqual({{ok, [20, 21, 22, 1, 23]}, 1}, {Both, G}),
+            ?assertEqual({ok, []}, graphdb:neighbors(R, 999, both)),
+            %% 分块的带 rank 组：同一对端的 rank 跨块也只出一次
+            ok = graphdb:put_edges(R, [{2, 7, Y, #{rank => K}} || Y <- lists:seq(100, 180), K <- [1, 2, 3]]),
+            {ok, #{chunks := NC}} = graphdb:check_invariants(R),
+            ?assert(NC >= 2),
+            ?assertEqual({ok, lists:seq(100, 180)}, graphdb:neighbors(R, 2, out)),
+            %% 遍历：both 方向
+            {ok, Reach} = graphdb:bfs(R, 23, #{dir => both, depth => 2}),
+            ?assertEqual([{23, 0}, {1, 1}, {20, 2}, {21, 2}, {22, 2}], Reach),
+            ?assertEqual({ok, [23, 1, 20]}, graphdb:shortest_path(R, 23, 20)),
+            graphdb:close(R)
+        end)
+     end}}.
+
+bad_head_read_errors_test_() ->
+    {"头 / 块损坏：各读入口都报 {error, {bad_adj…}}，不崩、不当成空",
+     fun() ->
+        with_dir(fun(D) ->
+            R = graphdb:open(D, [read_write, {adj_inline_max, 256}, {adj_chunk_max, 256}]),
+            ok = graphdb:put_edge(R, 1, 7, 2),
+            ok = bitcask:put(R, graphdb:akey(1), <<1, 1:16, 0, 0, 7:32, 2:64, 9:64>>),  %% Count 2、只有 1 条
+            ?assertEqual({error, {bad_adj, 1}}, graphdb:out_edges(R, 1)),
+            ?assertEqual({error, {bad_adj, 1}}, graphdb:in_edges(R, 1)),
+            ?assertEqual({error, {bad_adj, 1}}, graphdb:degree(R, 1)),
+            ?assertEqual({error, {bad_adj, 1}}, graphdb:edge(R, 1, 7, 9)),
+            ?assertEqual({error, {bad_adj, 1}}, graphdb:neighbors(R, 1, both)),
+            ?assertEqual({error, {bad_adj, 1}}, graphdb:put_edge(R, 1, 7, 3)),
+            %% 坏块
+            ok = graphdb:put_edges(R, [{5, 7, Y} || Y <- lists:seq(1001, 1200)]),
+            [{CK, _} | _] = [KV || {K, _} = KV <- bitcask:range(R, {graphdb:akey(5), graphdb:akey(6)}),
+                                   byte_size(K) =:= 34],
+            ok = bitcask:put(R, CK, <<1, 0, 3:32, 1:64>>),
+            ?assertEqual({error, {bad_adj_chunk, CK}}, graphdb:out_edges(R, 5)),
+            ?assertEqual({error, {bad_adj_chunk, CK}}, graphdb:edge(R, 5, 7, 1001)),
+            ?assertEqual({error, {bad_adj_chunk, CK}}, graphdb:neighbors(R, 5, out)),
+            ?assertEqual({ok, 200}, graphdb:degree(R, 5)),           %% 度数只看头
+            graphdb:close(R)
+        end)
+     end}.
+
+session_zipper_matches_model_test_() ->
+    {"一个会话里对同一张条目表做升序 / 降序 / 乱序的加、改、删（内联与分块，含 rank 与"
+     "属性）：结果与模型一致，不变式成立",
+     {timeout, 120, fun() ->
+        rand:seed(exsss, {7, 8, 9}),
+        Run = fun(Order) ->
+            with_dir(fun(D) ->
+                R = graphdb:open(D, [read_write, {adj_inline_max, 256}, {adj_chunk_max, 256}]),
+                Base = [{1, 7, Y, #{rank => Y rem 3}} || Y <- lists:seq(2000, 2600, 2)],
+                ok = graphdb:put_edges(R, Base),
+                Model0 = maps:from_list([{{Y, K}, <<>>} || {_, _, Y, #{rank := K}} <- Base]),
+                %% 三轮：每轮一个大批（一个会话），混着加 / 改属性 / 重复加
+                Final = lists:foldl(
+                  fun(Round, Model) ->
+                      Ys0 = [1990 + rand:uniform(640) || _ <- lists:seq(1, 300)],
+                      Ys = case Order of
+                               asc  -> lists:sort(Ys0);
+                               desc -> lists:reverse(lists:sort(Ys0));
+                               rnd  -> Ys0
+                           end,
+                      Puts = [{1, 7, Y, #{rank => Y rem 3,
+                                          props => case Y rem 5 of 0 -> <<"r", (Round + $0)>>; _ -> <<>> end}}
+                              || Y <- Ys],
+                      ok = graphdb:put_edges(R, Puts, #{sort => false, batch_vids => 100000}),
+                      M1 = lists:foldl(fun({_, _, Y, #{rank := K, props := P}}, M) -> M#{{Y, K} => P} end,
+                                       Model, Puts),
+                      Dels0 = [K || {K, _} <- maps:to_list(M1), rand:uniform(4) =:= 1],
+                      Dels = case Order of
+                                 asc  -> lists:sort(Dels0);
+                                 desc -> lists:reverse(lists:sort(Dels0));
+                                 rnd  -> [K || {_, K} <- lists:sort([{rand:uniform(), K} || K <- Dels0])]
+                             end,
+                      ok = graphdb:del_edges(R, [{1, 7, Y, K} || {Y, K} <- Dels] ++ [{1, 7, 9, 9}],
+                                             #{sort => false, batch_vids => 100000}),
+                      M2 = maps:without(Dels, M1),
+                      {ok, Out} = graphdb:out_edges(R, 1),
+                      ?assertEqual(lists:sort(maps:to_list(M2)),
+                                   [{{Y, K}, P} || #{dst := Y, rank := K, props := P} <- Out]),
+                      ?assertEqual({ok, map_size(M2)}, graphdb:degree(R, 1)),
+                      ?assertMatch({ok, _}, graphdb:check_invariants(R)),
+                      M2
+                  end, Model0, [1, 2, 3]),
+                %% 对端的入边组也对得上
+                [?assertEqual({ok, length([1 || {{Y2, _}, _} <- maps:to_list(Final), Y2 =:= Y])},
+                              graphdb:in_degree(R, Y)) || Y <- [2000, 2100, 2333, 2600]],
+                graphdb:close(R)
+            end)
+        end,
+        [Run(O) || O <- [asc, desc, rnd]]
+     end}}.

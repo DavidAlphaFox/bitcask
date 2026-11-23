@@ -3,6 +3,21 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [Unreleased]
+
+图层读写路径的内部优化。盘上格式、API 与 libbitcask 版本均不变。
+
+### Changed
+
+- **邻接读直接在头 / 块的二进制上解**：只解要的方向和类型，别的组按字节数跳过，一遍出结果。`neighbors` 直接出对端 id，结果只来自
+  一个组时不再逐个去重，`both` 只读一次头：20 万度 hub 的 `neighbors` 102 ms → 9.0 ms，低度数 `neighbors(both)` 7.5 → 4.2 µs；
+  hub 全量 `out_edges` 57 → 43 ms。`degree` 只读各组的头、`edge` 在条目区 / 块目录上二分：20 万度 hub 上 18 → 4.8 µs、32 → 8.5 µs。
+- **hub 的块目录不再每次解成列表**：定位块用二分，写回时目录没变原样复用，收尾只处理改过的块。20 万度 hub 上
+  `put_edge` 255 → 64 µs、`del_edge` 240 → 52 µs。
+- **批量加边在同一张条目表上接着上次的位置找**（批内已按 dst 排序，插入是升序的），查原值与写入合成一次定位：
+  dst 乱序的 20 万度 hub 装载 3.5 s → 0.95 s；5 万条边指向同一顶点的装载 11.4 → 5.9 µs/边。
+- `neighbors/3` 对同一对端的去重结果与顺序不变；BFS / 最短路的展开不再把同一组里同一对端的多条 rank 重复交给 visited 表，结果不变。
+
 ## [12.0.2] — 2026-11-23
 
 升级 libbitcask **12.0.1 → 12.0.2**（上游 S64），并修正图层 hub 路径的性能。submodule 从 `c364cd3` 切到 `ab9b51f`

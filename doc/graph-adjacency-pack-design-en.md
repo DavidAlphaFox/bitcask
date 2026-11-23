@@ -562,3 +562,11 @@ round, O(degree²)); chunked groups are read by point reads from the chunk direc
 time, and the first range after every write made the engine re-sort its whole unflushed in-memory delta); loading a head no
 longer builds a table of every chunk key; the `put_edges` sort key now includes dst. What remains is inherent to the design: every
 edge write on a large hub rewrites the whole head (about 13 KiB of chunk directory at degree 200k).
+
+**Read path and in-session structures (added 2026-11-23, TASK G11)**: reads select groups by direction and type directly on the
+head / chunk binaries and decode results in one pass (no session state); the chunk directory stays binary inside a session,
+is binary-searched, and is written back as is when unchanged; in-session entry lists are zippers, so ascending inserts within a
+batch resume from the previous position. On the 200k-degree hub, "after" above → this round: `put_edges` load 3.5 s → 0.95 s,
+`put_edge` 255 → 64 µs, `edge` 32 → 8.5 µs, `degree` 18 → 4.8 µs, `out_edges(#{limit => 10})` 30 → 11 µs; `neighbors`
+102 → 9.0 ms, full `out_edges` 57 → 43 ms. One-hop reads on low-degree graphs change little (`out_edges` about 6%,
+`neighbors(both)` 7.5 → 4.2 µs): the point read itself takes 2 µs. `del_vertex` is essentially unchanged.

@@ -55,7 +55,7 @@
          encode_head/1, decode_head/1, encode_chunk/1, decode_chunk/1,
          default_cfg/0, encode_cfg/1, decode_cfg/1,
          %% 读原语
-         entries/5, entries_guarded/5, lookup/6, counts/2,
+         entries/5, entries_guarded/5, edge_maps/6, neighbor_ids/4, lookup/6, counts/2,
          %% 写会话
          new_session/2, put_edge/6, del_edge/5, all_entries/2, first_entries/3,
          commit/1, commit/2,
@@ -75,13 +75,17 @@
               etype    :: non_neg_integer(),
               count    :: non_neg_integer(),
               flags = 0 :: non_neg_integer(),        %% 分块组：各块标志的并（只升不降）
-              body     :: {entries, [entry()]} | {chunks, [lb()]}}).
+              %% 内联组：条目表（会话里改过的可能是拉链，见 elist()）。
+              %% 分块组：块目录保持盘上的二进制（各块下界 <<O:64, R:64>> 依次排列）——
+              %% hub 的目录上千项，解成列表再线性找块曾是 hub 点操作的大头；现在在
+              %% 二进制上二分，写回时目录没变就原样复用。
+              body     :: {entries, elist()} | {chunks, binary()}}).
 
 -record(vs, {vid      :: non_neg_integer(),
              hcond    :: absent | {ord, non_neg_integer()} | txn,
              existed = false :: boolean(),           %% 读到时头 key 是否存在
              groups = [] :: [#grp{}],
-             chunks = #{} :: #{binary() => [entry()]}, %% 已读入的块（key → 条目）
+             chunks = #{} :: #{binary() => elist()},   %% 已读入的块（key → 条目）
              dirty  = #{} :: #{binary() => true},      %% 要写的块
              dels   = #{} :: #{binary() => true},      %% 要删的块
              orig   = [] :: [#grp{}],                  %% 读到时的组（提交时由它算盘上已有的块，
@@ -89,13 +93,18 @@
              rconds = #{} :: #{binary() => absent | {ord, non_neg_integer()}},
                                                        %% 直通读过的块 → 读到时的版本（提交条件）
              extra  = [] :: [term()],                  %% p 家族 op（逆序）
-             touched = false :: boolean()}).
+             touched = false :: boolean(),
+             henc :: undefined | binary()}).           %% finalize 算好的头编码（emit 复用）
 
 -record(sess, {io :: {direct, term()} | {txn, term(), read | write},
                cfg :: map(), vs = #{} :: #{non_neg_integer() => #vs{}}}).
 
 -type entry() :: {non_neg_integer(), non_neg_integer(), binary() | ext}.
--type lb()    :: {non_neg_integer(), non_neg_integer()}.
+%% 条目表：按 (O, R) 升序的列表；写会话里正在改的表是「拉链」{z, RevLeft, Right}
+%%（RevLeft 逆序、全部小于 Right），游标停在上次改动处——批量加边按 (src, etype, dst,
+%% rank) 排过序，同一张表上的插入是升序的，接着上次的位置找，不必每条从头走。
+%% 拉链只存在于会话内（touched 的组 / dirty 的块），finalize 开头统一拍平。
+-type elist() :: [entry()] | {z, [entry()], [entry()]}.
 
 %% =========================================================================
 %% Keys
@@ -227,13 +236,13 @@ encode_head(Groups) ->
     iolist_to_binary([<<?VER:8, (length(Groups)):16/big>>
                       | [enc_group(G) || G <- Groups]]).
 
-enc_group(#grp{dir = D, etype = T, count = C, body = {entries, Es}}) ->
+enc_group(#grp{dir = D, etype = T, count = C, body = {entries, Es0}}) ->
+    Es = e_list(Es0),
     F = flags_of(Es),
     [<<D:8, F:8, T:32/big, C:64/big>> | enc_entries(Es, F)];
-enc_group(#grp{dir = D, etype = T, count = C, flags = F0, body = {chunks, Lbs}}) ->
+enc_group(#grp{dir = D, etype = T, count = C, flags = F0, body = {chunks, Dir}}) ->
     F = (F0 band (?F_RANK bor ?F_PROPS)) bor ?F_CHUNKED,
-    [<<D:8, F:8, T:32/big, C:64/big, (length(Lbs)):32/big>>
-     | [<<O:64/big, R:64/big>> || {O, R} <- Lbs]].
+    [<<D:8, F:8, T:32/big, C:64/big, (byte_size(Dir) div 16):32/big>>, Dir].
 
 decode_head(<<?VER:8, N:16/big, Rest/binary>>) ->
     dec_groups(N, Rest, undefined, []);
@@ -259,14 +268,13 @@ dec_groups(N, <<D:8, F:8, T:32/big, C:64/big, Rest/binary>>, Prev, Acc)
         _ ->
             case Rest of
                 <<NC:32/big, Dir:(NC * 16)/binary, Rest2/binary>> when NC > 0 ->
-                    Lbs = [{O, R} || <<O:64/big, R:64/big>> <= Dir],
-                    case hd(Lbs) =:= ?LB0 of
-                        true ->
+                    case Dir of
+                        <<0:64, 0:64, _/binary>> ->          %% 块 0 的下界恒为 (0, 0)
                             dec_groups(N - 1, Rest2, {D, T},
                                        [#grp{dir = D, etype = T, count = C,
                                              flags = F band (?F_RANK bor ?F_PROPS),
-                                             body = {chunks, Lbs}} | Acc]);
-                        false ->
+                                             body = {chunks, Dir}} | Acc]);
+                        _ ->
                             error
                     end;
                 _ ->
@@ -332,136 +340,345 @@ vbin(B) when is_binary(B) -> B.
 %% 读原语
 %% =========================================================================
 
+%% 读路径不建会话状态：直接在头 / 块的二进制上挑出要的组（方向、类型），别的组按
+%% 字节数跳过，要的组一遍解成调用方要的形态（条目元组 / 边 map / 邻居 id）。
+%% 以前是「整头解成记录 → 取条目 → 补类型 → 转 map → 逐条看属性」四遍。
+
 %% 顶点 Vid 在 Dir 方向的条目：[{Etype, Other, Rank, Props}]，组序 × 条目序。
 %% Etype = undefined 取全部类型；Limit = infinity | N。Props 可能是 ext
 %% （属性在 p 家族，由调用方按需解析）。
 entries(Io, Vid, Dir, Etype, Limit) ->
-    case load(Io, Vid) of
-        {error, _} = E -> E;
-        {ok, Vs} ->
-            Gs = [G || #grp{dir = D, etype = T} = G <- Vs#vs.groups,
-                       D =:= Dir, Etype =:= undefined orelse T =:= Etype],
-            collect_groups(Io, Vid, Gs, Limit, [])
+    case read_groups(Io, Vid, Dir, Etype, Limit, tuples, false) of
+        {ok, Es, _NG, _Props, _Checks} -> {ok, Es};
+        {error, _} = E                 -> E
     end.
 
-collect_groups(_Io, _Vid, _Gs, 0, Acc) ->
-    {ok, lists:append(lists:reverse(Acc))};
-collect_groups(_Io, _Vid, [], _Limit, Acc) ->
-    {ok, lists:append(lists:reverse(Acc))};
-collect_groups(Io, Vid, [#grp{etype = T, body = {entries, Es}} | Gs], Limit, Acc) ->
-    Taken = take(Es, Limit),
-    collect_groups(Io, Vid, Gs, dec_limit(Limit, length(Taken)),
-                   [[{T, O, R, P} || {O, R, P} <- Taken] | Acc]);
-collect_groups(Io, Vid, [#grp{dir = D, etype = T, body = {chunks, Lbs}} | Gs], Limit, Acc) ->
-    case read_chunks(Io, Vid, D, T, Lbs, Limit, []) of
-        {error, _} = E -> E;
-        {ok, Es} ->
-            collect_groups(Io, Vid, Gs, dec_limit(Limit, length(Es)),
-                           [[{T, O, R, P} || {O, R, P} <- Es] | Acc])
-    end.
-
-%% 同 entries/5，但分块组按头的块目录逐块点读并记下每个读到的 key 的版本：
-%% {ok, Entries, Checks}，Checks = [{check, Key, Cond}]（头 + 读过的块）。调用方
+%% 同 entries/5，并记下每个读到的 key 的版本：{ok, Entries, Checks}，
+%% Checks = [{check, Key, Cond}]（头 + 读过的块；读到缺失的块记 absent）。调用方
 %% 在引擎写锁下用只含 check 的原子批校验 Checks 仍是当前版本，即得一致快照
 %% （graphdb consistent_read；读集校验还能挡住绕过图层协议直写块的写入者，
-%% 见不变式 2）。
-%% 只用于直通模式。
+%% 见不变式 2）。只用于直通模式。
 entries_guarded({direct, _} = Io, Vid, Dir, Etype, Limit) ->
-    case load(Io, Vid) of
-        {error, _} = E -> E;
-        {ok, Vs0} ->
-            Gs = [G || #grp{dir = D, etype = T} = G <- Vs0#vs.groups,
-                       D =:= Dir, Etype =:= undefined orelse T =:= Etype],
-            case guarded_groups(Io, Vs0, Gs, Limit, []) of
-                {error, _} = E -> E;
-                {ok, Es, #vs{vid = V, hcond = HC, rconds = RC}} ->
-                    {ok, Es, [{check, head_key(V), HC} |
-                              [{check, K, C} || {K, C} <- lists:sort(maps:to_list(RC))]]}
+    case read_groups(Io, Vid, Dir, Etype, Limit, tuples, true) of
+        {ok, Es, _NG, _Props, Checks} -> {ok, Es, Checks};
+        {error, _} = E                -> E
+    end.
+
+%% 直接出边 map（graphdb 的 edge() 形态）：{ok, Maps, HasProps, Checks}。
+%%   Dir = 0：#{src => Vid, etype, dst, rank, props}；props 可能是 ext（HasProps 为
+%%            true 时调用方再过一遍把 ext 换成 p 家族的值）。
+%%   Dir = 1：#{dst => Vid, etype, src, rank, props => <<>>}（入边一侧不存属性）。
+%% Guard = true 时 Checks 同 entries_guarded/5，否则为 []。
+edge_maps(Io, Vid, Dir, Etype, Limit, Guard) ->
+    case read_groups(Io, Vid, Dir, Etype, Limit, {maps, Vid, Dir}, Guard) of
+        {ok, Ms, _NG, Props, Checks} -> {ok, Ms, Props andalso Dir =:= 0, Checks};
+        {error, _} = E               -> E
+    end.
+
+%% 邻居 vid：{ok, Ids, Unique}。DirSel = 0 | 1 | both（both：出边组在前、入边组在后，
+%% 只读一次头）。同一组内相邻的重复（同一个对端的多条 rank）已去掉；Unique = true
+%% 表示 Ids 整体无重复（只来自一个组）——调用方可以不再去重。
+neighbor_ids(Io, Vid, DirSel, Etype) ->
+    case read_groups(Io, Vid, DirSel, Etype, infinity, ids, false) of
+        {ok, Ids, NG, _Props, _Checks} -> {ok, Ids, NG =< 1};
+        {error, _} = E                 -> E
+    end.
+
+%% {ok, 扁平结果, 选中的组数, 选中的组里是否有带属性的, Checks} | {error, _}
+read_groups(Io, Vid, DirSel, Etype, Limit, Mode, Guard) ->
+    HK = head_key(Vid),
+    case io_head(Io, HK) of
+        {error, _} = E ->
+            E;
+        {absent, HC} ->
+            {ok, [], 0, false, [{check, HK, HC} || Guard]};
+        {ok, Bin, HC} ->
+            case sel_groups(Bin, DirSel, Etype) of
+                error ->
+                    {error, {bad_adj, Vid}};
+                {ok, Sel} ->
+                    Props = lists:any(fun({_, _, F, _, _}) -> F band ?F_PROPS =/= 0 end, Sel),
+                    case rg_groups(Io, Vid, Sel, Limit, Mode, Guard, [], []) of
+                        {ok, Parts, Checks} ->
+                            {ok, lists:append(lists:reverse(Parts)), length(Sel), Props,
+                             [{check, HK, HC} || Guard] ++ lists:reverse(Checks)};
+                        {error, _} = E ->
+                            E
+                    end
             end
     end.
 
-guarded_groups(_Io, Vs, _Gs, 0, Acc) ->
-    {ok, lists:append(lists:reverse(Acc)), Vs};
-guarded_groups(_Io, Vs, [], _Limit, Acc) ->
-    {ok, lists:append(lists:reverse(Acc)), Vs};
-guarded_groups(Io, Vs, [#grp{etype = T, body = {entries, Es}} | Gs], Limit, Acc) ->
-    Taken = take(Es, Limit),
-    guarded_groups(Io, Vs, Gs, dec_limit(Limit, length(Taken)),
-                   [[{T, O, R, P} || {O, R, P} <- Taken] | Acc]);
-guarded_groups(Io, Vs, [#grp{dir = D, etype = T, body = {chunks, Lbs}} | Gs], Limit, Acc) ->
-    case guarded_chunks(Io, Vs, D, T, Lbs, Limit, []) of
-        {error, _} = E -> E;
-        {ok, Es, Vs1} ->
-            guarded_groups(Io, Vs1, Gs, dec_limit(Limit, length(Es)),
-                           [[{T, O, R, P} || {O, R, P} <- Es] | Acc])
-    end.
-
-guarded_chunks(_Io, Vs, _D, _T, _Lbs, 0, Acc) ->
-    {ok, lists:append(lists:reverse(Acc)), Vs};
-guarded_chunks(_Io, Vs, _D, _T, [], _Limit, Acc) ->
-    {ok, lists:append(lists:reverse(Acc)), Vs};
-guarded_chunks(Io, #vs{vid = Vid} = Vs, D, T, [Lb | Lbs], Limit, Acc) ->
-    case get_chunk(Io, Vs, chunk_key(Vid, D, T, Lb)) of
-        {error, _} = E -> E;
-        {ok, Es, Vs1}  ->
-            Taken = take(Es, Limit),
-            guarded_chunks(Io, Vs1, D, T, Lbs, dec_limit(Limit, length(Taken)), [Taken | Acc])
-    end.
-
-%% 一个分块组的条目：按头的块目录逐块点读（块序 = 下界序 = 条目序），Limit 到了
-%% 就停。直通与事务同一条路：事务里经事务缓冲、点锁（持有头的锁即覆盖它名下全部
-%% 块，§8），不拿前缀锁。
-%% 以前直通读走前缀 range：range 一次往返按批取块（limit 10 也要搬一批 4 KiB 的
-%% 块），而且 libbitcask ≤ 12.0.1 的范围迭代器在每次写之后要重排整个未落盘的内存
-%% 增量，耗时随库里未落盘的行数涨（libbitcask feedbacks/2026-11-23-range-iter-
-%% after-write-resorts-memdelta.md，12.0.2 已修）；点读与这两样都无关。
-%% 目录里有、盘上读不到的块按空处理：这条路是弱一致读（头与块分次读，中间可能
-%% 插进一次删块 / 分裂）；要原子快照用 entries_guarded/5。
-read_chunks(_Io, _Vid, _D, _T, _Lbs, 0, Acc) ->
-    {ok, lists:append(lists:reverse(Acc))};
-read_chunks(_Io, _Vid, _D, _T, [], _Limit, Acc) ->
-    {ok, lists:append(lists:reverse(Acc))};
-read_chunks(Io, Vid, D, T, [Lb | Lbs], Limit, Acc) ->
-    Key = chunk_key(Vid, D, T, Lb),
-    case io_head(Io, Key) of
-        {ok, Bin, _Cond} ->
-            case decode_chunk(Bin) of
-                {ok, Es} ->
-                    Taken = take(Es, Limit),
-                    read_chunks(Io, Vid, D, T, Lbs, dec_limit(Limit, length(Taken)),
-                                [Taken | Acc]);
-                error ->
-                    {error, {bad_adj_chunk, Key}}
-            end;
-        {absent, _Cond} ->
-            read_chunks(Io, Vid, D, T, Lbs, Limit, Acc);
+rg_groups(_Io, _Vid, _Sel, 0, _Mode, _Guard, Acc, Checks) ->
+    {ok, Acc, Checks};
+rg_groups(_Io, _Vid, [], _Limit, _Mode, _Guard, Acc, Checks) ->
+    {ok, Acc, Checks};
+rg_groups(Io, Vid, [{_D, T, F, C, {inline, Body}} | Sel], Limit, Mode, Guard, Acc, Checks) ->
+    case dec_body(Mode, T, F, C, Body) of
+        {ok, L} when Limit =:= infinity ->
+            rg_groups(Io, Vid, Sel, infinity, Mode, Guard, [L | Acc], Checks);
+        {ok, L0} ->
+            L = lists:sublist(L0, Limit),
+            rg_groups(Io, Vid, Sel, Limit - length(L), Mode, Guard, [L | Acc], Checks);
+        error ->
+            {error, {bad_adj, Vid}}
+    end;
+rg_groups(Io, Vid, [{D, T, F, _C, {chunks, Dir}} | Sel], Limit, Mode, Guard, Acc, Checks) ->
+    case rg_chunks(Io, Vid, D, T, Dir, Limit, Mode, Guard, [], 0, Checks) of
+        {ok, Parts, N, Checks2} ->
+            %% 分块的带 rank 组取 id：同一对端的多条 rank 可能跨块相邻，整组拼好再去一遍。
+            Acc2 = case Mode =:= ids andalso F band ?F_RANK =/= 0 of
+                       true  -> [adj_dedupe(lists:append(lists:reverse(Parts))) | Acc];
+                       false -> Parts ++ Acc
+                   end,
+            rg_groups(Io, Vid, Sel, dec_limit(Limit, N), Mode, Guard, Acc2, Checks2);
         {error, _} = E ->
             E
     end.
 
-take(L, infinity) -> L;
-take(L, N)        -> lists:sublist(L, N).
+%% 一个分块组：按头的块目录逐块点读（块序 = 下界序 = 条目序），Limit 到了就停。
+%% 直通与事务同一条路：事务里经事务缓冲、点锁（持有头的锁即覆盖它名下全部块，§8），
+%% 不拿前缀锁。不走前缀 range：range 一次往返按批取块（limit 10 也要搬一批 4 KiB 的
+%% 块），而且 libbitcask ≤ 12.0.1 的范围迭代器在每次写之后要重排整个未落盘的内存
+%% 增量（libbitcask feedbacks/2026-11-23-range-iter-after-write-resorts-memdelta.md，
+%% 12.0.2 已修）。
+%% 目录里有、盘上读不到的块按空处理：这条路是弱一致读（头与块分次读，中间可能插进
+%% 一次删块 / 分裂）；Guard = true 时把它记成 absent 条件，由调用方在写锁下校验。
+rg_chunks(_Io, _Vid, _D, _T, _Dir, 0, _Mode, _Guard, Acc, N, Checks) ->
+    {ok, Acc, N, Checks};
+rg_chunks(_Io, _Vid, _D, _T, <<>>, _Limit, _Mode, _Guard, Acc, N, Checks) ->
+    {ok, Acc, N, Checks};
+rg_chunks(Io, Vid, D, T, <<O:64/big, R:64/big, Dir/binary>>, Limit, Mode, Guard, Acc, N, Checks) ->
+    Key = chunk_key(Vid, D, T, {O, R}),
+    case io_head(Io, Key) of
+        {ok, <<?VER:8, CF:8, CC:32/big, Body/binary>>, Cond} ->
+            case dec_body(Mode, T, CF, CC, Body) of
+                {ok, L} when Limit =:= infinity ->
+                    rg_chunks(Io, Vid, D, T, Dir, infinity, Mode, Guard,
+                              [L | Acc], N, [{check, Key, Cond} || Guard] ++ Checks);
+                {ok, L0} ->
+                    L = lists:sublist(L0, Limit),
+                    K = length(L),
+                    rg_chunks(Io, Vid, D, T, Dir, Limit - K, Mode, Guard,
+                              [L | Acc], N + K, [{check, Key, Cond} || Guard] ++ Checks);
+                error ->
+                    {error, {bad_adj_chunk, Key}}
+            end;
+        {ok, _Bad, _Cond} ->
+            {error, {bad_adj_chunk, Key}};
+        {absent, Cond} ->
+            rg_chunks(Io, Vid, D, T, Dir, Limit, Mode, Guard, Acc, N,
+                      [{check, Key, Cond} || Guard] ++ Checks);
+        {error, _} = E ->
+            E
+    end.
+
+%% 头二进制 → 选中的组 [{Dir, Etype, Flags, Count, {inline, Body} | {chunks, DirBin}}]
+%% （头里的顺序 = (Dir, Etype) 升序）。没选中的组只算字节数跳过；结构校验与
+%% decode_head/1 同口径（版本、组序、Dir、Count、长度、块 0 下界、无尾随字节）。
+sel_groups(<<?VER:8, N:16/big, Rest/binary>>, DirSel, Etype) ->
+    sel_groups(N, Rest, undefined, DirSel, Etype, []);
+sel_groups(_, _DirSel, _Etype) ->
+    error.
+
+sel_groups(0, <<>>, _Prev, _DirSel, _Etype, Acc) ->
+    {ok, lists:reverse(Acc)};
+sel_groups(0, _Trailing, _Prev, _DirSel, _Etype, _Acc) ->
+    error;
+sel_groups(N, <<D:8, F:8, T:32/big, C:64/big, Rest/binary>>, Prev, DirSel, Etype, Acc)
+  when D =< 1, C > 0, (Prev =:= undefined orelse {D, T} > Prev) ->
+    Want = (DirSel =:= both orelse D =:= DirSel)
+        andalso (Etype =:= undefined orelse T =:= Etype),
+    case F band ?F_CHUNKED of
+        0 ->
+            case split_body(Rest, C, F) of
+                {ok, Body, Rest2} ->
+                    Acc2 = case Want of
+                               true  -> [{D, T, F, C, {inline, Body}} | Acc];
+                               false -> Acc
+                           end,
+                    sel_groups(N - 1, Rest2, {D, T}, DirSel, Etype, Acc2);
+                error ->
+                    error
+            end;
+        _ ->
+            case Rest of
+                <<NC:32/big, Dir:(NC * 16)/binary, Rest2/binary>> when NC > 0 ->
+                    case Dir of
+                        <<0:64, 0:64, _/binary>> ->
+                            Acc2 = case Want of
+                                       true  -> [{D, T, F band (?F_RANK bor ?F_PROPS), C,
+                                                  {chunks, Dir}} | Acc];
+                                       false -> Acc
+                                   end,
+                            sel_groups(N - 1, Rest2, {D, T}, DirSel, Etype, Acc2);
+                        _ ->
+                            error
+                    end;
+                _ ->
+                    error
+            end
+    end;
+sel_groups(_N, _Bin, _Prev, _DirSel, _Etype, _Acc) ->
+    error.
+
+%% 内联组的条目区：定宽组直接按 Count × 宽度切；带属性的要走一遍才知道多长。
+split_body(Bin, C, F) when F band ?F_PROPS =:= 0 ->
+    W = entry_width(F),
+    case Bin of
+        <<Body:(C * W)/binary, Rest/binary>> -> {ok, Body, Rest};
+        _                                    -> error
+    end;
+split_body(Bin, C, F) ->
+    case skip_prop_entries(Bin, C, F band ?F_RANK =/= 0) of
+        {ok, Rest} ->
+            Len = byte_size(Bin) - byte_size(Rest),
+            {ok, binary:part(Bin, 0, Len), Rest};
+        error ->
+            error
+    end.
+
+skip_prop_entries(Rest, 0, _HasRank) -> {ok, Rest};
+skip_prop_entries(<<_:128, ?PEXT:16/big, Rest/binary>>, N, true) ->
+    skip_prop_entries(Rest, N - 1, true);
+skip_prop_entries(<<_:128, L:16/big, _:L/binary, Rest/binary>>, N, true) ->
+    skip_prop_entries(Rest, N - 1, true);
+skip_prop_entries(<<_:64, ?PEXT:16/big, Rest/binary>>, N, false) ->
+    skip_prop_entries(Rest, N - 1, false);
+skip_prop_entries(<<_:64, L:16/big, _:L/binary, Rest/binary>>, N, false) ->
+    skip_prop_entries(Rest, N - 1, false);
+skip_prop_entries(_, _N, _HasRank) -> error.
+
+entry_width(F) -> case F band ?F_RANK of 0 -> 8; _ -> 16 end.
+
+%% 一段条目区（恰好 Count 条，不多不少）→ 调用方要的形态。定宽组一遍 binary
+%% comprehension 直接出结果；带属性的先解成条目再转。
+%%   tuples          [{Etype, O, R, P}]
+%%   {maps, Vid, 0}  出边 map；{maps, Vid, 1} 入边 map
+%%   ids             [O]（带 rank 的组去掉相邻重复）
+dec_body(Mode, T, F, C, Body) when F band ?F_PROPS =:= 0 ->
+    W = entry_width(F),
+    case byte_size(Body) =:= C * W of
+        false -> error;
+        true  -> {ok, dec_fixed(Mode, T, W, Body)}
+    end;
+dec_body(Mode, T, F, C, Body) ->
+    case dec_prop_entries(Body, C, F band ?F_RANK =/= 0, []) of
+        {ok, Es, <<>>} ->
+            {ok, case Mode of
+                     tuples ->
+                         [{T, O, R, P} || {O, R, P} <- Es];
+                     {maps, V, 0} ->
+                         [#{src => V, etype => T, dst => O, rank => R, props => P}
+                          || {O, R, P} <- Es];
+                     {maps, V, 1} ->
+                         [#{dst => V, etype => T, src => O, rank => R, props => <<>>}
+                          || {O, R, _P} <- Es];
+                     ids ->
+                         adj_dedupe([O || {O, _R, _P} <- Es])
+                 end};
+        _ ->
+            error
+    end.
+
+dec_fixed(tuples, T, 8, Body)  -> [{T, O, 0, <<>>} || <<O:64/big>> <= Body];
+dec_fixed(tuples, T, 16, Body) -> [{T, O, R, <<>>} || <<O:64/big, R:64/big>> <= Body];
+dec_fixed({maps, V, 0}, T, 8, Body) ->
+    [#{src => V, etype => T, dst => O, rank => 0, props => <<>>} || <<O:64/big>> <= Body];
+dec_fixed({maps, V, 0}, T, 16, Body) ->
+    [#{src => V, etype => T, dst => O, rank => R, props => <<>>}
+     || <<O:64/big, R:64/big>> <= Body];
+dec_fixed({maps, V, 1}, T, 8, Body) ->
+    [#{dst => V, etype => T, src => O, rank => 0, props => <<>>} || <<O:64/big>> <= Body];
+dec_fixed({maps, V, 1}, T, 16, Body) ->
+    [#{dst => V, etype => T, src => O, rank => R, props => <<>>}
+     || <<O:64/big, R:64/big>> <= Body];
+dec_fixed(ids, _T, 8, Body)  -> [O || <<O:64/big>> <= Body];
+dec_fixed(ids, _T, 16, Body) -> adj_dedupe([O || <<O:64/big, _R:64>> <= Body]).
+
+%% 去掉相邻重复（条目按 (O, R) 升序，同一个 O 的多条 rank 相邻）。
+adj_dedupe([X | [X | _] = T]) -> adj_dedupe(T);
+adj_dedupe([X | T])           -> [X | adj_dedupe(T)];
+adj_dedupe([])                -> [].
 
 dec_limit(infinity, _) -> infinity;
 dec_limit(N, K)        -> max(0, N - K).
 
-%% 点查一条条目：{ok, Props} | not_found | {error, _}。
+%% 点查一条条目：{ok, Props} | not_found | {error, _}。只挑出那一组；内联组在条目区
+%% 上找，分块组在块目录上二分出所在的块、再点读那一块。
 lookup(Io, Vid, Dir, Etype, Other, Rank) ->
-    case load(Io, Vid) of
+    case io_head(Io, head_key(Vid)) of
         {error, _} = E -> E;
-        {ok, Vs} ->
-            case get_entry(Io, Vs, Dir, Etype, Other, Rank) of
-                {ok, none, _}  -> not_found;
-                {ok, P, _}     -> {ok, P};
-                {error, _} = E -> E
+        {absent, _}    -> not_found;
+        {ok, Bin, _} ->
+            case sel_groups(Bin, Dir, Etype) of
+                error    -> {error, {bad_adj, Vid}};
+                {ok, []} -> not_found;
+                {ok, [{_, _, F, C, {inline, Body}}]} ->
+                    case find_in_body(F, C, Body, Other, Rank) of
+                        error -> {error, {bad_adj, Vid}};
+                        Res   -> Res
+                    end;
+                {ok, [{_, _, _F, _C, {chunks, DirBin}}]} ->
+                    Key = chunk_key(Vid, Dir, Etype, locate_lb(DirBin, {Other, Rank})),
+                    case io_head(Io, Key) of
+                        {ok, <<?VER:8, CF:8, CC:32/big, Body/binary>>, _} ->
+                            case find_in_body(CF, CC, Body, Other, Rank) of
+                                error -> {error, {bad_adj_chunk, Key}};
+                                Res   -> Res
+                            end;
+                        {ok, _, _}     -> {error, {bad_adj_chunk, Key}};
+                        {absent, _}    -> not_found;
+                        {error, _} = E -> E
+                    end
             end
     end.
 
-%% 各组的 {Dir, Etype, Count}。
+%% {ok, Props} | not_found | error
+find_in_body(F, C, Body, O, R) when F band ?F_PROPS =:= 0 ->
+    W = entry_width(F),
+    case byte_size(Body) =:= C * W of
+        false -> error;
+        true when W =:= 8, R =/= 0 -> not_found;
+        true ->
+            case bsearch_fixed(Body, W, 0, C, O, R) of
+                true  -> {ok, <<>>};
+                false -> not_found
+            end
+    end;
+find_in_body(F, C, Body, O, R) ->
+    case dec_prop_entries(Body, C, F band ?F_RANK =/= 0, []) of
+        {ok, Es, <<>>} ->
+            case ent_find(Es, O, R) of
+                {ok, P} -> {ok, P};
+                none    -> not_found
+            end;
+        _ ->
+            error
+    end.
+
+%% 定宽条目区 [Lo, Hi) 上二分找 (O, R)。
+bsearch_fixed(_Body, _W, Lo, Hi, _O, _R) when Lo >= Hi -> false;
+bsearch_fixed(Body, W, Lo, Hi, O, R) ->
+    Mid = (Lo + Hi) div 2,
+    K = case W of
+            8  -> <<_:(Mid * 8)/binary, MO:64/big, _/binary>> = Body, {MO, 0};
+            16 -> <<_:(Mid * 16)/binary, MO:64/big, MR:64/big, _/binary>> = Body, {MO, MR}
+        end,
+    if K =:= {O, R} -> true;
+       K < {O, R}   -> bsearch_fixed(Body, W, Mid + 1, Hi, O, R);
+       true         -> bsearch_fixed(Body, W, Lo, Mid, O, R)
+    end.
+
+%% 各组的 {Dir, Etype, Count}：只读各组的头，不解条目。
 counts(Io, Vid) ->
-    case load(Io, Vid) of
+    case io_head(Io, head_key(Vid)) of
         {error, _} = E -> E;
-        {ok, Vs}       -> {ok, [{D, T, C} || #grp{dir = D, etype = T, count = C} <- Vs#vs.groups]}
+        {absent, _}    -> {ok, []};
+        {ok, Bin, _} ->
+            case sel_groups(Bin, both, undefined) of
+                {ok, Sel} -> {ok, [{D, T, C} || {D, T, _F, C, _Body} <- Sel]};
+                error     -> {error, {bad_adj, Vid}}
+            end
     end.
 
 %% =========================================================================
@@ -483,8 +700,13 @@ load(Io, Vid) ->
     end.
 
 chunk_keys_of(Vid, Gs) ->
-    maps:from_list([{chunk_key(Vid, D, T, Lb), true}
-                    || #grp{dir = D, etype = T, body = {chunks, Lbs}} <- Gs, Lb <- Lbs]).
+    maps:from_list([{chunk_key(Vid, D, T, {O, R}), true}
+                    || #grp{dir = D, etype = T, body = {chunks, Dir}} <- Gs,
+                       <<O:64/big, R:64/big>> <= Dir]).
+
+%% 块目录：二进制 ⟷ 下界列表（只在目录要变 / 要整组遍历时才展开）。
+dir_lbs(Dir) -> [{O, R} || <<O:64/big, R:64/big>> <= Dir].
+lbs_dir(Lbs) -> << <<O:64/big, R:64/big>> || {O, R} <- Lbs >>.
 
 find_group([#grp{dir = D, etype = T} = G | _], D, T) -> {ok, G};
 find_group([_ | Gs], D, T) -> find_group(Gs, D, T);
@@ -503,31 +725,59 @@ store_group(Gs, _Key, G, Acc) ->
 drop_group(Gs, D, T) ->
     [G || #grp{dir = D2, etype = T2} = G <- Gs, {D2, T2} =/= {D, T}].
 
-%% 有序条目表上的查 / 写 / 删（按 (O, R)）。
+%% 有序条目列表上的查找（按 (O, R)）。
 ent_find([{O, R, P} | _], O, R) -> {ok, P};
 ent_find([{O2, R2, _} | Es], O, R) when {O2, R2} < {O, R} -> ent_find(Es, O, R);
 ent_find(_, _O, _R) -> none.
 
-ent_put(Es, {O, R, _} = E) -> ent_put(Es, O, R, E, []).
+%% ---- 条目表 elist()：列表或拉链（类型说明见文件头的 -type）----
 
-ent_put([{O, R, Old} | Es], O, R, E, Acc) ->
-    {Old, lists:reverse(Acc, [E | Es])};
-ent_put([{O2, R2, _} = H | Es], O, R, E, Acc) when {O2, R2} < {O, R} ->
-    ent_put(Es, O, R, E, [H | Acc]);
-ent_put(Es, _O, _R, E, Acc) ->
-    {none, lists:reverse(Acc, [E | Es])}.
+e_list({z, L, R})         -> lists:reverse(L, R);
+e_list(L) when is_list(L) -> L.
 
-ent_del(Es, O, R) -> ent_del(Es, O, R, []).
+e_empty([])           -> true;
+e_empty({z, [], []})  -> true;
+e_empty(_)            -> false.
 
-ent_del([{O, R, Old} | Es], O, R, Acc) -> {Old, lists:reverse(Acc, Es)};
-ent_del([{O2, R2, _} = H | Es], O, R, Acc) when {O2, R2} < {O, R} ->
-    ent_del(Es, O, R, [H | Acc]);
-ent_del(Es, _O, _R, Acc) -> {none, lists:reverse(Acc, Es)}.
+%% 把游标移到 Key：返回 {RevLeft, Right}，RevLeft 全部 < Key ≤ Right 的首条。
+%% 从上次停的位置接着走——升序的一串操作摊下来每次 O(1)。
+e_seek({z, [{O, R, _} | _] = L, Rt}, K) when {O, R} >= K -> z_back(L, Rt, K);
+e_seek({z, L, Rt}, K)                                     -> z_fwd(L, Rt, K);
+e_seek(L, K) when is_list(L)                              -> z_fwd([], L, K).
 
-%% 下界表里最后一个 ≤ Key 的下界（块 0 恒为 (0, 0)，必有）。
-locate_lb([Lb | Lbs], Key) -> locate_lb(Lbs, Key, Lb).
-locate_lb([Lb | Lbs], Key, _Cur) when Lb =< Key -> locate_lb(Lbs, Key, Lb);
-locate_lb(_, _Key, Cur) -> Cur.
+z_fwd(L, [{O, R, _} = H | T], K) when {O, R} < K -> z_fwd([H | L], T, K);
+z_fwd(L, Rt, _K)                                 -> {L, Rt}.
+
+z_back([{O, R, _} = H | T], Rt, K) when {O, R} >= K -> z_back(T, [H | Rt], K);
+z_back(L, Rt, _K)                                   -> {L, Rt}.
+
+%% upsert：{Old | none, Es'}。一次定位同时完成「查原值」和「写入」。
+ent_put(Es, {O, R, _} = E) ->
+    case e_seek(Es, {O, R}) of
+        {L, [{O, R, Old} | T]} -> {Old, {z, L, [E | T]}};
+        {L, Rt}                -> {none, {z, L, [E | Rt]}}
+    end.
+
+%% {Old, Es'} | {none, Es}（不存在时原样返回）。
+ent_del(Es, O, R) ->
+    case e_seek(Es, {O, R}) of
+        {L, [{O, R, Old} | T]} -> {Old, {z, L, T}};
+        _                      -> {none, Es}
+    end.
+
+%% 块目录（二进制）里最后一个 ≤ Key 的下界：二分。块 0 恒为 (0, 0)，必有。
+locate_lb(Dir, Key) -> locate_lb(Dir, 0, byte_size(Dir) div 16, Key).
+
+locate_lb(Dir, Lo, Hi, _Key) when Hi - Lo =< 1 ->
+    <<_:(Lo * 16)/binary, O:64/big, R:64/big, _/binary>> = Dir,
+    {O, R};
+locate_lb(Dir, Lo, Hi, Key) ->
+    Mid = (Lo + Hi) div 2,
+    <<_:(Mid * 16)/binary, O:64/big, R:64/big, _/binary>> = Dir,
+    case {O, R} =< Key of
+        true  -> locate_lb(Dir, Mid, Hi, Key);
+        false -> locate_lb(Dir, Lo, Mid, Key)
+    end.
 
 %% 读块（会话内缓存），带版本：直通记进 rconds（提交时作条件），事务经
 %% read_guarded 由 bitcask_txn 登记。块 key 缺失按空块处理并标脏（自愈成真实
@@ -563,24 +813,8 @@ set_chunk(#vs{chunks = Cs, dirty = Dy, dels = Ds} = Vs, Key, Es) ->
 del_chunk(#vs{chunks = Cs, dirty = Dy, dels = Ds} = Vs, Key) ->
     Vs#vs{chunks = maps:remove(Key, Cs), dirty = maps:remove(Key, Dy), dels = Ds#{Key => true}}.
 
-%% {ok, Props | none, Vs'} | {error, _}
-get_entry(Io, #vs{vid = Vid, groups = Gs} = Vs, Dir, T, O, R) ->
-    case find_group(Gs, Dir, T) of
-        none -> {ok, none, Vs};
-        {ok, #grp{body = {entries, Es}}} ->
-            {ok, found(ent_find(Es, O, R)), Vs};
-        {ok, #grp{body = {chunks, Lbs}}} ->
-            Key = chunk_key(Vid, Dir, T, locate_lb(Lbs, {O, R})),
-            case get_chunk(Io, Vs, Key) of
-                {ok, Es, Vs1}  -> {ok, found(ent_find(Es, O, R)), Vs1};
-                {error, _} = E -> E
-            end
-    end.
-
-found({ok, P}) -> P;
-found(none)    -> none.
-
-%% upsert：{ok, Old | none, Vs'} | {error, _}
+%% upsert：{ok, Old | none | same, Vs'} | {error, _}。
+%% same = 条目原样已在（同样的内联属性）：不改、不标脏（外置属性恒重写）。
 put_entry(Io, #vs{vid = Vid, groups = Gs} = Vs, Dir, T, O, R, P) ->
     E = {O, R, P},
     case find_group(Gs, Dir, T) of
@@ -588,17 +822,25 @@ put_entry(Io, #vs{vid = Vid, groups = Gs} = Vs, Dir, T, O, R, P) ->
             G = #grp{dir = Dir, etype = T, count = 1, body = {entries, [E]}},
             {ok, none, touch(Vs#vs{groups = store_group(Gs, G)})};
         {ok, #grp{count = C, body = {entries, Es}} = G} ->
-            {Old, Es2} = ent_put(Es, E),
-            G2 = G#grp{count = C + new(Old), body = {entries, Es2}},
-            {ok, Old, touch(Vs#vs{groups = store_group(Gs, G2)})};
-        {ok, #grp{count = C, flags = F, body = {chunks, Lbs}} = G} ->
-            Key = chunk_key(Vid, Dir, T, locate_lb(Lbs, {O, R})),
+            case ent_put(Es, E) of
+                {P, _} when P =/= ext ->
+                    {ok, same, Vs};
+                {Old, Es2} ->
+                    G2 = G#grp{count = C + new(Old), body = {entries, Es2}},
+                    {ok, Old, touch(Vs#vs{groups = store_group(Gs, G2)})}
+            end;
+        {ok, #grp{count = C, flags = F, body = {chunks, Dirb}} = G} ->
+            Key = chunk_key(Vid, Dir, T, locate_lb(Dirb, {O, R})),
             case get_chunk(Io, Vs, Key) of
                 {ok, Es, Vs1} ->
-                    {Old, Es2} = ent_put(Es, E),
-                    G2 = G#grp{count = C + new(Old), flags = F bor flags_of([E])},
-                    Vs2 = set_chunk(Vs1#vs{groups = store_group(Gs, G2)}, Key, Es2),
-                    {ok, Old, touch(Vs2)};
+                    case ent_put(Es, E) of
+                        {P, _} when P =/= ext ->
+                            {ok, same, Vs1};
+                        {Old, Es2} ->
+                            G2 = G#grp{count = C + new(Old), flags = F bor flags_of([E])},
+                            Vs2 = set_chunk(Vs1#vs{groups = store_group(Gs, G2)}, Key, Es2),
+                            {ok, Old, touch(Vs2)}
+                    end;
                 {error, _} = Err ->
                     Err
             end
@@ -614,13 +856,17 @@ del_entry(Io, #vs{vid = Vid, groups = Gs} = Vs, Dir, T, O, R) ->
         {ok, #grp{count = C, body = {entries, Es}} = G} ->
             case ent_del(Es, O, R) of
                 {none, _} -> {ok, none, Vs};
-                {Old, []} -> {ok, Old, touch(Vs#vs{groups = drop_group(Gs, Dir, T)})};
                 {Old, Es2} ->
-                    G2 = G#grp{count = C - 1, body = {entries, Es2}},
-                    {ok, Old, touch(Vs#vs{groups = store_group(Gs, G2)})}
+                    case e_empty(Es2) of
+                        true ->
+                            {ok, Old, touch(Vs#vs{groups = drop_group(Gs, Dir, T)})};
+                        false ->
+                            G2 = G#grp{count = C - 1, body = {entries, Es2}},
+                            {ok, Old, touch(Vs#vs{groups = store_group(Gs, G2)})}
+                    end
             end;
-        {ok, #grp{count = C, body = {chunks, Lbs}} = G} ->
-            Key = chunk_key(Vid, Dir, T, locate_lb(Lbs, {O, R})),
+        {ok, #grp{count = C, body = {chunks, Dirb}} = G} ->
+            Key = chunk_key(Vid, Dir, T, locate_lb(Dirb, {O, R})),
             case get_chunk(Io, Vs, Key) of
                 {ok, Es, Vs1} ->
                     case ent_del(Es, O, R) of
@@ -640,41 +886,52 @@ touch(Vs) -> Vs#vs{touched = true}.
 %% 按组序（内联组整组、分块组逐块）读条目，直到「不同的对端顶点数 > MaxOthers」或
 %% 读完：{ok, [{Dir, Etype, O, R, P}], Complete, Vs'} | {error, _}。Complete = 该顶点
 %% 的条目已全部读到。MaxOthers = infinity 读全部。对端不计 Vid 自己（自环）。
+%% 块目录边走边读（不先展开成列表）：hub 分轮删除时每轮只碰目录的开头几项。
 vs_first_entries(Io, #vs{vid = Vid, groups = Gs} = Vs, MaxOthers) ->
-    Units = lists:append([case Body of
-                              {entries, Es} -> [{D, T, {entries, Es}}];
-                              {chunks, Lbs} -> [{D, T, {chunk, Lb}} || Lb <- Lbs]
-                          end || #grp{dir = D, etype = T, body = Body} <- Gs]),
-    vs_first_units(Io, Vs, Vid, Units, MaxOthers, #{}, []).
+    vs_first_groups(Io, Vs, Vid, Gs, MaxOthers, #{}, []).
 
-vs_first_units(_Io, Vs, _Vid, [], _Max, _Seen, Acc) ->
+vs_first_groups(_Io, Vs, _Vid, [], _Max, _Seen, Acc) ->
     {ok, lists:append(lists:reverse(Acc)), true, Vs};
-vs_first_units(_Io, Vs, _Vid, _Units, Max, Seen, Acc) when is_integer(Max), map_size(Seen) > Max ->
+vs_first_groups(_Io, Vs, _Vid, _Gs, Max, Seen, Acc) when is_integer(Max), map_size(Seen) > Max ->
     {ok, lists:append(lists:reverse(Acc)), false, Vs};
-vs_first_units(Io, Vs, Vid, [{D, T, Unit} | Units], Max, Seen, Acc) ->
-    Res = case Unit of
-              {entries, Es0} -> {ok, Es0, Vs};
-              {chunk, Lb}    -> get_chunk(Io, Vs, chunk_key(Vid, D, T, Lb))
-          end,
-    case Res of
-        {error, _} = E -> E;
-        {ok, Es, Vs1} ->
-            Seen1 = lists:foldl(fun({O, _R, _P}, M) when O =/= Vid -> M#{O => true};
-                                   (_, M) -> M
-                                end, Seen, Es),
-            vs_first_units(Io, Vs1, Vid, Units, Max, Seen1,
-                           [[{D, T, O, R, P} || {O, R, P} <- Es] | Acc])
+vs_first_groups(Io, Vs, Vid, [#grp{dir = D, etype = T, body = {entries, Es0}} | Gs], Max, Seen, Acc) ->
+    Es = e_list(Es0),
+    vs_first_groups(Io, Vs, Vid, Gs, Max, seen_others(Es, Vid, Seen),
+                    [[{D, T, O, R, P} || {O, R, P} <- Es] | Acc]);
+vs_first_groups(Io, Vs, Vid, [#grp{dir = D, etype = T, body = {chunks, Dirb}} | Gs], Max, Seen, Acc) ->
+    case vs_first_chunks(Io, Vs, Vid, D, T, Dirb, Max, Seen, Acc) of
+        {more, Vs1, Seen1, Acc1} -> vs_first_groups(Io, Vs1, Vid, Gs, Max, Seen1, Acc1);
+        {stop, Vs1, Acc1}        -> {ok, lists:append(lists:reverse(Acc1)), false, Vs1};
+        {error, _} = E           -> E
     end.
 
-%% 各块逆序攒起来最后拼一次（以前每块 `Acc ++ Es`，块数 × 条目数的拷贝）。
-load_group_chunks(Io, Vs0, Vid, D, T, Lbs) ->
+vs_first_chunks(_Io, Vs, _Vid, _D, _T, <<>>, _Max, Seen, Acc) ->
+    {more, Vs, Seen, Acc};
+vs_first_chunks(_Io, Vs, _Vid, _D, _T, _Dirb, Max, Seen, Acc) when is_integer(Max), map_size(Seen) > Max ->
+    {stop, Vs, Acc};
+vs_first_chunks(Io, Vs, Vid, D, T, <<LO:64/big, LR:64/big, Dirb/binary>>, Max, Seen, Acc) ->
+    case get_chunk(Io, Vs, chunk_key(Vid, D, T, {LO, LR})) of
+        {error, _} = E -> E;
+        {ok, Es0, Vs1} ->
+            Es = e_list(Es0),
+            vs_first_chunks(Io, Vs1, Vid, D, T, Dirb, Max, seen_others(Es, Vid, Seen),
+                            [[{D, T, O, R, P} || {O, R, P} <- Es] | Acc])
+    end.
+
+seen_others(Es, Vid, Seen) ->
+    lists:foldl(fun({O, _R, _P}, M) when O =/= Vid -> M#{O => true};
+                   (_, M) -> M
+                end, Seen, Es).
+
+%% 一个分块组的全部条目。各块逆序攒起来最后拼一次。
+load_group_chunks(Io, Vs0, Vid, D, T, Dirb) ->
     Res = lists:foldl(fun(_Lb, {error, _} = E) -> E;
                          (Lb, {ok, Acc, Vs}) ->
                               case get_chunk(Io, Vs, chunk_key(Vid, D, T, Lb)) of
-                                  {ok, Es, Vs2}  -> {ok, [Es | Acc], Vs2};
+                                  {ok, Es, Vs2}  -> {ok, [e_list(Es) | Acc], Vs2};
                                   {error, _} = E -> E
                               end
-                      end, {ok, [], Vs0}, Lbs),
+                      end, {ok, [], Vs0}, dir_lbs(Dirb)),
     case Res of
         {ok, Acc, Vs} -> {ok, lists:append(lists:reverse(Acc)), Vs};
         {error, _} = E -> E
@@ -685,7 +942,24 @@ load_group_chunks(Io, Vs0, Vid, D, T, Lbs) ->
 %% =========================================================================
 
 %% {ok, Ops, Vs'} | {error, _}
-finalize(Io, #vs{touched = false} = Vs, Cfg) ->
+finalize(Io, Vs, Cfg) ->
+    finalize_1(Io, flatten(Vs), Cfg).
+
+%% 会话里的拉链统一拍平成列表（只有 touched 的组 / dirty 的块会是拉链）。
+flatten(#vs{groups = Gs, chunks = Cs, dirty = Dy} = Vs) ->
+    Gs2 = [case G of
+               #grp{body = {entries, {z, _, _} = Z}} -> G#grp{body = {entries, e_list(Z)}};
+               _ -> G
+           end || G <- Gs],
+    Cs2 = maps:fold(fun(K, _, A) ->
+                            case A of
+                                #{K := {z, _, _} = Z} -> A#{K := e_list(Z)};
+                                _ -> A
+                            end
+                    end, Cs, Dy),
+    Vs#vs{groups = Gs2, chunks = Cs2}.
+
+finalize_1(Io, #vs{touched = false} = Vs, Cfg) ->
     %% all_entries/2、first_entries/3 只读（用于 del_vertex）也可能修复过 chunk 状态：读非块 0
     %% 的空块时会把“头目录里有、盘上没有”的块补成真实空块并标脏。此时头尚未
     %% 被标 touched，仍必须把这类自愈块提交，否则下次读到坏块。
@@ -705,9 +979,9 @@ finalize(Io, #vs{touched = false} = Vs, Cfg) ->
                     end
             end
     end;
-finalize(_Io, #vs{vid = Vid, groups = Gs}, _Cfg) when length(Gs) > 16#FFFF ->
+finalize_1(_Io, #vs{vid = Vid, groups = Gs}, _Cfg) when length(Gs) > 16#FFFF ->
     {error, {too_many_groups, Vid}};
-finalize(Io, Vs0, Cfg) ->
+finalize_1(Io, Vs0, Cfg) ->
     Vs1 = normalize_chunked(Vs0, Cfg),
     case unchunk_small(Io, Vs1, Cfg) of
         {error, _} = E -> E;
@@ -722,44 +996,54 @@ normalize_chunked(#vs{groups = Gs} = Vs0, Cfg) ->
                    (_, Vs) -> Vs
                 end, Vs0, Gs).
 
-normalize_group(#grp{dir = D, etype = T, count = 0, body = {chunks, Lbs}}, #vs{vid = Vid} = Vs, _Cfg) ->
-    Vs1 = lists:foldl(fun(Lb, A) -> del_chunk(A, chunk_key(Vid, D, T, Lb)) end, Vs, Lbs),
+normalize_group(#grp{dir = D, etype = T, count = 0, body = {chunks, Dirb}}, #vs{vid = Vid} = Vs, _Cfg) ->
+    Vs1 = lists:foldl(fun(Lb, A) -> del_chunk(A, chunk_key(Vid, D, T, Lb)) end, Vs, dir_lbs(Dirb)),
     Vs1#vs{groups = drop_group(Vs1#vs.groups, D, T)};
-normalize_group(#grp{dir = D, etype = T, count = C, body = {chunks, Lbs}} = G,
+normalize_group(#grp{dir = D, etype = T, count = C, body = {chunks, Dirb}} = G,
                 #vs{vid = Vid} = Vs0, Cfg) ->
+    %% 只看本组里改过的块（从 dirty 表反查），不遍历整个块目录；目录只在有块被删 /
+    %% 分裂时才展开重建——hub 上绝大多数写只改一两个块的内容，目录原样复用。
+    Mine = lists:sort([Lb || K <- maps:keys(Vs0#vs.dirty),
+                             {ok, V, D2, T2, Lb} <- [parse_chunk_key(K)],
+                             V =:= Vid, D2 =:= D, T2 =:= T]),
     Max = eff_chunk_max(C, Cfg),
-    {Lbs2, Vs2} =
+    {Changes, Vs2} =
         lists:foldl(
-          fun(Lb, {AccLbs, Vs}) ->
+          fun(Lb, {Ch, Vs}) ->
                   Key = chunk_key(Vid, D, T, Lb),
-                  case maps:is_key(Key, Vs#vs.dirty) of
-                      false ->
-                          {[Lb | AccLbs], Vs};
-                      true ->
-                          Es = maps:get(Key, Vs#vs.chunks),
-                          case Es of
-                              [] when Lb =/= ?LB0 ->
-                                  {AccLbs, del_chunk(Vs, Key)};
-                              _ ->
-                                  case split_balanced(Es, Max) of
-                                      [_] ->
-                                          {[Lb | AccLbs], Vs};
-                                      [First | More] ->
-                                          VsA = set_chunk(Vs, Key, First),
-                                          {NewLbs, VsB} =
-                                              lists:foldl(
-                                                fun([{O, R, _} | _] = Piece, {L, VV}) ->
-                                                        NLb = {O, R},
-                                                        {[NLb | L],
-                                                         set_chunk(VV, chunk_key(Vid, D, T, NLb), Piece)}
-                                                end, {[], VsA}, More),
-                                          {NewLbs ++ [Lb | AccLbs], VsB}
-                                  end
+                  case maps:get(Key, Vs#vs.chunks) of
+                      [] when Lb =/= ?LB0 ->
+                          {[{Lb, remove} | Ch], del_chunk(Vs, Key)};
+                      Es ->
+                          case split_balanced(Es, Max) of
+                              [_] ->
+                                  {Ch, Vs};
+                              [First | More] ->
+                                  VsA = set_chunk(Vs, Key, First),
+                                  {NewLbsR, VsB} =
+                                      lists:foldl(
+                                        fun([{O, R, _} | _] = Piece, {L, VV}) ->
+                                                NLb = {O, R},
+                                                {[NLb | L],
+                                                 set_chunk(VV, chunk_key(Vid, D, T, NLb), Piece)}
+                                        end, {[], VsA}, More),
+                                  {[{Lb, {add, lists:reverse(NewLbsR)}} | Ch], VsB}
                           end
                   end
-          end, {[], Vs0}, Lbs),
-    G2 = G#grp{body = {chunks, lists:reverse(Lbs2)}},
-    Vs2#vs{groups = store_group(Vs2#vs.groups, G2)}.
+          end, {[], Vs0}, Mine),
+    case Changes of
+        [] ->
+            Vs2;
+        _ ->
+            M = maps:from_list(Changes),
+            Lbs2 = lists:append([case maps:find(Lb, M) of
+                                     error            -> [Lb];
+                                     {ok, remove}     -> [];
+                                     {ok, {add, New}} -> [Lb | New]
+                                 end || Lb <- dir_lbs(Dirb)]),
+            G2 = G#grp{body = {chunks, lbs_dir(Lbs2)}},
+            Vs2#vs{groups = store_group(Vs2#vs.groups, G2)}
+    end.
 
 %% 单块值上限：超大组放宽到 组字节 / 1024，让块目录保持在约 1024 项内（§4.3）。
 eff_chunk_max(Count, #{chunk_max := CM}) ->
@@ -795,13 +1079,13 @@ unchunk_small(Io, #vs{groups = Gs} = Vs0, #{inline_max := IM}) ->
     Thresh = IM div 4,
     lists:foldl(
       fun(_G, {error, _} = E) -> E;
-         (#grp{dir = D, etype = T, count = C, flags = F, body = {chunks, Lbs}} = G, {ok, Vs}) ->
+         (#grp{dir = D, etype = T, count = C, flags = F, body = {chunks, Dirb}} = G, {ok, Vs}) ->
               MinW = 8 + case F band ?F_RANK of 0 -> 0; _ -> 8 end
                        + case F band ?F_PROPS of 0 -> 0; _ -> 2 end,
               case C * MinW < Thresh of
                   false -> {ok, Vs};
                   true ->
-                      case load_group_chunks(Io, Vs, Vs#vs.vid, D, T, Lbs) of
+                      case load_group_chunks(Io, Vs, Vs#vs.vid, D, T, Dirb) of
                           {error, _} = E -> E;
                           {ok, Es, Vs1} ->
                               case body_size(Es) < Thresh of
@@ -810,7 +1094,7 @@ unchunk_small(Io, #vs{groups = Gs} = Vs0, #{inline_max := IM}) ->
                                       Vs2 = lists:foldl(
                                               fun(Lb, A) ->
                                                       del_chunk(A, chunk_key(Vs1#vs.vid, D, T, Lb))
-                                              end, Vs1, Lbs),
+                                              end, Vs1, dir_lbs(Dirb)),
                                       G2 = G#grp{flags = 0, body = {entries, Es}},
                                       {ok, Vs2#vs{groups = store_group(Vs2#vs.groups, G2)}}
                               end
@@ -821,14 +1105,16 @@ unchunk_small(Io, #vs{groups = Gs} = Vs0, #{inline_max := IM}) ->
 
 %% 头超过 inline_max → 把最大的内联组转为分块，直到放得下或没有可转的组
 %% （只转体积 > inline_max / 4 的组，与 unchunk_small 的门槛构成滞回）。
+%% 顺带把定稿的头编码记进 henc，emit_ops 直接用（以前量一次大小编一遍、写出时再编一遍）。
 chunk_oversized(#vs{groups = Gs} = Vs, #{inline_max := IM} = Cfg) ->
-    case byte_size(encode_head(Gs)) =< IM of
-        true -> Vs;
+    Enc = encode_head(Gs),
+    case byte_size(Enc) =< IM of
+        true -> Vs#vs{henc = Enc};
         false ->
             Cands = [{body_size(Es), G} || #grp{body = {entries, Es}} = G <- Gs,
                                            length(Es) >= 2],
             case [X || {Sz, _} = X <- Cands, Sz > IM div 4] of
-                [] -> Vs;
+                [] -> Vs#vs{henc = Enc};
                 Big ->
                     {_, G} = lists:max(Big),
                     chunk_oversized(chunkify(Vs, G, Cfg), Cfg)
@@ -841,16 +1127,17 @@ chunkify(#vs{vid = Vid} = Vs0, #grp{dir = D, etype = T, count = C, body = {entri
     {Lbs, Vs2} = lists:foldl(fun([{O, R, _} | _] = Piece, {L, V}) ->
                                      {[{O, R} | L], set_chunk(V, chunk_key(Vid, D, T, {O, R}), Piece)}
                              end, {[], Vs1}, More),
-    G2 = G#grp{flags = flags_of(Es), body = {chunks, [?LB0 | lists:reverse(Lbs)]}},
+    G2 = G#grp{flags = flags_of(Es), body = {chunks, lbs_dir([?LB0 | lists:reverse(Lbs)])}},
     Vs2#vs{groups = store_group(Vs2#vs.groups, G2)}.
 
 %% 头 op（带条件）+ 块删除 + 块写入 + p 家族 op。
-emit_ops(#vs{vid = Vid, hcond = Cond, existed = Existed, groups = Gs,
+emit_ops(#vs{vid = Vid, hcond = Cond, existed = Existed, groups = Gs, henc = HEnc,
              chunks = Cs, dirty = Dy, dels = Ds, orig = Orig, extra = Extra, rconds = RC}) ->
     HK = head_key(Vid),
     HeadOps = case Gs of
                   [] when Existed -> [cond_op({remove, HK}, Cond)];
                   []              -> [];
+                  _ when is_binary(HEnc) -> [cond_op({put, HK, HEnc}, Cond)];
                   _               -> [cond_op({put, HK, encode_head(Gs)}, Cond)]
               end,
     %% 本次会话里新建又删掉的块从没落过盘，不发删除（否则白写一条墓碑）。
@@ -864,7 +1151,8 @@ emit_ops(#vs{vid = Vid, hcond = Cond, existed = Existed, groups = Gs,
                    [chunk_op({remove, K}, RC) || K <- lists:sort(maps:keys(Ds)),
                                                  maps:is_key(K, OnDisk)]
            end,
-    Puts = [chunk_op({put, K, encode_chunk(maps:get(K, Cs))}, RC) || K <- lists:sort(maps:keys(Dy))],
+    Puts = [chunk_op({put, K, encode_chunk(e_list(maps:get(K, Cs)))}, RC)
+            || K <- lists:sort(maps:keys(Dy))],
     HeadOps ++ Dels ++ Puts ++ read_checks(RC, Dy, Ds) ++ lists:reverse(Extra).
 
 chunk_op({put, K, _} = Op, RC) ->
@@ -909,30 +1197,23 @@ put_edge(S0, Src, T, Dst, R, Props) ->
     case sess_vs(S0, Src) of
         {error, _} = E -> E;
         {ok, VsS, S1} ->
-            case get_entry(Io, VsS, 0, T, Dst, R) of
-                {error, _} = E -> E;
-                {ok, PStore, VsS1} when PStore =/= ext ->
+            case put_entry(Io, VsS, 0, T, Dst, R, PStore) of
+                {error, _} = E ->
+                    E;
+                {ok, same, VsS1} ->
                     {ok, sess_store(S1, VsS1)};             %% 原样存在：不写
-                {ok, _Cur, VsS1} ->
-                    put_edge_write(S1, VsS1, Src, T, Dst, R, Props, PStore)
-            end
-    end.
-
-put_edge_write(S1, VsS1, Src, T, Dst, R, Props, PStore) ->
-    #sess{io = Io} = S1,
-    case put_entry(Io, VsS1, 0, T, Dst, R, PStore) of
-        {error, _} = E -> E;
-        {ok, Old, VsS2} ->
-            PK = pkey(Src, T, Dst, R),
-            Extra = case {Old, PStore} of
-                        {_, ext} -> [{put, PK, Props}];
-                        {ext, _} -> [{remove, PK}];
-                        _        -> []
-                    end,
-            S2 = sess_store(S1, VsS2#vs{extra = Extra ++ VsS2#vs.extra}),
-            case Old of
-                none -> other_side(S2, Dst, fun(Vs) -> put_entry(Io, Vs, 1, T, Src, R, <<>>) end);
-                _    -> {ok, S2}
+                {ok, Old, VsS2} ->
+                    PK = pkey(Src, T, Dst, R),
+                    Extra = case {Old, PStore} of
+                                {_, ext} -> [{put, PK, Props}];
+                                {ext, _} -> [{remove, PK}];
+                                _        -> []
+                            end,
+                    S2 = sess_store(S1, VsS2#vs{extra = Extra ++ VsS2#vs.extra}),
+                    case Old of
+                        none -> other_side(S2, Dst, fun(Vs) -> put_entry(Io, Vs, 1, T, Src, R, <<>>) end);
+                        _    -> {ok, S2}
+                    end
             end
     end.
 
@@ -1045,6 +1326,11 @@ to_groups([{D, T, _} | _] = L) ->
 %% 头 binary → [{Dir, Etype, Count, {entries, [Entry]} | {chunks, [Lb]}}]
 groups_info(Bin) ->
     case decode_head(Bin) of
-        {ok, Gs} -> {ok, [{D, T, C, B} || #grp{dir = D, etype = T, count = C, body = B} <- Gs]};
-        error    -> error
+        {ok, Gs} ->
+            {ok, [{D, T, C, case B of
+                                {chunks, Dir} -> {chunks, dir_lbs(Dir)};
+                                {entries, Es} -> {entries, e_list(Es)}
+                            end} || #grp{dir = D, etype = T, count = C, body = B} <- Gs]};
+        error ->
+            error
     end.

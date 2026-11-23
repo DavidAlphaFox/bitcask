@@ -3,6 +3,26 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+Internal optimizations of the graph layer's read and write paths. On-disk format, API and the libbitcask version are unchanged.
+
+### Changed
+
+- **Adjacency reads decode straight from the head / chunk binaries**: only the requested direction and type are decoded, other
+  groups are skipped by byte count, and results are produced in one pass. `neighbors` emits peer ids directly, skips the
+  dedupe pass when the result comes from a single group, and reads the head once for `both`: `neighbors` on a 200k-degree hub
+  102 ms → 9.0 ms, low-degree `neighbors(both)` 7.5 → 4.2 µs; full `out_edges` on the hub 57 → 43 ms. `degree` reads only the
+  group headers and `edge` binary-searches the entry area / chunk directory: 18 → 4.8 µs and 32 → 8.5 µs on the 200k-degree hub.
+- **A hub's chunk directory is no longer decoded into a list on every access**: chunks are located by binary search, an
+  unchanged directory is written back as is, and finalization only touches modified chunks. On a 200k-degree hub
+  `put_edge` 255 → 64 µs, `del_edge` 240 → 52 µs.
+- **Batch edge inserts resume from the previous position in an entry list** (batches are sorted by dst, so inserts ascend), and
+  the old-value lookup and the write share one positioning: loading a 200k-degree hub with shuffled dsts 3.5 s → 0.95 s; loading
+  50k edges that point at one vertex 11.4 → 5.9 µs/edge.
+- `neighbors/3` returns the same deduplicated ids in the same order; BFS / shortest-path expansion no longer hands the visited
+  table repeated ranks of one peer within a group, with identical results.
+
 ## [12.0.2] — 2026-11-23
 
 Upgrades libbitcask **12.0.1 → 12.0.2** (upstream S64) and fixes hub-vertex performance in the graph layer. The submodule

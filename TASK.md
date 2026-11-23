@@ -655,6 +655,43 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## G11 — 图层：读路径一遍解码、块目录二分、会话条目拉链（未发版）
+
+> 2026-11-23 第二轮排查（eprof + 原型，脚本在开发机 `/tmp/gprof/{ep2,proto,low,hub}.escript`）。只改 `graphdb_adj` / `graphdb`
+> 内部，盘上格式与 API 不变。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **G11-1** | 邻居 id 直出（`graphdb_adj:neighbor_ids/4`）：从头 / 块的二进制直接解出对端 id；同一组里同一对端的多条 rank 相邻去重；结果只来自一个组时标 `Unique`，`neighbors` 不再逐个过去重表；`both` 一次读头取两个方向（原来读两次头、各解一遍）。BFS / 最短路的展开走同一入口。 | ✅ |
+| **G11-2** | 分块组的块目录在会话里保持盘上的二进制：定位块用二分（`locate_lb/2`），写回时目录没变原样复用；`normalize_group` 只看本组里改过的块（从 dirty 表反查），目录只在有块被删 / 分裂时展开重建；`first_entries` 边走目录边读，不先展开。`finalize` 算头大小时的编码结果记进 `#vs.henc`，写出时直接用（原来编两遍）。 | ✅ |
+| **G11-3** | 读路径不建会话状态：`sel_groups/3` 在头二进制上按方向 / 类型挑组，别的组按字节数跳过（带属性的组走一遍跳过）；`dec_body/5` 把条目区一遍解成调用方要的形态（条目元组 / 边 map / id）。`entries/5`、`entries_guarded/5`、新 `edge_maps/6`、`counts/2`（只读各组的头）、`lookup/6`（定宽条目区上二分；分块组二分块目录后点读一块）都走它。`graphdb:adj_edges` 直接拿边 map，只有选中的组带属性时才再过一遍换外置属性。结构校验与 `decode_head/1` 同口径。删掉 `collect_groups` / `guarded_groups` / `guarded_chunks` / `get_entry` / 列表版 `locate_lb`、`graphdb:to_edges/5` / `edge_endpoints/3`。 | ✅ |
+| **G11-4** | 会话里的条目表可以是拉链 `{z, RevLeft, Right}`，游标停在上次改动处：`ent_put` / `ent_del` 从上次的位置接着找（`e_seek`），批内升序的一串插入摊下来每次 O(1)；「查原值」与「写入」合成一次定位（`put_entry` 返回 `same` 表示原样已在，不标脏）。拉链只存在于 touched 的组 / dirty 的块，`finalize` 开头统一拍平。 | ✅ |
+| **G11-5** | 测试 `graphdb_tests` 加 4 项：按方向 / 类型挑组（跳过带属性、带 rank、外置属性、分块的组）、limit 跨组、consistent / 事务读同结果、`edge` 点查各形态；邻居 id 去重保序、`both` 恰好 1 次读头、跨块 rank 去重、BFS / 最短路结果；坏头 / 坏块各读入口报错（`degree` 只看头）；一个会话里升序 / 降序 / 乱序加改删（内联与分块、含 rank 与属性）三轮对模型。全量 `rebar3 eunit` **398/398**；`rebar3 as prod compile` 零警告；`rebar3 do xref, dialyzer` 干净。 | ✅ |
+| **G11-6** | 文档：设计稿 §14（中英）、CHANGELOG（中英）`[Unreleased]`、模块注释。 | ✅ |
+
+实测（同一台机器，G10 → G11）。20 万度 hub、4 KiB：
+
+| 操作 | G10 | G11 |
+|---|---|---|
+| `put_edges` 装载 hub（dst 乱序） | 3.5 s | 0.95 s |
+| `put_edge(hub → 新顶点)` | 255 µs | 64 µs |
+| `del_edge(hub)` | 240 µs | 52 µs |
+| `edge(hub, d)` | 32 µs | 8.5 µs |
+| `degree(hub)` | 18 µs | 4.8 µs |
+| `out_edges(hub, #{limit => 10})` | 30 µs | 11 µs |
+| `neighbors(hub, out)` | 102 ms | 9.0 ms |
+| `out_edges(hub)` 全量 | 57 ms | 43 ms |
+| `out_edges(hub, #{consistent => true})` | 63 ms | 46 ms |
+| `del_vertex(hub)` | 2.07 s | 1.94 s |
+
+低度数（1 万顶点 / 5 万边，同一轮前后对比）：`neighbors(both)` 7.5 → 4.2 µs，`in_edges` 4.2 → 3.5 µs，`neighbors(out)` 3.5 → 3.0 µs，
+`out_edges` 4.1 → 3.9 µs，`shortest_path` 513 → 445 µs；5 万条边指向同一顶点的装载 11.4 → 5.9 µs/边。`test/graphdb_bench` 两档
+在噪声内（`put_edges` 100k → 114k、96.5k → 92.5k 边/秒）。**没达到预期的**：低度数 `out_edges` 原型估 30%，实际约 6%
+（一次点读占 2 µs，剩下的是门面与通用读路径的固定开销）；`del_vertex(hub)` 与从 hub 出发的 BFS 基本没变——前者的时间在每轮
+重写 12.5 KiB 的头和 64 个邻居的头，后者在 20 万个顶点进 visited 表。
+
+---
+
 ## M25 — libbitcask 升级 12.0.1 → 12.0.2（12.0.2）
 
 > submodule `c364cd3` → `ab9b51f`（tag `12.0.2`，上游 S64）。范围迭代器的 memdelta 排序视图改增量维护：每次写之后的
