@@ -22,6 +22,13 @@ Internal optimizations of the graph layer's read and write paths. On-disk format
   50k edges that point at one vertex 11.4 → 5.9 µs/edge.
 - `neighbors/3` returns the same deduplicated ids in the same order; BFS / shortest-path expansion no longer hands the visited
   table repeated ranks of one peer within a group, with identical results.
+- **Single edge inserts / deletes edit the entry area's binary directly**: fixed-width (no-props) entry lists are not decoded
+  when read; the position is found by binary search and the binary is spliced, then written back as is — previously changing
+  one edge decoded the whole chunk (about 500 entries) into a list and re-encoded it. On a 200k-degree hub `put_edge`
+  56 → 29 µs, inserting on the hub's in-edge side 68 → 38 µs, `del_edge` 40 → 33 µs; `put_edge` between degree-50 vertices
+  29.6 → 20.5 µs. No change on degree-5 graphs. Bytes on disk are identical to before.
+- `graphdb_analytics:materialize` decodes only out-edge groups and emits peer ids directly: 20k vertices / 200k edges
+  214 → 168 ms.
 
 ## [12.0.2] — 2026-11-23
 

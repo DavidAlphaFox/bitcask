@@ -60,7 +60,7 @@
          new_session/2, put_edge/6, del_edge/5, all_entries/2, first_entries/3,
          commit/1, commit/2,
          %% 分析 / 校验用的纯函数
-         build_vertex/3, groups_info/1]).
+         build_vertex/3, groups_info/1, out_ids/2, out_entries/2, chunk_ids/1]).
 
 -define(VER, 1).
 -define(F_RANK,    1).
@@ -70,6 +70,8 @@
 -define(LB0, {0, 0}).
 -define(LAYOUT_VER, 1).
 -define(PREFIX, <<16#01, "_g:">>).
+-define(B_OPS_MAX, 16).
+-define(ENC_FAST_MIN, 32).               % 条目数达到它才走一遍式编码（小表逐条拼更快）
 
 -record(grp, {dir      :: 0 | 1,
               etype    :: non_neg_integer(),
@@ -104,7 +106,12 @@
 %%（RevLeft 逆序、全部小于 Right），游标停在上次改动处——批量加边按 (src, etype, dst,
 %% rank) 排过序，同一张表上的插入是升序的，接着上次的位置找，不必每条从头走。
 %% 拉链只存在于会话内（touched 的组 / dirty 的块），finalize 开头统一拍平。
--type elist() :: [entry()] | {z, [entry()], [entry()]}.
+%% 定宽（无属性）的表从盘上读进会话时不解码，保持二进制 {b, W, Bin, NOps}（W = 8 无
+%% rank / 16 带 rank，Bin 即盘上的条目区）：单条增删在二进制上二分定位、直接拼接，
+%% 写回时原样落盘——以前改一条边要把整块（约 500 条）解成列表再整个编回去。同一张
+%% 表在一个会话里改到 @B_OPS_MAX 次（批量装载）就转成拉链，免得每条都拷一遍整块。
+-type elist() :: [entry()] | {z, [entry()], [entry()]}
+               | {b, 8 | 16, binary(), non_neg_integer()}.
 
 %% =========================================================================
 %% Keys
@@ -236,10 +243,9 @@ encode_head(Groups) ->
     iolist_to_binary([<<?VER:8, (length(Groups)):16/big>>
                       | [enc_group(G) || G <- Groups]]).
 
-enc_group(#grp{dir = D, etype = T, count = C, body = {entries, Es0}}) ->
-    Es = e_list(Es0),
-    F = flags_of(Es),
-    [<<D:8, F:8, T:32/big, C:64/big>> | enc_entries(Es, F)];
+enc_group(#grp{dir = D, etype = T, count = C, body = {entries, Es}}) ->
+    {F, _N, Data} = e_enc(Es),
+    [<<D:8, F:8, T:32/big, C:64/big>> | Data];
 enc_group(#grp{dir = D, etype = T, count = C, flags = F0, body = {chunks, Dir}}) ->
     F = (F0 band (?F_RANK bor ?F_PROPS)) bor ?F_CHUNKED,
     [<<D:8, F:8, T:32/big, C:64/big, (byte_size(Dir) div 16):32/big>>, Dir].
@@ -257,7 +263,7 @@ dec_groups(N, <<D:8, F:8, T:32/big, C:64/big, Rest/binary>>, Prev, Acc)
   when D =< 1, C > 0, (Prev =:= undefined orelse {D, T} > Prev) ->
     case F band ?F_CHUNKED of
         0 ->
-            case dec_entries(Rest, C, F) of
+            case dec_entries_s(Rest, C, F) of
                 {ok, Es, Rest2} ->
                     dec_groups(N - 1, Rest2, {D, T},
                                [#grp{dir = D, etype = T, count = C, flags = F,
@@ -285,8 +291,44 @@ dec_groups(_N, _Bin, _Prev, _Acc) ->
     error.
 
 encode_chunk(Entries) ->
-    F = flags_of(Entries),
-    iolist_to_binary([<<?VER:8, F:8, (length(Entries)):32/big>> | enc_entries(Entries, F)]).
+    {F, N, Data} = e_enc(Entries),
+    iolist_to_binary([<<?VER:8, F:8, N:32/big>> | Data]).
+
+%% 条目表 → {Flags, 条数, iodata}。二进制表原样输出；列表在条目多且定宽时一遍
+%% binary comprehension 编出（逐条拼小二进制在 500 条的块上是 28 µs 对 3.6 µs）。
+e_enc({b, 8, Bin, _})  -> {0, byte_size(Bin) div 8, [Bin]};
+e_enc({b, 16, Bin, _}) -> {?F_RANK, byte_size(Bin) div 16, [Bin]};
+e_enc({z, _, _} = Z)   -> e_enc(e_list(Z));
+e_enc(Es) when is_list(Es) ->
+    F = flags_of(Es),
+    N = length(Es),
+    Data = case F of
+               0 when N >= ?ENC_FAST_MIN ->
+                   [<< <<O:64/big>> || {O, _, _} <- Es >>];
+               ?F_RANK when N >= ?ENC_FAST_MIN ->
+                   [<< <<O:64/big, R:64/big>> || {O, R, _} <- Es >>];
+               _ ->
+                   enc_entries(Es, F)
+           end,
+    {F, N, Data}.
+
+%% 会话用的解码：定宽表不解，保持二进制（见 elist()）；带属性的照旧解成列表。
+dec_entries_s(Bin, Count, F) when F band ?F_PROPS =:= 0 ->
+    W = entry_width(F),
+    case Bin of
+        <<Body:(Count * W)/binary, Rest/binary>> -> {ok, {b, W, Body, 0}, Rest};
+        _                                        -> error
+    end;
+dec_entries_s(Bin, Count, F) ->
+    dec_entries(Bin, Count, F).
+
+decode_chunk_s(<<?VER:8, F:8, C:32/big, Rest/binary>>) ->
+    case dec_entries_s(Rest, C, F) of
+        {ok, Es, <<>>} -> {ok, Es};
+        _              -> error
+    end;
+decode_chunk_s(_) ->
+    error.
 
 decode_chunk(<<?VER:8, F:8, C:32/big, Rest/binary>>) ->
     case dec_entries(Rest, C, F) of
@@ -565,6 +607,8 @@ dec_body(Mode, T, F, C, Body) ->
     case dec_prop_entries(Body, C, F band ?F_RANK =/= 0, []) of
         {ok, Es, <<>>} ->
             {ok, case Mode of
+                     raw ->
+                         Es;
                      tuples ->
                          [{T, O, R, P} || {O, R, P} <- Es];
                      {maps, V, 0} ->
@@ -580,6 +624,8 @@ dec_body(Mode, T, F, C, Body) ->
             error
     end.
 
+dec_fixed(raw, _T, 8, Body)    -> [{O, 0, <<>>} || <<O:64/big>> <= Body];
+dec_fixed(raw, _T, 16, Body)   -> [{O, R, <<>>} || <<O:64/big, R:64/big>> <= Body];
 dec_fixed(tuples, T, 8, Body)  -> [{T, O, 0, <<>>} || <<O:64/big>> <= Body];
 dec_fixed(tuples, T, 16, Body) -> [{T, O, R, <<>>} || <<O:64/big, R:64/big>> <= Body];
 dec_fixed({maps, V, 0}, T, 8, Body) ->
@@ -733,11 +779,53 @@ ent_find(_, _O, _R) -> none.
 %% ---- 条目表 elist()：列表或拉链（类型说明见文件头的 -type）----
 
 e_list({z, L, R})         -> lists:reverse(L, R);
+e_list({b, 8, Bin, _})    -> [{O, 0, <<>>} || <<O:64/big>> <= Bin];
+e_list({b, 16, Bin, _})   -> [{O, R, <<>>} || <<O:64/big, R:64/big>> <= Bin];
 e_list(L) when is_list(L) -> L.
 
-e_empty([])           -> true;
-e_empty({z, [], []})  -> true;
-e_empty(_)            -> false.
+e_empty([])               -> true;
+e_empty({z, [], []})      -> true;
+e_empty({b, _, <<>>, _})  -> true;
+e_empty(_)                -> false.
+
+%% 条目区的字节数（= 落盘后的条目区大小；二进制表不必解码）。
+e_bytes({b, _, Bin, _}) -> byte_size(Bin);
+e_bytes(Es)             -> body_size(e_list(Es)).
+
+%% 带 rank 的二进制表删到一条 rank 都不剩时收窄成 8 字节宽——与「列表重新编码时
+%% 标志按实际条目算」保持同样的落盘字节。只对改过的表检查。
+e_canon({b, 16, Bin, N} = Es) when N > 0 ->
+    case b_has_rank(Bin) of
+        true  -> Es;
+        false -> {b, 8, << <<O:64/big>> || <<O:64/big, _:64>> <= Bin >>, N}
+    end;
+e_canon({z, _, _} = Z) -> e_list(Z);
+e_canon(Es)            -> Es.
+
+b_has_rank(<<_:64, 0:64, Rest/binary>>) -> b_has_rank(Rest);
+b_has_rank(<<>>)                        -> false;
+b_has_rank(_)                           -> true.
+
+%% 定宽条目区 [Lo, Hi) 上第一个 ≥ Key 的位置（下标）。
+b_lower(_Bin, _W, Lo, Hi, _Key) when Lo >= Hi -> Lo;
+b_lower(Bin, W, Lo, Hi, Key) ->
+    Mid = (Lo + Hi) div 2,
+    case b_at(Bin, W, Mid) < Key of
+        true  -> b_lower(Bin, W, Mid + 1, Hi, Key);
+        false -> b_lower(Bin, W, Lo, Mid, Key)
+    end.
+
+b_at(Bin, 8, I)  -> <<_:(I * 8)/binary, O:64/big, _/binary>> = Bin, {O, 0};
+b_at(Bin, 16, I) -> <<_:(I * 16)/binary, O:64/big, R:64/big, _/binary>> = Bin, {O, R}.
+
+%% {found | absent, 位置}；8 字节宽的表里问带 rank 的 key 一定不在。
+b_find(Bin, W, O, R) ->
+    C = byte_size(Bin) div W,
+    Pos = b_lower(Bin, W, 0, C, {O, R}),
+    case Pos < C andalso b_at(Bin, W, Pos) =:= {O, R} of
+        true  -> {found, Pos};
+        false -> {absent, Pos}
+    end.
 
 %% 把游标移到 Key：返回 {RevLeft, Right}，RevLeft 全部 < Key ≤ Right 的首条。
 %% 从上次停的位置接着走——升序的一串操作摊下来每次 O(1)。
@@ -752,6 +840,22 @@ z_back([{O, R, _} = H | T], Rt, K) when {O, R} >= K -> z_back(T, [H | Rt], K);
 z_back(L, Rt, _K)                                   -> {L, Rt}.
 
 %% upsert：{Old | none, Es'}。一次定位同时完成「查原值」和「写入」。
+%% 二进制表：无属性、宽度装得下（8 字节宽只收 rank 0）且本会话改得还不多时直接拼接；
+%% 否则转成列表走拉链。
+ent_put({b, W, Bin, N}, {O, R, <<>>}) when N < ?B_OPS_MAX, (W =:= 16 orelse R =:= 0) ->
+    case b_find(Bin, W, O, R) of
+        {found, _} ->
+            {<<>>, {b, W, Bin, N}};
+        {absent, Pos} ->
+            <<A:(Pos * W)/binary, B/binary>> = Bin,
+            New = case W of
+                      8  -> <<A/binary, O:64/big, B/binary>>;
+                      16 -> <<A/binary, O:64/big, R:64/big, B/binary>>
+                  end,
+            {none, {b, W, New, N + 1}}
+    end;
+ent_put({b, _, _, _} = Es, E) ->
+    ent_put(e_list(Es), E);
 ent_put(Es, {O, R, _} = E) ->
     case e_seek(Es, {O, R}) of
         {L, [{O, R, Old} | T]} -> {Old, {z, L, [E | T]}};
@@ -759,6 +863,21 @@ ent_put(Es, {O, R, _} = E) ->
     end.
 
 %% {Old, Es'} | {none, Es}（不存在时原样返回）。
+ent_del({b, 8, _, _} = Es, _O, R) when R =/= 0 ->
+    {none, Es};
+ent_del({b, W, Bin, N} = Es, O, R) when N < ?B_OPS_MAX ->
+    case b_find(Bin, W, O, R) of
+        {found, Pos} ->
+            <<A:(Pos * W)/binary, _:W/binary, B/binary>> = Bin,
+            {<<>>, {b, W, <<A/binary, B/binary>>, N + 1}};
+        {absent, _} ->
+            {none, Es}
+    end;
+ent_del({b, _, _, _} = Es, O, R) ->
+    case ent_del(e_list(Es), O, R) of
+        {none, _} -> {none, Es};
+        Found     -> Found
+    end;
 ent_del(Es, O, R) ->
     case e_seek(Es, {O, R}) of
         {L, [{O, R, Old} | T]} -> {Old, {z, L, T}};
@@ -791,7 +910,7 @@ get_chunk(Io, #vs{chunks = Cs} = Vs, Key) ->
         error ->
             case io_head(Io, Key) of
                 {ok, Bin, Cond} ->
-                    case decode_chunk(Bin) of
+                    case decode_chunk_s(Bin) of
                         {ok, Es} -> {ok, Es, rcond(Vs#vs{chunks = Cs#{Key => Es}}, Key, Cond)};
                         error    -> {error, {bad_adj_chunk, Key}}
                     end;
@@ -945,15 +1064,17 @@ load_group_chunks(Io, Vs0, Vid, D, T, Dirb) ->
 finalize(Io, Vs, Cfg) ->
     finalize_1(Io, flatten(Vs), Cfg).
 
-%% 会话里的拉链统一拍平成列表（只有 touched 的组 / dirty 的块会是拉链）。
+%% 会话里的拉链统一拍平成列表、改过的二进制表规整宽度（e_canon）。只有 touched 的
+%% 组 / dirty 的块会是拉链或改过的二进制表；没改过的二进制表原样留着，写回时直出。
 flatten(#vs{groups = Gs, chunks = Cs, dirty = Dy} = Vs) ->
     Gs2 = [case G of
-               #grp{body = {entries, {z, _, _} = Z}} -> G#grp{body = {entries, e_list(Z)}};
+               #grp{body = {entries, Es}} when not is_list(Es) ->
+                   G#grp{body = {entries, e_canon(Es)}};
                _ -> G
            end || G <- Gs],
     Cs2 = maps:fold(fun(K, _, A) ->
                             case A of
-                                #{K := {z, _, _} = Z} -> A#{K := e_list(Z)};
+                                #{K := Es} when not is_list(Es) -> A#{K := e_canon(Es)};
                                 _ -> A
                             end
                     end, Cs, Dy),
@@ -1011,10 +1132,11 @@ normalize_group(#grp{dir = D, etype = T, count = C, body = {chunks, Dirb}} = G,
         lists:foldl(
           fun(Lb, {Ch, Vs}) ->
                   Key = chunk_key(Vid, D, T, Lb),
-                  case maps:get(Key, Vs#vs.chunks) of
-                      [] when Lb =/= ?LB0 ->
+                  Es = maps:get(Key, Vs#vs.chunks),
+                  case e_empty(Es) andalso Lb =/= ?LB0 of
+                      true ->
                           {[{Lb, remove} | Ch], del_chunk(Vs, Key)};
-                      Es ->
+                      false ->
                           case split_balanced(Es, Max) of
                               [_] ->
                                   {Ch, Vs};
@@ -1052,12 +1174,12 @@ eff_chunk_max(Count, #{chunk_max := CM}) ->
 %% 已有块超限：切成 n = max(2, ⌈字节/Max⌉) 片、每片约等大（对半分裂的推广）。
 %% 只超一点点时就是对半分，随机插入下两半各有余量，不会下一条又分裂。
 split_balanced(Es, Max) ->
-    Size = 6 + body_size(Es),
+    Size = 6 + e_bytes(Es),
     case Size =< Max of
-        true  -> [Es];
+        true  -> [Es];                               %% 原样（二进制表不展开）
         false ->
             N = max(2, (Size + Max - 1) div Max),
-            split_entries(Es, Size div N + 1)
+            split_entries(e_list(Es), Size div N + 1)
     end.
 
 %% 按字节贪心切片（块头 6 B）；每片至少一条。
@@ -1111,8 +1233,9 @@ chunk_oversized(#vs{groups = Gs} = Vs, #{inline_max := IM} = Cfg) ->
     case byte_size(Enc) =< IM of
         true -> Vs#vs{henc = Enc};
         false ->
-            Cands = [{body_size(Es), G} || #grp{body = {entries, Es}} = G <- Gs,
-                                           length(Es) >= 2],
+            Cands = [{body_size(L), G#grp{body = {entries, L}}}
+                     || #grp{body = {entries, Es}} = G <- Gs,
+                        L <- [e_list(Es)], length(L) >= 2],
             case [X || {Sz, _} = X <- Cands, Sz > IM div 4] of
                 [] -> Vs#vs{henc = Enc};
                 Big ->
@@ -1151,7 +1274,7 @@ emit_ops(#vs{vid = Vid, hcond = Cond, existed = Existed, groups = Gs, henc = HEn
                    [chunk_op({remove, K}, RC) || K <- lists:sort(maps:keys(Ds)),
                                                  maps:is_key(K, OnDisk)]
            end,
-    Puts = [chunk_op({put, K, encode_chunk(e_list(maps:get(K, Cs)))}, RC)
+    Puts = [chunk_op({put, K, encode_chunk(maps:get(K, Cs))}, RC)
             || K <- lists:sort(maps:keys(Dy))],
     HeadOps ++ Dels ++ Puts ++ read_checks(RC, Dy, Ds) ++ lists:reverse(Extra).
 
@@ -1322,6 +1445,36 @@ to_groups([{D, T, _} | _] = L) ->
     {Mine, Rest} = lists:splitwith(fun({D2, T2, _}) -> {D2, T2} =:= {D, T} end, L),
     Es = [E || {_, _, E} <- Mine],
     [#grp{dir = D, etype = T, count = length(Es), body = {entries, Es}} | to_groups(Rest)].
+
+%% 全库扫描（物化 / 按类型列边）用：只解头里**内联**的出边组，入边组与块目录跳过。
+%% 分块的出边组的条目在它的块里，扫描方按 key 序紧跟着头读到。
+%%   out_ids/2      各内联出边组的对端 id（Etype = undefined 取全部类型）
+%%   out_entries/2  某一类型内联出边组的条目 [{Dst, Rank, Props}]
+%%   chunk_ids/1    一个块里的对端 id
+out_ids(HeadBin, Etype) ->
+    inline_out(HeadBin, Etype, ids).
+
+out_entries(HeadBin, Etype) when is_integer(Etype) ->
+    inline_out(HeadBin, Etype, raw).
+
+inline_out(HeadBin, Etype, Mode) ->
+    case sel_groups(HeadBin, 0, Etype) of
+        error     -> error;
+        {ok, Sel} -> inline_out_1(Sel, Mode, [])
+    end.
+
+inline_out_1([], _Mode, Acc) ->
+    {ok, lists:append(lists:reverse(Acc))};
+inline_out_1([{_D, T, F, C, {inline, Body}} | Sel], Mode, Acc) ->
+    case dec_body(Mode, T, F, C, Body) of
+        {ok, L} -> inline_out_1(Sel, Mode, [L | Acc]);
+        error   -> error
+    end;
+inline_out_1([{_D, _T, _F, _C, {chunks, _}} | Sel], Mode, Acc) ->
+    inline_out_1(Sel, Mode, Acc).
+
+chunk_ids(<<?VER:8, F:8, C:32/big, Body/binary>>) -> dec_body(ids, 0, F, C, Body);
+chunk_ids(_)                                      -> error.
 
 %% 头 binary → [{Dir, Etype, Count, {entries, [Entry]} | {chunks, [Lb]}}]
 groups_info(Bin) ->

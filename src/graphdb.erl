@@ -380,9 +380,12 @@ edge(Handle, Src, Etype, Dst, Rank) ->
 %% 与并发写者冲突时整批重来的代价越大）。
 put_edges(Handle, Edges) -> put_edges(Handle, Edges, #{}).
 put_edges(Handle, Edges, Opts) when is_list(Edges), is_map(Opts) ->
-    Norm = [norm_put(E, Handle) || E <- Edges],
+    %% 归一化成 {S, T, D, R, Seq, Props}：Seq 是输入序号，放在 Props 前面——整元组直接
+    %% lists:sort 就是按 (src, etype, dst, rank) 的稳定排序（同一条边的多次 upsert 按
+    %% 输入顺序），不用再套一层排序键、排完再剥。
+    Norm = norm_puts(Edges, Handle, 0, []),
     run_batches(Handle, maybe_sort(Norm, Opts),
-                fun(S, {Src, T, Dst, R, P}) -> graphdb_adj:put_edge(S, Src, T, Dst, R, P) end,
+                fun(S, {Src, T, Dst, R, _Seq, P}) -> graphdb_adj:put_edge(S, Src, T, Dst, R, P) end,
                 opt_retries(Opts), opt_batch_vids(Opts)).
 
 %% 批量删边：[{S, T, D} | {S, T, D, Rank}]，幂等。切批与原子性同 put_edges。
@@ -400,12 +403,12 @@ del_edges(Handle, Edges, Opts) when is_list(Edges), is_map(Opts) ->
 %% 仍按调用方给的顺序生效。
 maybe_sort(Items, Opts) ->
     case maps:get(sort, Opts, true) of
-        true  -> [It || {_K, It} <- lists:keysort(1, [{edge_key(It), It} || It <- Items])];
+        %% 加边项带输入序号（见 put_edges/3），删边项 {S, T, D, R} 重复即相同：整元组序
+        %% 就是按 (src, etype, dst, rank) 的稳定序。
+        true  -> lists:sort(Items);
         false -> Items;
         Bad   -> erlang:error(badarg, [Opts, Bad])
     end.
-
-edge_key(It) -> {element(1, It), element(2, It), element(3, It), element(4, It)}.
 
 opt_batch_vids(Opts) ->
     case maps:get(batch_vids, Opts, ?BATCH_VIDS) of
@@ -413,12 +416,17 @@ opt_batch_vids(Opts) ->
         Bad -> erlang:error(badarg, [Opts, Bad])
     end.
 
-norm_put({S, T, D}, H) -> norm_put({S, T, D, #{}}, H);
-norm_put({S, T, D, Opts} = E, H) when is_map(Opts) ->
+norm_puts([], _H, _Seq, Acc) ->
+    lists:reverse(Acc);
+norm_puts([{S, T, D} | Rest], H, Seq, Acc) ->
+    ok = v_edge(S, T, D, 0),
+    norm_puts(Rest, H, Seq + 1, [{S, T, D, 0, Seq, <<>>} | Acc]);
+norm_puts([{S, T, D, Opts} = E | Rest], H, Seq, Acc) when is_map(Opts) ->
     {R, P} = edge_opts(Opts, [H, E]),
     ok = v_edge(S, T, D, R),
-    {S, T, D, R, P};
-norm_put(Bad, H) -> erlang:error(badarg, [H, Bad]).
+    norm_puts(Rest, H, Seq + 1, [{S, T, D, R, Seq, P} | Acc]);
+norm_puts([Bad | _], H, _Seq, _Acc) ->
+    erlang:error(badarg, [H, Bad]).
 
 norm_del({S, T, D}) -> norm_del({S, T, D, 0});
 norm_del({S, T, D, R} = E) ->
@@ -723,13 +731,10 @@ edges_by_type(Handle, Etype, Opts) when is_map(Opts) ->
                    end
            end,
     Fun = fun(<< _P:4/binary, "a", Src:64/big >>, V, _T, _O, A) ->
-                  case graphdb_adj:groups_info(vbin(V)) of
-                      {ok, Gs} ->
-                          case lists:keyfind(Etype, 2, [G || {0, _, _, _} = G <- Gs]) of
-                              {0, Etype, _C, {entries, Es}} -> Emit(Src, Es, A);
-                              _ -> A
-                          end;
-                      error -> A
+                  %% 只解该类型内联的出边组；别的组按字节数跳过
+                  case graphdb_adj:out_entries(vbin(V), Etype) of
+                      {ok, [_ | _] = Es} -> Emit(Src, Es, A);
+                      _                  -> A
                   end;
              (<< _P:4/binary, "a", Src:64/big, 0:8, T:32/big, _:128 >>,
               V, _T, _O, A) when T =:= Etype ->

@@ -61,27 +61,24 @@ materialize(Handle, Opts) when is_map(Opts) ->
 collect_edges(Handle, Etype) ->
     Want = fun(T) -> Etype =:= undefined orelse T =:= Etype end,
     Fun = fun(<< _P:4/binary, "a", S:64/big >>, V, _T, _O, Acc) ->
-                  case graphdb_adj:groups_info(vbin(V)) of
-                      {ok, Gs} ->
-                          lists:foldl(fun({0, T, _C, {entries, Es}}, A) ->
-                                              case Want(T) of
-                                                  true  -> [{S, D} || {D, _R, _Pr} <- Es] ++ A;
-                                                  false -> A
-                                              end;
-                                         (_, A) -> A
-                                      end, Acc, Gs);
-                      error -> Acc
+                  %% 只解内联的出边组，直接出对端 id（入边组、块目录按字节数跳过）
+                  case graphdb_adj:out_ids(vbin(V), Etype) of
+                      {ok, Ds} -> pairs(S, Ds, Acc);
+                      error    -> Acc
                   end;
              (<< _P:4/binary, "a", S:64/big, 0:8, T:32/big, _:128 >>,
               V, _T, _O, Acc) ->
-                  case Want(T) andalso graphdb_adj:decode_chunk(vbin(V)) of
-                      {ok, Es} -> [{S, D} || {D, _R, _Pr} <- Es] ++ Acc;
+                  case Want(T) andalso graphdb_adj:chunk_ids(vbin(V)) of
+                      {ok, Ds} -> pairs(S, Ds, Acc);
                       _        -> Acc
                   end;
              (_, _, _, _, Acc) -> Acc                     %% 非图层 key / 入边块
           end,
     {Lo, Hi} = graphdb_adj:range(<<"a">>),
     scan(Handle, Lo, Hi, Fun, []).
+
+pairs(S, [D | Ds], Acc) -> pairs(S, Ds, [{S, D} | Acc]);
+pairs(_S, [], Acc)      -> Acc.
 
 scan(Handle, Lo, Hi, Fun, Acc0) ->
     case bitcask:range_fold(Handle, {Lo, Hi}, [], Fun, Acc0) of
@@ -94,7 +91,7 @@ vbin(B) when is_binary(B) -> B.
 
 %% 排序去重后的边对 → 双向 CSR 二进制。
 build_csr(EdgeList) ->
-    Vids = lists:usort(lists:append([[S, D] || {S, D} <- EdgeList])),
+    Vids = lists:usort(lists:foldl(fun({S, D}, A) -> [S, D | A] end, [], EdgeList)),
     N = length(Vids),
     Idx = maps:from_list(lists:zip(Vids, lists:seq(0, N - 1))),
     %% 每条边只查一次 index。index 随 vid 单调，所以 Out 与 EdgeList 同序，

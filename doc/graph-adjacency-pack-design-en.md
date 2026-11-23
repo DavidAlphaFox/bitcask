@@ -570,3 +570,9 @@ batch resume from the previous position. On the 200k-degree hub, "after" above �
 `put_edge` 255 → 64 µs, `edge` 32 → 8.5 µs, `degree` 18 → 4.8 µs, `out_edges(#{limit => 10})` 30 → 11 µs; `neighbors`
 102 → 9.0 ms, full `out_edges` 57 → 43 ms. One-hop reads on low-degree graphs change little (`out_edges` about 6%,
 `neighbors(both)` 7.5 → 4.2 µs): the point read itself takes 2 µs. `del_vertex` is essentially unchanged.
+
+**Single-edge writes (added 2026-11-23, TASK G12)**: fixed-width entry lists stay in their on-disk binary form inside a session;
+a single insert / delete binary-searches the position, splices the binary and writes it back as is, instead of decoding and
+re-encoding the whole chunk. On the 200k-degree hub `put_edge` 56 → 29 µs, `del_edge` 40 → 33 µs; between degree-50 vertices
+29.6 → 20.5 µs; unchanged on degree-5 graphs (about 17 µs, of which reading the graph config, reading two heads and the atomic
+batch take about 9 µs).

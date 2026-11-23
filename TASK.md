@@ -655,6 +655,38 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## G12 — 图层：定宽条目表保持二进制、单条增删直接拼接（未发版）
+
+> 2026-11-23 第三轮排查（脚本在开发机 `/tmp/gprof/{r3,enc,r4}.escript`）。只改图层内部，盘上格式与 API 不变。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **G12-1** | 会话里的条目表加第三种表示 `{b, W, Bin, NOps}`：定宽（无属性）的内联组 / 块从盘上读进来不解码，保持条目区二进制（`dec_entries_s/3`、`decode_chunk_s/1`）；`ent_put` / `ent_del` 在二进制上二分定位（`b_find/4`）、直接拼接；写回时原样落盘（`e_enc/1`）。加属性、8 字节宽的表里加带 rank 的边、或同一张表一个会话里改满 16 次时转成列表走拉链。带 rank 的表删到没有 rank 时在 `finalize` 收窄回 8 字节宽（`e_canon/1`），落盘字节与一次建成的相同。没改过的组 / 块写回头时也不再解码重编。 | ✅ |
+| **G12-2** | 列表的定宽编码走一遍式（条目数 ≥ 32 时；小表保持逐条拼，实测更快）。 | ✅ |
+| **G12-3** | `graphdb_analytics:materialize` 与 `graphdb:edges_by_type` 改用挑组解码：新 `graphdb_adj:out_ids/2`、`chunk_ids/1`（直接出对端 id）、`out_entries/2`（某类型内联出边组的条目），不再把整头（含入边组、块目录）解成记录；`build_csr` 收集顶点少建一遍小列表。 | ✅ |
+| **G12-4** | `put_edges` 归一化成 `{S, T, D, R, Seq, Props}`（Seq = 输入序号），整元组 `lists:sort` 即按 (src, etype, dst, rank) 的稳定序；去掉「套排序键 → keysort → 剥掉」两遍。 | ✅ |
+| **G12-5** | 测试 `graphdb_tests` 加 2 项：逐条加删（含原样已在、不存在、rank 出现又删光、加属性又清掉）后的落盘字节与一次建成的**完全相同**；分块 hub 上 1500 步逐条随机加删（穿过块分裂 / 空块删除）对模型、整段删光后邻接清空；一个会话里对同一张表改 85 次（二进制表转拉链）与逐条提交结果、字节相同。全量 `rebar3 eunit` **400/400**；`rebar3 as prod compile` 零警告；`rebar3 do xref, dialyzer` 干净。 | ✅ |
+| **G12-6** | 文档：设计稿 §14（中英）、CHANGELOG（中英）`[Unreleased]`。 | ✅ |
+
+实测（同一台机器、同一轮前后对比，`/tmp/gprof/r4.escript`）：
+
+| 操作 | G11 | G12 |
+|---|---|---|
+| `put_edge(hub → 新顶点)`（20 万度） | 56 µs | 29 µs |
+| `put_edge(叶子 → hub)`（hub 的入边一侧） | 68 µs | 38 µs |
+| `del_edge(hub)` | 40 µs | 33 µs |
+| `put_edge` 度数 50 的顶点之间 | 29.6 µs | 20.5 µs |
+| `put_edge` / `del_edge` 度数 5 的顶点之间 | 16.7 / 16.2 µs | 17.3 / 17.0 µs |
+| `materialize`（2 万顶点、20 万条边） | 214 ms | 168 ms |
+| `materialize`（20 万度 hub + 5 万入边） | 721 ms | 645 ms |
+| `edges_by_type`（10 万条） | 57 ms | 57 ms |
+
+`test/graphdb_bench` 两档、hub 批量装载（4.2 µs/边）、`del_vertex(hub)` 都在噪声内。**没达到预期的**：度数 5 的单条写没变（原估
+10%～15%）——那里图层自己的部分已经很小，16～17 µs 里读图参数、读两个头、原子批共约 9 µs；hub 单条 `put_edge` 原估约 20 µs，
+实际 29 µs；G12-2、G12-4 在基准里看不出差别（批量装载本来每批每块只编一次、预处理占比小），留着是因为代码更直接。
+
+---
+
 ## G11 — 图层：读路径一遍解码、块目录二分、会话条目拉链（未发版）
 
 > 2026-11-23 第二轮排查（eprof + 原型，脚本在开发机 `/tmp/gprof/{ep2,proto,low,hub}.escript`）。只改 `graphdb_adj` / `graphdb`

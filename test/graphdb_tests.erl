@@ -1288,3 +1288,109 @@ session_zipper_matches_model_test_() ->
         end,
         [Run(O) || O <- [asc, desc, rnd]]
      end}}.
+
+%% ===================================================================
+%% G12：定宽条目表在会话里保持二进制，单条增删直接拼接
+%% ===================================================================
+
+%% 顶点邻接的盘上字节（头 + 全部块）。
+adj_bytes(R, V) ->
+    bitcask:range(R, {graphdb:akey(V), graphdb:akey(V + 1)}).
+
+binary_entry_list_single_ops_test_() ->
+    {"单条加 / 删边直接在条目区二进制上改：内联组的落盘字节与一次建成的完全相同（含 rank 出现"
+     "又删光后收窄回 8 字节宽、加属性后转带属性格式再删回来）；分块 hub 上逐条加删对模型",
+     {timeout, 120, fun() ->
+        %% ---- 内联：逐条操作 vs 一次建成，字节相同 ----
+        Final = [{1, 7, Y} || Y <- [5, 9, 12, 20, 33, 47]] ++ [{1, 8, 3}],
+        A = with_dir(fun(D) ->
+                R = graphdb:open(D, [read_write]),
+                [ok = graphdb:put_edge(R, 1, 7, Y) || Y <- [33, 5, 47, 12, 99, 9, 20, 1]],
+                ok = graphdb:put_edge(R, 1, 7, 12),                        %% 原样已在
+                ok = graphdb:del_edge(R, 1, 7, 99),
+                ok = graphdb:del_edge(R, 1, 7, 1),
+                ok = graphdb:del_edge(R, 1, 7, 1000),                      %% 不存在
+                ok = graphdb:put_edge(R, 1, 7, 12, #{rank => 4}),          %% 8 → 16 字节宽
+                ok = graphdb:put_edge(R, 1, 7, 12, #{rank => 2}),
+                ?assertMatch({ok, #{rank := 4}}, graphdb:edge(R, 1, 7, 12, 4)),
+                ok = graphdb:del_edge(R, 1, 7, 12, 3),                     %% 不存在的 rank
+                ok = graphdb:del_edge(R, 1, 7, 12, 4),
+                ok = graphdb:del_edge(R, 1, 7, 12, 2),                     %% rank 删光 → 收窄
+                ok = graphdb:put_edge(R, 1, 7, 20, #{props => <<"p">>}),   %% 转带属性
+                ?assertMatch({ok, #{props := <<"p">>}}, graphdb:edge(R, 1, 7, 20)),
+                ok = graphdb:put_edge(R, 1, 7, 20),                        %% 属性清掉
+                ok = graphdb:put_edge(R, 1, 8, 3),
+                ok = graphdb:put_edge(R, 1, 8, 4),
+                ok = graphdb:del_edge(R, 1, 8, 4),
+                ?assertMatch({ok, #{edges := 7}}, graphdb:check_invariants(R)),
+                Bs = [adj_bytes(R, V) || V <- [1, 3, 5, 12, 20, 47]],
+                graphdb:close(R),
+                Bs
+            end),
+        B = with_dir(fun(D) ->
+                R = graphdb:open(D, [read_write]),
+                ok = graphdb:put_edges(R, Final),
+                Bs = [adj_bytes(R, V) || V <- [1, 3, 5, 12, 20, 47]],
+                graphdb:close(R),
+                Bs
+            end),
+        ?assertEqual(B, A),
+        %% ---- 分块 hub：逐条加删（穿过块分裂 / 空块删除），与模型一致 ----
+        with_dir(fun(D) ->
+            R = graphdb:open(D, [read_write, {adj_inline_max, 256}, {adj_chunk_max, 256}]),
+            ok = graphdb:put_edges(R, [{1, 7, Y} || Y <- lists:seq(1000, 1600, 2)]),
+            rand:seed(exsss, {11, 12, 13}),
+            M = lists:foldl(
+                  fun(I, Model) ->
+                      Y = 990 + rand:uniform(640),
+                      case rand:uniform(3) of
+                          1 ->
+                              ok = graphdb:del_edge(R, 1, 7, Y),
+                              maps:remove({Y, 0}, Model);
+                          2 when I rem 50 =:= 0 ->
+                              ok = graphdb:put_edge(R, 1, 7, Y, #{rank => 6}),
+                              Model#{{Y, 6} => true};
+                          _ ->
+                              ok = graphdb:put_edge(R, 1, 7, Y),
+                              Model#{{Y, 0} => true}
+                      end
+                  end,
+                  maps:from_list([{{Y, 0}, true} || Y <- lists:seq(1000, 1600, 2)]),
+                  lists:seq(1, 1500)),
+            {ok, Out} = graphdb:out_edges(R, 1),
+            ?assertEqual(lists:sort(maps:keys(M)), [{Y, K} || #{dst := Y, rank := K} <- Out]),
+            ?assertEqual({ok, map_size(M)}, graphdb:degree(R, 1)),
+            ?assertMatch({ok, _}, graphdb:check_invariants(R)),
+            %% 整段删光：空块删掉、组转回内联 / 消失
+            ok = graphdb:del_edges(R, [{1, 7, Y, K} || {Y, K} <- maps:keys(M)]),
+            ?assertEqual([], adj_bytes(R, 1)),
+            ?assertMatch({ok, #{edges := 0, chunks := 0}}, graphdb:check_invariants(R)),
+            graphdb:close(R)
+        end)
+     end}}.
+
+binary_entry_list_batch_ops_test_() ->
+    {"一个会话里对同一张定宽表改超过 16 次（二进制表转拉链）：结果与逐条提交相同、字节相同",
+     {timeout, 60, fun() ->
+        Ys = [((I * 37) rem 101) + 1 || I <- lists:seq(1, 60)],
+        Run = fun(Mode) ->
+            with_dir(fun(D) ->
+                R = graphdb:open(D, [read_write]),
+                ok = graphdb:put_edges(R, [{1, 7, Y} || Y <- lists:seq(200, 230)]),
+                case Mode of
+                    batch  -> ok = graphdb:put_edges(R, [{1, 7, Y} || Y <- Ys], #{sort => false}),
+                              ok = graphdb:del_edges(R, [{1, 7, Y} || Y <- lists:sublist(Ys, 25)],
+                                                     #{sort => false});
+                    single -> [ok = graphdb:put_edge(R, 1, 7, Y) || Y <- Ys],
+                              [ok = graphdb:del_edge(R, 1, 7, Y) || Y <- lists:sublist(Ys, 25)]
+                end,
+                ?assertMatch({ok, _}, graphdb:check_invariants(R)),
+                Res = {dsts_of(graphdb:out_edges(R, 1)), adj_bytes(R, 1)},
+                graphdb:close(R),
+                Res
+            end)
+        end,
+        {OutB, BytesB} = Run(batch),
+        ?assertEqual({OutB, BytesB}, Run(single)),
+        ?assertEqual(lists:usort(lists:seq(200, 230) ++ (Ys -- lists:sublist(Ys, 25))), OutB)
+     end}}.
