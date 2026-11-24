@@ -3,6 +3,34 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [13.1.1] — 2026-11-24
+
+升级 libbitcask **13.1.0 → 13.1.1**（上游 PATCH：S77、S78）。submodule 从 `02aa247` 切到 `8511c09`（tag `v13.1.1`）。上游库源码与
+13.1.0 逐字节相同（`src` / `include` / `c_api` / `tools` / `cmake` 无差异），C API、C++ ABI（`SOVERSION` 13）、盘上格式与本库既有 API
+均不变，NIF 不用改，重编即得；升级只为跟上上游 tag。本版同时修复 13.1.0 这个 tag 在下游 `git_subdir` 依赖下构建失败的问题
+（见 Fixed）。本库 `bitcask` 与 `bitcask_cypher` 的 `vsn` 一起升到 13.1.1；`bitcask_cypher` 本身没有变化。
+
+### Fixed
+
+- **下游按 `git_subdir` 依赖时子模块初始化失败**（13.1.0 引入）：`apps/bitcask/third_party` 提交成了指向根目录 `third_party/` 的符号链接，
+  而 hook 按 `apps/bitcask/third_party/libbitcask` 初始化子模块（git：pathspec 不匹配）；而且 rebar3 拉 git_subdir 依赖是只含 `apps/bitcask`
+  的 sparse checkout，根目录的 `third_party/` 根本没检出、符号链接悬空。hook 现在按 `third_party/<子模块>` 的物理位置（`pwd -P`）算子模块
+  路径，悬空时先把 `/third_party/` 加进 sparse 范围再初始化；符号链接与「子模块真的挪进 `apps/bitcask`」两种布局都能用。用临时仓库按
+  litegate 的依赖写法从零构建验证过（拉子模块、编 NIF、编应用）。**按 `git_subdir` 依赖的下游请用 13.1.1 及之后**。
+
+### Changed
+
+- **（随 libbitcask 13.1.1）两个时序敏感的上游用例满载时假红**（S77，上游反馈
+  `feedbacks/2026-11-23-two-timing-sensitive-tests-fail-under-full-load.md`）：
+  `AtomicBatchVisibilityTest.HeadThenTailNeverShowsHalfBatch`、`OkiCompactionModelTest.ConcurrentLoaderNeverFallsBackToUnloaded`
+  照核数并行（`-j 14`）时偶发失败，是用例对调度时序的假设偏紧，不是库的行为问题；读写交叠改由同步点与条件循环保证。
+  只影响上游自己的测试——本库的 CMake 以 `BUILD_TESTING=OFF` 配置，不编也不跑上游测试。
+- （随 libbitcask 13.1.1）上游 `check` 目标照核数并行：去掉 13.0.0 为绕开上面两个用例加的封顶 8。
+- （随 libbitcask 13.1.1）**上游 README 拆分**（S78）：功能表、构建、文本编码、架构总览移到子模块的 `doc/` 下（`doc/features-zh.md`、
+  `doc/build-zh.md` 等），README 只留概览与快速开始。查子模块里的文档时按新位置找。
+- 上游的 range 免分配批视图（S75-3）**没有发**：实测收益 4%～12%，没到门槛，而且会改 `CaskRangeIter` 的对象布局；已从上游 main
+  移回分支 `s75-3-range-batch-view`，留到下次 MAJOR。13.1.0 与 13.1.1 都不含它，C API 导出表没变。
+
 ## [13.1.0] — 2026-11-24
 
 ### Added

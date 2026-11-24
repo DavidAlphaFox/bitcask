@@ -3,6 +3,42 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [13.1.1] — 2026-11-24
+
+Upgrades libbitcask **13.1.0 → 13.1.1** (an upstream PATCH: S77, S78). The submodule moves from `02aa247` to `8511c09` (tag `v13.1.1`).
+Upstream library source is byte-for-byte identical to 13.1.0 (no diff under `src` / `include` / `c_api` / `tools` / `cmake`); the C API,
+C++ ABI (`SOVERSION` 13), on-disk format and this library's existing API are unchanged, the NIFs need no change — just rebuild; the upgrade
+only follows the upstream tag. This release also fixes the build failure of the 13.1.0 tag for downstream `git_subdir` dependencies
+(see Fixed). The `vsn` of both `bitcask` and `bitcask_cypher` moves to 13.1.1; `bitcask_cypher` itself has no changes.
+
+### Fixed
+
+- **Submodule initialisation failed for downstream `git_subdir` dependencies** (introduced in 13.1.0): `apps/bitcask/third_party` was
+  committed as a symlink to the root `third_party/`, while the hook initialised the submodule as `apps/bitcask/third_party/libbitcask`
+  (git: pathspec did not match); on top of that rebar3 fetches git_subdir dependencies as a sparse checkout of `apps/bitcask` only,
+  so the root `third_party/` isn't checked out and the symlink dangles. The hook now derives the submodule path from the physical
+  location of `third_party/<submodule>` (`pwd -P`) and, when the symlink dangles, adds `/third_party/` to the sparse patterns before
+  initialising; both the symlink layout and submodules really moved into `apps/bitcask` work. Verified by building from scratch with a
+  scratch repository and litegate's dependency spec (submodule fetch, NIF build, application build).
+  **Downstream `git_subdir` users need 13.1.1 or later.**
+
+### Changed
+
+- **(via libbitcask 13.1.1) Two timing-sensitive upstream tests went red under full load** (S77, upstream feedback
+  `feedbacks/2026-11-23-two-timing-sensitive-tests-fail-under-full-load.md`):
+  `AtomicBatchVisibilityTest.HeadThenTailNeverShowsHalfBatch` and `OkiCompactionModelTest.ConcurrentLoaderNeverFallsBackToUnloaded`
+  failed intermittently when run with one job per core (`-j 14`). The tests assumed too much about scheduling order; library behaviour
+  was not at fault. Read / write interleaving is now guaranteed by sync points and condition loops. This only affects upstream's own
+  tests — this project configures CMake with `BUILD_TESTING=OFF`, so upstream tests are neither built nor run here.
+- (via libbitcask 13.1.1) Upstream's `check` target runs with one job per core: the cap of 8 that 13.0.0 added to work around the two
+  tests above is gone.
+- (via libbitcask 13.1.1) **Upstream README split** (S78): the feature table, build, text-encoding and architecture overview moved under
+  the submodule's `doc/` (`doc/features-zh.md`, `doc/build-zh.md`, …); the README keeps only the overview and quick start. Look in the
+  new locations when consulting docs inside the submodule.
+- Upstream's allocation-free range batch view (S75-3) **was not released**: measured gain 4%–12%, below the bar, and it changes the
+  `CaskRangeIter` object layout. It has been moved off upstream main to the branch `s75-3-range-batch-view` and is deferred to the
+  next MAJOR. Neither 13.1.0 nor 13.1.1 contains it; the C API export table is unchanged.
+
 ## [13.1.0] — 2026-11-24
 
 ### Added

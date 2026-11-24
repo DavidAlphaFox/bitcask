@@ -6,6 +6,14 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 13.1.1 落地
+
+### 修复 git_subdir 下游构建 + libbitcask 升级 13.1.0 → 13.1.1 ✅
+
+13.1.0 这个 tag 按 `git_subdir` 依赖时子模块初始化失败（hook 找错子模块路径，且 sparse checkout 下根目录 `third_party/` 没检出）；
+hook 改为按物理位置算路径、悬空时先补 sparse 范围（明细见 TASK.md C1-5）。libbitcask 升到上游 PATCH `v13.1.1`（`8511c09`）：
+只动上游测试、`check` 目标与文档，库源码、C API、C++ ABI（`SOVERSION` 13）与盘上格式不变。明细见 TASK.md M29。
+
 ## 13.1.0 落地
 
 ### 图查询语言 `bitcask_cypher` 与统一数据模型 ✅

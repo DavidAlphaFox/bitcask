@@ -681,7 +681,8 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 |---|---|---|
 | **C1-1** | 搬核心：`src/`、`include/`、`priv/`、`test/`、`cpp/`、`CMakeLists.txt`、`cmake/`、`scripts/`、`examples/` 搬到 `apps/bitcask/`（普通 mv，未动 git 索引）。CMake 里的路径都相对 `${CMAKE_SOURCE_DIR}`，不用改。 | ✅ |
 | **C1-2** | 构建配置拆开：`apps/bitcask/rebar.config` 放编译选项、`minimum_otp_vsn` 与 C++ NIF 的 hooks（下游 git_subdir 依赖时 rebar3 读的就是它）；根目录 `rebar.config` 只留项目级的（测试依赖、dialyzer、xref）。hooks 改成在 `apps/bitcask` 里跑：子模块用 `git rev-parse --show-toplevel` / `--show-prefix` 找仓库与路径（下游 git_subdir 时 rebar3 克隆整个仓库带 `.git`，实验确认）；CMake 构建目录是 `$REBAR_ROOT_DIR/_build/cmake`（仓库里仍是原来那个；当依赖时在下游项目的 `_build/cmake`）；缓存的源目录与当前不符时丢掉缓存重新配置（这次搬迁 44 s 重建，ccache 命中）。 | ✅ |
-| **C1-3** | 子模块：`third_party/libbitcask`、`third_party/llama.cpp` 要用 `git mv` 才能连同 `.gitmodules`、索引与 `.git/modules` 里的嵌套指针一起挪——留给提交时做；现在 `apps/bitcask/third_party` 是指向根目录 `third_party` 的符号链接，构建照常。 | ⏳ 待提交时 `git mv` |
+| **C1-3** | 子模块：13.1.0 提交时保留了 `apps/bitcask/third_party` → `../../third_party` 的符号链接、子模块仍注册在根目录。hook 已兼容（C1-5），所以不挪也能用；要挪的话提交时 `git rm` 链接、`git mv third_party/libbitcask apps/bitcask/third_party/libbitcask`（llama.cpp 同）。 | ✅（可选） |
+| **C1-5** | 修 hook（13.1.0 的 git_subdir 下游构建失败）：子模块路径按 `third_party/<名>` 的物理位置（`pwd -P`）算；rebar3 的 git_subdir 是只含 `apps/bitcask` 的 sparse checkout，符号链接悬空时先把 `/third_party/` 加进 `info/sparse-checkout` 再 `read-tree`。用临时仓库按 litegate 的写法从零构建验证（2 分 38 秒，子模块、NIF、应用都过）。随 13.1.1 发出（M29），下游用这个 tag 及之后的。 | ✅ |
 | **C1-4** | 路径修正：测试 `-include("bitcask.hrl")` 改 `-include_lib("bitcask/include/bitcask.hrl")`；`bitcask_schema_tests` 的 `priv/…`、`test/…` 改成 `code:lib_dir(bitcask)` 下的路径；示例脚本找 ebin 的相对路径上溯三层；`.gitignore`、CI（`cmake -S apps/bitcask`、PLT 缓存键带 `apps/*/rebar.config`）、README（新增「目录结构与作为依赖使用」）、`doc/` 与 ROADMAP 里的源码路径加 `apps/bitcask/` 前缀（TASK / CHANGELOG 是历史记录，不改）。 | ✅ |
 
 下游（`beamai_muse`、`bosun`、`litegate` 现在都是 `{bitcask, {git, Url, {tag, "12.0.1"}}}`）升到这之后的版本时改成
@@ -715,6 +716,22 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 - 重开时的恢复重放不再把已进过索引的文档原文填回缓存（S73）：重开后高亮更常走冷路径，`cold => load`（缺省）照常出片段。
 - 实测（上游数字）：单条写最大延迟 153 ms → 约 1.5 ms；全表扫描每行约 950 → 250～440 ns；range 重开后每行约 600～830 → 270～410 ns。
   本库的图读 / 写基准没有重跑。
+
+---
+
+## M29 — 发 13.1.1：修 git_subdir 下游构建 + libbitcask 升级 13.1.0 → 13.1.1（13.1.1）
+
+> submodule `02aa247` → `8511c09`（tag `v13.1.1`，上游 S77 + S78）。上游库源码与 13.1.0 逐字节相同，C API、C++ ABI
+> （`SOVERSION` 13）与盘上格式不变；NIF 不用改。发这版的直接原因：C1-5 的 hook 修复要新 tag 下游才拿得到。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M29-1** | submodule checkout `8511c09`（`v13.1.1`）；`apps/bitcask/CMakeLists.txt` 子模块注释同步。 | ✅ |
+| **M29-2** | 上游这版动了什么（对本库都不可见）：S77 两个时序敏感用例满载时假红，改由同步点保证读写交叠；`check` 目标去掉封顶 8；S78 README 拆到 `doc/`。上游的 range 免分配批视图（S75-3）没发，已移回分支 `s75-3-range-batch-view`。 | ✅ |
+| **M29-3** | 验证：`rebar3 compile`、eunit 628/628、xref、dialyzer 干净。上游 `check`（1002 项）本库不跑（`BUILD_TESTING=OFF`）。 | ✅ |
+| **M29-4** | 发版记录：`vsn` 13.1.0 → **13.1.1**（`bitcask` 与 `bitcask_cypher` 同版）；CHANGELOG（中英）、README（中英，13.1.0 的 tag 在 git_subdir 下会失败的提示改成「13.1.1 起已修」）、ROADMAP（中英）。 | ✅ |
+
+下游（`litegate` 等）的 git_subdir 端到端构建：hook 的机制已用临时仓库验证过（C1-5），按这个 tag 的真实依赖要在 tag 推上去之后才能验。
 
 ---
 

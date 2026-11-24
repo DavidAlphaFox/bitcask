@@ -6,6 +6,16 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 13.1.1 shipped
+
+### git_subdir downstream build fix + libbitcask upgrade 13.1.0 → 13.1.1 ✅
+
+The 13.1.0 tag failed to initialise the submodule when depended on through `git_subdir` (the hook looked up the wrong submodule path,
+and under the sparse checkout the root `third_party/` isn't checked out); the hook now derives the path from the physical location and
+extends the sparse patterns when the symlink dangles (details in TASK.md C1-5). libbitcask moves to the upstream PATCH `v13.1.1`
+(`8511c09`): only upstream tests, the `check` target and docs changed; library source, C API, C++ ABI (`SOVERSION` 13) and on-disk
+format are unchanged. Details in TASK.md M29.
+
 ## 13.1.0 shipped
 
 ### Graph query language `bitcask_cypher` and a unified data model ✅
