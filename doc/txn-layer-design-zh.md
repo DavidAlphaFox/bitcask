@@ -1,8 +1,8 @@
 # 事务协调层设计（bitcask_txn）：2PL + 死锁检测 + 事务重启
 
-> 状态：**P1 + P2（前缀锁）+ P3（分片 + victim 启发式）已实施**（2026-09-21，`src/bitcask_txn.erl` +
-> `src/bitcask_txn_locker.erl` + `src/bitcask_txn_locker_sup.erl`，
-> `test/bitcask_txn_tests.erl` 27 例），**随 6.5.1 发布**（2026-09-21）。实现与本稿的
+> 状态：**P1 + P2（前缀锁）+ P3（分片 + victim 启发式）已实施**（2026-09-21，`apps/bitcask/src/bitcask_txn.erl` +
+> `apps/bitcask/src/bitcask_txn_locker.erl` + `apps/bitcask/src/bitcask_txn_locker_sup.erl`，
+> `apps/bitcask/test/bitcask_txn_tests.erl` 27 例），**随 6.5.1 发布**（2026-09-21）。实现与本稿的
 > 偏差见 §11，前缀锁模型见 §12，分片与 victim 启发式见 §13。
 > 前置阅读：`third_party/libbitcask/doc/multikey-txn-zh.md` §4（引擎事务边界：
 > 只有 A+D，没有 I，也没有 CAS）、`doc/graph-layer-design-zh.md`。
@@ -255,6 +255,15 @@ commit(Tx):
   超时是调用方问题，重跑大概率再超时）。
 - `{lock_wait_timeout, Ms}`（默认 5000）：单锁等待上限，纯兜底（正常
   路径检测必达），触发按死锁处理（中止 + 重启）。
+- `{read_locks, locked | guard_only}`（默认 locked，G15）：guard_only 下带版本守卫的读
+  （`read_guarded/3`、`read_doc_guarded/3`）以 read 模式读时不拿读锁——提交批里的守卫条件已经
+  保证可串行化，读锁只是让冲突方排队而不是重跑。写、write 模式读、不带守卫的 `read/2,3` 照旧
+  加锁，所以与悲观事务混跑时，悲观事务靠锁得到的隔离不变。只读事务（缓冲为空）在 guard_only 下
+  补一条只含 `{check, K, Cond}` 的批确认版本没变（不成立 → 重跑）。Cypher 写语句缺省用它。
+- 注册 / 注销（G15）：`register/2` 不与分片往返——调用方直接把 `#txn{}` 写进共享表（`mon` 先为
+  undefined），再 cast 归属分片去 monitor；注销同样 cast。同一调用方发给同一分片的消息按序处理，
+  调用进程在分片处理前就死了 monitor 立即收到 DOWN，清理路径不变。`release_all` 只给本事务要过锁
+  的分片发 release（调用方进程字典里记；不在事务进程里调用时退回逐分片探 held 表）。
 
 ### 4.8 与脏写的关系（契约声明）
 
@@ -311,10 +320,10 @@ commit(Tx):
 ## 6. 模块与工程布局
 
 ```
-src/bitcask_txn.erl          门面 + 重启循环 + pdict 写缓冲（~300 行）
-src/bitcask_txn_locker.erl   gen_server：锁/等待/检测/监控（~400 行）
-src/bitcask_sup.erl          加一个 ?CHILD(bitcask_txn_locker, worker)
-test/bitcask_txn_tests.erl   eunit（meck 已在 test profile）
+apps/bitcask/src/bitcask_txn.erl          门面 + 重启循环 + pdict 写缓冲（~300 行）
+apps/bitcask/src/bitcask_txn_locker.erl   gen_server：锁/等待/检测/监控（~400 行）
+apps/bitcask/src/bitcask_sup.erl          加一个 ?CHILD(bitcask_txn_locker, worker)
+apps/bitcask/test/bitcask_txn_tests.erl   eunit（meck 已在 test profile）
 ```
 
 - locker 常驻（空载开销 ≈ 一张空 ETS），不做 embedder 式 env 门控——
@@ -537,3 +546,24 @@ A 的边——环至少被一方检出。过期快照最多造成**误报**（�
 - 测试：`younger_is_victim_across_shards_test_`（闭环者更老，受害者在别的
   分片上等，cast 路径）、`older_txn_never_restarts_test_`（门面：老事务闭环
   也一次过，年轻的重跑一次）。
+
+### 13.8 一次入队闭合多个环（G16-4 修复）
+
+- **现象**：「数一遍再建一个」的 Cypher 写语句 8 进程并发（无属性索引）时，每轮有 0～20 次 `lock_wait_timeouts`，
+  整轮卡 5～35 s（结果仍可串行化，只是靠兜底计时器脱困）。
+- **定位**：在兜底计时器到点时打印等待图、旁路巡检各分片 state / 锁表 / 共享表的一致性、记录加锁事件历史。三者
+  一致、没有丢唤醒；卡住的都是**真实存在的环**，`find_cycle` 事后从外面调能找到。事件历史：事务 14 持标签前缀读锁
+  （8 个分片）与计数器写锁；29、22、24、16 … 也持前缀读锁、并先后排队等计数器——它们入队时 14 还没在等，没有环。
+  14 去写前缀下的标签键，被全部前缀读者挡住（阻塞者 [16, 18, 20, 22, 24, 27, 29]），**一次入队同时闭合 7 个环**；
+  `find_cycle` 只返回第一个环 [22, 14]，中止 22 后就停了。之后入队的 24、16 … 各自检出与 14 的环并自我牺牲，但 29
+  早在 14 之前入队、14↔29 这个环再也没有人检，只能等计时器。
+- **修复**：`resolve_cycles/3`——请求者入队后循环找环：每个环选最年轻的当受害者；受害者不是请求者时它的中止是
+  异步的（表里的边还在），之后的搜索把已选的受害者当作已移除（`find_cycle/2` 的排除集），直到从请求者出发再
+  找不到环，或请求者自己成了受害者。§4.6 / 表里「只在入队时检」的论证仍成立：漏掉的不是「不检」，而是「检了
+  只解一个」。
+- **效果**：同一场景 8 轮 `lock_wait_timeouts` 全为 0，每轮 0.02～0.06 s（原 5～35 s），结果仍可串行化。回归
+  `multi_cycle_requester_test_`（A 最老，B、C 持前缀读锁且先排队等 A 的锁，A 写前缀下的 key 一次闭合两个环：B、C
+  都在 500 ms 内拿到 `deadlock`，A 随后拿到锁；旧实现下 C 一直等到兜底计时器，用例失败）。
+- G15-5 曾把 register / 注销改成异步，之后 `graphdb_txn_tests:concurrent_insert_vs_del_vertex_test_` 偶发靠计时器脱困、
+  一度回退。修复后恢复异步：全量连跑 8 次、事务测试模块连跑 10 次全过（原来全量 3～4 次挂 1 次）——证实是同一个漏洞被
+  时序变化放大。异步注册同一轮对比同步：空事务 4.9～5.1 → 2.2～2.4 µs、`put_edge_txn` 19.7 → 15.9 µs。

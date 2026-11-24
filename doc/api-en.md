@@ -69,7 +69,7 @@ Upstream measured 100M `doc:` keys: 11 GB resident → **1.14 GB peak while load
 | Option | Meaning | Constraints |
 |--------|---------|-------------|
 | `{analyzer, Type}` | `ngram` \| `whitespace` \| `jieba` | required to enable search |
-| `{dict_path, Path}` | jieba dictionary dir | required for `jieba` (auto-defaults to `priv/dict`) |
+| `{dict_path, Path}` | jieba dictionary dir | required for `jieba` (auto-defaults to `apps/bitcask/priv/dict`) |
 | `{enable_stop_words, true}` | stop-word filtering | — |
 | `{min_n, N}` / `{max_n, N}` | n-gram bounds (ngram) | `1 =< min_n =< max_n` |
 | `{min_token_length, N}` | drop short latin tokens | `N >= 1` |
@@ -218,9 +218,12 @@ allowed during the fold (`-1` = unlimited).
 Walks `[Lo, Hi)` in key lexicographic order at **O(range)** cost rather than
 filtering the whole table. Backed by the OKI ordered-key index.
 
-> ⚠️ **Not a snapshot.** Consistency is per-key weak (the same tier as
-> `parallel_scan`) — writes concurrent with the iteration may be partially
-> visible. Use `fold` when you need a snapshot.
+> **Snapshot** (since libbitcask 13.1.0, same as `fold`): the key set and the
+> values are those when `range` / `range_fold` starts; writes (including deletes) concurrent with
+> the iteration are not visible. Exception: if a merge drops a key's snapshot
+> version during the iteration (the key was rewritten afterwards), that one key
+> yields its current value. Up to 12.x this was per-key weak consistency
+> (deleted keys skipped, updated keys returned with the new value).
 
 | Function | Notes |
 |----------|-------|

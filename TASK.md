@@ -655,6 +655,69 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## C0 — Cypher 查询层拆为独立应用（未发版）
+
+背景：bitcask 本身是接口查询（`bitcask:*`、`graphdb:*`、`bitcask_query` 结构化 DSL）的库；Cypher 层（语言前端、语义、规划、执行、
+时间时区等）越做越重，拆到同一仓库里的独立 OTP 应用 `apps/bitcask_cypher/`，只依赖核心的公开接口。原 Q2～Q8、G15、G16 的明细
+随之搬到 `apps/bitcask_cypher/TASK.md`；那几项里落在图层的部分（统一数据模型 `graphdb_model`、标签索引、属性索引、关系 rank 高水位）
+留在核心。
+
+| 编号 | 任务 | 状态 |
+|---|---|---|
+| **C0-1** | 搬文件：Cypher 的源码、测试、TCK 运行器、基准、文档、示例搬到 `apps/bitcask_cypher/`；`bitcask_exec` / `bitcask_expr` / `bitcask_plan` / `bitcask_temporal` / `bitcask_tz` / `bitcask_ieee` 改名为 `bitcask_cypher_*`；新增 `bitcask_cypher.app.src`（依赖 kernel、stdlib、bitcask）与 `bitcask_cypher_app`（启动时注册值编解码）。rebar3 缺省同时识别根目录与 `apps/*`，NIF / CMake 不动。 | ✅ |
+| **C0-2** | 断开核心对 Cypher 的唯一依赖：`graphdb_model` 原先直接调时间 / IEEE 模块存取扩展值，改为编解码挂点 `register_value_codec/1`（回调 `is_value` / `type_tag` / `to_text` / `from_text`）；`bitcask_cypher_values` 实现它（应用启动与各入口第一次调用时注册，幂等）。没注册时写这类值报 `unsupported_property_type`、读出存储文本。回归 `graphdb_model_tests:value_codec_test`。 | ✅ |
+| **C0-3** | 配置项 `cypher_import_dir` / `cypher_max_write_vertices` / `tz_dir` / `tz_backzone` 改到 `bitcask_cypher` 应用名下（写进其 `.app.src` 的 env 缺省值）。 | ✅ |
+| **C0-4** | 文档与日志：根 README / ROADMAP / examples / 图层设计稿里的 Cypher 改为指向新应用；CHANGELOG 未发版条目按核心 / Cypher 拆开；新应用有自己的 README、TASK、CHANGELOG。 | ✅ |
+
+验证：两个应用一起 eunit 623/623（连跑 2 遍），TCK 3880/3880（`escript apps/bitcask_cypher/test/tck/tck.escript`），`rebar3 as prod compile`、xref、dialyzer 干净。
+
+---
+
+## C1 — 核心也移进 apps/：umbrella 结构（未发版）
+
+仓库改成 rebar3 umbrella：`apps/bitcask`（核心）+ `apps/bitcask_cypher`（查询层）；根目录只留项目级配置与文档。
+
+| 编号 | 任务 | 状态 |
+|---|---|---|
+| **C1-1** | 搬核心：`src/`、`include/`、`priv/`、`test/`、`cpp/`、`CMakeLists.txt`、`cmake/`、`scripts/`、`examples/` 搬到 `apps/bitcask/`（普通 mv，未动 git 索引）。CMake 里的路径都相对 `${CMAKE_SOURCE_DIR}`，不用改。 | ✅ |
+| **C1-2** | 构建配置拆开：`apps/bitcask/rebar.config` 放编译选项、`minimum_otp_vsn` 与 C++ NIF 的 hooks（下游 git_subdir 依赖时 rebar3 读的就是它）；根目录 `rebar.config` 只留项目级的（测试依赖、dialyzer、xref）。hooks 改成在 `apps/bitcask` 里跑：子模块用 `git rev-parse --show-toplevel` / `--show-prefix` 找仓库与路径（下游 git_subdir 时 rebar3 克隆整个仓库带 `.git`，实验确认）；CMake 构建目录是 `$REBAR_ROOT_DIR/_build/cmake`（仓库里仍是原来那个；当依赖时在下游项目的 `_build/cmake`）；缓存的源目录与当前不符时丢掉缓存重新配置（这次搬迁 44 s 重建，ccache 命中）。 | ✅ |
+| **C1-3** | 子模块：`third_party/libbitcask`、`third_party/llama.cpp` 要用 `git mv` 才能连同 `.gitmodules`、索引与 `.git/modules` 里的嵌套指针一起挪——留给提交时做；现在 `apps/bitcask/third_party` 是指向根目录 `third_party` 的符号链接，构建照常。 | ⏳ 待提交时 `git mv` |
+| **C1-4** | 路径修正：测试 `-include("bitcask.hrl")` 改 `-include_lib("bitcask/include/bitcask.hrl")`；`bitcask_schema_tests` 的 `priv/…`、`test/…` 改成 `code:lib_dir(bitcask)` 下的路径；示例脚本找 ebin 的相对路径上溯三层；`.gitignore`、CI（`cmake -S apps/bitcask`、PLT 缓存键带 `apps/*/rebar.config`）、README（新增「目录结构与作为依赖使用」）、`doc/` 与 ROADMAP 里的源码路径加 `apps/bitcask/` 前缀（TASK / CHANGELOG 是历史记录，不改）。 | ✅ |
+
+下游（`beamai_muse`、`bosun`、`litegate` 现在都是 `{bitcask, {git, Url, {tag, "12.0.1"}}}`）升到这之后的版本时改成
+`{bitcask, {git_subdir, Url, {tag, …}, "apps/bitcask"}}`。
+
+验证：两个应用一起 eunit 628/628（连跑 2 遍），TCK 3880/3880，`rebar3 as prod compile`、xref、dialyzer 干净，示例脚本能跑。下游的 git_subdir
+端到端构建要等提交、打 tag 之后才能验（机制已用临时仓库实验确认）。
+
+---
+
+## M28 — libbitcask 升级 12.1.0 → 13.1.0（13.1.0）
+
+> submodule `1caee1a` → `02aa247`（tag `v13.1.0`，跨上游 12.2.0 / 13.0.0 / 13.1.0：S69～S76）。上游 13.0.0 破坏 C++ ABI（`SOVERSION` 13），
+> 本库从源码编 libbitcask，NIF 不受影响；C API 与盘上格式不变。对应本库提的反馈：
+> `2026-11-23-atomic-batch-remove-span-overcounts-tombstone-shadow.md`（S69，🔴）。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M28-1** | submodule checkout `02aa247`（`v13.1.0`）；NIF 重编（NIF 源码不用改）。 | ✅ |
+| **M28-2** | 测试修正：`bitcask_doc_ops_tests:text_highlight_test_` 假设「小库重开会被重放焐热原文缓存」——上游 S73 起重放已进过索引的文档不再回填，重开后 `cold => skip` 可能没有片段。改为 skip 只断言命中、`cold => load` 断言有片段。 | ✅ |
+| **M28-3** | range 一致性口径改成快照（上游 S76）：`bitcask:range/2,3` / `range_fold/5` 文档注释、`bitcask_cpp_nifs`、`bitcask_query` 模块头、`nif_cask_range.cpp`、`doc/api-zh.md` / `doc/api-en.md`。执行逻辑没有动。 | ✅ |
+| **M28-4** | 验证：eunit 528/528，`rebar3 as prod compile`、xref、dialyzer 干净。 | ✅ |
+| **M28-5** | 发版记录：`vsn` 12.1.0 → **13.1.0**（用户定，与 Q2 同版）；CHANGELOG（中英）、README（中英）、ROADMAP（中英）、`CMakeLists.txt` 子模块注释。 | ✅ |
+
+注意（上游这几版对本库调用方可见的变化）：
+- **range 是快照了**：`range` / `range_fold` 读开始那一刻的版本，迭代期间的写（含删除）不可见（12.x 是 per-key 弱一致：被删的跳过、被改的交
+  新值）；迭代期间被 merge 合并掉快照版本的 key 交出当前值。图层逐跳 range 的「跨跳弱一致」不变（每跳一个新的快照）。
+- 原子批删除的批头区间修好了（S69）：12.1.0 写出、重开 `bad_crc` 的库，新版本能直接打开、删除生效、文件不改；12.0.3 及更早已经截断掉的数据
+  救不回来。CHANGELOG 里这一条从 Known issues 挪到 Fixed。
+- 读写打开的库第一次写到 memdelta 阈值（64 MiB）时多起一条后台落段线程，`close` 时停。
+- 重开时的恢复重放不再把已进过索引的文档原文填回缓存（S73）：重开后高亮更常走冷路径，`cold => load`（缺省）照常出片段。
+- 实测（上游数字）：单条写最大延迟 153 ms → 约 1.5 ms；全表扫描每行约 950 → 250～440 ns；range 重开后每行约 600～830 → 270～410 ns。
+  本库的图读 / 写基准没有重跑。
+
+---
+
 ## M27 — libbitcask 升级 12.0.3 → 12.1.0 + `vector_rank`（12.1.0）
 
 > submodule `d995557` → `1caee1a`（tag `12.1.0`，上游 S66 + S67）。既有 C API、C++ ABI（`SOVERSION` 12）与盘上格式不变；

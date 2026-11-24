@@ -8,8 +8,8 @@ English: 暂缺。本文档定义「以 libbitcask 为单一存储、Erlang 为�
 > 会返回 `{error, graph_layout_v1}`。遍历算法（§6）、OLAP 物化（§7）、etype 注册
 > 仍然有效。
 
-状态：**P1–P5 已落地**（2026-09：`src/graphdb.erl` + `src/graphdb_analytics.erl` +
-测试 + `test/graphdb_bench` 基准）。**本文档覆盖 2.2.1 规划的「CSR 整图一个 value」
+状态：**P1–P5 已落地**（2026-09：`apps/bitcask/src/graphdb.erl` + `apps/bitcask/src/graphdb_analytics.erl` +
+测试 + `apps/bitcask/test/graphdb_bench` 基准）。**本文档覆盖 2.2.1 规划的「CSR 整图一个 value」
 方案**：旧方案的核心约束（keydir 无序、前缀扫描退化 O(全部 key)）已被 6.0.0 的
 OKI 有序 range 推翻。原 CSR 盘上格式不被丢弃——降级为本方案 §7 的全图分析物化缓存层。
 英文版：[graph-layer-design-en.md](graph-layer-design-en.md)。
@@ -120,7 +120,7 @@ OKI（有序 key 索引，见 libbitcask `doc/ordered-key-index-design-zh.md`）
 
 四元组 `(Src, Etype, Dst, Rank)`；应用需要不透明句柄时用去家族字节的 28 字节编码
 `<<Src:64, Etype:32, Dst:64, Rank:64>>`。`e` / `ei` 互为镜像：从反向扫描结果交换
-src/dst 段即可重算正向 key（对偶性白送，JanusGraph full-id 四元组的同构）。
+apps/bitcask/src/dst 段即可重算正向 key（对偶性白送，JanusGraph full-id 四元组的同构）。
 
 ---
 
@@ -274,6 +274,17 @@ end, [{retries, 10}])                                   -> {atomic, R} | {aborte
 %%（e<vid>/ei<vid> 前缀写锁下级联，一批提交）。
 %% ⚠️ 同一图的边写要么全走事务、要么全走直通（直通绕过锁）。
 
+%% 统一数据模型（2026-11-23，apps/bitcask_cypher/doc/cypher-query-design-zh.md 第 4、8.2、11 节；graphdb_model）
+%% 与 Cypher（独立应用 apps/bitcask_cypher）共用：一个 id 空间、一份标签索引、一种属性编码。
+%% 引擎 meta 存不了的值（时间 / 空间值、NaN）由上层经 graphdb_model:register_value_codec/1 注册编解码。
+graphdb:create_vertex(R, #{labels => [L], props => #{K => V}, text => B, vector => Vec})
+                                                        -> {ok, Vid}.   %% 自动分配 id
+graphdb:put_vertex(R, Vid, Doc).                        %% Doc 也可以是上面那种 map；vid ≥ 高水位时推高它
+graphdb:vertex(R, Vid)                                  -> {ok, #{id, labels, properties}}.
+graphdb:set_labels(R, Vid, [L]) / remove_labels(R, Vid, [L]).
+graphdb:vertices_by_label(R, L, #{limit, 'after'})      -> {ok, [Vid]}.
+graphdb:put_edge(R, S, T, D, #{props => #{K => V}}).    %% 边属性 map 走 meta 编码
+
 %% 检索联动（复用引擎能力）
 graphdb:search_vertex(R, Query).                        %% search_fields/search_text 直通
 graphdb:search_vector(R, Q).                            %% 顶点向量近邻
@@ -324,11 +335,11 @@ vbyte 前缀差分压缩率高（`prefix:id` 形态正是 BCOK 的优化目标�
 2. **P2** ✅：BFS / k-hop / 双向最短路；hub 策略（limit / 前缀收窄）；visited 去重结构。
 3. **P3**：`deg` / `et` 家族 + `search_*` 联动的属性过滤遍历 + 向量近邻联动。
 4. **P4** ✅：CSR 物化缓存（`parallel_scan` → GCSR）+ PageRank / 连通分量 / SSSP。
-5. **P5** ✅：基准（`test/graphdb_bench`：稳态一跳 ~0.02 ms/op、批量装载 ~94k edges/s
+5. **P5** ✅：基准（`apps/bitcask/test/graphdb_bench`：稳态一跳 ~0.02 ms/op、批量装载 ~94k edges/s
    @2k/8k 规模；⚠️ 未 flush memdelta 上查询 ~12ms/跳——装载型负载装载后建议
    checkpoint/reopen）+ 一致性语义测试（扫中插入/删除可见性不变量）+ EN 文档（本文英文版）。
 6. **X1-5** ✅（2026-09-21）：事务式 API（`transaction/2,3` + `put_edge_txn` /
    `del_edge_txn` / `edge_txn` / `degree_txn` / `put_vertex_txn` / `get_vertex_txn`），
-   建在 `bitcask_txn` 上；16 进程并发对同一 hub 加边计数精确（`test/graphdb_txn_tests.erl`）。
+   建在 `bitcask_txn` 上；16 进程并发对同一 hub 加边计数精确（`apps/bitcask/test/graphdb_txn_tests.erl`）。
 7. **X1-6** ✅（2026-09-21）：前缀锁版 `out_edges_txn` / `in_edges_txn` / `degree_txn/2`
    / `del_vertex_txn`（txn 设计 §12）；加边 vs 删点随机交错的全图不变式测试。

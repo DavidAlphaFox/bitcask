@@ -1,13 +1,13 @@
 # bitcask 使用指南
 
 本指南涵盖 C++23 NIF（`cask_cpp`）——唯一可用的模式。
-所有操作通过 `bitcask_cpp_nifs` → `priv/bitcask_cpp.so` 进行。
+所有操作通过 `bitcask_cpp_nifs` → `apps/bitcask/priv/bitcask_cpp.so` 进行。
 
 ## 构建与 Shell
 
 ```bash
 cd /path/to/bitcask
-rebar3 compile        # 生成 priv/bitcask_cpp.so
+rebar3 compile        # 生成 apps/bitcask/priv/bitcask_cpp.so
 rebar3 shell          # 启动生产模式 shell
 ```
 

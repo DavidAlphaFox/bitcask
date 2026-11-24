@@ -1,0 +1,17 @@
+{application, bitcask_cypher,
+ [
+  {description, "Cypher (openCypher) query layer over the bitcask graph API"},
+  {vsn, "13.1.0"},
+  {modules, []},
+  {registered, [bitcask_cypher_sup]},
+  {applications, [kernel, stdlib, bitcask]},
+  {mod, {bitcask_cypher_app, []}},
+  {env, [
+         %% 一条写语句最多写多少个顶点；undefined（缺省）= 不限。
+         {cypher_max_write_vertices, undefined},
+         %% 命名时区的数据目录（TZif）；undefined = 环境变量 TZDIR > /usr/share/zoneinfo。Windows 上要配。
+         {tz_dir, undefined},
+         %% true = 被 IANA 合并的时区照用本机（带 backzone 编的）zoneinfo；缺省按 IANA 缺省编法（同 Java / Neo4j）。
+         {tz_backzone, false}
+        ]}
+ ]}.
