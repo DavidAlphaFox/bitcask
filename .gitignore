@@ -1,12 +1,12 @@
 .eunit/*
 deps/*
 ebin
-priv/*.so
+apps/bitcask/priv/*.so
 # vendored ggml/llama runtime libs flattened into priv/ by the opt-in
 # BITCASK_WITH_LLAMA build. They carry SONAME suffixes (libggml-base.so.0,
 # libllama.so.0.0.1, ...) which `priv/*.so` above does NOT match.
-priv/*.so.*
-priv/dict/
+apps/bitcask/priv/*.so.*
+apps/bitcask/priv/dict/
 *.o
 *.beam
 *~
@@ -47,6 +47,14 @@ third_party/oneTBB
 third_party/utf8proc
 third_party/unordered_dense
 third_party/libbitcask/
+apps/bitcask/third_party/benchmark
+apps/bitcask/third_party/cppjieba
+apps/bitcask/third_party/googletest
+apps/bitcask/third_party/limonp
+apps/bitcask/third_party/oneTBB
+apps/bitcask/third_party/utf8proc
+apps/bitcask/third_party/unordered_dense
+apps/bitcask/third_party/libbitcask/
 
 # IDE / editor
 .vscode/
@@ -60,3 +68,7 @@ third_party/libbitcask/
 *.gcno
 *.gcov
 coverage/
+
+# leex / yecc 生成物（rebar3 从 apps/bitcask_cypher/src/*.xrl、*.yrl 生成到同目录）
+apps/bitcask_cypher/src/bitcask_cypher_lexer.erl
+apps/bitcask_cypher/src/bitcask_cypher_parser.erl

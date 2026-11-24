@@ -3,7 +3,7 @@
 English version: [`local-embedding-en.md`](local-embedding-en.md)。
 
 在 BEAM 进程内直接算 embedding，不经 HTTP 端点。产物是**第二个 NIF**
-`priv/bitcask_llama.so`，与核心的 `priv/bitcask_cpp.so` 互不依赖。
+`apps/bitcask/priv/bitcask_llama.so`，与核心的 `apps/bitcask/priv/bitcask_cpp.so` 互不依赖。
 
 **默认不构建。** 关掉时本仓库的构建产物与这个后端存在之前一字不差：不拉子模块、
 不加 CMake 开关、不多任何 target。
@@ -41,7 +41,7 @@ BITCASK_WITH_LLAMA=1 rebar3 compile
 或直接用 CMake：
 
 ```sh
-cmake -S . -B _build/cmake -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release \
+cmake -S apps/bitcask -B _build/cmake -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release \
       -DBITCASK_WITH_LLAMA=ON
 cmake --build _build/cmake --target bitcask_llama -j
 ```
@@ -49,15 +49,15 @@ cmake --build _build/cmake --target bitcask_llama -j
 首次会拉 `third_party/llama.cpp` 子模块（约 200 MB，钉在 tag `v1.0.0`）并全量
 编译，是分钟级。之后增量是 no-op。
 
-构建完 `priv/` 下会多出一组共享库：
+构建完 `apps/bitcask/priv/` 下会多出一组共享库：
 
 ```
-priv/bitcask_llama.so          ← NIF 本体
-priv/libggml-base.so*          ← ggml 核心（必须是共享库）
-priv/libggml-cpu-{x64,sse42,sandybridge,ivybridge,haswell,piledriver,
+apps/bitcask/priv/bitcask_llama.so          ← NIF 本体
+apps/bitcask/priv/libggml-base.so*          ← ggml 核心（必须是共享库）
+apps/bitcask/priv/libggml-cpu-{x64,sse42,sandybridge,ivybridge,haswell,piledriver,
                   skylakex,cannonlake,cascadelake,icelake,cooperlake,
                   zen4,alderlake,sapphirerapids}.so   ← 14 个 CPU 变体（x86；ARM 上另一套）
-priv/libggml.so* priv/libllama.so*
+apps/bitcask/priv/libggml.so* apps/bitcask/priv/libllama.so*
 ```
 
 **这些变体是运行时按 CPU 微架构 `dlopen` 的**，不是构建期选一个。发行时必须
@@ -222,9 +222,9 @@ bitcask 是跑在服务器上的产品，取舍是**性能优先，体积不是�
 脚本也按这条线切开——两段可以在不同机器上分别跑：
 
 ```sh
-scripts/detect-llama-backends.sh --build     # 构建机：有没有 SDK
-scripts/detect-llama-backends.sh --runtime   # 部署机：有没有卡 + 这个包用不用得上
-scripts/detect-llama-backends.sh             # 两段都跑
+apps/bitcask/scripts/detect-llama-backends.sh --build     # 构建机：有没有 SDK
+apps/bitcask/scripts/detect-llama-backends.sh --runtime   # 部署机：有没有卡 + 这个包用不用得上
+apps/bitcask/scripts/detect-llama-backends.sh             # 两段都跑
 ```
 
 #### 构建期：探测 SDK，决定编什么
@@ -245,7 +245,7 @@ scripts/detect-llama-backends.sh             # 两段都跑
 > 打开 `GGML_VULKAN` 会**直接把构建炸掉**——而 AUTO 的全部意义是"没有就安静地
 > 不编"。
 
-`scripts/detect-llama-backends.sh` 是**构建期工具**：CMake 只会说"没找到"，它会
+`apps/bitcask/scripts/detect-llama-backends.sh` 是**构建期工具**：CMake 只会说"没找到"，它会
 说**缺哪个包**，并给出建议的构建命令。
 
 #### 运行期：Erlang 自己决定用哪个后端
@@ -424,7 +424,7 @@ application 起不来。
 **(1) CUDA 运行时随包走。** `GGML_STATIC` 与我们必须开的 `BUILD_SHARED_LIBS=ON`
 冲突（前者会加全局 `-static`），所以 `libggml-cuda.so` 是**动态**链
 cudart / cublas / cublasLt 的。默认 `BITCASK_LLAMA_CUDA_BUNDLE_RUNTIME=ON` 会把
-这三个库平铺进 `priv/`，和它们的使用者并排、靠 `$ORIGIN` 解析。
+这三个库平铺进 `apps/bitcask/priv/`，和它们的使用者并排、靠 `$ORIGIN` 解析。
 
 > cuBLAS 确实很大（CUDA 12 下几百 MB），但换掉的是一整类"构建机上好好的、到
 > 目标机就没 GPU"的故障——而且那种故障**不报错**：ggml 对后端 `dlopen` 失败是
@@ -572,7 +572,7 @@ worker 喂，K 张卡里同时只有一张在算。某个 worker 那一段失败
 > 请求**报 400，一条空文档就把同批的另外 63 条一起废掉。
 
 解析逻辑是纯函数（`bitcask_embedder_util:parse_embedding_batch/3`），有不打网络的
-单测（`test/bitcask_embedder_util_tests.erl`）——包括故意乱序返回的那一条。
+单测（`apps/bitcask/test/bitcask_embedder_util_tests.erl`）——包括故意乱序返回的那一条。
 
 
 ---
@@ -616,7 +616,7 @@ NIF **在加载这一步就拒绝 NONE**，给一条能照做的错。但注意�
 
 > ⚠️ **配成"错的那一个"（GGUF 带了错值）这条链检测不出来。** 加载会成功、嵌入
 > 会成功、向量长度也对，只是语义全错。唯一的判据是自检探针——
-> `test/bitcask_llama_tests.erl` 的 `self_check_semantics_test_`：近义句相似度
+> `apps/bitcask/test/bitcask_llama_tests.erl` 的 `self_check_semantics_test_`：近义句相似度
 > 必须显著高于无关句。换模型时**跑一遍那个用例**。
 
 对照表：Qwen3-Embedding 要 `last`，BERT/BGE 要 `cls`，E5/GTE 要 `mean`。
@@ -709,7 +709,7 @@ bitcask_llama_nifs:last_error().      %% llama/ggml 打的最后一条 error
 | 症状 | 原因 |
 |---|---|
 | `{error, {llama_nif_unavailable, _, _}}` | 没开 `BITCASK_WITH_LLAMA` 构建 |
-| `ensure_backend` 返回 `{ok, 0}` | `priv/` 里没有匹配本机 CPU 的 `libggml-cpu-*` |
+| `ensure_backend` 返回 `{ok, 0}` | `apps/bitcask/priv/` 里没有匹配本机 CPU 的 `libggml-cpu-*` |
 | `{error, {pooling_none, _}}` | GGUF 没带 `pooling_type`，显式配 `pooling` |
 | `{error, {model_not_found, _}}` | 路径不对（Erlang 侧就拦下了，没进 llama） |
 | `{error, {dim_mismatch, _}}` | 配置里的 `dim` 与模型实际维度不符 |
@@ -721,14 +721,14 @@ bitcask_llama_nifs:last_error().      %% llama/ggml 打的最后一条 error
 | `{error, {bad_opt, {instances, duplicate_gpu}}}` | 同一张卡出现在两个 instance 里 |
 | `{error, {bad_gpu_index, _}}` | `gpu_index` 超出这台机器的卡数 —— 按 `backend_info()` 的设备表开池 |
 | `{error, {bad_backend, _}}` / `{error, {bad_split_mode, _}}` | 取值只能是 auto\|cuda\|vulkan\|cpu / none\|layer\|row |
-| `gpu_status()` 返回 `no_gpu_device` | 包里有 CUDA 但机器上没卡 —— 装驱动 / 容器透传 / 查依赖，跑 `scripts/detect-llama-backends.sh --runtime` |
+| `gpu_status()` 返回 `no_gpu_device` | 包里有 CUDA 但机器上没卡 —— 装驱动 / 容器透传 / 查依赖，跑 `apps/bitcask/scripts/detect-llama-backends.sh --runtime` |
 
 ## 8. 测试
 
 构建期 SDK 探测（**构建机**上跑；运行期不需要脚本）：
 
 ```sh
-scripts/detect-llama-backends.sh
+apps/bitcask/scripts/detect-llama-backends.sh
 ```
 
 ```sh

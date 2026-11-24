@@ -414,7 +414,7 @@ writes were conditional write + retry from day one.
 
 ## 12. Acceptance Criteria
 
-Benchmarks extend `test/graphdb_bench` with the earlier per-edge layout as a reference:
+Benchmarks extend `apps/bitcask/test/graphdb_bench` with the earlier per-edge layout as a reference:
 
 | Metric | Expectation |
 |---|---|
@@ -486,7 +486,7 @@ Benchmarks extend `test/graphdb_bench` with the earlier per-edge layout as a ref
 - Crash consistency has no dedicated kill test: every write is a single engine atomic
   batch, and the engine's crash atomicity (all or nothing per batch) is covered upstream.
 
-### 14.3 Benchmarks (`test/graphdb_bench`, 8 vCPU, 2026-11-18)
+### 14.3 Benchmarks (`apps/bitcask/test/graphdb_bench`, 8 vCPU, 2026-11-18)
 
 10,000 vertices / 50,000 edges (power-law sources, average out-degree 5), three
 thresholds:

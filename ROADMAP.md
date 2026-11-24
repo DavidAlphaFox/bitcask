@@ -6,6 +6,23 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 13.1.0 落地
+
+### 图查询语言 `bitcask_cypher` 与统一数据模型 ✅
+
+openCypher 子集（读、写、变长与最短路、全文 `@@`、向量 `<=>`），三层：leex / yecc 前端 → 与语法无关的计划 → 执行器；写语句整条在
+`bitcask_txn` 事务里。图层 API 与 Cypher 共用一个数据模型：同一个 id 空间（从 1 起、指定 id 推高水位）、标签存 meta、标签索引与顶点同批
+维护。使用说明 `doc/cypher-zh.md`，明细见 TASK.md Q2。
+
+> 2026-11-24：Cypher 查询层已拆为同一仓库里的独立应用 `apps/bitcask_cypher/`（见 TASK.md C0），使用说明与明细随之搬到
+> `apps/bitcask_cypher/doc/`、`apps/bitcask_cypher/TASK.md`；统一数据模型（`graphdb_model`）留在本库。
+
+### libbitcask 升级 12.1.0 → 13.1.0 ✅
+
+跨上游 12.2.0 / 13.0.0：S69 原子批删除的批头区间（本库提的反馈）、S70 后台落段、S71 / S76 扫描与 range 按索引位置映射读（range 变成
+快照语义）、S73 重开重放不回填原文缓存、S75 扫描免分配批视图。13.0.0 破坏 C++ ABI（`SOVERSION` 13），本库从源码编、无影响；C API
+与盘上格式不变。submodule 切到上游 `v13.1.0`（`02aa247`）。明细见 TASK.md M28。
+
 ## 12.1.0 落地
 
 ### libbitcask 升级 12.0.3 → 12.1.0 ✅
@@ -62,7 +79,7 @@ C++ ABI（`SOVERSION` 12）与盘上格式均不变；merge 竞争拒批后整�
 
 随升级解除「写会话可能基于半个批覆盖块」的上游缺陷；graph 层另保留显式防护：写会话
 条件覆盖整个读集（改过的头、读过的块、读过没改的顶点），`#{consistent => true}` 在读集
-版本校验后返回。确定性回归 `test/graphdb_batch_isolation_tests.erl`。
+版本校验后返回。确定性回归 `apps/bitcask/test/graphdb_batch_isolation_tests.erl`。
 
 ## 12.0.0 落地
 
@@ -531,7 +548,7 @@ DetailBinary}}`。此前上游那两类「只有消息、没有 errno」的故�
 ### 本地嵌入后端（llama.cpp / ggml）✅
 
 在 BEAM 进程内直接算 embedding，不经 HTTP 端点。产物是**独立的第二个 NIF**
-`priv/bitcask_llama.so`，与核心 `bitcask_cpp.so` 互不依赖；**默认不构建**
+`apps/bitcask/priv/bitcask_llama.so`，与核心 `bitcask_cpp.so` 互不依赖；**默认不构建**
 （`BITCASK_WITH_LLAMA=1`），关掉时构建产物与 5.0.0 一字不差。新增 submodule
 `third_party/llama.cpp`（tag `b10257`）。**本次不涉及 libbitcask 升级**，无 ABI
 变更、无盘上格式变更。
@@ -565,7 +582,7 @@ embedder，进程的 `terminate/2` 才关）、**串行本来就是要的**（`l
 ### GPU（NVIDIA CUDA / Vulkan）✅
 
 服务器产品的取舍是**性能优先、体积不是约束**：CUDA 架构覆盖 Maxwell..Blackwell
-不收窄成 native，CUDA 运行时随包平铺进 `priv/`——换掉的是"目标机缺 libcublas →
+不收窄成 native，CUDA 运行时随包平铺进 `apps/bitcask/priv/`——换掉的是"目标机缺 libcublas →
 ggml 静默跳过 → 降级纯 CPU"这一整类不报错的故障。
 
 **构建期探测 SDK，运行期探测显卡** —— 这两件事在**不同的机器**上发生（构建机常常
@@ -639,11 +656,11 @@ HTTP 档（openai / anthropic）也实现了原生批量：一次请求带数组
 **默认不开**：实测短文本 7.0x / 中文本 2.9x，但测量时机器有外部满载进程，安静机器
 上倍数会小得多，长文本档无可信数据——开之前在自己的硬件上量。
 
-构建期 SDK 探测脚本 `scripts/detect-llama-backends.sh`：CMake 只会说"没找到"，它说
+构建期 SDK 探测脚本 `apps/bitcask/scripts/detect-llama-backends.sh`：CMake 只会说"没找到"，它说
 **缺哪个包**并给出带上探到的开关的构建命令。
 
 > **Vulkan 构建路径已实测**：开发机上有 Vulkan SDK（1.4.309），AUTO 探到并编入，
-> `priv/libggml-vulkan.so` 落地。因为这台机器没有 GPU，`gpu_status/0` 给的是
+> `apps/bitcask/priv/libggml-vulkan.so` 落地。因为这台机器没有 GPU，`gpu_status/0` 给的是
 > `no_gpu_device` 而不是 `cpu_only_build`——**这正是构建期/运行期分离要区分的那两
 > 种情况，本次是用真实数据验证的**。
 >
@@ -700,7 +717,7 @@ submodule 由 v3.1.0 升至 **v4.0.0**（S32 向量双引擎 + S29-11-②④ AVX
 重放窗口有界）。随库引入 IVF-RaBitQ-lite 引擎（100k/384d 查询 36.5µs、召回损失 ≤0.08pt）、
 DiskANN 引擎（实验性）、AVX2 int8 点积内核（VNNI512→VNNI256→AVX2 分发，非 VNNI 机器全
 int8 路径激活）、向量 ckpt 崩溃恢复有界（最坏 ~4.2M 条 → ≤320K 条）、HNSW `.qc8` 码字
-mmap 化 + `clone_live` payload 外溢。`examples/` 增加 Wikipedia 检索库示例
+mmap 化 + `clone_live` payload 外溢。`apps/bitcask/examples/` 增加 Wikipedia 检索库示例
 （`wiki_hnsw` / `wiki_diskann` 双引擎对比）。
 
 > ⚠️ ABI 破坏：soname `libbitcask.so.3` → `libbitcask.so.4`，下游须重新编译链接。
@@ -791,7 +808,7 @@ load_failed}`）；`StatusInfo::index_errors` 经新 `bitcask:index_errors/1` �
 遍历 + deg/et 索引 → P4 CSR 物化 + 样例算法 → P5 基准与一致性测试。
 **落地（2026-09）**：P1–P5 全部实现——`graphdb`（codec/CRUD/遍历/计数器/et 索引/
 etype registry）+ `graphdb_analytics`（CSR 物化 + PageRank/连通分量/SSSP）+
-一致性语义测试 + `test/graphdb_bench`（稳态一跳 ~0.02 ms/op，未 flush memdelta
+一致性语义测试 + `apps/bitcask/test/graphdb_bench`（稳态一跳 ~0.02 ms/op，未 flush memdelta
 上 ~12 ms/跳——装载型负载装载后建议 checkpoint/reopen）。
 
 ---
@@ -802,12 +819,12 @@ etype registry）+ `graphdb_analytics`（CSR 物化 + PageRank/连通分量/SSSP
 
 > 可行性评估：[`doc/libcask-extraction-zh.md`](doc/libcask-extraction-zh.md)
 
-将 C++ 非 NIF 核心（`cpp/src/` + `cpp/include/`，24 源文件 + 45 头文件）独立为
-`libcask.so` / `libcask.a`，当前 Erlang 项目仅保留 NIF 胶水层（`cpp/nif/`）依赖之。
+将 C++ 非 NIF 核心（`apps/bitcask/cpp/src/` + `apps/bitcask/cpp/include/`，24 源文件 + 45 头文件）独立为
+`libcask.so` / `libcask.a`，当前 Erlang 项目仅保留 NIF 胶水层（`apps/bitcask/cpp/nif/`）依赖之。
 
 现有架构已具备分离条件：
 - C++ 核心零 `erl_nif.h` 依赖、零 `enif_*` 调用
-- 构建系统已模块化（11 个 static library，`cpp/CMakeLists.txt` 支持独立构建）
+- 构建系统已模块化（11 个 static library，`apps/bitcask/cpp/CMakeLists.txt` 支持独立构建）
 - 耦合单向且极薄（NIF → C++，无反向调用；唯一桥接是 `CaskHandle { unique_ptr<Cask> }`）
 
 **路径 A（C++ API 直出，推荐）**：导出 C++ 类，NIF 层直接 include，改动最小，保留 LTO。

@@ -1,0 +1,119 @@
+#!/usr/bin/env escript
+
+%% cypher_bench — 图查询语言（bitcask_cypher）手动基准（doc/cypher-query-design-zh.md 第 13 节 Q2-6）。
+%%
+%% 用法：
+%%   test/cypher_bench [n_vertices] [n_edges]
+%% 缺省：20000 顶点 / 100000 边（幂律近似：小 id 高频，含 hub），带标签、属性、正文与 8 维向量。
+%%
+%% 口径（单位 µs/次，固定随机种子，墙钟 timer:tc）：
+%%   装载：create_vertex（API）/ CREATE 单条 / UNWIND 批量 CREATE；put_edges
+%%   读：一跳（API out_edges / Cypher 预编译 / Cypher 文本）、两跳计数、标签扫描 + 属性过滤、
+%%       聚合、最短路
+%%   写：SET 单个属性、CREATE 关系、DETACH DELETE
+%%   检索：全文 @@、向量 top-k（ORDER BY <=> LIMIT）、图模式 + 向量排序
+%% 行在 memdelta 与重开后（行在 run 里）各测一遍读；写在最后（重开之后）。
+
+-mode(compile).
+
+main(Args) ->
+    Ints = [list_to_integer(A) || A <- Args],
+    [NV, NE] = Ints ++ lists:nthtail(length(Ints), [20000, 100000]),
+    code:add_pathsz(filelib:wildcard("_build/default/lib/*/ebin")),
+    {ok, _} = application:ensure_all_started(bitcask),
+    Dir = "/tmp/cypher_bench_" ++ integer_to_list(erlang:unique_integer([positive])),
+    Opts = [read_write, {analyzer, whitespace}, {vector_dim, 8}],
+    io:format("== cypher bench: ~p vertices / ~p edges ==~n", [NV, NE]),
+    rand:seed(exsss, {42, 43, 44}),
+    try
+        R0 = graphdb:open(Dir, Opts),
+        load(R0, NV, NE),
+        reads("rows in memdelta", R0, NV),
+        ok = graphdb:close(R0),
+        %% 写放在重开之后：量的是行已落盘（读走 run）时的稳态写
+        R1 = graphdb:open(Dir, Opts),
+        reads("after reopen", R1, NV),
+        writes(R1, NV),
+        graphdb:close(R1)
+    after
+        os:cmd("rm -rf " ++ Dir)
+    end.
+
+words() -> {<<"graph">>, <<"vector">>, <<"store">>, <<"edge">>, <<"query">>, <<"index">>, <<"path">>, <<"node">>}.
+
+text(I) ->
+    W = words(),
+    iolist_to_binary(lists:join(<<" ">>, [element(1 + (I * K) rem 8, W) || K <- [1, 3, 7]])).
+
+vec(I) -> << <<(math:sin(I * K * 0.37)):32/float-little>> || K <- lists:seq(1, 8) >>.
+
+load(R, NV, NE) ->
+    {ok, Knows} = graphdb:register_etype(R, <<"KNOWS">>),
+    N1 = NV div 2,
+    per("load: graphdb:create_vertex", N1, fun() ->
+        [{ok, _} = graphdb:create_vertex(R, #{labels => [<<"Person">>],
+                                              props => #{k => I rem 100, name => integer_to_binary(I)},
+                                              text => text(I), vector => vec(I)})
+         || I <- lists:seq(1, N1)] end),
+    N2 = 200,
+    per("load: CREATE (one statement each)", N2, fun() ->
+        [{ok, _} = bitcask_cypher:q(R, "CREATE (:Person {k: $k, name: $n, text: $t, embedding: $v})",
+                                    #{k => I rem 100, n => integer_to_binary(I), t => text(I), v => vec(I)})
+         || I <- lists:seq(N1 + 1, N1 + N2)] end),
+    Rest = NV - N1 - N2,
+    Batch = 1000,
+    per("load: UNWIND $rows CREATE (1000 per statement), per vertex", Rest, fun() ->
+        [{ok, _} = bitcask_cypher:q(R, "UNWIND $rows AS r CREATE (:Person {k: r.k, name: r.n, text: r.t, embedding: r.v})",
+                                    #{rows => [#{k => I rem 100, n => integer_to_binary(I), t => text(I), v => vec(I)}
+                                               || I <- lists:seq(S, min(S + Batch - 1, NV))]})
+         || S <- lists:seq(N1 + N2 + 1, NV, Batch)] end),
+    Edges = [{max(1, trunc(NV * math:pow(rand:uniform(), 2.0))), Knows, rand:uniform(NV)} || _ <- lists:seq(1, NE)],
+    per("load: graphdb:put_edges, per edge", NE, fun() -> ok = graphdb:put_edges(R, Edges) end).
+
+reads(Tag, R, NV) ->
+    io:format("-- reads (~s) --~n", [Tag]),
+    Vs = [rand:uniform(NV) || _ <- lists:seq(1, 5000)],
+    per("one hop: graphdb:out_edges", 5000, fun() -> [graphdb:out_edges(R, V) || V <- Vs] end),
+    {ok, P1} = bitcask_cypher:prepare(R, "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = $v RETURN id(b)"),
+    per("one hop: Cypher prepared", 5000, fun() -> [{ok, _} = bitcask_cypher:q(R, P1, #{v => V}) || V <- Vs] end),
+    per("one hop: Cypher text (parse + plan each time)", 5000, fun() ->
+        [{ok, _} = bitcask_cypher:q(R, "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = $v RETURN id(b)", #{v => V}) || V <- Vs] end),
+    {ok, P2} = bitcask_cypher:prepare(R, "MATCH (a)-[:KNOWS]->()-[:KNOWS]->(c) WHERE id(a) = $v RETURN count(c)"),
+    per("two hops count: Cypher prepared", 1000, fun() -> [{ok, _} = bitcask_cypher:q(R, P2, #{v => V}) || V <- lists:sublist(Vs, 1000)] end),
+    {ok, P3} = bitcask_cypher:prepare(R, "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = $v AND b.k < 50 RETURN b.name"),
+    per("one hop + property filter on neighbours", 2000, fun() -> [{ok, _} = bitcask_cypher:q(R, P3, #{v => V}) || V <- lists:sublist(Vs, 2000)] end),
+    per("label scan + filter (all Person, k = 7), per query", 5, fun() ->
+        [{ok, _} = bitcask_cypher:q(R, "MATCH (n:Person) WHERE n.k = 7 RETURN count(*)") || _ <- lists:seq(1, 5)] end),
+    per("aggregate: count per k over all Person, per query", 3, fun() ->
+        [{ok, _} = bitcask_cypher:q(R, "MATCH (n:Person) RETURN n.k, count(*) ORDER BY n.k") || _ <- lists:seq(1, 3)] end),
+    Pairs = lists:zip(lists:sublist(Vs, 200), lists:sublist(lists:reverse(Vs), 200)),
+    {ok, P4} = bitcask_cypher:prepare(R, "MATCH (a), (b) WHERE id(a) = $a AND id(b) = $b "
+                                         "MATCH p = shortestPath((a)-[:KNOWS*..10]->(b)) RETURN length(p)"),
+    per("shortestPath: Cypher prepared", 200, fun() -> [{ok, _} = bitcask_cypher:q(R, P4, #{a => A, b => B}) || {A, B} <- Pairs] end),
+    per("shortestPath: graphdb:shortest_path", 200, fun() -> [graphdb:shortest_path(R, A, B) || {A, B} <- Pairs] end),
+    {ok, P5} = bitcask_cypher:prepare(R, "MATCH (n) WHERE n.text @@ 'graph path' RETURN count(*)"),
+    per("full-text @@ ('graph path', all hits), per query", 20, fun() -> [{ok, _} = bitcask_cypher:q(R, P5) || _ <- lists:seq(1, 20)] end),
+    {ok, P6} = bitcask_cypher:prepare(R, "MATCH (n:Person) RETURN id(n) ORDER BY n.embedding <=> $q LIMIT 10"),
+    per("vector top-10 (ORDER BY <=> LIMIT)", 200, fun() -> [{ok, _} = bitcask_cypher:q(R, P6, #{q => vec(V)}) || V <- lists:sublist(Vs, 200)] end),
+    per("bitcask:search_vector top-10 (engine)", 200, fun() -> [{ok, _} = bitcask:search_vector(R, vec(V), 10) || V <- lists:sublist(Vs, 200)] end),
+    {ok, P7} = bitcask_cypher:prepare(R, "MATCH (a)-[:KNOWS]->(b) WHERE id(a) = $v RETURN id(b) ORDER BY b.embedding <=> $q LIMIT 3"),
+    per("neighbours ranked by vector (graph + <=>)", 2000, fun() -> [{ok, _} = bitcask_cypher:q(R, P7, #{v => V, q => vec(V)}) || V <- lists:sublist(Vs, 2000)] end).
+
+writes(R, NV) ->
+    io:format("-- writes --~n", []),
+    Vs = [rand:uniform(NV) || _ <- lists:seq(1, 2000)],
+    {ok, S1} = bitcask_cypher:prepare(R, "MATCH (n) WHERE id(n) = $v SET n.seen = true"),
+    per("SET one property (one statement each)", 2000, fun() -> [{ok, _} = bitcask_cypher:q(R, S1, #{v => V}) || V <- Vs] end),
+    {ok, S2} = bitcask_cypher:prepare(R, "MATCH (a), (b) WHERE id(a) = $a AND id(b) = $b CREATE (a)-[:LIKES]->(b)"),
+    per("CREATE one relationship between existing nodes", 2000, fun() ->
+        [{ok, _} = bitcask_cypher:q(R, S2, #{a => A, b => B}) || {A, B} <- lists:zip(Vs, lists:reverse(Vs))] end),
+    per("graphdb:put_edge (API, for comparison)", 2000, fun() ->
+        [ok = graphdb:put_edge(R, A, 99, B) || {A, B} <- lists:zip(Vs, lists:reverse(Vs))] end),
+    {ok, S3} = bitcask_cypher:prepare(R, "MATCH (n) WHERE id(n) = $v DETACH DELETE n"),
+    Del = lists:usort(lists:sublist(Vs, 200)),
+    per("DETACH DELETE one node", length(Del), fun() -> [{ok, _} = bitcask_cypher:q(R, S3, #{v => V}) || V <- Del] end).
+
+per(Label, N, F) ->
+    garbage_collect(),
+    {T, _} = timer:tc(F),
+    io:format("  ~-62s ~12.2f~n", [Label, T / max(N, 1)]).

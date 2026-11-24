@@ -16,8 +16,8 @@ scheme**: its core constraint (hash keydir → no prefix scans, range degrades t
 O(all keys)) was invalidated by the OKI ordered-range capability shipped in 6.0.0.
 The original CSR on-disk format is not discarded — it is demoted to the OLAP
 materialized-cache layer of this design (§7). Implementation status: **P1–P5 landed**
-(`src/graphdb.erl`, `src/graphdb_analytics.erl`, `test/graphdb_tests.erl`,
-`test/graphdb_analytics_tests.erl`, `test/graphdb_bench`).
+(`apps/bitcask/src/graphdb.erl`, `apps/bitcask/src/graphdb_analytics.erl`, `apps/bitcask/test/graphdb_tests.erl`,
+`apps/bitcask/test/graphdb_analytics_tests.erl`, `apps/bitcask/test/graphdb_bench`).
 
 ---
 
@@ -144,7 +144,7 @@ last remaining byte (all `0xFF` → unbounded).
 
 The tuple `(Src, Etype, Dst, Rank)`; applications wanting an opaque handle can use
 the family-less 28-byte encoding `<<Src:64, Etype:32, Dst:64, Rank:64>>`. `e` / `ei`
-are mirror images: swapping the src/dst fields of an in-edge scan result recomputes
+are mirror images: swapping the apps/bitcask/src/dst fields of an in-edge scan result recomputes
 the forward key (dual representation for free — isomorphic to JanusGraph's
 `relation-outV-label-inV` full id).
 
@@ -351,7 +351,7 @@ graphdb:pregel(CsrRef, ComputeFun, Opts).
 - ⚠️ **Unflushed OKI memdelta is query-expensive**: measured ~12 ms/one-hop right
   after a bulk load vs ~0.02 ms/op after close→reopen (memdelta flushed to sealed
   runs, 600×+). Load-then-query workloads should checkpoint/reopen after loading,
-  or wait for automatic memdelta flush thresholds (`test/graphdb_bench`).
+  or wait for automatic memdelta flush thresholds (`apps/bitcask/test/graphdb_bench`).
 
 ---
 
@@ -382,6 +382,6 @@ hint v5 / OKI runs — `prefix:id` shapes are exactly what BCOK optimizes for.
    out + transpose) + PageRank / connected components / SSSP
    (`graphdb_analytics`).
 5. **P5** ✅: one-hop latency + bulk-load throughput benchmarks
-   (`test/graphdb_bench`; steady-state one-hop ~0.02 ms/op after flush,
+   (`apps/bitcask/test/graphdb_bench`; steady-state one-hop ~0.02 ms/op after flush,
    ~94k edges/s bulk load at 2k/8k scale), consistency-semantics tests
    (mid-scan insert/delete visibility invariants), EN documentation (this file).

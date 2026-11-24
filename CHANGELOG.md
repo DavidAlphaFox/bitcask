@@ -3,9 +3,62 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
-## [Unreleased]
+## [13.1.0] — 2026-11-24
+
+### Added
+
+- **图查询语法参考**：`apps/bitcask_cypher/doc/cypher-syntax-zh.md` / `cypher-syntax-en.md`（openCypher 2024.3 语法与 bitcask 特有的
+  图查询语法）；明细见 `apps/bitcask_cypher/CHANGELOG.md`。
+- **图层：扩展值编解码挂点** `graphdb_model:register_value_codec/1`：引擎 meta 存不了的值（时间 / 空间值、NaN / Infinity）由上层
+  注册编解码模块，核心只存「文本 + `_types` 类型标记」；没注册时这类属性按存储文本读出（数据照样兼容）。同类列表属性（整数 / 浮点 / 布尔）
+  仍在核心。
+- **属性索引**：`graphdb:create_index/3` / `drop_index/3` / `indexes/1` 声明 (标签, 属性) 索引，建在现有数据上、之后的写入同批维护
+  （图层 API 与 Cypher 都算，与建索引并发的写不漏）；Cypher 的标签扫描起点执行时自动改走就绪的索引（等值、`IN`、大小比较），结果不变。
+  2 万个顶点、命中 200 个的 `MATCH (n:L) WHERE n.k = 7` 11.6～11.7 ms → 0.46～0.49 ms。
+- **关系 id 不复用**：Cypher 删掉的关系，其 id（`[src, etype, dst, rank]`）不会再分给新建的关系——删边时在新键
+  `<<1,"_g:">> r <src> <etype> <dst>` 记下 rank 高水位（`graphdb:retire_rank_txn/5`、`rank_floor_txn/4`）。
+
+- `bitcask_txn:transaction/3` 选项 `{read_locks, guard_only}`：带版本守卫的读（`read_guarded/3`、`read_doc_guarded/3`）以 `read` 模式读时
+  不拿读锁，由提交时的守卫校验保证可串行化；写、`write` 模式读、不带守卫的 `read/2,3` 照旧加锁（与悲观事务混跑时隔离不变）；只读事务补一条
+  只含校验的批。缺省 `locked`（行为不变）。Cypher 写语句缺省用 `guard_only`（`q/4` 的 `TxOpts` 可覆盖）。
+
+- **图查询语言 `bitcask_cypher`（openCypher 子集）**：读——`MATCH`（多个模式、带标签 / 属性的节点、三种方向与多类型的关系、
+  变长 `*n..m`、`shortestPath`）、`WHERE`、`WITH`、`UNWIND`、`RETURN`（`DISTINCT`、别名、`*`、聚合、`ORDER BY` / `SKIP` / `LIMIT`）；
+  写——`CREATE` / `SET` / `REMOVE` / `DELETE` / `DETACH DELETE`，**一条语句一个事务**（读带锁与版本守卫、提交一条原子批、冲突自动重跑），
+  也可以在 `graphdb:transaction/2` 里把事务传进来与图层事务 API 混用；检索——`v.text @@ '…'`（全文，`score(v)`）与
+  `v.embedding <=> $q`（向量距离），`ORDER BY … <=> … LIMIT k` 与阈值两种形态走向量索引。`q/2,3,4`、`prepare/2`、`explain/2`、
+  `writes/1`；结果 `#{columns, rows, stats}`；错误带阶段与行列。说明：`doc/cypher-zh.md` / `doc/cypher-en.md`；
+  示例 `examples/cypher_demo.escript`；基准 `test/cypher_bench`。
+- `bitcask_txn:read_doc_guarded/3`：事务里读出完整文档（KV 模式下 `read/3` 只回正文），同时登记版本守卫。
+- **图的统一数据模型**（图层 API 与 Cypher 共用）：`graphdb:create_vertex/2,3`（自动分配 id）、`vertex/2`
+  （`#{id, labels, properties}`）、`set_labels/3`、`remove_labels/3`、`vertices_by_label/2,3`；`put_vertex` 收
+  `#{labels, props, text, vector}`；边属性可以传 map。顶点 id 全库一个空间，自动分配从 1 起，指定 id 的写入推高水位，分配器不会
+  发出已被占用的 id；标签存在顶点 meta 的 `_labels`，标签索引与顶点同批维护。
+
+- `bitcask:range_fold/5` 与 `range/3` 的 `{batch, N}` 选项（1..1024，默认 256）：每次 NIF 往返最多取 N 条。只要开头几条就 `throw`
+  出来的调用方用小批。
 
 ### Changed
+
+- **核心移进 `apps/bitcask`**：仓库改成 rebar3 umbrella（`apps/bitcask` 核心 + `apps/bitcask_cypher` 查询层）。C++ NIF 的构建链与子模块
+  随核心一起搬，构建 hooks 在 `apps/bitcask/rebar.config`；CMake 构建目录仍是项目根的 `_build/cmake`。**下游依赖写法要改**：
+  `{bitcask, {git_subdir, "https://github.com/DavidAlphaFox/bitcask.git", {tag, "<版本>"}, "apps/bitcask"}}`（rebar3 3.14+）。
+- **Cypher 查询层拆为独立应用** `apps/bitcask_cypher/`（同一仓库，rebar3 同时编译两个应用）：模块 `bitcask_exec` / `bitcask_expr` /
+  `bitcask_plan` / `bitcask_temporal` / `bitcask_tz` / `bitcask_ieee` 改名为 `bitcask_cypher_*`；配置项 `cypher_import_dir` /
+  `cypher_max_write_vertices` / `tz_dir` / `tz_backzone` 改到 `bitcask_cypher` 应用名下；文档、测试、TCK 运行器随之搬走。
+  核心不再依赖 Cypher；本仓库 13.1.0 中 `bitcask` 与 `bitcask_cypher` 均发布为 13.1.0。更新日志见 `apps/bitcask_cypher/CHANGELOG.md`。
+- **事务**：注册与注销不再与锁服务往返、释放锁只发给要过锁的分片——空事务 6.0～6.2 → 2.2～2.4 µs，`put_edge_txn` 19.7 → 15.9 µs
+  （同一轮对比同步注册）。
+
+- **libbitcask 12.1.0 → 13.1.0**（跨上游 12.2.0 / 13.0.0；13.0.0 破坏 C++ ABI，本库从源码编，无影响；C API 与盘上格式不变）：
+  - ⚠️ `range` / `range_fold` 的一致性变成**快照**：读开始那一刻的版本，迭代期间的写（含删除）不可见（此前被删的跳过、被改的交新值）；
+    迭代期间被 merge 合并掉快照版本的 key 交出当前值。全表扫描与 range 都改成按索引里的位置映射读：扫描每行约 950 → 250～440 ns，
+    range 重开后每行约 600～830 → 270～410 ns。
+  - memdelta 落段挪到后台线程：单条写最大延迟 153 ms → 约 1.5 ms。读写打开的库第一次写到阈值时多起一条线程，`close` 时停。
+  - 重开时的恢复重放不再把已进过索引的文档原文填回缓存：重开后高亮更常走冷路径，`cold => load`（缺省）照常出片段。
+- `graphdb:put_vertex` 改为「读旧版本 → 带条件的原子批」（同批维护标签索引）：约 1.9 → 3.5 µs；与并发写同一顶点按版本串行。
+  `put_edge` / `put_edges` 多一次 id 计数器的点读（约 +0.3 µs）。`put_vertex_txn` / `del_vertex_txn` / `del_vertex` 同时删除
+  旧标签的索引项。`check_invariants` 多查标签索引与 id 水位。
 
 - **小 frontier 的图遍历不再起进程并行展开**：BFS / k-hop / 最短路此前 frontier 超过 4 个顶点就切片、起进程并行展开；起进程和把邻居列表
   拷回调用方的开销在 frontier 上百时仍吃掉并行的收益。阈值改为 256。2 万顶点 / 10 万条边的幂律图上：`shortest_path` 278 → 152 µs
@@ -15,10 +68,20 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
   记录；现在只解还差的条数，range 按 limit 取小批。同一张图重开后 limit 10 / 100：221 / 225 → 30 / 69 µs。结果是全量结果的前缀，
   与此前相同；limit ≥ 1000 或不带 limit 时没有变化。
 
-### Added
+### Fixed
 
-- `bitcask:range_fold/5` 与 `range/3` 的 `{batch, N}` 选项（1..1024，默认 256）：每次 NIF 往返最多取 N 条。只要开头几条就 `throw`
-  出来的调用方用小批。
+- **图层：单字符关系类型名**（`:X`、`:Y`）从第二个起注册拿到错误的 id（0x6E0001xx），并覆盖了别的单字符类型的名字索引——之后
+  `etype_id/2` / `etype_name/2` 查不到、Cypher 的 `type(r)` 返回乱码。已有库里受影响的类型需要重新注册。
+- **事务：一次加锁同时闭合多个死锁环时只解开一个**：其余环要等 5 s 的兜底计时器（高争用的写语句会整批卡住几秒到几十秒，
+  `status()` 里 `lock_wait_timeouts` 增长）。现在逐个解开经过请求者的全部环。见 `doc/txn-layer-design-zh.md` §13.8。
+
+- **图层删边 / 删顶点、Cypher `DELETE` 之后重开丢数据或打不开**（随 libbitcask 13.1.0，上游 S69）：原子批里删除存在的 key 时批头声明的区间多算
+  4 字节，恢复时批被判为不完整——12.0.3 及更早截断数据文件（删除与之后的写静默丢失），12.1.0 跳过这些删除、同一文件多于 64 个时打不开
+  （`bad_crc`）。12.1.0 写出的这种库，新版本直接能打开、删除生效、文件不改；12.0.3 及更早已经截断掉的数据救不回来。
+- **索引模式的图注册不了关系类型**：引擎在索引模式下回 `#{text, meta}`，`graphdb:etype_id/2` / `etype_name/2` / `register_etype/2`
+  按 binary 匹配，一律 `{error, invalid_etype_record}`。改为取值的 text 段。
+- `graphdb:put_edge_txn` / `put_vertex_txn` 推高 id 水位改在事务内进行：原先在事务外直接写计数器，同一事务若已分配过 id 就会让它对计数器的
+  版本守卫失效、反复重跑到 `retry_limit`。
 
 ## [12.1.0] — 2026-11-23
 

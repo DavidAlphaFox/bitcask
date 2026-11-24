@@ -63,7 +63,7 @@ BCOK v2 run（内嵌 bloom + 块 LRU，冷 get ≤2 次 pread）；`fold`/`range
 | 选项 | 含义 | 限制 |
 |------|------|------|
 | `{analyzer, Type}` | `ngram` \| `whitespace` \| `jieba` | 启用搜索必填 |
-| `{dict_path, Path}` | jieba 词典目录 | `jieba` 必填（默认回退 `priv/dict`） |
+| `{dict_path, Path}` | jieba 词典目录 | `jieba` 必填（默认回退 `apps/bitcask/priv/dict`） |
 | `{enable_stop_words, true}` | 停用词过滤 | — |
 | `{min_n, N}` / `{max_n, N}` | n-gram 上下界（ngram） | `1 =< min_n =< max_n` |
 | `{min_token_length, N}` | 丢弃过短拉丁词 | `N >= 1` |
@@ -199,8 +199,10 @@ embedder 生成并写入向量；显式传 `vector` 则跳过。
 按 key 字典序遍历 `[Lo, Hi)`，代价 **O(range)**，不是 O(全表) 过滤。底座是 OKI
 有序 key 索引。
 
-> ⚠️ **不是快照。** 一致性是 per-key 弱一致（与 `parallel_scan` 同档）——迭代期间
-> 的并发写可能部分可见。需要快照请用 `fold`。
+> **快照**（libbitcask 13.1.0 起，与 `fold` 相同）：key 集合与值都是 `range` / `range_fold`
+> 开始那一刻的版本，迭代期间的并发写（含删除）不可见。例外：迭代期间 merge 把某个 key
+> 的快照版本合并掉了（之后又改写过），这一个 key 交出当前值。12.x 及更早是 per-key
+> 弱一致（被删的跳过、被改的交新值）。
 
 | 函数 | 说明 |
 |------|------|

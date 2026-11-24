@@ -4,7 +4,7 @@
 
 ## 概述
 
-C++23 NIF（`cask_cpp`）是唯一可用的模式。`bitcask_legacy.erl` 已被删除。所有 API 调用都路由到 `bitcask_cpp_nifs` → `priv/bitcask_cpp.so`。
+C++23 NIF（`cask_cpp`）是唯一可用的模式。`bitcask_legacy.erl` 已被删除。所有 API 调用都路由到 `bitcask_cpp_nifs` → `apps/bitcask/priv/bitcask_cpp.so`。
 
 - **KV 模式**（默认）：`open(Dir, [read_write])` — 纯键/值存储
 - **索引模式**：`open(Dir, [read_write, {analyzer, ...}])` — 添加 BM25 全文检索；创建 `bitcask.meta` 文件并设置 `mode=kIndex`
@@ -77,7 +77,7 @@ _build/cmake/libbitcask-build/bitcask_migrate hintord <旧目录> <新目录>
 
 ## 选项
 
-选项通过 `src/bitcask.erl` 中的 `?CASK_PASSTHROUGH_OPTS` 传递。无法识别的选项会被静默丢弃。
+选项通过 `apps/bitcask/src/bitcask.erl` 中的 `?CASK_PASSTHROUGH_OPTS` 传递。无法识别的选项会被静默丢弃。
 
 ### 通用选项
 

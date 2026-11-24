@@ -6,6 +6,28 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 13.1.0 shipped
+
+### Graph query language `bitcask_cypher` and a unified data model ✅
+
+An openCypher subset (reads, writes, variable length and shortest path, full-text `@@`, vector `<=>`) in three layers: a
+leex / yecc front end → a syntax-independent plan → an executor; write statements run entirely inside a `bitcask_txn`
+transaction. The graph API and Cypher share one data model: a single id space (from 1; explicit ids raise the watermark),
+labels in meta, and a label index maintained in the same batch as the vertex. Guide in `doc/cypher-en.md`; details in
+TASK.md Q2.
+
+> 2026-11-24: the Cypher query layer is now a separate application in this repository, `apps/bitcask_cypher/` (TASK.md
+> C0); its guide and task details moved to `apps/bitcask_cypher/doc/` and `apps/bitcask_cypher/TASK.md`. The unified data
+> model (`graphdb_model`) stays in this library.
+
+### libbitcask upgrade 12.1.0 → 13.1.0 ✅
+
+Across upstream 12.2.0 / 13.0.0: S69 atomic-batch deletion span (reported by this project), S70 background flushes, S71 / S76
+scans and ranges read through index locations via mmap (ranges become snapshots), S73 reopen replay no longer refills the text
+cache, S75 allocation-free scan batch views. 13.0.0 breaks the C++ ABI (`SOVERSION` 13), which does not matter here since
+libbitcask is built from source; C API and on-disk format unchanged. The submodule moves to upstream `v13.1.0` (`02aa247`).
+Details in TASK.md M28.
+
 ## 12.1.0 shipped
 
 ### libbitcask upgrade 12.0.3 → 12.1.0 ✅
@@ -72,7 +94,7 @@ the rejected batch as a whole; check-only batches write no bytes, allocate no LS
 The upgrade removes the upstream flaw where a write session could overwrite a chunk based on half a
 batch. The graph layer also keeps explicit defence: write-session conditions cover the whole read set
 (modified heads, chunks read, vertices read but unmodified), and `#{consistent => true}` validates
-read-set versions before returning. Deterministic regression: `test/graphdb_batch_isolation_tests.erl`.
+read-set versions before returning. Deterministic regression: `apps/bitcask/test/graphdb_batch_isolation_tests.erl`.
 
 ## 12.0.0 shipped
 
@@ -653,7 +675,7 @@ unchanged** (notably `{error, write_locked}`, still a bare atom).
 ### Local embedding backend (llama.cpp / ggml) ✅
 
 Computes embeddings in-process, with no HTTP endpoint. The artifact is a
-**second, independent NIF**, `priv/bitcask_llama.so`, with no coupling to the
+**second, independent NIF**, `apps/bitcask/priv/bitcask_llama.so`, with no coupling to the
 core `bitcask_cpp.so`; **not built by default** (`BITCASK_WITH_LLAMA=1`), and
 with it off the build output is byte-for-byte what 5.0.0 produced. Adds the
 `third_party/llama.cpp` submodule (tag `b10257`). **No libbitcask upgrade is
@@ -699,7 +721,7 @@ carried verbatim duplicates).
 
 The trade-off for a server-side product is **performance first, size is not a
 constraint**: CUDA architecture coverage spans Maxwell..Blackwell rather than
-narrowing to native, and the CUDA runtime is flattened into `priv/` alongside the
+narrowing to native, and the CUDA runtime is flattened into `apps/bitcask/priv/` alongside the
 package — removing the silent "target is missing libcublas → ggml skips the
 backend → degrades to CPU" class of failure.
 
@@ -799,13 +821,13 @@ previously had only a manual, skipped-by-default case).
 measurement box had external load which inflates the ratio, and the long-text case
 has no trustworthy data — measure on your own hardware before enabling.
 
-The build-time SDK probe `scripts/detect-llama-backends.sh`: CMake only says "not
+The build-time SDK probe `apps/bitcask/scripts/detect-llama-backends.sh`: CMake only says "not
 found"; the script says **which package is missing** and prints the build command
 pre-filled with whichever switches it detected.
 
 > **The Vulkan build path was exercised for real**: the development box has a
 > Vulkan SDK (1.4.309), AUTO detected and compiled it in, and
-> `priv/libggml-vulkan.so` was produced. Since that machine has no GPU,
+> `apps/bitcask/priv/libggml-vulkan.so` was produced. Since that machine has no GPU,
 > `gpu_status/0` returns `no_gpu_device` rather than `cpu_only_build` — **exactly
 > the distinction the build/run-time split exists to make, demonstrated with real
 > data**.
@@ -882,7 +904,7 @@ recall loss ≤0.08pt), the DiskANN engine (experimental), AVX2 int8 dot-product
 kernels (VNNI512→VNNI256→AVX2 dispatch; full int8 path active on non-VNNI
 machines), bounded vector-checkpoint crash recovery (worst case ~4.2M → ≤320K
 entries), and HNSW `.qc8` codeword mmap + `clone_live` payload spill. The
-`examples/` directory gains a Wikipedia search-database example (`wiki_hnsw` /
+`apps/bitcask/examples/` directory gains a Wikipedia search-database example (`wiki_hnsw` /
 `wiki_diskann` dual-engine comparison).
 
 > ⚠️ ABI break: soname `libbitcask.so.3` → `libbitcask.so.4`; downstream must
@@ -947,13 +969,13 @@ recompiled/relinked (ABI `SOVERSION` 1 → 3).
 
 > Feasibility assessment: [`doc/libcask-extraction-zh.md`](doc/libcask-extraction-zh.md)
 
-Extract the C++ non-NIF core (`cpp/src/` + `cpp/include/`, 24 source files + 45 headers)
+Extract the C++ non-NIF core (`apps/bitcask/cpp/src/` + `apps/bitcask/cpp/include/`, 24 source files + 45 headers)
 into a standalone `libcask.so` / `libcask.a`; the Erlang project retains only the NIF
-glue layer (`cpp/nif/`) and depends on the library.
+glue layer (`apps/bitcask/cpp/nif/`) and depends on the library.
 
 The architecture is already separation-ready:
 - Zero `erl_nif.h` dependency and zero `enif_*` calls in the C++ core
-- Build system already modularized (11 static libraries; `cpp/CMakeLists.txt` supports
+- Build system already modularized (11 static libraries; `apps/bitcask/cpp/CMakeLists.txt` supports
   standalone builds)
 - Coupling is one-directional and paper-thin (NIF → C++, no reverse calls; the sole
   bridge is `CaskHandle { unique_ptr<Cask> }`)

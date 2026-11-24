@@ -3,9 +3,79 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [13.1.0] — 2026-11-24
+
+### Added
+
+- **Graph query syntax reference**: `apps/bitcask_cypher/doc/cypher-syntax-en.md` / `cypher-syntax-zh.md` (the openCypher 2024.3
+  syntax and the graph query syntax specific to bitcask); details in `apps/bitcask_cypher/CHANGELOG_EN.md`.
+- **Graph layer: extension value codec hook** `graphdb_model:register_value_codec/1`: values the engine meta can't hold
+  (temporal / spatial values, NaN / Infinity) are encoded by a module the upper layer registers; the core stores only
+  "text + a `_types` tag", and without a codec such properties read back as their stored text (data stays compatible).
+  Homogeneous list properties (integers / floats / booleans) remain in the core.
+- **Property indexes**: `graphdb:create_index/3` / `drop_index/3` / `indexes/1` declare a (label, property) index, built over existing
+  data and maintained in the same batch by every later write (graph API and Cypher alike; writes concurrent with the build aren't
+  missed); Cypher label-scan starts switch to a ready index at run time (equality, `IN`, range comparisons) with unchanged results.
+  `MATCH (n:L) WHERE n.k = 7` over 20k vertices with 200 hits drops from 11.6–11.7 ms to 0.46–0.49 ms.
+- **Relationship ids are not reused**: the id (`[src, etype, dst, rank]`) of a relationship deleted through Cypher is never given to a
+  new relationship; deletes record a rank high-water mark under the new key `<<1,"_g:">> r <src> <etype> <dst>`
+  (`graphdb:retire_rank_txn/5`, `rank_floor_txn/4`).
+
+- `bitcask_txn:transaction/3` option `{read_locks, guard_only}`: guarded reads (`read_guarded/3`, `read_doc_guarded/3`) in `read`
+  mode take no read lock; the commit-time guard check keeps the transaction serializable. Writes, `write`-mode reads and unguarded
+  `read/2,3` still lock (isolation against pessimistic transactions is unchanged); a read-only transaction commits one check-only
+  batch. Default `locked` (unchanged behaviour). Cypher write statements default to `guard_only` (overridable through `TxOpts` of
+  `q/4`).
+
+- **Graph query language `bitcask_cypher` (openCypher subset)**: reads — `MATCH` (multiple patterns, nodes with labels /
+  properties, relationships in three directions with alternative types, variable length `*n..m`, `shortestPath`), `WHERE`, `WITH`,
+  `UNWIND`, `RETURN` (`DISTINCT`, aliases, `*`, aggregates, `ORDER BY` / `SKIP` / `LIMIT`); writes — `CREATE` / `SET` / `REMOVE` /
+  `DELETE` / `DETACH DELETE`, **one transaction per statement** (reads are locked and version-guarded, one atomic batch on commit,
+  conflicts rerun automatically), or join a `graphdb:transaction/2` transaction and mix with the transactional graph API; search —
+  `v.text @@ '…'` (full text, `score(v)`) and `v.embedding <=> $q` (vector distance), with `ORDER BY … <=> … LIMIT k` and the
+  threshold form using the vector index. `q/2,3,4`, `prepare/2`, `explain/2`, `writes/1`; results `#{columns, rows, stats}`; errors
+  carry stage and line / column. Guide: `doc/cypher-en.md` / `doc/cypher-zh.md`; example `examples/cypher_demo.escript`; benchmark
+  `test/cypher_bench`.
+- `bitcask_txn:read_doc_guarded/3`: read the whole document inside a transaction (`read/3` returns only the body in KV mode) and
+  register a version guard.
+- **One data model for the graph** (shared by the graph API and Cypher): `graphdb:create_vertex/2,3` (allocates the id),
+  `vertex/2` (`#{id, labels, properties}`), `set_labels/3`, `remove_labels/3`, `vertices_by_label/2,3`; `put_vertex` accepts
+  `#{labels, props, text, vector}`; edge properties may be a map. Vertex ids share one space: allocation starts at 1, writes with
+  an explicit id raise the high-water mark, and the allocator never hands out an id that is already in use. Labels live in the
+  vertex meta under `_labels`; the label index is maintained in the same batch as the vertex.
+
+- `{batch, N}` option for `bitcask:range_fold/5` and `range/3` (1..1024, default 256): at most N entries per NIF round trip, for callers
+  that only want the first few entries and then `throw`.
 
 ### Changed
+
+- **The core moved to `apps/bitcask`**: the repository is now a rebar3 umbrella (`apps/bitcask` core + `apps/bitcask_cypher` query
+  layer). The C++ NIF build chain and submodules moved with the core, the build hooks live in `apps/bitcask/rebar.config`, and the
+  CMake build tree is still the project root's `_build/cmake`. **Downstream dependencies must change** to
+  `{bitcask, {git_subdir, "https://github.com/DavidAlphaFox/bitcask.git", {tag, "<version>"}, "apps/bitcask"}}` (rebar3 3.14+).
+- **The Cypher query layer is a separate application** `apps/bitcask_cypher/` (same repository; rebar3 builds both):
+  modules `bitcask_exec` / `bitcask_expr` / `bitcask_plan` / `bitcask_temporal` / `bitcask_tz` / `bitcask_ieee` are
+  renamed `bitcask_cypher_*`; the settings `cypher_import_dir` / `cypher_max_write_vertices` / `tz_dir` / `tz_backzone`
+  move to the `bitcask_cypher` application; docs, tests and the TCK runner move with it. The core no longer depends on
+  Cypher. In this repository, both `bitcask` and `bitcask_cypher` are released as 13.1.0. Changelog in `apps/bitcask_cypher/CHANGELOG.md`.
+- **Transactions**: registration and unregistration no longer round-trip to the locker, and lock releases go only to the shards that
+  were asked for locks — an empty transaction drops from 6.0–6.2 to 2.2–2.4 µs, `put_edge_txn` from 19.7 to 15.9 µs (compared in the
+  same run with synchronous registration).
+
+- **libbitcask 12.1.0 → 13.1.0** (across upstream 12.2.0 / 13.0.0; 13.0.0 breaks the C++ ABI, which does not matter here since this
+  project builds libbitcask from source; C API and on-disk format unchanged):
+  - ⚠️ `range` / `range_fold` are now **snapshots**: they read the versions as of the start, and writes (including deletes) during the
+    iteration are not visible (previously deleted keys were skipped and updated keys returned their new value); a key whose snapshot
+    version is dropped by a merge during the iteration yields its current value. Full scans and ranges now read values through the
+    index locations via mmap: about 950 → 250–440 ns per row for scans, about 600–830 → 270–410 ns per row for ranges after a reopen.
+  - memdelta flushes moved to a background thread: the worst single-write latency drops from 153 ms to about 1.5 ms. A read-write store
+    starts one extra thread the first time it reaches the threshold; it stops on `close`.
+  - Recovery replay on reopen no longer refills the document text cache for documents already indexed: highlighting after a reopen takes
+    the cold path more often; `cold => load` (the default) still produces snippets.
+- `graphdb:put_vertex` now reads the current version and writes a conditional atomic batch (maintaining the label index): about
+  1.9 → 3.5 µs; concurrent writes to the same vertex serialize on its version. `put_edge` / `put_edges` do one extra point read of
+  the id counter (about +0.3 µs). `put_vertex_txn` / `del_vertex_txn` / `del_vertex` also remove the index entries of the old
+  labels. `check_invariants` also checks the label index and the id high-water mark.
 
 - **Graph traversal no longer spawns workers for small frontiers**: BFS / k-hop / shortest path used to slice the frontier and expand it in
   parallel workers as soon as it had more than 4 vertices; spawning and copying neighbour lists back ate the gain even for frontiers of a few
@@ -17,10 +87,25 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   Limit 10 / 100 on the same graph after reopen: 221 / 225 → 30 / 69 µs. Results are a prefix of the full result, as before; no change
   for limit ≥ 1000 or without a limit.
 
-### Added
+### Fixed
 
-- `{batch, N}` option for `bitcask:range_fold/5` and `range/3` (1..1024, default 256): at most N entries per NIF round trip, for callers
-  that only want the first few entries and then `throw`.
+- **Graph layer: one-character relationship type names** (`:X`, `:Y`) got a wrong id (0x6E0001xx) from the second one on and
+  overwrote another one-character type's name index entry — `etype_id/2` / `etype_name/2` then failed and Cypher's `type(r)` returned
+  garbage. Affected types in existing stores need to be registered again.
+- **Transactions: a lock request that closed several deadlock cycles at once resolved only one of them**; the others waited for
+  the 5 s fallback timer (highly contended updating statements stalled for seconds, and `lock_wait_timeouts` grew in `status()`).
+  Every cycle through the requester is now resolved. See `doc/txn-layer-design-zh.md` §13.8.
+
+- **Reopen after graph-layer edge / vertex deletion or Cypher `DELETE` lost data or failed to open** (via libbitcask 13.1.0, upstream S69):
+  an atomic batch removing an existing key declared 4 bytes more than it wrote, so recovery treated the batch as incomplete — 12.0.3 and
+  earlier truncated the data file (the deletion and later writes were lost silently), 12.1.0 skipped those deletions and refused to open
+  (`bad_crc`) once a file held more than 64 of them. Stores written by 12.1.0 now open as-is, deletions take effect, files are not modified;
+  data already truncated by 12.0.3 or earlier cannot be recovered.
+- **Graphs in index mode could not register relationship types**: in index mode the engine returns `#{text, meta}`, and
+  `graphdb:etype_id/2` / `etype_name/2` / `register_etype/2` matched on a binary, always giving `{error, invalid_etype_record}`. They now
+  take the text segment.
+- `graphdb:put_edge_txn` / `put_vertex_txn` raise the id high-water mark inside the transaction: they used to write the counter outside
+  it, which invalidated the counter guard of a transaction that had already allocated an id and made it rerun up to `retry_limit`.
 
 ## [12.1.0] — 2026-11-23
 

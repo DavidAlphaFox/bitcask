@@ -3,8 +3,8 @@
 中文版见 [`local-embedding-zh.md`](local-embedding-zh.md)。
 
 Computes embeddings inside the BEAM process, with no HTTP endpoint. The artifact
-is a **second NIF**, `priv/bitcask_llama.so`, independent of the core
-`priv/bitcask_cpp.so`.
+is a **second NIF**, `apps/bitcask/priv/bitcask_llama.so`, independent of the core
+`apps/bitcask/priv/bitcask_cpp.so`.
 
 **Not built by default.** With the flag off, this repository's build output is
 byte-for-byte what it was before this backend existed: no submodule fetch, no
@@ -48,7 +48,7 @@ BITCASK_WITH_LLAMA=1 rebar3 compile
 Or straight from CMake:
 
 ```sh
-cmake -S . -B _build/cmake -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release \
+cmake -S apps/bitcask -B _build/cmake -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release \
       -DBITCASK_WITH_LLAMA=ON
 cmake --build _build/cmake --target bitcask_llama -j
 ```
@@ -57,15 +57,15 @@ The first run fetches the `third_party/llama.cpp` submodule (~200 MB, pinned to
 tag `v1.0.0`) and compiles all of it — minutes, not seconds. Incremental builds
 after that are a no-op.
 
-Once built, `priv/` gains a set of shared libraries:
+Once built, `apps/bitcask/priv/` gains a set of shared libraries:
 
 ```
-priv/bitcask_llama.so          ← the NIF itself
-priv/libggml-base.so*          ← ggml core (must be a shared library)
-priv/libggml-cpu-{x64,sse42,sandybridge,ivybridge,haswell,piledriver,
+apps/bitcask/priv/bitcask_llama.so          ← the NIF itself
+apps/bitcask/priv/libggml-base.so*          ← ggml core (must be a shared library)
+apps/bitcask/priv/libggml-cpu-{x64,sse42,sandybridge,ivybridge,haswell,piledriver,
                   skylakex,cannonlake,cascadelake,icelake,cooperlake,
                   zen4,alderlake,sapphirerapids}.so   ← 14 CPU variants (x86; ARM has its own set)
-priv/libggml.so* priv/libllama.so*
+apps/bitcask/priv/libggml.so* apps/bitcask/priv/libllama.so*
 ```
 
 **These variants are `dlopen`ed at runtime by CPU microarchitecture**, not
@@ -248,9 +248,9 @@ The script is split along the same line — the two halves can run on different
 machines:
 
 ```sh
-scripts/detect-llama-backends.sh --build     # build box: is there an SDK
-scripts/detect-llama-backends.sh --runtime   # deploy box: is there a GPU, and can this package use it
-scripts/detect-llama-backends.sh             # both
+apps/bitcask/scripts/detect-llama-backends.sh --build     # build box: is there an SDK
+apps/bitcask/scripts/detect-llama-backends.sh --runtime   # deploy box: is there a GPU, and can this package use it
+apps/bitcask/scripts/detect-llama-backends.sh             # both
 ```
 
 #### Build time: probe the SDK, decide what to compile
@@ -273,7 +273,7 @@ a CPU-only package on a machine without the SDK, and the two look identical.
 > `GGML_VULKAN` on having found only one of them **fails the build outright** —
 > and the entire point of AUTO is "quietly don't compile it if it isn't there".
 
-`scripts/detect-llama-backends.sh` is a **build-time tool**: CMake only says "not
+`apps/bitcask/scripts/detect-llama-backends.sh` is a **build-time tool**: CMake only says "not
 found", while the script says **which package is missing** and prints the build
 command to use.
 
@@ -485,7 +485,7 @@ free VRAM) and reports early when it clearly will not fit:
 **(1) The CUDA runtime ships with the package.** `GGML_STATIC` conflicts with the
 `BUILD_SHARED_LIBS=ON` we require (it adds a global `-static`), so
 `libggml-cuda.so` links cudart / cublas / cublasLt **dynamically**. By default
-`BITCASK_LLAMA_CUDA_BUNDLE_RUNTIME=ON` flattens those three into `priv/`, next to
+`BITCASK_LLAMA_CUDA_BUNDLE_RUNTIME=ON` flattens those three into `apps/bitcask/priv/`, next to
 their consumer, resolved via `$ORIGIN`.
 
 > cuBLAS is genuinely large (hundreds of MB under CUDA 12), but what it buys is
@@ -666,7 +666,7 @@ fails the **whole request**, so it chunks on that).
 
 The parsing is a pure function
 (`bitcask_embedder_util:parse_embedding_batch/3`) with network-free unit tests
-(`test/bitcask_embedder_util_tests.erl`), including a deliberately out-of-order
+(`apps/bitcask/test/bitcask_embedder_util_tests.erl`), including a deliberately out-of-order
 response.
 
 
@@ -714,7 +714,7 @@ The NIF **rejects NONE at load time** with an error you can act on. But note:
 > detectable by that chain.** The load succeeds, the embedding succeeds, the
 > vector length is right — only the semantics are wrong. The only test that
 > catches it is the self-check probe, `self_check_semantics_test_` in
-> `test/bitcask_llama_tests.erl`: a near-synonym pair must score distinctly
+> `apps/bitcask/test/bitcask_llama_tests.erl`: a near-synonym pair must score distinctly
 > higher than an unrelated pair. **Run that case whenever you change models.**
 
 The mapping: Qwen3-Embedding needs `last`, BERT/BGE need `cls`, E5/GTE need
@@ -822,7 +822,7 @@ default they are all swallowed, keeping only the most recent error for
 | Symptom | Cause |
 |---|---|
 | `{error, {llama_nif_unavailable, _, _}}` | Not built with `BITCASK_WITH_LLAMA` |
-| `ensure_backend` returns `{ok, 0}` | No `libggml-cpu-*` in `priv/` matches this CPU |
+| `ensure_backend` returns `{ok, 0}` | No `libggml-cpu-*` in `apps/bitcask/priv/` matches this CPU |
 | `{error, {pooling_none, _}}` | GGUF carries no `pooling_type`; set `pooling` explicitly |
 | `{error, {model_not_found, _}}` | Bad path (caught on the Erlang side, never reached llama) |
 | `{error, {dim_mismatch, _}}` | Configured `dim` disagrees with the model's actual dimension |
@@ -834,14 +834,14 @@ default they are all swallowed, keeping only the most recent error for
 | `{error, {bad_opt, {instances, duplicate_gpu}}}` | The same card appears in two instances |
 | `{error, {bad_gpu_index, _}}` | `gpu_index` exceeds this machine's card count — size the pool from `backend_info()`'s device list |
 | `{error, {bad_backend, _}}` / `{error, {bad_split_mode, _}}` | Values are auto\|cuda\|vulkan\|cpu / none\|layer\|row |
-| `gpu_status()` returns `no_gpu_device` | CUDA is in the package but no GPU here — driver / container passthrough / dependency resolution; run `scripts/detect-llama-backends.sh --runtime` |
+| `gpu_status()` returns `no_gpu_device` | CUDA is in the package but no GPU here — driver / container passthrough / dependency resolution; run `apps/bitcask/scripts/detect-llama-backends.sh --runtime` |
 
 ## 8. Tests
 
 Build-time SDK probe (run it on the **build box**; run time needs no script):
 
 ```sh
-scripts/detect-llama-backends.sh
+apps/bitcask/scripts/detect-llama-backends.sh
 ```
 
 ```sh

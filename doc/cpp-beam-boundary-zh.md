@@ -1,22 +1,22 @@
 # C++ 核心层与 BEAM 依赖边界分析
 
-本文档分析 `cpp/` 目录下哪些模块依赖 BEAM/Erlang VM、哪些是纯 C++，
+本文档分析 `apps/bitcask/cpp/` 目录下哪些模块依赖 BEAM/Erlang VM、哪些是纯 C++，
 以及核心层脱离 BEAM 独立使用的可行性。
 
 ## 分层总览
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  Erlang 层 (src/*.erl)                                       │
+│  Erlang 层 (apps/bitcask/src/*.erl)                                       │
 │  bitcask.erl / bitcask_cpp_nifs.erl / bitcask_merge_worker   │
 │  bitcask_sup.erl / bitcask_app.erl / bitcask_stream.erl      │  ← 需要 BEAM VM
 ├──────────────────────────────────────────────────────────────┤
-│  NIF 胶水层 (cpp/nif/)                                       │
+│  NIF 胶水层 (apps/bitcask/cpp/nif/)                                       │
 │  nif_main.cpp / nif_cask.cpp / nif_cask_iter.cpp             │
 │  nif_cask_admin.cpp / nif_helpers.* / nif_options.cpp        │  ← 唯一引用 erl_nif.h
 │  atoms.* / resources.* / priv_data.hpp / term_conv.hpp       │
 ├──────────────────────────────────────────────────────────────┤
-│  核心层 (cpp/src/ + cpp/include/bitcask/)                    │
+│  核心层 (apps/bitcask/cpp/src/ + apps/bitcask/cpp/include/bitcask/)                    │
 │  cask/  keydir/  fileops/  io/  lock/                        │
 │  merge/  search/  bm25/  text/                               │  ← 纯 C++23，零 BEAM 依赖
 └──────────────────────────────────────────────────────────────┘
@@ -24,16 +24,16 @@
 
 ## 依赖方向验证
 
-通过 `grep -r 'erl_nif\|enif_\|ErlNif' cpp/src/ cpp/include/` 确认：
+通过 `grep -r 'erl_nif\|enif_\|ErlNif' apps/bitcask/cpp/src/ apps/bitcask/cpp/include/` 确认：
 
-**`cpp/src/` 和 `cpp/include/` 中零 BEAM 符号引用。** 所有 `erl_nif.h`、
-`ErlNifEnv`、`enif_*` 调用全部被隔离在 `cpp/nif/` 的 13 个文件中。
+**`apps/bitcask/cpp/src/` 和 `apps/bitcask/cpp/include/` 中零 BEAM 符号引用。** 所有 `erl_nif.h`、
+`ErlNifEnv`、`enif_*` 调用全部被隔离在 `apps/bitcask/cpp/nif/` 的 13 个文件中。
 
 ## CMake 编译单元与依赖图
 
 ### 纯 C++ 库（不链接任何 BEAM 依赖）
 
-下表对齐 libbitcask **6.0.0** 的 `CMakeLists.txt`。
+下表对齐 libbitcask **6.0.0** 的 `apps/bitcask/CMakeLists.txt`。
 
 | 库名                    | 源文件                    | 依赖                          | 说明 |
 |-------------------------|--------------------------|-------------------------------|------|
@@ -55,14 +55,14 @@
 
 | 库名          | 源文件                          | 链接                                   | 产物 |
 |---------------|---------------------------------|----------------------------------------|------|
-| `bitcask_cpp` | `cpp/nif/*.cpp`（10 个 TU）     | `bitcask_cask` + Erlang 头文件         | `priv/bitcask_cpp.so` |
+| `bitcask_cpp` | `apps/bitcask/cpp/nif/*.cpp`（10 个 TU）     | `bitcask_cask` + Erlang 头文件         | `apps/bitcask/priv/bitcask_cpp.so` |
 
 NIF 侧的 10 个 TU：`nif_main`（导出表 + on_load）、`nif_cask`（单 key 读写）、
 `nif_cask_iter`（fold / iterator）、`nif_cask_range`（**6.0.0**：OKI range 迭代
 器）、`nif_cask_batch`（**6.0.0**：原子批 + 多键事务）、`nif_cask_admin`、
 `nif_cask_meta`、`nif_helpers`、`nif_options`、`atoms` + `resources`。
 
-NIF 库的编译是**条件性的**（`cpp/CMakeLists.txt` 第 280 行）：
+NIF 库的编译是**条件性的**（`apps/bitcask/cpp/CMakeLists.txt` 第 280 行）：
 
 ```cmake
 if(Erlang_INCLUDE_DIR)    # 只有找到 Erlang 头文件才编译 NIF .so
@@ -197,9 +197,9 @@ NIF 层不做任何业务逻辑，仅负责类型转换和生命周期管理：
 现有证据：
 
 1. **300+ GoogleTest 用例**直接链接核心层 static 库运行，不需要 BEAM
-2. **CMake 独立构建**已在 CI 中使用（`cmake -S . -B _build/cmake`）
+2. **CMake 独立构建**已在 CI 中使用（`cmake -S apps/bitcask -B _build/cmake`）
 3. **Benchmark** 同样直接跑在核心层上（`_build/bench/cpp/bench/bitcask_bench`）
-4. **零侵入**：`cpp/src/` 和 `cpp/include/` 中无任何 `#ifdef` 或条件编译守卫引用 BEAM
+4. **零侵入**：`apps/bitcask/cpp/src/` 和 `apps/bitcask/cpp/include/` 中无任何 `#ifdef` 或条件编译守卫引用 BEAM
 
 ### 潜在的非 BEAM 使用场景
 
@@ -212,8 +212,8 @@ NIF 层不做任何业务逻辑，仅负责类型转换和生命周期管理：
 
 如果要把核心层抽为独立 CMake project，需要：
 
-1. 复制 `cpp/include/` + `cpp/src/` 到独立仓库
-2. 复制 `cpp/CMakeLists.txt` 中 `bitcask_io` 到 `bitcask_cask` 的 target 定义
+1. 复制 `apps/bitcask/cpp/include/` + `apps/bitcask/cpp/src/` 到独立仓库
+2. 复制 `apps/bitcask/cpp/CMakeLists.txt` 中 `bitcask_io` 到 `bitcask_cask` 的 target 定义
 3. 移除顶层 `find_package(Erlang REQUIRED)`
 4. 保留 `find_package(ZLIB)`、`find_package(TBB)`、ICU（`BitcaskICU.cmake`，默认系统包）、cppjieba 的 FetchContent
 

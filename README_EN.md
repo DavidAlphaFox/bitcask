@@ -12,15 +12,34 @@ Features include BM25 full-text search, approximate nearest-neighbor vector
 retrieval (three selectable engines: `hnsw` in-memory graph / `ivfrq` disk tier /
 `diskann` experimental), and RRF hybrid search that fuses both ranking signals.
 
-The implementation is a single C++23 NIF (`cpp/`) with a thin Erlang facade (`src/bitcask.erl`).
-All operations go through `bitcask_cpp_nifs` → `priv/bitcask_cpp.so`.
+The implementation is a single C++23 NIF (`apps/bitcask/cpp/`) with a thin Erlang facade (`apps/bitcask/src/bitcask.erl`).
+All operations go through `bitcask_cpp_nifs` → `apps/bitcask/priv/bitcask_cpp.so`.
+
+## Layout and use as a dependency
+
+The repository is a rebar3 umbrella project:
+
+| Directory | Contents |
+|---|---|
+| `apps/bitcask/` | the core: Erlang facade (`src/`, `include/`, `test/`), C++23 NIF (`cpp/`, `CMakeLists.txt`, `cmake/`), submodules (`third_party/libbitcask`, `third_party/llama.cpp`), `priv/`, `scripts/`, `examples/` |
+| `apps/bitcask_cypher/` | the graph query language (openCypher), using only the core's public API (see its `README.md`) |
+| `doc/`, `README*`, `CHANGELOG*`, `TASK.md`, `ROADMAP*` | project documentation |
+
+Depending on the core from another rebar3 project (`git_subdir` needs rebar3 3.14+):
+
+```erlang
+{deps, [{bitcask, {git_subdir, "https://github.com/DavidAlphaFox/bitcask.git", {tag, "<version>"}, "apps/bitcask"}}]}.
+```
+
+rebar3 clones the whole repository and runs the build hooks in `apps/bitcask` (submodule init, CMake for the NIF, with the build
+tree in your project's `_build/cmake`). Versions from before the move (≤ 13.1.0) are still depended on as `{git, Url, {tag, …}}`.
 
 ## Build
 
 ### rebar3 (Erlang + C++ NIF)
 
 ```sh
-rebar3 compile        # builds priv/bitcask_cpp.so
+rebar3 compile        # builds apps/bitcask/priv/bitcask_cpp.so
 rebar3 eunit          # Erlang/NIF tests (eunit)
 rebar3 do xref, dialyzer
 ```
@@ -34,7 +53,7 @@ only when missing does the build fall back to the vendored `third_party/icu`
 Optional local embedding backend (llama.cpp), **off by default**:
 
 ```sh
-BITCASK_WITH_LLAMA=1 rebar3 compile   # + priv/bitcask_llama.so and the vendored ggml/llama libs
+BITCASK_WITH_LLAMA=1 rebar3 compile   # + apps/bitcask/priv/bitcask_llama.so and the vendored ggml/llama libs
 ```
 
 Leaving it off keeps the build byte-for-byte as it was before that backend
@@ -44,7 +63,7 @@ existed: no submodule fetch, no CMake flag, no extra target. See
 ### CMake (C++ tests + benchmarks)
 
 ```sh
-cmake -S . -B _build/cmake -DBUILD_TESTING=ON
+cmake -S apps/bitcask -B _build/cmake -DBUILD_TESTING=ON
 cmake --build _build/cmake -j
 ctest --test-dir _build/cmake --output-on-failure   # 400+ GoogleTests
 ```
@@ -52,16 +71,16 @@ ctest --test-dir _build/cmake --output-on-failure   # 400+ GoogleTests
 Sanitizers (one at a time — ASan and TSan are mutually exclusive):
 
 ```sh
-cmake -S . -B _build/asan -DCMAKE_BUILD_TYPE=Debug \
+cmake -S apps/bitcask -B _build/asan -DCMAKE_BUILD_TYPE=Debug \
     -DBITCASK_SANITIZE=address,undefined -DBUILD_TESTING=ON
-cmake -S . -B _build/tsan -DCMAKE_BUILD_TYPE=Debug \
+cmake -S apps/bitcask -B _build/tsan -DCMAKE_BUILD_TYPE=Debug \
     -DBITCASK_SANITIZE=thread -DBUILD_TESTING=ON
 ```
 
 Benchmarks (release only):
 
 ```sh
-cmake -S . -B _build/bench -DCMAKE_BUILD_TYPE=Release \
+cmake -S apps/bitcask -B _build/bench -DCMAKE_BUILD_TYPE=Release \
     -DBITCASK_BUILD_BENCHMARKS=ON -DBUILD_TESTING=OFF
 cmake --build _build/bench -j
 _build/bench/cpp/bench/bitcask_bench
@@ -314,7 +333,7 @@ ok
 > **Local embedding (optional, not built by default)**: `{custom,
 > bitcask_embedder_llama}` computes embeddings in-process via llama.cpp, with no
 > HTTP endpoint. Enable with `BITCASK_WITH_LLAMA=1 rebar3 compile`; it produces a
-> **second, independent NIF** (`priv/bitcask_llama.so` plus a set of vendored
+> **second, independent NIF** (`apps/bitcask/priv/bitcask_llama.so` plus a set of vendored
 > ggml/llama shared libraries) and leaves the core `bitcask_cpp.so` untouched.
 > ⚠️ This is **a different tier, not a replacement** for the HTTP endpoint: what
 > runs on CPU is the 0.6B/1024-dim class, so switching tiers changes the stored
@@ -335,9 +354,9 @@ ok
 > machine has a CUDA Toolkit (`BITCASK_LLAMA_CUDA=AUTO|ON|OFF`). Use `ON` for
 > release builds; AUTO **silently** produces a CPU-only package on a machine
 > without a toolkit. The CUDA runtime (cudart/cublas/cublasLt) is flattened into
-> `priv/` by default — size is not a constraint, and it removes the whole "target
+> `apps/bitcask/priv/` by default — size is not a constraint, and it removes the whole "target
 > is missing libcublas → ggml silently skips the backend → degrades to CPU" class
-> of failure. Run `scripts/detect-llama-backends.sh` first to probe the
+> of failure. Run `apps/bitcask/scripts/detect-llama-backends.sh` first to probe the
 > environment and verify what the runtime actually enumerates (`--build` asks about
 > the SDK, `--runtime` about the GPU; the two halves can run on different machines).
 > The build-time answer is baked into the .so, and `bitcask_llama_nifs:gpu_status()`
@@ -365,7 +384,7 @@ ok
 | `range/2,3`, `range_fold/5` | Ordered range query over `[Lo, Hi)`, costs **O(range)**; per-key weak consistency (not a snapshot); `{prefetch, N}` fetches values concurrently |
 | `put_batch_atomic/2,3`, `txn_commit/2,3` | Crash-atomic batch / multi-key transaction; `Ops :: [{put,K,V} \| {remove,K}]`, optionally with preconditions `{put,K,V,Cond}` / `{remove,K,Cond}` / `{check,K,Cond}` (`Cond :: absent \| {ord,N}`; failure → `{error,{conflict,I}}`); `/3` with `[return_ords]` returns each op's LSN; ⚠️ the first call lazily upgrades the directory's meta to v6 |
 | `get_with_ord/2` | Reads the value plus the key's current LSN (`{ok, V, Ord}`), for `{ord, Ord}` preconditions |
-| `bitcask_txn:transaction/2,3`, `read/2,3`, `read_guarded/3`, `write/3`, `delete/2`, `abort/1` | **Isolated transactions** (6.5.1): pessimistic 2PL point locks + deadlock detection + automatic restart, Mnesia-style; `{atomic,R} \| {aborted,Why}`; options `retries`/`timeout`/`lock_wait_timeout`/`sync`/`index_fun`; `read/3` with `write` takes the write lock up front for read-modify-write; Fun must be side-effect free (may run more than once); `read_guarded/3` turns the version read into a commit condition (safe to mix with direct writes) |
+| `bitcask_txn:transaction/2,3`, `read/2,3`, `read_guarded/3`, `write/3`, `delete/2`, `abort/1` | **Isolated transactions** (6.5.1): pessimistic 2PL point locks + deadlock detection + automatic restart, Mnesia-style; `{atomic,R} \| {aborted,Why}`; options `retries`/`timeout`/`lock_wait_timeout`/`sync`/`index_fun`/`read_locks`; `read/3` with `write` takes the write lock up front for read-modify-write; Fun must be side-effect free (may run more than once); `read_guarded/3` turns the version read into a commit condition (safe to mix with direct writes) |
 | `bitcask:put_docs/2` | **Batch document write**: `[{Key, Doc}]`, texts needing embedding go through **one** `embed_batch` call; nothing is written if embedding fails, a failing put returns `{error, {Key, Reason}}` (not atomic) |
 | `bitcask_txn:idem_lookup/2`, `idem_purge/2,3` | **Idempotency keys** (`transaction/3` option `{idem_key, K}`; `{idem_result, false}` skips storing the result): a key commits at most once, repeats return the first result; `idem_lookup` is a lock-free check, `idem_purge(H, MaxAgeSec [, [{chunk, N}]])` removes old markers in streamed chunks |
 | `bitcask_txn:lock_key/3` | **Point lock**: takes the lock without reading or writing (like `mnesia:lock`), for callers that act on the engine directly under the lock |
@@ -378,6 +397,7 @@ ok
 | `search_near/3,4,5`, `search_fuzzy/3,4,5`, `search_wildcard/2,3,4` | Proximity / fuzzy (edit-distance) / wildcard search; the last arity takes a meta filter |
 | `search_vector/2,3,4,5`, `search_hybrid/2,3,4,5` | Vector NN (HNSW / IVF-RaBitQ / DiskANN — selected at `open` via `{vector_engine, ...}`) / RRF hybrid (BM25+vector); pass `{text,_}` (vector) or `auto` (hybrid) to auto-embed the query; `/5` takes a trailing meta filter |
 | `bitcask_query:q/2` | Structured query DSL: key (eq/prefix/range) + full text (match/phrase/fields/near/fuzzy/wildcard) + meta `where`; the planner picks one index to drive; see `doc/api-en.md` |
+| `bitcask_cypher:q/2,3,4` | Graph query language (openCypher): now a separate application in this repository, `apps/bitcask_cypher/` (uses only this library's public API); see its `README.md` |
 | `embed/2` | Encode text to a vector via the handle's embedder (`{ok, Vec}`/`{error, no_embedder}`) |
 | `is_empty_estimate/1`, `is_frozen/1`, `close_write_file/1` | Utilities |
 
@@ -397,13 +417,15 @@ ok
 | `doc/vector-db-design-zh.md` | 向量库设计方案（V1–V6 蓝图） |
 | `doc/vector-search-extension-zh.md` | 向量搜索扩展：HNSW + RRF 混合检索 |
 | `doc/graph-adjacency-pack-design-en.md` / `-zh.md` | **Graph layer v2**: two KVs per vertex (packed adjacency + hub chunks) + LSN-conditional writes; on-disk contract, write path, migration, benchmarks |
+| `apps/bitcask_cypher/doc/cypher-en.md` / `cypher-zh.md` | **Graph query language guide** (separate application `bitcask_cypher`; design in `cypher-query-design-zh.md` next to it) |
+| `apps/bitcask_cypher/doc/cypher-syntax-en.md` / `cypher-syntax-zh.md` | **Graph query syntax reference**: openCypher 2024.3 clauses, patterns (quantified paths and path search prefixes included), expressions and functions, plus the syntax specific to bitcask (`@@`, `<=>`, search functions, `text` / `embedding`, user procedures) |
 | `doc/graph-layer-design-en.md` / `-zh.md` | **Graph layer design v1** (KV per-key; on-disk layout superseded by v2, traversal / OLAP materialization / etype registry still apply) (EN/中) |
 | `doc/txn-layer-design-zh.md` | **Transaction layer design** (2PL + deadlock detection + restart on top of atomic batches; §11 implementation deviations, §12 prefix locks, §13 sharded lock manager) (中) |
 | `doc/hnsw-design-zh.md` | HNSW 向量索引设计（并发/持久化/RRF/实施表） |
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
 | `doc/unified-architecture-plan-zh.md` | 统一架构计划（已实施） |
 | `doc/libcask-extraction-zh.md` | **libcask standalone extraction feasibility** (2.2.0 plan) |
-| `ROADMAP_EN.md` / `ROADMAP.md` | **Roadmap**: 12.1.0 / 12.0.3 / 12.0.2 / 12.0.1 / 12.0.0 / 11.0.0 / 10.0.0 / 9.0.0 / 8.0.0 / 7.0.3 / 7.0.2 / 7.0.1 / 7.0.0 / 6.9.1 / 6.9.0 / 6.8.1 / 6.8.0 / 6.7.3 / 6.7.2 / 6.7.1 / 6.7.0 / 6.6.0 / 6.5.1 / 6.5.0 / 6.4.0 / 6.3.2 / 6.3.1 / 6.2.2 / 6.2.1 / 6.1.0 / 6.0.0 / 5.1.0 / 5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 shipped + 2.1.1 shipped (P5–P15) + 2.2.0 plan (libcask extraction / V7+ vector optimization) (EN/中) |
+| `ROADMAP_EN.md` / `ROADMAP.md` | **Roadmap**: 13.1.0 / 12.1.0 / 12.0.3 / 12.0.2 / 12.0.1 / 12.0.0 / 11.0.0 / 10.0.0 / 9.0.0 / 8.0.0 / 7.0.3 / 7.0.2 / 7.0.1 / 7.0.0 / 6.9.1 / 6.9.0 / 6.8.1 / 6.8.0 / 6.7.3 / 6.7.2 / 6.7.1 / 6.7.0 / 6.6.0 / 6.5.1 / 6.5.0 / 6.4.0 / 6.3.2 / 6.3.1 / 6.2.2 / 6.2.1 / 6.1.0 / 6.0.0 / 5.1.0 / 5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 shipped + 2.1.1 shipped (P5–P15) + 2.2.0 plan (libcask extraction / V7+ vector optimization) (EN/中) |
 | `TASK.md` | Detailed task breakdown & history |
 
 ## Project status
@@ -420,9 +442,10 @@ ok
 - **Concurrency hardening** (2026-06 audit) — search read path is safe against the async index worker: `meta_blob`/search-cache copy under lock without escaping pointers, inverted-index snapshot uses safe iteration, cross-thread scalars are atomic, IndexPool consumer is exception-safe; see [`doc/concurrency-zh.md` §6](doc/concurrency-zh.md)
 - **3.0.0** (2026-06-25) — libbitcask v3.0.0 upgrade (ABI break, `SOVERSION` 1→3): synonym dictionary becomes the open-time immutable option `{synonym_file, Path}` (runtime `set_synonym_map/2` removed); ships with thread-safe `Cask` handle, `parallel_scan` full-table parallel scan, async-index MapReduce pipeline, batch retrieval
 - **3.1.0** (2026-07-01) — libbitcask v3.1.0 upgrade (ABI unbroken): `{max_read_handles, unlimited}` / `{auto_compact_dead_ratio, R}` options, `closed` error atom; ships with default read-handle cap (auto-derived from `RLIMIT_NOFILE`), `bitcask.meta` v3 with CRC32, field.schema FSCH v1 header + CRC
-- **4.0.0** (2026-07-13) — libbitcask v4.0.0 upgrade (ABI break, `SOVERSION` 3→4, source-compatible): `{vector_engine, hnsw|ivfrq|diskann}` vector dual-engine + tuning options, `{auto_checkpoint_min_docs, N}` bounded crash-recovery replay; ships with IVF-RaBitQ-lite engine, DiskANN engine (experimental), AVX2 int8 kernels, HNSW `.qc8` codeword mmap; `examples/` Wikipedia search-database example
+- **4.0.0** (2026-07-13) — libbitcask v4.0.0 upgrade (ABI break, `SOVERSION` 3→4, source-compatible): `{vector_engine, hnsw|ivfrq|diskann}` vector dual-engine + tuning options, `{auto_checkpoint_min_docs, N}` bounded crash-recovery replay; ships with IVF-RaBitQ-lite engine, DiskANN engine (experimental), AVX2 int8 kernels, HNSW `.qc8` codeword mmap; `apps/bitcask/examples/` Wikipedia search-database example
 - **4.1.0** (2026-07-15) — libbitcask v4.1.0 upgrade (ABI unbroken, `SOVERSION` stays 4, on-disk format unchanged): **no API change** for Erlang callers — just rebuild; ships with the Phase 5/6 deep audit — fixes a process-wide permanent hang on the `close/1` teardown path (`IndexPool` count leak + unbounded `flush` in `unregister_lib`), adds `fdatasync` before `rename` to hnsw's three atomic writes (previously a crash left a truncated file), closes `RowChunks`/`MmapSegment` resource leaks; `file_util` consolidation converges fsync discipline from 4 variants to 1
-- **12.1.0** (2026-11-23, current) — libbitcask 12.0.3 → **12.1.0** upgrade (MINOR; existing C API / ABI / on-disk format unchanged, `SOVERSION` stays 12). Adds `bitcask:vector_rank/3,4`: exact ranking by vector similarity among a given set of keys (no vector index involved). Upstream fixes: corruption in the middle of a data file no longer makes open truncate the file (damaged regions are skipped; only a crashed writer's active file can be truncated); filtered `search_vector` fills K for HNSW graphs of up to 2^20 nodes; faster point reads once rows are on disk. ⚠️ For a cleanly closed store a damaged file tail is no longer truncated away; vector queries whose filter rejects (nearly) everything pay one extra filter evaluation per node
+- **13.1.0** (2026-11-23, current) — Adds the graph query language `bitcask_cypher` (openCypher subset: MATCH / WHERE / WITH / UNWIND / RETURN, CREATE / SET / REMOVE / DELETE, one transaction per statement, variable length and shortest path, full-text `@@` and vector `<=>`; see `doc/cypher-en.md`) and a unified graph data model (`graphdb:create_vertex/2,3`, labels and a label index, one id space shared by the API and Cypher). libbitcask 12.1.0 → **13.1.0** upgrade (across 12.2.0 / 13.0.0; 13.0.0 breaks the C++ ABI, which does not matter here since libbitcask is built from source; C API and on-disk format unchanged): fixes data loss / failure to open after atomic-batch deletions (graph edge / vertex deletion and Cypher `DELETE` hit it); memdelta flushes moved to a background thread (worst single-write latency 153 ms → about 1.5 ms); faster full scans and ranges (about 950 → 250–440 ns per row; ranges after a reopen about 600–830 → 270–410 ns). ⚠️ `range` / `range_fold` are now snapshots (writes during the iteration are not visible); highlighting after a reopen takes the cold path more often (`cold => load` still produces snippets)
+- **12.1.0** (2026-11-23) — libbitcask 12.0.3 → **12.1.0** upgrade (MINOR; existing C API / ABI / on-disk format unchanged, `SOVERSION` stays 12). Adds `bitcask:vector_rank/3,4`: exact ranking by vector similarity among a given set of keys (no vector index involved). Upstream fixes: corruption in the middle of a data file no longer makes open truncate the file (damaged regions are skipped; only a crashed writer's active file can be truncated); filtered `search_vector` fills K for HNSW graphs of up to 2^20 nodes; faster point reads once rows are on disk. ⚠️ For a cleanly closed store a damaged file tail is no longer truncated away; vector queries whose filter rejects (nearly) everything pay one extra filter evaluation per node
 - **12.0.3** (2026-11-23) — libbitcask 12.0.2 → **12.0.3** upgrade (PATCH; C API / ABI / on-disk format unchanged, `SOVERSION` stays 12). Upstream S65 speeds up point-read hits (flat in-memory point-lookup index; hits in the active file served from a read-only mapping, Linux / FreeBSD only): one hit through the NIF 1.3–2.0 µs → 0.26–0.73 µs. This release also folds in internal optimizations of the graph layer and NIF scheduling (one-pass adjacency reads, binary-searched hub chunk directories, single edits that splice binaries, small atomic batches that skip the dirty scheduler): `out_edges` about 4 → 2 µs, single `put_edge` about 17 → 8 µs, `put_edge` on a 200k-degree hub 255 → 20 µs; API and on-disk format unchanged. ⚠️ Pages of the active file touched by point reads count toward RSS, and an I/O error on a mapped read is a SIGBUS (same as sealed files)
 - **12.0.2** (2026-11-23) — libbitcask 12.0.1 → **12.0.2** upgrade (PATCH; C API / ABI / on-disk format unchanged, `SOVERSION` stays 12). Upstream S64: the first `range` / iteration after every write no longer re-sorts all unflushed rows (scanning one row with 400k unflushed rows: 80 ms → 13 µs). This release also fixes hub paths in the graph layer: `del_vertex` on a hub goes from O(degree²) to linear (200k neighbors: 450 s → 2.1 s), adjacency reads of chunked vertices use point reads from the chunk directory (`limit` reads only the chunks it needs), and the `put_edges` sort key now includes dst (hub load 15.3 s → 3.5 s); API and on-disk format unchanged
 - **12.0.1** (2026-11-20) — libbitcask 12.0.0 → **12.0.1** upgrade (PATCH; C API / ABI / on-disk format unchanged, `SOVERSION` stays 12). Upstream S63 fixes atomic batches not being wholly visible to concurrent readers: graph write sessions could base a write-back on "new head + old chunk" and overwrite a chunk someone had just written, and missing-chunk self-heal could write a freshly created chunk as empty. The engine now arbitrates the whole batch first and publishes it in one index critical section, so a reader sees either the entire batch or none of it. This release also extends graph write-session conditions to the whole read set (heads, chunks read, vertices read but unmodified) and makes `out_edges` / `in_edges` with `#{consistent => true}` validate the read-set versions with a check-only atomic batch before returning.
@@ -446,13 +469,13 @@ ok
 - **6.5.1** (2026-09-21) — **Transaction layer lands**: `bitcask_txn` (isolation on top of atomic batches: pessimistic 2PL point locks + wait-for graph deadlock detection + automatic restart; writes buffered in the pdict and committed as one `txn_commit` batch; `{retries,N}`/`{timeout,Ms}`/`index_fun`); **prefix locks** `lock_prefix/3` + `prefix_range/2,3` (phantom-free range scans inside a transaction); **sharded lock manager** (`txn_locker_shards`, default 8; prefix locks taken on every shard; cross-shard deadlock detection never misses a cycle; locker microbench flat 26k → 50k+ at P=16); **victim = youngest on the cycle** (age preserved across restarts, so long transactions are not starved by short ones). `graphdb` transactional API (`transaction` + `put_edge_txn`/`del_edge_txn`/`del_vertex_txn`/`out_edges_txn`/`degree_txn` …): an edge's five keys + counters commit in one locked batch, exact counts under concurrency. Zero engine changes, zero new dependencies, no ABI / on-disk format change; design `doc/txn-layer-design-zh.md`; `rebar3 eunit` 235/235
 - **6.5.0** (2026-09-18) — **Graph layer lands**: `graphdb` (KV per-key: k = vertex, edges as fixed-width big-endian keys dual-written in one atomic batch, adjacency via OKI prefix ranges, BFS/k-hop/bidirectional shortest path, deg/et indexes, `neighbors_where` filtered traversal) + `graphdb_analytics` (in-memory CSR materialization + PageRank/connected components/SSSP); design doc `doc/graph-layer-design-en.md`. Ships the libbitcask 6.3.2 → **6.5.0** bump: OKI memdelta sorted view cache removes the "range slows down 4200× after bulk loads" cliff (graph bench measured one-hop 110ms → 0.078ms), `status()` gains `oki_delta_rows`/`oki_delta_bytes`; embedder pool dispatch test unified sampling kills the false red. C API purely additive, SOVERSION 6 unchanged, no on-disk format change
 - **6.4.0** (2026-09-08) — two product decisions for the local embedding backend: **`slots => K` concurrency slots** (new configuration: K identically-configured workers = K genuinely concurrent forwards, config passed through untouched, transparent least-queue spreading via the proxy, fewer-than-K started is fatal, mutually exclusive with `instances`) and **device selection only accepting discrete GPUs** (via llama.cpp b10859's IGPU type: iGPUs never participate in GPU acceleration, no discrete GPU goes straight to CPU — a deliberate call: embedding workloads are small, iGPU drivers and shared-memory policies uneven). `backend_info`/`gpu_status` device-list `type` grew to five values `cpu/gpu/igpu/accel/meta`. Reuses the existing pool machinery; core KV/search untouched, no ABI / on-disk format change
-- **6.3.2** (2026-09-08) — llama.cpp `b10257` → **`b10859`** upgrade (the local embedding backend, opt-in; **no libbitcask change**, the core `bitcask_cpp.so` is untouched): zero NIF source changes, with the **CPU and Vulkan build paths re-verified end to end** — 14 CPU variants, `libggml-vulkan.so` flattened into `priv/`, and the build-time/runtime diagnostics in `build_info` / `gpu_status` truthful across all three states (vulkan on/off, gpu_count, cpu_only_build). ⚠️ Upstream keeps the Discrete/Integrated-GPU-only Vulkan enumeration filter: CPU-software-rendered devices (llvmpipe) are skipped by default (`GGML_VK_VISIBLE_DEVICES` force-includes them, diagnostics only). ⚠️ An in-place upgrade from the old pin leaves stale `libggml-*.so.0.18.0` files behind (harmless; `rebar3 clean` removes them)
+- **6.3.2** (2026-09-08) — llama.cpp `b10257` → **`b10859`** upgrade (the local embedding backend, opt-in; **no libbitcask change**, the core `bitcask_cpp.so` is untouched): zero NIF source changes, with the **CPU and Vulkan build paths re-verified end to end** — 14 CPU variants, `libggml-vulkan.so` flattened into `apps/bitcask/priv/`, and the build-time/runtime diagnostics in `build_info` / `gpu_status` truthful across all three states (vulkan on/off, gpu_count, cpu_only_build). ⚠️ Upstream keeps the Discrete/Integrated-GPU-only Vulkan enumeration filter: CPU-software-rendered devices (llvmpipe) are skipped by default (`GGML_VK_VISIBLE_DEVICES` force-includes them, diagnostics only). ⚠️ An in-place upgrade from the old pin leaves stale `libggml-*.so.0.18.0` files behind (harmless; `rebar3 clean` removes them)
 - **6.3.1** (2026-09-08) — libbitcask 6.2.2 → **6.3.1** upgrade (spanning upstream 6.3.0 + 6.3.1; zero changes to the existing C API and public C++ header signatures, enumerators and struct layouts — everything new is additive, `SOVERSION` stays 6, on-disk format untouched, no migration): **no API change** for Erlang callers, not one line of NIF code changed — just rebuild. ⚠️ **New build dependency: ICU** (≥ 60): the text substrate moves from utf8proc to ICU (NFKC_Casefold / character properties / GB18030 etc. encoding conversion); the system `libicu-dev` is the default and the vendored `third_party/icu` (380 MB, `update = none`, deliberately skipped by `--recursive`) is the fallback; the CI apt lists are updated accordingly. ⚠️ Index reproducibility: tokenization = the NFKC_Casefold table = the ICU version — when the system ICU drifts, new and old documents may be tokenized into different terms (recall quietly shrinks, no visible symptom); `bitcask.meta` now records the ICU/Unicode major version at index-build time and warns on reopen mismatch (warn-only, never refuses to open); pin the version with `-DBITCASK_ICU_PROVIDER=vendored`. Brings the S39 additive C API (multi-field `bitcask_put_doc_ex`, meta codec, search pagination `*_ex`, `bitcask_search_text_highlight`), not yet surfaced in the Erlang facade
 - **6.2.2** (2026-09-01) — libbitcask 6.2.1 → **6.2.2** upgrade (PATCH, pure portability; zero changes to the signatures, enumerators and struct layouts of the C API and public C++ headers, `SOVERSION` stays 6, on-disk format untouched, no migration): **no API change** for Erlang callers, not one line of this repo's Erlang / NIF code changed — just rebuild. Upstream made the library compile against **libc++** (the default standard library on FreeBSD 15 and macOS): four `std::atomic<std::shared_ptr<T>>` sites moved to the new `AtomicSharedPtr<T>` shim (an alias for `std::atomic` under libstdc++, so **this build is literally unchanged**; libc++ lacks the P0718R2 specialization and falls back to a mutex-backed version), `hnsw`'s `atomic_ref` drops its `const`, and bundled oneTBB headers are marked SYSTEM. It also brings **a real UB fix**: a use-after-scope in the `IndexPool` timeout test that had always passed silently on Linux (libstdc++ tolerates unlocking a mutex it does not hold) and traps under libc++
 - **6.2.1** (2026-08-14) — libbitcask 6.1.0 → **6.2.1** upgrade (spanning upstream 6.2.0 and 6.2.1; zero changes to the C API and public C++ headers, `SOVERSION` stays 6, on-disk format untouched, no migration): **no API change** for Erlang callers — just rebuild. Ships with upstream's Windows port (native MSVC x64) and its I/O robustness work — **torn-tail coverage** (the write offset is anchored to the last complete record, so a half-written record at the tail is no longer treated as valid data after a crash or power loss), every raw POSIX call moved behind the `bitcask::io` seam, and SIMD dispatch moved to runtime CPU detection (moving a binary between machines no longer SIGILLs). Build side: with upstream's paths switched to `PROJECT_SOURCE_DIR`, this repo's `third_party/*` symlink workaround is deleted. ⚠️ The one externally visible behaviour change is a second line in `bitcask.write.lock` (a process instance token, always `0` on POSIX); both parsers read only the first line, so old and new lock files stay compatible in both directions
 - **6.1.0** (2026-08-06) — libbitcask 6.0.0 → **6.1.0** upgrade (MINOR, purely additive: the new enumerator is appended at the end, ABI intact, `SOVERSION` stays 6, no on-disk format change and no migration): `range`'s "index unavailable" is split into two error codes by cause — `{error, no_index}` (the index was never built for this handle: a read-only / `merge_only` open of a directory with no OKI; reopen read-write and it builds) and the new `{error, index_rebuild_failed}` (a writable open attempted a rebuild and it failed — an IO/environment problem). ⚠️ The latter means **the data is there and only the index is missing** — worth alerting on rather than treating as an empty database
 - **6.0.0** (2026-08-06) — libbitcask v5.0.0 → **6.0.0** upgrade (spanning upstream 5.1.0 and 6.0.0; ABI break, `SOVERSION` 5→6, but this repo depends on it at source level so a rebuild suffices): three new API surfaces — `range/2,3` + `range_fold/5` ordered range queries (O(range); upstream measured 15×), `put_batch_atomic/2` crash-atomic batches, `txn_commit/2,3` multi-key transactions; new `{keydir_cache_entries, N}` option (disk-resident keydir Level B; upstream measured -90% resident memory at 100M keys); `open/2` errors now carry detail (`{error, {io_error \| invalid_option, Msg}}`). ⚠️ **Existing directories must be migrated offline first**: upstream 5.1.0's hint-ord flag day moves `bitcask.meta` v4 → v5, so directories written by the 5.x line are cleanly refused — migrate non-destructively with `bitcask_migrate hintord <src> <dst>` (zero changes to data bytes)
-- **5.1.0** (2026-08-06) — Local embedding backend (llama.cpp / ggml, **not built by default**) plus a standalone embedder process. **No libbitcask upgrade**, no ABI or on-disk format change, and with the backend off the output is byte-for-byte 5.0.0's: a second independent NIF `priv/bitcask_llama.so` (enable with `BITCASK_WITH_LLAMA=1`), `bitcask_embedder_server` so all casks share one copy of the weights with the lifecycle tied to the process, CUDA support (`BITCASK_LLAMA_CUDA=AUTO|ON|OFF`) with build-time/run-time split diagnostics (`build_info/0` / `backend_info/0` / `gpu_status/0`) and the `scripts/detect-llama-backends.sh` probe; ⚠️ `bitcask:open/2` no longer swallows an `application:start` failure (returns `{error, {bitcask_app_start_failed, _}}` — a deliberate behaviour change)
+- **5.1.0** (2026-08-06) — Local embedding backend (llama.cpp / ggml, **not built by default**) plus a standalone embedder process. **No libbitcask upgrade**, no ABI or on-disk format change, and with the backend off the output is byte-for-byte 5.0.0's: a second independent NIF `apps/bitcask/priv/bitcask_llama.so` (enable with `BITCASK_WITH_LLAMA=1`), `bitcask_embedder_server` so all casks share one copy of the weights with the lifecycle tied to the process, CUDA support (`BITCASK_LLAMA_CUDA=AUTO|ON|OFF`) with build-time/run-time split diagnostics (`build_info/0` / `backend_info/0` / `gpu_status/0`) and the `apps/bitcask/scripts/detect-llama-backends.sh` probe; ⚠️ `bitcask:open/2` no longer swallows an `application:start` failure (returns `{error, {bitcask_app_start_failed, _}}` — a deliberate behaviour change)
 - **5.0.0** (2026-07-17) — libbitcask v5.0.0 upgrade (64-bit timestamp flag-day, breaking both ABI and **on-disk format**, `SOVERSION` 4→5): `tstamp`/`expiry_at` widen u32→u64 end to end (Y2038 readiness), fixing a u32 wraparound with huge `expiry_secs` that misjudged every key as expired; **no API change** for Erlang callers (`tstamp` was always an arbitrary-precision integer); the `bitcask.meta` v4 gate cleanly refuses old u32-era databases — migrate existing ones offline and non-destructively with upstream's `bitcask_migrate tstamp64`, no re-ingest needed
 
 ## License

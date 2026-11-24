@@ -1,0 +1,1427 @@
+%% -------------------------------------------------------------------
+%% bitcask_txn_tests:
+%%   事务协调层（doc/txn-layer-design-zh.md §7）P1 覆盖：
+%%     - 锁矩阵         兼容 / 重入 / 升级（locker 裸 API）
+%%     - FIFO + 防写饿死 读者不准插到写等待者前面
+%%     - 死锁           交叉加锁恰好一方受害并重跑成功；计数守恒
+%%     - 重启预算       retries=0 → {aborted,{retry_limit,0}}
+%%     - 死亡清理       持锁进程被 kill → 等待者放行
+%%     - 缓冲语义       read-your-writes、delete 遮蔽、覆盖序、只读不提交
+%%     - 提交失败       meck txn_commit → {aborted,{commit_failed,_}} 且锁清零
+%%     - 真实 cask      多进程并发搬运计数器，总和守恒（mini-Jepsen）
+%%     - 杂项           timeout / lock_wait_timeout / 嵌套 / index_fun /
+%%                      跨 cask 同名 key 不冲突 / 非 owner 进程
+%%
+%%   ⚠️ 崩溃原子性归上游 C++ 测试，这里只测 BEAM 侧的锁与协议。
+%% -------------------------------------------------------------------
+-module(bitcask_txn_tests).
+
+-include_lib("eunit/include/eunit.hrl").
+
+-define(L, bitcask_txn_locker).
+-define(T, bitcask_txn).
+
+%% 所有用例都要 locker 在跑；embedder 测试会 stop/start application，
+%% 所以每个用例自己 ensure。
+setup() ->
+    catch application:load(bitcask),
+    {ok, _} = application:ensure_all_started(bitcask),
+    ok.
+
+with_dir(Fun) ->
+    setup(),
+    bitcask_test_util:with_dir("bitcask_txn_", Fun).
+
+open(D) -> bitcask:open(D, [read_write]).
+
+%% 快速提交：测试里不需要每次 fsync。
+-define(FAST, [{sync, no_sync}]).
+
+int(Bin) -> binary_to_integer(Bin).
+bin(Int) -> integer_to_binary(Int).
+
+%% ---------- 锁测试用的"裸事务"进程 ----------
+%%
+%% 一个 agent 进程就是一个注册过的 TxnId，按指令去 acquire，把结果回报。
+%% 阻塞中的 acquire 让 agent 自己挂在 gen_server:call 里，正好模拟真实事务。
+%% release 之后事务就结束了（release_all 注销 TxnId），agent 自动以新 TxnId
+%% 重新注册——测试里"同一个 agent"再 acquire 就是一个新事务。
+%% agent monitor 测试进程：用例失败（进程 normal 退出，link 不传播）时
+%% 也要跟着死，别把锁留给下一个用例。
+
+agent_start() -> agent_start(#{}).
+
+agent_start(Opts) ->
+    Parent = self(),
+    Pid = spawn_link(fun() ->
+                         erlang:monitor(process, Parent),
+                         agent_loop(Parent, undefined)
+                     end),
+    Pid ! {register, Opts},
+    receive {Pid, {ok, TxnId}} -> {Pid, TxnId} end.
+
+agent_loop(Parent, TxnId) ->
+    receive
+        {register, Opts} ->
+            R = ?L:register(self(), Opts),
+            Parent ! {self(), R},
+            {ok, Id} = R,
+            agent_loop(Parent, Id);
+        {acquire, LockId, Mode} ->
+            Parent ! {self(), {acquired, LockId, ?L:acquire(TxnId, LockId, Mode)}},
+            agent_loop(Parent, TxnId);
+        {release, Opts} ->
+            ok = ?L:release_all(TxnId),
+            {ok, Id} = ?L:register(self(), Opts),
+            Parent ! {self(), released, ok},
+            agent_loop(Parent, Id);
+        stop ->
+            ok = ?L:release_all(TxnId),
+            Parent ! {self(), stopped};
+        {'DOWN', _, process, Parent, _} ->
+            ok
+    end.
+
+%% 锁的释放是异步的（cast），断言"锁表清零"要等一下：最多 1s，返回末次 status。
+%% 只等锁表清空（locks / prefix_locks / waiting 归零），不管 txns——agent 还活着
+%% 时它们的事务仍注册着，txns 不会归零，用 wait_clean/0 会白白轮询满 1 s。
+wait_locks_clean() -> wait_locks_clean(50).
+wait_locks_clean(0) -> ?L:status();
+wait_locks_clean(N) ->
+    case ?L:status() of
+        #{locks := 0, prefix_locks := 0, waiting := 0} = S -> S;
+        _ -> timer:sleep(20), wait_locks_clean(N - 1)
+    end.
+
+wait_clean() -> wait_clean(50).
+wait_clean(0) -> ?L:status();
+wait_clean(N) ->
+    case ?L:status() of
+        #{locks := 0, txns := 0, waiting := 0} = S -> S;
+        _ -> timer:sleep(20), wait_clean(N - 1)
+    end.
+
+%% 发 acquire 指令；不等结果。
+acq({Pid, _}, LockId, Mode) -> Pid ! {acquire, LockId, Mode}, ok.
+
+%% 期望在 Ms 内收到 acquire 结果。
+expect({Pid, _}, LockId, Ms) ->
+    receive {Pid, {acquired, LockId, R}} -> R
+    after Ms -> timeout
+    end.
+
+%% 期望 agent 在 LockId 上**排队等着**（没拿到、也没失败）。
+%%
+%% 以前是"150 ms 内没收到结果就算阻塞"——既慢（29 处调用），又是反向断言：
+%% 负载高时晚于 150 ms 才授予的锁也会被当成阻塞。现在正向确认：轮询共享表
+%% bitcask_txn_txns，直到 agent 的事务记录 waiting = {_, LockId}。locker 在
+%% handle_call 里先入队 + 写 waiting、**之后**才 noreply（立即可授予的请求直接
+%% reply，根本不写 waiting），所以看到 waiting 就说明请求确实排上了队。
+%% 期间收到结果 → {unexpected, R}；2 s 内既没排队也没结果 → {not_queued, W}。
+%% 最后再 after 0 看一眼信箱，防"排上队后立刻被授予"。
+blocked({Pid, _}, LockId) ->
+    blocked(Pid, LockId, 1000).
+
+blocked(Pid, LockId, 0) ->
+    receive {Pid, {acquired, LockId, R}} -> {unexpected, R}
+    after 0 -> {not_queued, txn_waiting(Pid)}
+    end;
+blocked(Pid, LockId, N) ->
+    receive {Pid, {acquired, LockId, R}} -> {unexpected, R}
+    after 0 ->
+        case lists:any(fun({_Shard, L}) -> L =:= LockId end, txn_waiting(Pid)) of
+            true ->
+                receive {Pid, {acquired, LockId, R}} -> {unexpected, R}
+                after 0 -> blocked
+                end;
+            false ->
+                timer:sleep(2),
+                blocked(Pid, LockId, N - 1)
+        end
+    end.
+
+%% Pid 名下事务的 waiting 字段（非 undefined 的）。#txn{} 是 locker 私有记录，
+%% 这里按位置读：{txn, Id, Pid, Mon, Age, Deadline, LockWaitTimeout, Waiting, Commit}。
+txn_waiting(Pid) ->
+    [element(8, T) || T <- ets:tab2list(bitcask_txn_txns),
+                      element(3, T) =:= Pid, element(8, T) =/= undefined].
+
+%% 等到 Pid 名下有事务在排队（门面事务用：不知道具体 LockId）。
+wait_queued(Pid) ->
+    ok = wait_for(fun() -> txn_waiting(Pid) =/= [] end).
+
+rel(A) -> rel(A, #{}).
+
+rel({Pid, _}, Opts) ->
+    Pid ! {release, Opts},
+    receive {Pid, released, ok} -> ok end.
+
+%% 同步：agent 注销自己的事务后才回，之后看 status 不会撞上残留。
+stop({Pid, _}) ->
+    Pid ! stop,
+    receive {Pid, stopped} -> ok end.
+
+%% ===================================================================
+%% 锁矩阵
+%% ===================================================================
+
+lock_matrix_test_() ->
+    {"读读合并 / 读写互斥 / 写写互斥 / 重入 / 唯一 holder 升级",
+     fun() ->
+        setup(),
+        K = {make_ref(), <<"k">>, point},
+        A = agent_start(), B = agent_start(),
+        %% read + read
+        acq(A, K, read),  ?assertEqual(ok, expect(A, K, 500)),
+        acq(B, K, read),  ?assertEqual(ok, expect(B, K, 500)),
+        %% B 想升级：A 还持读 → 等
+        acq(B, K, write), ?assertEqual(blocked, blocked(B, K)),
+        rel(A),           ?assertEqual(ok, expect(B, K, 500)),
+        %% B 持写：A 读要等
+        acq(A, K, read),  ?assertEqual(blocked, blocked(A, K)),
+        %% B 重入（写后读、写后写）立即 ok
+        acq(B, K, read),  ?assertEqual(ok, expect(B, K, 500)),
+        acq(B, K, write), ?assertEqual(ok, expect(B, K, 500)),
+        rel(B),           ?assertEqual(ok, expect(A, K, 500)),
+        %% A 唯一读 holder 升级 write：立即
+        acq(A, K, write), ?assertEqual(ok, expect(A, K, 500)),
+        %% B 写要等
+        acq(B, K, write), ?assertEqual(blocked, blocked(B, K)),
+        rel(A),           ?assertEqual(ok, expect(B, K, 500)),
+        rel(B),
+        ?assertMatch(#{locks := 0}, wait_locks_clean()),
+        stop(A), stop(B)
+     end}.
+
+%% ===================================================================
+%% FIFO + 防写饿死
+%% ===================================================================
+
+fifo_no_writer_starvation_test_() ->
+    {"读持有中来了写等待者，之后的读必须排在写后面",
+     fun() ->
+        setup(),
+        K = {make_ref(), <<"k">>, point},
+        R1 = agent_start(), W = agent_start(), R2 = agent_start(), R3 = agent_start(),
+        acq(R1, K, read),  ?assertEqual(ok, expect(R1, K, 500)),
+        acq(W, K, write),  ?assertEqual(blocked, blocked(W, K)),
+        acq(R2, K, read),  ?assertEqual(blocked, blocked(R2, K)),   % 不准插队
+        acq(R3, K, read),  ?assertEqual(blocked, blocked(R3, K)),
+        rel(R1),
+        ?assertEqual(ok, expect(W, K, 500)),                          % 写先
+        ?assertEqual(blocked, blocked(R2, K)),
+        rel(W),
+        ?assertEqual(ok, expect(R2, K, 500)),                         % 读段合并
+        ?assertEqual(ok, expect(R3, K, 500)),
+        rel(R2), rel(R3),
+        ?assertMatch(#{locks := 0}, wait_locks_clean()),
+        [stop(X) || X <- [R1, W, R2, R3]]
+     end}.
+
+%% ===================================================================
+%% 死锁：locker 层直接检
+%% ===================================================================
+
+deadlock_detected_at_locker_test_() ->
+    {"A:K1→K2，B:K2→K1：后闭环者拿 {error,deadlock}，另一方随后放行",
+     fun() ->
+        setup(),
+        Ref = make_ref(),
+        K1 = {Ref, <<"k1">>, point}, K2 = {Ref, <<"k2">>, point},
+        A = agent_start(), B = agent_start(),
+        acq(A, K1, write), ?assertEqual(ok, expect(A, K1, 500)),
+        acq(B, K2, write), ?assertEqual(ok, expect(B, K2, 500)),
+        acq(A, K2, write), ?assertEqual(blocked, blocked(A, K2)),
+        #{deadlocks_total := D0} = ?L:status(),
+        acq(B, K1, write), ?assertEqual({error, deadlock}, expect(B, K1, 500)),
+        ?assertMatch(#{deadlocks_total := D1} when D1 =:= D0 + 1, ?L:status()),
+        %% A 仍在等 K2；B 放锁后 A 拿到
+        ?assertEqual(blocked, blocked(A, K2)),
+        rel(B),
+        ?assertEqual(ok, expect(A, K2, 500)),
+        rel(A),
+        ?assertMatch(#{locks := 0, waiting := 0}, wait_locks_clean()),
+        stop(A), stop(B)
+     end}.
+
+three_way_cycle_test_() ->
+    {"三方环 A→B→C→A 也能检出（DFS 多跳）",
+     fun() ->
+        setup(),
+        Ref = make_ref(),
+        [K1, K2, K3] = [{Ref, K, point} || K <- [<<"1">>, <<"2">>, <<"3">>]],
+        A = agent_start(), B = agent_start(), C = agent_start(),
+        acq(A, K1, write), ok = expect(A, K1, 500),
+        acq(B, K2, write), ok = expect(B, K2, 500),
+        acq(C, K3, write), ok = expect(C, K3, 500),
+        acq(A, K2, write), blocked = blocked(A, K2),
+        acq(B, K3, write), blocked = blocked(B, K3),
+        acq(C, K1, write), ?assertEqual({error, deadlock}, expect(C, K1, 500)),
+        rel(C),
+        ok = expect(B, K3, 500),
+        rel(B),
+        ok = expect(A, K2, 500),
+        rel(A),
+        ?assertMatch(#{locks := 0}, wait_locks_clean()),
+        [stop(X) || X <- [A, B, C]]
+     end}.
+
+%% ===================================================================
+%% 死亡清理
+%% ===================================================================
+
+holder_death_releases_test_() ->
+    {"持锁进程被 kill → 等待者放行；等待中被 kill → 出队不挡后面的人",
+     fun() ->
+        setup(),
+        K = {make_ref(), <<"k">>, point},
+        {PA, _} = A = agent_start(),
+        B = agent_start(), C = agent_start(),
+        process_flag(trap_exit, true),
+        acq(A, K, write), ok = expect(A, K, 500),
+        acq(B, K, write), blocked = blocked(B, K),
+        acq(C, K, read),  blocked = blocked(C, K),
+        %% 等待中的 B 死掉：C 仍被 A 挡着
+        {PB, _} = B,
+        exit(PB, kill), receive {'EXIT', PB, killed} -> ok end,
+        ?assertEqual(blocked, blocked(C, K)),
+        %% holder A 死掉：C 放行
+        exit(PA, kill), receive {'EXIT', PA, killed} -> ok end,
+        ?assertEqual(ok, expect(C, K, 500)),
+        rel(C),
+        process_flag(trap_exit, false),
+        ?assertMatch(#{locks := 0, waiting := 0}, wait_locks_clean()),
+        stop(C)
+     end}.
+
+lock_wait_timeout_at_locker_test_() ->
+    {"单锁等待兜底：到点 {error,lock_wait_timeout}，锁表不残留等待者",
+     fun() ->
+        setup(),
+        K = {make_ref(), <<"k">>, point},
+        A = agent_start(),
+        B = agent_start(#{lock_wait_timeout => 100}),
+        acq(A, K, write), ok = expect(A, K, 500),
+        acq(B, K, write),
+        ?assertEqual({error, lock_wait_timeout}, expect(B, K, 1000)),
+        ?assertMatch(#{waiting := 0}, ?L:status()),
+        rel(A), rel(B),
+        stop(A), stop(B)
+     end}.
+
+%% ===================================================================
+%% 门面：缓冲语义
+%% ===================================================================
+
+buffer_semantics_test_() ->
+    {"read-your-writes / delete 遮蔽 / 覆盖序 / 提交后可见",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open(D),
+            ok = bitcask:put(R, <<"a">>, <<"1">>),
+            ok = bitcask:put(R, <<"b">>, <<"2">>),
+            Res = ?T:transaction(R, fun(Tx) ->
+                ?assertEqual({ok, <<"1">>}, ?T:read(Tx, <<"a">>)),
+                ok = ?T:write(Tx, <<"a">>, <<"10">>),
+                ?assertEqual({ok, <<"10">>}, ?T:read(Tx, <<"a">>)),   % 读自己的写
+                ok = ?T:write(Tx, <<"a">>, <<"11">>),                 % 覆盖：后者胜
+                ok = ?T:delete(Tx, <<"b">>),
+                ?assertEqual(not_found, ?T:read(Tx, <<"b">>)),         % delete 遮蔽
+                ?assertEqual(not_found, ?T:read(Tx, <<"c">>)),
+                ok = ?T:write(Tx, <<"c">>, <<"new">>),
+                %% 事务中间态对直通读不可见（缓冲未提交）
+                ?assertEqual({ok, <<"1">>}, bitcask:get(R, <<"a">>)),
+                done
+            end, ?FAST),
+            ?assertEqual({atomic, done}, Res),
+            ?assertEqual({ok, <<"11">>}, bitcask:get(R, <<"a">>)),
+            ?assertEqual(not_found, bitcask:get(R, <<"b">>)),
+            ?assertEqual({ok, <<"new">>}, bitcask:get(R, <<"c">>)),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}.
+
+readonly_and_abort_test_() ->
+    {"只读事务不碰引擎；abort/1 不写不重跑；Fun 异常 → {aborted,{R,Stack}}",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open(D),
+            ok = bitcask:put(R, <<"a">>, <<"1">>),
+            ?assertEqual({atomic, {ok, <<"1">>}},
+                         ?T:transaction(R, fun(Tx) -> ?T:read(Tx, <<"a">>) end)),
+            ?assertEqual({aborted, nope},
+                         ?T:transaction(R, fun(Tx) ->
+                             ok = ?T:write(Tx, <<"a">>, <<"9">>),
+                             ?T:abort(nope)
+                         end)),
+            ?assertEqual({ok, <<"1">>}, bitcask:get(R, <<"a">>)),
+            ?assertMatch({aborted, {badarith, _}},
+                         ?T:transaction(R, fun(Tx) ->
+                             ok = ?T:write(Tx, <<"a">>, <<"9">>),
+                             erlang:error(badarith)      %% 即 1/0，但不招编译告警
+                         end)),
+            ?assertEqual({aborted, {throw, oops}},
+                         ?T:transaction(R, fun(_Tx) -> throw(oops) end)),
+            ?assertEqual({ok, <<"1">>}, bitcask:get(R, <<"a">>)),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}.
+
+nested_and_not_owner_test_() ->
+    {"嵌套 → {aborted,tx_nested}；别的进程用 Tx → error not_owner",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open(D),
+            ?assertEqual({atomic, {aborted, tx_nested}},
+                         ?T:transaction(R, fun(_Tx) ->
+                             ?T:transaction(R, fun(_) -> inner end)
+                         end)),
+            %% 外层结束后再开事务不受影响（ACTIVE 标记已清）
+            ?assertEqual({atomic, ok}, ?T:transaction(R, fun(_) -> ok end)),
+            Res = ?T:transaction(R, fun(Tx) ->
+                Parent = self(),
+                spawn(fun() ->
+                    Parent ! {other, catch ?T:read(Tx, <<"a">>)}
+                end),
+                receive {other, X} -> X end
+            end),
+            ?assertMatch({atomic, {'EXIT', {{bitcask_txn, not_owner}, _}}}, Res),
+            bitcask:close(R)
+        end)
+     end}.
+
+%% ===================================================================
+%% 门面：死锁重跑 + 计数守恒
+%% ===================================================================
+
+%% 两阶段栅栏：前 N 个到达者互等；之后（重跑时）直接放行。
+%% 测试专用——Fun 里带副作用是给死锁"制造确定性"的手段，不是使用示范。
+barrier_start(N) ->
+    spawn_link(fun() -> barrier_loop(N, []) end).
+
+barrier_loop(0, _) ->
+    receive {arrive, From} -> From ! go, barrier_loop(0, []) end;
+barrier_loop(N, Waiting) ->
+    receive
+        {arrive, From} ->
+            case [From | Waiting] of
+                All when length(All) =:= N ->
+                    [P ! go || P <- All], barrier_loop(0, []);
+                All ->
+                    barrier_loop(N, All)
+            end
+    end.
+
+barrier_wait(B) -> B ! {arrive, self()}, receive go -> ok end.
+
+transfer(Tx, From, To, Amount) ->
+    {ok, F} = ?T:read(Tx, From),
+    {ok, T} = ?T:read(Tx, To),
+    ok = ?T:write(Tx, From, bin(int(F) - Amount)),
+    ok = ?T:write(Tx, To, bin(int(T) + Amount)),
+    ok.
+
+deadlock_restart_conserves_test_() ->
+    {"对称转账死锁：一方重跑，双方最终 atomic，总额守恒",
+     {timeout, 30, fun() ->
+        with_dir(fun(D) ->
+            R = open(D),
+            ok = bitcask:put(R, <<"x">>, <<"100">>),
+            ok = bitcask:put(R, <<"y">>, <<"100">>),
+            B = barrier_start(2),
+            Parent = self(),
+            #{deadlocks_total := D0} = ?L:status(),
+            Spawn = fun(From, To) ->
+                spawn_link(fun() ->
+                    Res = ?T:transaction(R, fun(Tx) ->
+                        {ok, F} = ?T:read(Tx, From),
+                        ok = ?T:write(Tx, From, bin(int(F) - 10)),
+                        barrier_wait(B),           % 双方都拿到第一把锁后再交叉
+                        {ok, T} = ?T:read(Tx, To),
+                        ok = ?T:write(Tx, To, bin(int(T) + 10)),
+                        ok
+                    end, ?FAST),
+                    Parent ! {done, self(), Res}
+                end)
+            end,
+            P1 = Spawn(<<"x">>, <<"y">>),
+            P2 = Spawn(<<"y">>, <<"x">>),
+            Results = [receive {done, P, Res} -> Res end || P <- [P1, P2]],
+            ?assertEqual([{atomic, ok}, {atomic, ok}], Results),
+            {ok, X} = bitcask:get(R, <<"x">>),
+            {ok, Y} = bitcask:get(R, <<"y">>),
+            ?assertEqual(200, int(X) + int(Y)),
+            ?assertMatch(#{deadlocks_total := D1} when D1 > D0, ?L:status()),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}}.
+
+retry_limit_test_() ->
+    {"retries=0：死锁一次即 {aborted,{retry_limit,0}}，缓冲丢弃",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open(D),
+            ok = bitcask:put(R, <<"k1">>, <<"0">>),
+            ok = bitcask:put(R, <<"k2">>, <<"0">>),
+            {Ref, _} = R,
+            %% A：裸事务持 k1，并在 B 拿到 k2 后去等 k2
+            A = agent_start(),
+            acq(A, {Ref, <<"k1">>, point}, write), ok = expect(A, {Ref, <<"k1">>, point}, 500),
+            Res = ?T:transaction(R, fun(Tx) ->
+                ok = ?T:write(Tx, <<"k2">>, <<"1">>),
+                acq(A, {Ref, <<"k2">>, point}, write),
+                blocked = blocked(A, {Ref, <<"k2">>, point}),
+                ok = ?T:write(Tx, <<"k1">>, <<"1">>),   % 闭环 → 自己是受害者
+                unreachable
+            end, [{retries, 0} | ?FAST]),
+            ?assertEqual({aborted, {retry_limit, 0}}, Res),
+            ?assertEqual({ok, <<"0">>}, bitcask:get(R, <<"k2">>)),
+            %% B 退出后 A 拿到 k2
+            ?assertEqual(ok, expect(A, {Ref, <<"k2">>, point}, 500)),
+            rel(A), stop(A),
+            bitcask:close(R)
+        end)
+     end}.
+
+lock_wait_timeout_restarts_test_() ->
+    {"lock_wait_timeout 触发按死锁处理：重跑直到预算耗尽",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open(D),
+            {Ref, _} = R,
+            A = agent_start(),
+            acq(A, {Ref, <<"k">>, point}, write), ok = expect(A, {Ref, <<"k">>, point}, 500),
+            Cnt = counters:new(1, []),
+            Res = ?T:transaction(R, fun(Tx) ->
+                counters:add(Cnt, 1, 1),
+                ?T:write(Tx, <<"k">>, <<"v">>)
+            end, [{retries, 2}, {lock_wait_timeout, 50} | ?FAST]),
+            ?assertEqual({aborted, {retry_limit, 2}}, Res),
+            ?assertEqual(3, counters:get(Cnt, 1)),    % 1 次 + 2 次重跑
+            rel(A), stop(A),
+            bitcask:close(R)
+        end)
+     end}.
+
+timeout_test_() ->
+    {"{timeout,Ms} 总预算：过点后的 read/write/commit 都 {aborted,timeout}，不重跑",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open(D),
+            Cnt = counters:new(1, []),
+            Res = ?T:transaction(R, fun(Tx) ->
+                counters:add(Cnt, 1, 1),
+                timer:sleep(80),
+                ?T:write(Tx, <<"k">>, <<"v">>)
+            end, [{timeout, 30} | ?FAST]),
+            ?assertEqual({aborted, timeout}, Res),
+            ?assertEqual(1, counters:get(Cnt, 1)),
+            ?assertEqual(not_found, bitcask:get(R, <<"k">>)),
+            %% 等锁期间过 deadline 同样 timeout
+            {Ref, _} = R,
+            A = agent_start(),
+            acq(A, {Ref, <<"k">>, point}, write), ok = expect(A, {Ref, <<"k">>, point}, 500),
+            ?assertEqual({aborted, timeout},
+                         ?T:transaction(R, fun(Tx) -> ?T:write(Tx, <<"k">>, <<"v">>) end,
+                                        [{timeout, 50} | ?FAST])),
+            rel(A), stop(A),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}.
+
+%% ===================================================================
+%% 门面：提交失败 / 持锁进程死亡
+%% ===================================================================
+
+commit_failed_test_() ->
+    {"引擎拒绝提交 → {aborted,{commit_failed,_}}，整批不落、锁全放（真实 NIF 错误路径）",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open(D),
+            %% "_txn:" 是引擎 TxnCask 的保留前缀：校验失败、零副作用。
+            ?assertMatch({aborted, {commit_failed, {invalid_option, _}}},
+                         ?T:transaction(R, fun(Tx) ->
+                             ok = ?T:write(Tx, <<"k">>, <<"v">>),
+                             ?T:write(Tx, <<"_txn:x">>, <<"v">>)
+                         end)),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            ?assertEqual(not_found, bitcask:get(R, <<"k">>)),
+            bitcask:close(R)
+        end)
+     end}.
+
+txn_process_death_test_() ->
+    {"事务进程在 Fun 中被 kill → 锁清理，等待的事务继续",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open(D),
+            Parent = self(),
+            P1 = spawn(fun() ->
+                ?T:transaction(R, fun(Tx) ->
+                    ok = ?T:write(Tx, <<"k">>, <<"p1">>),
+                    Parent ! {self(), holding},
+                    receive never -> ok end
+                end)
+            end),
+            receive {P1, holding} -> ok end,
+            P2 = spawn_link(fun() ->
+                Parent ! {self(), ?T:transaction(R, fun(Tx) ->
+                                        ?T:write(Tx, <<"k">>, <<"p2">>)
+                                    end, ?FAST)}
+            end),
+            ok = wait_queued(P2),                                     % 确实在等
+            receive {P2, _} -> ?assert(false) after 0 -> ok end,
+            exit(P1, kill),
+            ?assertEqual({atomic, ok}, receive {P2, Res} -> Res after 2000 -> timeout end),
+            ?assertEqual({ok, <<"p2">>}, bitcask:get(R, <<"k">>)),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}.
+
+%% ===================================================================
+%% index_fun / 跨 cask
+%% ===================================================================
+
+doc_map_write_test_() ->
+    {"write/3 收 doc map：读自己的写给 map；提交后 meta 落盘（libbitcask 6.6.2）",
+     fun() ->
+        with_dir(fun(D) ->
+            H = bitcask:open(D, [read_write, {analyzer, whitespace}]),
+            Doc = #{text => <<"hello">>, meta => bitcask:encode_meta(#{<<"n">> => 1})},
+            {atomic, Seen} = bitcask_txn:transaction(
+                               H, fun(Tx) ->
+                                          ok = bitcask_txn:write(Tx, <<"k">>, Doc),
+                                          ok = bitcask_txn:lock_key(Tx, <<"other">>, write),
+                                          bitcask_txn:read(Tx, <<"k">>)
+                                  end),
+            ?assertEqual({ok, Doc}, Seen),
+            ?assertEqual({ok, Doc}, bitcask:get(H, <<"k">>)),
+            bitcask:close(H)
+        end)
+    end}.
+
+index_fun_test_() ->
+    {"index_fun 的额外 op 与主数据同批原子提交；与缓冲 key 重合 → index_conflict",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open(D),
+            IdxFun = fun(K, {put, V}) -> [{put, <<"idx:", V/binary>>, K}];
+                        (K, delete)   -> [{remove, <<"idx_del:", K/binary>>}]
+                     end,
+            ?assertEqual({atomic, ok},
+                         ?T:transaction(R, fun(Tx) -> ?T:write(Tx, <<"a">>, <<"v1">>) end,
+                                        [{index_fun, IdxFun} | ?FAST])),
+            ?assertEqual({ok, <<"a">>}, bitcask:get(R, <<"idx:v1">>)),
+            ?assertEqual({aborted, {index_conflict, <<"idx:v1">>}},
+                         ?T:transaction(R, fun(Tx) ->
+                             ok = ?T:write(Tx, <<"idx:v1">>, <<"clobber">>),
+                             ?T:write(Tx, <<"b">>, <<"v1">>)
+                         end, [{index_fun, IdxFun} | ?FAST])),
+            ?assertEqual(not_found, bitcask:get(R, <<"b">>)),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}.
+
+cross_cask_no_conflict_test_() ->
+    {"两个 cask 的同名 key 互不阻塞（LockId 带 cask ref）",
+     fun() ->
+        with_dir(fun(D1) ->
+            with_dir(fun(D2) ->
+                R1 = open(D1), R2 = open(D2),
+                {Ref1, _} = R1,
+                A = agent_start(),
+                acq(A, {Ref1, <<"k">>, point}, write), ok = expect(A, {Ref1, <<"k">>, point}, 500),
+                ?assertEqual({atomic, ok},
+                             ?T:transaction(R2, fun(Tx) -> ?T:write(Tx, <<"k">>, <<"v">>) end,
+                                            [{lock_wait_timeout, 200}, {retries, 0} | ?FAST])),
+                rel(A), stop(A),
+                bitcask:close(R1), bitcask:close(R2)
+            end)
+        end)
+     end}.
+
+%% ===================================================================
+%% 真实 cask：并发搬运，总额守恒
+%% ===================================================================
+
+concurrent_transfers_conserve_test_() ->
+    {"8 进程 × 40 次随机转账，10 个账户总额守恒，无锁泄漏",
+     {timeout, 120, fun() ->
+        with_dir(fun(D) ->
+            R = open(D),
+            NAcc = 10, NProc = 8, NIter = 40, Init = 1000,
+            Acc = fun(I) -> <<"acc", (bin(I))/binary>> end,
+            [ok = bitcask:put(R, Acc(I), bin(Init)) || I <- lists:seq(1, NAcc)],
+            Parent = self(),
+            Pids = [spawn_link(fun() ->
+                        rand:seed(exsss, {Seed, Seed, Seed}),
+                        Rs = [begin
+                                  From = Acc(rand:uniform(NAcc)),
+                                  To   = Acc(rand:uniform(NAcc)),
+                                  case From =:= To of
+                                      true  -> {atomic, skip};
+                                      false ->
+                                          ?T:transaction(R, fun(Tx) ->
+                                              transfer(Tx, From, To, rand:uniform(5))
+                                          end, [{retries, infinity} | ?FAST])
+                                  end
+                              end || _ <- lists:seq(1, NIter)],
+                        Parent ! {self(), Rs}
+                    end) || Seed <- lists:seq(1, NProc)],
+            All = lists:append([receive {P, Rs} -> Rs end || P <- Pids]),
+            ?assertEqual([], [X || X <- All, element(1, X) =/= atomic]),
+            Sum = lists:sum([int(element(2, bitcask:get(R, Acc(I)))) || I <- lists:seq(1, NAcc)]),
+            ?assertEqual(NAcc * Init, Sum),
+            ?assertMatch(#{locks := 0, txns := 0, waiting := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}}.
+
+%% ===================================================================
+%% 前缀锁（X1-6 / 设计 P2）
+%% ===================================================================
+
+prefix_lock_matrix_test_() ->
+    {"前缀 vs 点：覆盖即冲突（双向）；不相干前缀互不挡；读读合并；扩展前缀冲突",
+     fun() ->
+        setup(),
+        Ref = make_ref(),
+        P  = {Ref, <<"ab">>, prefix},
+        PL = {Ref, <<"abx">>, prefix},         % 更长的前缀（被 P 罩住，罩住 K1）
+        Q  = {Ref, <<"b">>, prefix},           % 不相干
+        K1 = {Ref, <<"abx">>, point},          % P 之下
+        K2 = {Ref, <<"zz">>, point},           % P 之外
+        A = agent_start(), B = agent_start(), C = agent_start(),
+        %% 前缀写挡点写/点读，不挡外面的
+        acq(A, P, write),  ok = expect(A, P, 500),
+        acq(B, K1, write), ?assertEqual(blocked, blocked(B, K1)),
+        acq(C, K2, read),  ok = expect(C, K2, 500),     % P 之外：无关
+        rel(A),            ok = expect(B, K1, 500),
+        %% 点写挡前缀读；不相干前缀不挡
+        acq(A, P, read),   ?assertEqual(blocked, blocked(A, P)),
+        acq(C, Q, write),  ok = expect(C, Q, 500),
+        rel(B),            ok = expect(A, P, 500),
+        rel(C),
+        %% 前缀读 + 点读合并；点写等
+        acq(B, K1, read),  ok = expect(B, K1, 500),
+        acq(B, K1, write), ?assertEqual(blocked, blocked(B, K1)),
+        rel(A),            ok = expect(B, K1, 500),
+        %% 扩展前缀：PL 写 vs P 读
+        acq(A, PL, write), ?assertEqual(blocked, blocked(A, PL)),   % B 持 K1 写在 PL 下
+        rel(B),            ok = expect(A, PL, 500),
+        acq(B, P, read),   ?assertEqual(blocked, blocked(B, P)),
+        rel(A),            ok = expect(B, P, 500),
+        rel(B),
+        ?assertMatch(#{locks := 0, prefix_locks := 0, waiting := 0}, wait_locks_clean()),
+        stop(A), stop(B), stop(C)
+     end}.
+
+%% 找一把落在 Pred(Shard) 为真的分片上的点锁（前缀固定，枚举后缀）。
+key_in_shard(Ref, Prefix, Pred) ->
+    hd([K || I <- lists:seq(1, 1000),
+             K <- [{Ref, <<Prefix/binary, I:16>>, point}],
+             Pred(?L:shard_of(K))]).
+
+prefix_writer_fairness_test_() ->
+    {"前缀写等待者不被后来的点请求饿死（跨记录 FIFO；分片版只对已到达的分片成立）",
+     fun() ->
+        setup(),
+        Ref = make_ref(),
+        P = {Ref, <<"e">>, prefix},
+        %% 前缀写按分片序推进：它卡在 K1 所在分片时，已持有编号更小的分片——
+        %% K2 必须落在这样的分片上，后来的点请求才会排在它后面。
+        N = ?L:shard_count(),
+        K1 = key_in_shard(Ref, <<"e">>, fun(S) -> S =:= N end),
+        K2 = key_in_shard(Ref, <<"e">>, fun(S) -> S < N orelse N =:= 1 end),
+        H = agent_start(), W = agent_start(), L = agent_start(),
+        acq(H, K1, write), ok = expect(H, K1, 500),
+        acq(W, P, write),  ?assertEqual(blocked, blocked(W, P)),   % 等 H
+        acq(L, K2, write), ?assertEqual(blocked, blocked(L, K2)),  % 空闲 key，但排在 W 后
+        rel(H),
+        ok = expect(W, P, 500),
+        ?assertEqual(blocked, blocked(L, K2)),
+        rel(W),
+        ok = expect(L, K2, 500),
+        rel(L),
+        ?assertMatch(#{locks := 0, prefix_locks := 0}, wait_locks_clean()),
+        [stop(X) || X <- [H, W, L]]
+     end}.
+
+prefix_covered_is_free_test_() ->
+    {"持前缀写锁后其下点锁免费：不建记录、不过 locker；死锁经前缀锁也能检出",
+     fun() ->
+        setup(),
+        Ref = make_ref(),
+        P = {Ref, <<"p">>, prefix},
+        A = agent_start(), B = agent_start(),
+        acq(A, P, write), ok = expect(A, P, 500),
+        [begin acq(A, {Ref, <<"p", I>>, point}, write), ok = expect(A, {Ref, <<"p", I>>, point}, 500) end
+         || I <- lists:seq(1, 20)],
+        %% 前缀锁每个分片一条记录，点锁一条都没建
+        N = ?L:shard_count(),
+        ?assertMatch(#{locks := N, prefix_locks := N}, ?L:status()),
+        %% 死锁：B 持 q 点锁等 P 下的 key；A 持 P 要 q。A 先注册（更老），
+        %% 受害者是更年轻的 B——即使闭环的是 A。
+        acq(B, {Ref, <<"q">>, point}, write), ok = expect(B, {Ref, <<"q">>, point}, 500),
+        acq(B, {Ref, <<"p9">>, point}, read), ?assertEqual(blocked, blocked(B, {Ref, <<"p9">>, point})),
+        acq(A, {Ref, <<"q">>, point}, read),
+        ?assertEqual({error, deadlock}, expect(B, {Ref, <<"p9">>, point}, 500)),
+        rel(B),                                        % B 重跑前放锁 → A 拿到 q
+        ?assertEqual(ok, expect(A, {Ref, <<"q">>, point}, 500)),
+        rel(A),
+        ?assertMatch(#{locks := 0, prefix_locks := 0}, wait_locks_clean()),
+        stop(A), stop(B)
+     end}.
+
+prefix_range_phantom_test_() ->
+    {"prefix_range：合并本事务缓冲；持前缀读锁期间并发插入被挡（无幻读）",
+     {timeout, 30, fun() ->
+        with_dir(fun(D) ->
+            R = open(D),
+            [ok = bitcask:put(R, <<"u:", I>>, <<I>>) || I <- lists:seq(1, 5)],
+            ok = bitcask:put(R, <<"v:1">>, <<"other">>),
+            Parent = self(),
+            Scanner = spawn_link(fun() ->
+                Res = ?T:transaction(R, fun(Tx) ->
+                    First = ?T:prefix_range(Tx, <<"u:">>),
+                    Parent ! {self(), scanned, length(First)},
+                    receive go -> ok end,            % 测试专用同步（Fun 不会重跑）
+                    ok = ?T:write(Tx, <<"u:", 7>>, <<"mine">>),
+                    ok = ?T:delete(Tx, <<"u:", 1>>),
+                    Second = ?T:prefix_range(Tx, <<"u:">>),
+                    {length(First), Second}
+                end, ?FAST),
+                Parent ! {self(), Res}
+            end),
+            receive {Scanner, scanned, 5} -> ok end,
+            %% 并发写者想插 u:9：前缀读锁在手，必须等
+            Writer = spawn_link(fun() ->
+                Parent ! {writer, ?T:transaction(R, fun(Tx) ->
+                                       ?T:write(Tx, <<"u:", 9>>, <<"phantom">>)
+                                   end, ?FAST)}
+            end),
+            ok = wait_queued(Writer),
+            receive {writer, _} -> ?assert(false) after 0 -> ok end,
+            Scanner ! go,
+            {atomic, {5, Second}} = receive {Scanner, Res} -> Res end,
+            %% 缓冲合并：u:1 没了、u:7 有了、u:9 不可见
+            ?assertEqual([<<"u:", I>> || I <- [2, 3, 4, 5, 7]], [K || {K, _} <- Second]),
+            ?assertEqual(<<"mine">>, proplists:get_value(<<"u:", 7>>, Second)),
+            ?assertEqual({atomic, ok}, receive {writer, W} -> W after 2000 -> timeout end),
+            ?assertEqual({ok, <<"phantom">>}, bitcask:get(R, <<"u:", 9>>)),
+            ?assertEqual(not_found, bitcask:get(R, <<"u:", 1>>)),
+            ?assertMatch(#{locks := 0, prefix_locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}}.
+
+%% ===================================================================
+%% 分片（X1-7）
+%% ===================================================================
+
+
+cross_shard_deadlock_test_() ->
+    {"两把锁明确落在不同分片：A:K1→K2，B:K2→K1 → 跨分片 DFS 检出",
+     fun() ->
+        setup(),
+        N = ?L:shard_count(),
+        ?assert(N >= 2),
+        Ref = make_ref(),
+        K1 = key_in_shard(Ref, <<"x">>, fun(S) -> S =:= 1 end),
+        K2 = key_in_shard(Ref, <<"x">>, fun(S) -> S =:= N end),
+        A = agent_start(), B = agent_start(),
+        acq(A, K1, write), ok = expect(A, K1, 500),
+        acq(B, K2, write), ok = expect(B, K2, 500),
+        acq(A, K2, write), ?assertEqual(blocked, blocked(A, K2)),
+        acq(B, K1, write), ?assertEqual({error, deadlock}, expect(B, K1, 500)),
+        rel(B), ok = expect(A, K2, 500),
+        rel(A),
+        ?assertMatch(#{locks := 0, waiting := 0}, wait_locks_clean()),
+        stop(A), stop(B)
+     end}.
+
+death_cleanup_across_shards_test_() ->
+    {"持有跨分片的 20 把点锁 + 1 把前缀锁的进程被 kill → 全部分片清零，等待者放行",
+     fun() ->
+        setup(),
+        Ref = make_ref(),
+        {PA, _} = A = agent_start(), B = agent_start(),
+        process_flag(trap_exit, true),
+        Ks = [{Ref, <<"d", I>>, point} || I <- lists:seq(1, 20)],
+        [begin acq(A, K, write), ok = expect(A, K, 500) end || K <- Ks],
+        acq(A, {Ref, <<"pre">>, prefix}, write), ok = expect(A, {Ref, <<"pre">>, prefix}, 500),
+        ?assert(length(lists:usort([?L:shard_of(K) || K <- Ks])) > 1),
+        acq(B, {Ref, <<"pre", 1>>, point}, write),
+        ?assertEqual(blocked, blocked(B, {Ref, <<"pre", 1>>, point})),
+        exit(PA, kill), receive {'EXIT', PA, killed} -> ok end,
+        ?assertEqual(ok, expect(B, {Ref, <<"pre", 1>>, point}, 1000)),
+        rel(B), stop(B),
+        process_flag(trap_exit, false),
+        ?assertMatch(#{locks := 0, prefix_locks := 0, txns := 0}, wait_clean())
+     end}.
+
+shard_crash_aborts_txn_test_() ->
+    {"某个分片崩溃 → one_for_all 全部重启，进行中的事务下一步 {aborted, locker_restarted}",
+     {timeout, 30, fun() ->
+        with_dir(fun(D) ->
+            R = open(D),
+            Parent = self(),
+            P = spawn_link(fun() ->
+                Res = ?T:transaction(R, fun(Tx) ->
+                    ok = ?T:write(Tx, <<"a">>, <<"1">>),
+                    Parent ! {self(), holding},
+                    receive go -> ok end,
+                    ?T:write(Tx, <<"b">>, <<"2">>)          %% 新分片不认识这个事务
+                end, ?FAST),
+                Parent ! {self(), Res}
+            end),
+            receive {P, holding} -> ok end,
+            Shard = whereis(bitcask_txn_locker_1),
+            exit(Shard, kill),
+            %% 等 supervisor 把整组拉起来
+            ok = wait_for(fun() -> is_pid(whereis(bitcask_txn_locker_1))
+                                   andalso whereis(bitcask_txn_locker_1) =/= Shard
+                                   andalso ets:info(bitcask_txn_txns) =/= undefined end),
+            P ! go,
+            ?assertEqual({aborted, locker_restarted}, receive {P, Res} -> Res after 5000 -> timeout end),
+            ?assertEqual(not_found, bitcask:get(R, <<"a">>)),
+            %% 重启后照常工作
+            ?assertEqual({atomic, ok}, ?T:transaction(R, fun(Tx) -> ?T:write(Tx, <<"c">>, <<"3">>) end, ?FAST)),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}}.
+
+%% 轮询 Pred 直到为真：5 ms 一次，最多 2 s。
+wait_for(Pred) -> wait_for(Pred, 400).
+wait_for(_Pred, 0) -> timeout;
+wait_for(Pred, N) ->
+    case catch Pred() of
+        true -> ok;
+        _    -> timer:sleep(5), wait_for(Pred, N - 1)
+    end.
+
+%% ===================================================================
+%% victim 启发式（X1-7 收尾）：牺牲环上最年轻的，年龄跨重跑不变
+%% ===================================================================
+
+younger_is_victim_across_shards_test_() ->
+    {"闭环者更老 → 受害者是更年轻的那个，哪怕它在别的分片上等（cast 中止）",
+     fun() ->
+        setup(),
+        N = ?L:shard_count(), ?assert(N >= 2),
+        Ref = make_ref(),
+        K1 = key_in_shard(Ref, <<"v">>, fun(S) -> S =:= 1 end),
+        K2 = key_in_shard(Ref, <<"v">>, fun(S) -> S =:= N end),
+        A = agent_start(#{age => 1}),               % 老
+        B = agent_start(#{age => 2}),               % 年轻
+        acq(A, K1, write), ok = expect(A, K1, 500),
+        acq(B, K2, write), ok = expect(B, K2, 500),
+        acq(B, K1, write), ?assertEqual(blocked, blocked(B, K1)),   % B 在分片 1 等
+        #{victims_other := V0} = ?L:status(),
+        acq(A, K2, write),                                          % A 在分片 N 闭环
+        ?assertEqual({error, deadlock}, expect(B, K1, 500)),        % 受害者是 B
+        ?assertEqual(blocked, blocked(A, K2)),                      % A 还在等 B 放 K2
+        rel(B),
+        ?assertEqual(ok, expect(A, K2, 500)),
+        ?assertMatch(#{victims_other := V1} when V1 =:= V0 + 1, ?L:status()),
+        rel(A),
+        ?assertMatch(#{locks := 0, waiting := 0}, wait_locks_clean()),
+        stop(A), stop(B)
+     end}.
+
+%% 一次入队同时闭合两个环：请求者 A（最老）要写前缀下的 key，被同样持前缀读锁、又在排队等
+%% A 手里那把锁的 B、C 挡住。B、C 在 A 之前入队（当时还没有环），只解第一个环的话另一个
+%% 要等兜底计时器（G16-4）。现在两个都当受害者，A 在它们放锁后立即拿到。
+multi_cycle_requester_test_() ->
+    {"一次入队闭合多个环：全部解开，不靠兜底计时器",
+     fun() ->
+        setup(),
+        Ref = make_ref(),
+        P = {Ref, <<"p">>, prefix}, K = {Ref, <<"k">>, point}, Kp = {Ref, <<"p1">>, point},
+        A = agent_start(#{age => 1}),
+        B = agent_start(#{age => 2}),
+        C = agent_start(#{age => 3}),
+        [begin acq(X, P, read), ok = expect(X, P, 500) end || X <- [A, B, C]],
+        acq(A, K, write), ok = expect(A, K, 500),
+        acq(B, K, write), ?assertEqual(blocked, blocked(B, K)),
+        acq(C, K, write), ?assertEqual(blocked, blocked(C, K)),
+        #{victims_other := V0, lock_wait_timeouts := T0} = ?L:status(),
+        acq(A, Kp, write),
+        ?assertEqual({error, deadlock}, expect(B, K, 500)),
+        ?assertEqual({error, deadlock}, expect(C, K, 500)),
+        ?assertEqual(blocked, blocked(A, Kp)),             % 还要等 B、C 放前缀读锁
+        rel(B), rel(C),
+        ?assertEqual(ok, expect(A, Kp, 500)),
+        ?assertMatch(#{victims_other := V1, lock_wait_timeouts := T0} when V1 =:= V0 + 2, ?L:status()),
+        rel(A),
+        ?assertMatch(#{locks := 0, waiting := 0}, wait_locks_clean()),
+        stop(A), stop(B), stop(C)
+     end}.
+
+older_txn_never_restarts_test_() ->
+    {"门面：老事务闭环也不重跑，年轻的重跑一次；年龄按 transaction 调用算",
+     {timeout, 30, fun() ->
+        with_dir(fun(D) ->
+            R = open(D),
+            ok = bitcask:put(R, <<"k1">>, <<"0">>), ok = bitcask:put(R, <<"k2">>, <<"0">>),
+            Parent = self(),
+            Old = counters:new(1, []), Young = counters:new(1, []),
+            POld = spawn_link(fun() ->
+                Res = ?T:transaction(R, fun(Tx) ->
+                    counters:add(Old, 1, 1),
+                    ok = ?T:write(Tx, <<"k1">>, <<"old">>),
+                    Parent ! {self(), has_k1},
+                    receive go -> ok end,                 % 测试专用同步
+                    ?T:write(Tx, <<"k2">>, <<"old">>)     % 闭环：老事务是请求者
+                end, ?FAST),
+                Parent ! {self(), Res}
+            end),
+            receive {POld, has_k1} -> ok end,
+            PYoung = spawn_link(fun() ->
+                Res = ?T:transaction(R, fun(Tx) ->
+                    counters:add(Young, 1, 1),
+                    ok = ?T:write(Tx, <<"k2">>, <<"young">>),
+                    case counters:get(Young, 1) of
+                        1 -> Parent ! {self(), has_k2};   % 只在首次尝试同步
+                        _ -> ok
+                    end,
+                    ?T:write(Tx, <<"k1">>, <<"young">>)   % 首次：等老事务 → 被牺牲
+                end, ?FAST),
+                Parent ! {self(), Res}
+            end),
+            receive {PYoung, has_k2} -> ok end,
+            ok = wait_queued(PYoung),                      % young 真的挂在 k1 上
+            POld ! go,
+            ?assertEqual({atomic, ok}, receive {POld, R1} -> R1 after 5000 -> timeout end),
+            ?assertEqual({atomic, ok}, receive {PYoung, R2} -> R2 after 5000 -> timeout end),
+            ?assertEqual(1, counters:get(Old, 1)),         % 老的一次过
+            ?assertEqual(2, counters:get(Young, 1)),       % 年轻的重跑了一次
+            %% 年轻的重跑在老的提交之后：终值是 young
+            ?assertEqual({ok, <<"young">>}, bitcask:get(R, <<"k1">>)),
+            ?assertEqual({ok, <<"young">>}, bitcask:get(R, <<"k2">>)),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}}.
+
+%% ===================================================================
+%% 幂等键 + 提交完成通知（设计 §4.5 / §4.5.1）
+%% ===================================================================
+
+%% 计数器 +1，并向 Owner 报一次"Fun 跑过"（测试专用副作用）。
+bump(Tx, Owner, Tag) ->
+    Owner ! {ran, Tag},
+    V = case ?T:read(Tx, <<"ctr">>, write) of
+            {ok, B}   -> int(B);
+            not_found -> 0
+        end,
+    ok = ?T:write(Tx, <<"ctr">>, bin(V + 1)),
+    {Tag, V + 1}.
+
+ran_count(Tag) ->
+    receive {ran, Tag} -> 1 + ran_count(Tag) after 0 -> 0 end.
+
+idem_once_test_() ->
+    {"同一幂等键第二次调用不跑 Fun，原样返回首次结果；不同键各自执行",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open(D), Me = self(),
+            Opts = [{idem_key, <<"op-1">>} | ?FAST],
+            ?assertEqual({atomic, {a, 1}}, ?T:transaction(R, fun(Tx) -> bump(Tx, Me, a) end, Opts)),
+            ?assertEqual({atomic, {a, 1}}, ?T:transaction(R, fun(Tx) -> bump(Tx, Me, b) end, Opts)),
+            ?assertEqual(1, ran_count(a)),
+            ?assertEqual(0, ran_count(b)),
+            ?assertEqual({ok, <<"1">>}, bitcask:get(R, <<"ctr">>)),
+            ?assertEqual({ok, {a, 1}}, ?T:idem_lookup(R, <<"op-1">>)),
+            ?assertEqual(not_found, ?T:idem_lookup(R, <<"op-2">>)),
+            ?assertEqual({atomic, {c, 2}},
+                         ?T:transaction(R, fun(Tx) -> bump(Tx, Me, c) end,
+                                        [{idem_key, <<"op-2">>} | ?FAST])),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}.
+
+idem_abort_not_recorded_test_() ->
+    {"中止 / Fun 抛异常的事务不留标记，同键重来会执行；只读事务也记标记",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open(D), Me = self(),
+            Opts = [{idem_key, <<"k">>} | ?FAST],
+            ?assertEqual({aborted, nope},
+                         ?T:transaction(R, fun(Tx) -> bump(Tx, Me, a), ?T:abort(nope) end, Opts)),
+            ?assertEqual(not_found, ?T:idem_lookup(R, <<"k">>)),
+            ?assertEqual({atomic, {b, 1}}, ?T:transaction(R, fun(Tx) -> bump(Tx, Me, b) end, Opts)),
+            %% 只读 + 幂等键：标记照写，第二次返回首次读到的值
+            RO = [{idem_key, <<"ro">>} | ?FAST],
+            ?assertEqual({atomic, {ok, <<"1">>}}, ?T:transaction(R, fun(Tx) -> ?T:read(Tx, <<"ctr">>) end, RO)),
+            ok = bitcask:put(R, <<"ctr">>, <<"99">>),
+            ?assertEqual({atomic, {ok, <<"1">>}}, ?T:transaction(R, fun(Tx) -> ?T:read(Tx, <<"ctr">>) end, RO)),
+            bitcask:close(R)
+        end)
+     end}.
+
+idem_reserved_key_test_() ->
+    {"事务内 write/delete 标记前缀下的 key → reserved_key",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open(D),
+            K = <<0, "bitcask_txn:idem:x">>,
+            ?assertMatch({aborted, {{bitcask_txn, reserved_key, K}, _}},
+                         ?T:transaction(R, fun(Tx) -> ?T:write(Tx, K, <<"v">>) end, ?FAST)),
+            ?assertMatch({aborted, {{bitcask_txn, reserved_key, K}, _}},
+                         ?T:transaction(R, fun(Tx) -> ?T:delete(Tx, K) end, ?FAST)),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}.
+
+idem_concurrent_exactly_once_test_() ->
+    {"8 进程同时用同一幂等键：Fun 只提交一次，全部拿到同一结果",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open(D), Me = self(),
+            Pids = [spawn_link(fun() ->
+                        Res = ?T:transaction(R, fun(Tx) -> bump(Tx, Me, I) end,
+                                             [{idem_key, <<"same">>}, {retries, infinity} | ?FAST]),
+                        Me ! {self(), Res}
+                    end) || I <- lists:seq(1, 8)],
+            Rs = [receive {P, X} -> X end || P <- Pids],
+            ?assertMatch([{atomic, {_, 1}}], lists:usort(Rs)),
+            ?assertEqual({ok, <<"1">>}, bitcask:get(R, <<"ctr">>)),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}.
+
+idem_result_off_test_() ->
+    {"{idem_result, false}：标记不存结果，重来返回 idem_replayed；lookup 同样",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open(D), Me = self(),
+            Opts = [{idem_key, <<"k">>}, {idem_result, false} | ?FAST],
+            %% tag 别与前面用例重名：eunit 同一进程跑整模块，信箱里有别人的 {ran, _}
+            ?assertEqual({atomic, {off_a, 1}}, ?T:transaction(R, fun(Tx) -> bump(Tx, Me, off_a) end, Opts)),
+            ?assertEqual({atomic, idem_replayed}, ?T:transaction(R, fun(Tx) -> bump(Tx, Me, off_b) end, Opts)),
+            ?assertEqual(0, ran_count(off_b)),
+            ?assertEqual({ok, idem_replayed}, ?T:idem_lookup(R, <<"k">>)),
+            %% 标记值只有 9 字节头
+            {ok, Raw} = bitcask:get(R, <<0, "bitcask_txn:idem:k">>),
+            ?assertEqual(9, byte_size(Raw)),
+            bitcask:close(R)
+        end)
+     end}.
+
+idem_purge_test_() ->
+    {"idem_purge：按年龄删标记，删后同键重新执行；年龄未到的不动",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open(D), Me = self(),
+            [{atomic, _} = ?T:transaction(R, fun(Tx) -> bump(Tx, Me, x) end,
+                                          [{idem_key, bin(I)} | ?FAST]) || I <- lists:seq(1, 5)],
+            ?assertEqual({ok, 0}, ?T:idem_purge(R, 3600)),
+            ?assertEqual({ok, {x, 1}}, ?T:idem_lookup(R, <<"1">>)),
+            %% 按块删：5 条、块大小 2 → 3 个事务，总数仍 5
+            ?assertEqual({ok, 5}, ?T:idem_purge(R, 0, [{chunk, 2}])),
+            ?assertEqual(not_found, ?T:idem_lookup(R, <<"1">>)),
+            ?assertEqual({atomic, {y, 6}}, ?T:transaction(R, fun(Tx) -> bump(Tx, Me, y) end,
+                                                          [{idem_key, <<"1">>} | ?FAST])),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}.
+
+%% 调用进程在提交途中被 kill：锁必须等批落盘才放（NIF 完成通知），否则
+%% 重试者可能在批落盘前查标记 → 看不到 → 再执行一次。每次执行写一个唯一
+%% 的 exec 键，断言每轮恰好一个（计数器 RMW 断言不够：两次执行若读到同一
+%% 个旧值，各写 V+1，重复执行被丢更新掩盖掉）。
+%% 大批（~8MB + sync）把 dirty NIF 的执行窗口撑宽。kill 时刻：A 进入 NIF
+%% （current_function 是 NIF——⚠️ 这时它多半还在 dirty 队列里排队，直接 kill
+%% 得到的是"NIF 永不执行"，那条路径归 nif_commit_notify_test_）之后再睡
+%% [NIF 耗时的 1/4, 3/4]，落在真正执行中。orphan_timeouts 不许涨：锁是被令牌
+%% 析构通知放的，不是 30s 兜底计时器放的。
+idem_killed_mid_commit_test_() ->
+    {"提交途中 kill 调用方 + 同幂等键重试：每轮恰好执行一次",
+     {timeout, 300, fun() ->
+        with_dir(fun(D) ->
+            R = open(D),
+            Big = binary:copy(<<"x">>, 4096),
+            Fun = fun(Round, Tag) -> fun(Tx) ->
+                      [ok = ?T:write(Tx, <<"big", (bin(I))/binary>>, Big) || I <- lists:seq(1, 2000)],
+                      ok = ?T:write(Tx, <<"exec-", Round/binary, "-", Tag>>, <<>>),
+                      Tag
+                  end end,
+            {Us, {atomic, _}} = timer:tc(fun() -> ?T:transaction(R, Fun(<<"warm">>, $w), []) end),
+            NifMs = max(4, (element(1, timer:tc(fun() ->
+                        ok = bitcask:txn_commit(R, [{put, <<"big", (bin(I))/binary>>, Big}
+                                                    || I <- lists:seq(1, 2000)], sync_on_commit)
+                    end)) div 1000)),
+            #{orphan_timeouts := Orph0} = ?L:status(),
+            %% 默认 10 轮（每轮一次 ~8 MB 同步提交）；BITCASK_STRESS_ROUNDS=30 跑压测。
+            %% 每轮都打在 NIF 执行中，错误实现一轮就会露馅，10 轮足够区分。
+            Rounds = case os:getenv("BITCASK_STRESS_ROUNDS") of
+                         false -> 10;
+                         RS    -> list_to_integer(RS)
+                     end,
+            Seen = [begin
+                        K = bin(N),
+                        A = spawn(fun() -> ?T:transaction(R, Fun(K, $a), [{idem_key, K}]) end),
+                        ok = wait_in_commit(A),
+                        timer:sleep(NifMs div 4 + rand:uniform(NifMs div 2)),
+                        exit(A, kill),
+                        {atomic, Who} = ?T:transaction(R, Fun(K, $b),
+                                                       [{idem_key, K}, {retries, infinity}]),
+                        Execs = [T || T <- [$a, $b],
+                                      bitcask:get(R, <<"exec-", K/binary, "-", T>>) =/= not_found],
+                        {K, Who, Execs}
+                    end || N <- lists:seq(1, Rounds)],
+            ?debugFmt("txn ~pus, nif ~pms, A 已提交 ~p / 重试者执行 ~p",
+                      [Us, NifMs, length([x || {_, $a, _} <- Seen]),
+                       length([x || {_, $b, _} <- Seen])]),
+            ?assertEqual([], [X || {_, Who, Execs} = X <- Seen, Execs =/= [Who]]),
+            ?assertMatch(#{locks := 0, txns := 0, orphan_timeouts := Orph0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}}.
+
+%% 忙等 Pid 进入 txn_commit NIF。进程已死 → ok。
+wait_in_commit(Pid) ->
+    case erlang:process_info(Pid, current_function) of
+        undefined -> ok;
+        {current_function, {bitcask_cpp_nifs, cask_txn_commit, _}} -> ok;
+        _ -> erlang:yield(), wait_in_commit(Pid)
+    end.
+
+%% 忙等 Pid 真正在 dirty 调度器上**执行** txn_commit（status = running）。
+%% wait_in_commit 在它还排在 dirty 队列里时就返回——那时 kill 得到的是「NIF
+%% 永不执行、整批不落」，机器忙的时候「执行中被 kill」那一段会因此偶发失败。
+wait_running_in_commit(Pid) ->
+    case erlang:process_info(Pid, [current_function, status]) of
+        undefined -> ok;
+        [{current_function, {bitcask_cpp_nifs, cask_txn_commit, _}}, {status, running}] -> ok;
+        _ -> erlang:yield(), wait_running_in_commit(Pid)
+    end.
+
+nif_commit_notify_test_() ->
+    {"提交令牌：disarm 不发；不 disarm 进程一退就发；NIF 执行中 / 排队中被 kill 都发（后者整批不落）",
+     {timeout, 120, fun() ->
+        with_dir(fun(D) ->
+            R = open(D), Me = self(),
+            Recv = fun(Id, Ms) -> receive {txn_committed, Id} -> ok after Ms -> no_notify end end,
+            Tok = fun(Id) -> bitcask_cpp_nifs:txn_commit_token(Me, Id) end,
+            %% 正常 + disarm：不发
+            spawn(fun() -> T = Tok(1),
+                           ok = bitcask:txn_commit(R, [{put, <<"a">>, <<"1">>}], no_sync, T),
+                           ok = bitcask_cpp_nifs:txn_commit_token_disarm(T) end),
+            ?assertEqual(no_notify, Recv(1, 300)),
+            %% 引擎拒绝、不 disarm：进程退出放掉令牌即发
+            spawn(fun() -> {error, _} = bitcask:txn_commit(R, [], no_sync, Tok(2)) end),
+            ?assertEqual(ok, Recv(2, 5000)),
+            ?assertError(badarg, bitcask:txn_commit(R, [{put, <<"b">>, <<"1">>}], no_sync, make_ref())),
+            ?assertError(badarg, bitcask_cpp_nifs:txn_commit_token(Me, not_an_int)),
+            Big = binary:copy(<<"x">>, 4096),
+            Ops = fun(P) -> [{put, <<P/binary, (bin(I))/binary>>, Big} || I <- lists:seq(1, 1000)] end,
+            %% NIF 执行中被 kill：通知在批落盘之后
+            [begin
+                 {A, M} = spawn_monitor(fun() ->
+                              bitcask:txn_commit(R, Ops(<<"run">>), sync_on_commit, Tok(100 + N))
+                          end),
+                 ok = wait_running_in_commit(A),
+                 exit(A, kill),
+                 receive {'DOWN', M, _, _, _} -> ok end,
+                 ?assertEqual(ok, Recv(100 + N, 5000)),
+                 ?assertMatch({ok, _}, bitcask:get(R, <<"run1000">>))
+             end || N <- lists:seq(1, 3)],
+            %% 排队中被 kill：先占满全部 dirty IO 调度器，A 只能排队；kill 后
+            %% NIF 永不执行——通知照样到（令牌随进程退出析构），整批不落
+            NDio = erlang:system_info(dirty_io_schedulers),
+            Hogs = [spawn_monitor(fun() -> erts_debug:dirty_io(wait, 600) end)
+                    || _ <- lists:seq(1, NDio)],
+            %% 等每个 hog 真的进了 dirty NIF（占住调度器），不靠 sleep 猜
+            [ok = wait_for(fun() ->
+                               process_info(H, current_function)
+                                   =:= {current_function, {erts_debug, dirty_io, 2}}
+                           end) || {H, _} <- Hogs],
+            {A2, M2} = spawn_monitor(fun() ->
+                           bitcask:txn_commit(R, Ops(<<"queued">>), sync_on_commit, Tok(200))
+                       end),
+            ok = wait_in_commit(A2),
+            exit(A2, kill),
+            receive {'DOWN', M2, _, _, _} -> ok end,
+            ?assertEqual(ok, Recv(200, 5000)),
+            [exit(H, kill) || {H, _} <- Hogs],
+            [receive {'DOWN', HM, _, _, _} -> ok after 5000 -> error(hog_not_down) end
+             || {_, HM} <- Hogs],
+            %% hog 的 DOWN 在 kill 时就到了，dirty 调度器要等 NIF 自己返回才空出来。
+            %% 以前在这里 sleep(1600) 等。现在：dirty 队列先进先出，排一个探针
+            %% dirty 调用，它跑起来时排在前面的 A2（若还在队里）必已被派发；再做
+            %% 一次小提交——它要拿引擎写锁，A2 的批若真在写，一定先写完。
+            erts_debug:dirty_io(wait, 0),
+            ok = bitcask:txn_commit(R, [{put, <<"probe">>, <<"1">>}], no_sync),
+            ?assertEqual(not_found, bitcask:get(R, <<"queued1">>)),
+            bitcask:close(R)
+        end)
+     end}}.
+
+%% ===================================================================
+%% 6.7.0:坏选项在门面就挡住,不进 locker
+%% ===================================================================
+
+bad_options_do_not_reach_locker_test_() ->
+    {"lock_wait_timeout / timeout 坏值 → badarg,locker 分片不重启;{timeout,0} → {aborted,timeout}",
+     fun() ->
+        with_dir(fun(D) ->
+            R = open(D),
+            Shards = [whereis(bitcask_txn_locker_1), whereis(bitcask_txn_locker_2)],
+            F = fun(Tx) -> ?T:write(Tx, <<"k">>, <<"v">>) end,
+            ?assertError({badarg, {lock_wait_timeout, -1}},
+                         ?T:transaction(R, F, [{lock_wait_timeout, -1}])),
+            ?assertError({badarg, {lock_wait_timeout, foo}},
+                         ?T:transaction(R, F, [{lock_wait_timeout, foo}])),
+            ?assertError({badarg, {timeout, -5}}, ?T:transaction(R, F, [{timeout, -5}])),
+            ?assertError({badarg, {timeout, bar}}, ?T:transaction(R, F, [{timeout, bar}])),
+            ?assertEqual({aborted, timeout}, ?T:transaction(R, F, [{timeout, 0} | ?FAST])),
+            ?assertEqual({atomic, ok}, ?T:transaction(R, F, [{lock_wait_timeout, infinity} | ?FAST])),
+            ?assertEqual(Shards, [whereis(bitcask_txn_locker_1), whereis(bitcask_txn_locker_2)]),
+            %% 直接对 locker 塞坏值(绕过门面):用默认值注册,不崩
+            {ok, TxnId} = ?L:register(self(), #{lock_wait_timeout => nope, deadline => nope}),
+            ?assertEqual(ok, ?L:release_all(TxnId)),
+            ?assertEqual(Shards, [whereis(bitcask_txn_locker_1), whereis(bitcask_txn_locker_2)]),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}.
+
+%% ===================================================================
+%% 6.7.0 B 档：held 表按 {TxnId, Shard} 建键；重跑不越过 deadline
+%% ===================================================================
+
+held_table_keyed_by_shard_test_() ->
+    {"20 把点锁 + 1 把前缀锁：held 行数 = 20 + 分片数，status 一致；放锁后清零",
+     fun() ->
+        setup(),
+        Ref = make_ref(),
+        N = ?L:shard_count(),
+        A = agent_start(),
+        Points = [{Ref, <<"k", (bin(I))/binary>>, point} || I <- lists:seq(1, 20)],
+        [begin acq(A, K, write), ok = expect(A, K, 500) end || K <- Points],
+        P = {Ref, <<"pre">>, prefix},
+        acq(A, P, read), ok = expect(A, P, 500),
+        %% 重入不加行
+        acq(A, hd(Points), read), ok = expect(A, hd(Points), 500),
+        ?assertEqual(20 + N, ets:info(bitcask_txn_held, size)),
+        ?assertMatch(#{locks := L, prefix_locks := N} when L =:= 20 + N, ?L:status()),
+        %% 键形态：{TxnId, Shard}，每个分片至少有前缀锁那一行
+        Keys = lists:usort([Sh || {{_, Sh}, _} <- ets:tab2list(bitcask_txn_held)]),
+        ?assertEqual(lists:seq(1, N), Keys),
+        rel(A),
+        ?assertMatch(#{locks := 0, prefix_locks := 0}, wait_locks_clean()),
+        ?assertEqual(0, ets:info(bitcask_txn_held, size)),
+        stop(A)
+     end}.
+
+restart_stops_at_deadline_test_() ->
+    {"{timeout,50} + {retries,infinity} 在别人持锁下：{aborted,timeout}，不再越过预算重跑",
+     fun() ->
+        with_dir(fun(D) ->
+            {Ref, _} = R = open(D),
+            A = agent_start(),
+            K = {Ref, <<"k">>, point},
+            acq(A, K, write), ok = expect(A, K, 500),
+            {Us, Res} = timer:tc(fun() ->
+                            ?T:transaction(R, fun(Tx) -> ?T:write(Tx, <<"k">>, <<"v">>) end,
+                                           [{timeout, 50}, {retries, infinity},
+                                            {lock_wait_timeout, 10} | ?FAST])
+                        end),
+            ?assertEqual({aborted, timeout}, Res),
+            ?assert(Us < 1000000),
+            rel(A), stop(A),
+            ?assertMatch(#{locks := 0, txns := 0}, wait_clean()),
+            bitcask:close(R)
+        end)
+     end}.
+
+%% =========================================================================
+%% {read_locks, guard_only}：带守卫的读模式读不拿读锁，靠提交时的守卫校验
+%% =========================================================================
+
+%% 只读事务：读完之后被直通写者改了 → 补的校验批不成立 → 重跑，第二次读到新值。
+guard_only_read_only_txn_revalidates_test() ->
+    with_dir(fun(D) ->
+        H = open(D),
+        try
+            ok = bitcask:put(H, <<"g">>, <<"1">>),
+            Self = self(),
+            Res = ?T:transaction(H, fun(Tx) ->
+                      {ok, V} = ?T:read_guarded(Tx, <<"g">>, read),
+                      N = case get(attempts) of undefined -> 1; A -> A + 1 end,
+                      put(attempts, N),
+                      N =:= 1 andalso begin
+                          %% 别的进程直通写（不经事务）
+                          {_, Ref} = spawn_monitor(fun() -> ok = bitcask:put(H, <<"g">>, <<"2">>) end),
+                          receive {'DOWN', Ref, _, _, normal} -> ok end
+                      end,
+                      _ = Self,
+                      V
+                  end, [{read_locks, guard_only} | ?FAST]),
+            ?assertEqual({atomic, <<"2">>}, Res),
+            ?assertEqual(2, erase(attempts))
+        after
+            bitcask:close(H)
+        end
+    end).
+
+%% guard_only：带守卫的 read 模式读不进锁表；写、以 write 模式读照旧加锁。默认模式下读也加锁。
+guard_only_skips_read_locks_test() ->
+    with_dir(fun(D) ->
+        H = open(D),
+        try
+            ok = bitcask:put(H, <<"a">>, <<"1">>),
+            Locks = fun() -> maps:get(locks, ?L:status()) end,
+            wait_no_locks(200),
+            {atomic, {L1, L2}} = ?T:transaction(H, fun(Tx) ->
+                      {ok, _} = ?T:read_guarded(Tx, <<"a">>, read),
+                      not_found = ?T:read_guarded(Tx, <<"b">>, read),
+                      A = Locks(),
+                      ok = ?T:write(Tx, <<"c">>, <<"x">>),
+                      {A, Locks()}
+                  end, [{read_locks, guard_only} | ?FAST]),
+            ?assertEqual({0, 1}, {L1, L2}),
+            wait_no_locks(200),
+            {atomic, L3} = ?T:transaction(H, fun(Tx) ->
+                      {ok, _} = ?T:read_guarded(Tx, <<"a">>, read),
+                      Locks()
+                  end, ?FAST),
+            ?assertEqual(1, L3),
+            %% 读到的版本在提交时仍被校验：读 a 后 a 被改 → 写 c 的事务重跑
+            put(attempts, 0),
+            {atomic, _} = ?T:transaction(H, fun(Tx) ->
+                      {ok, _} = ?T:read_guarded(Tx, <<"a">>, read),
+                      put(attempts, get(attempts) + 1),
+                      get(attempts) =:= 1 andalso begin
+                          {_, Ref} = spawn_monitor(fun() -> ok = bitcask:put(H, <<"a">>, <<"9">>) end),
+                          receive {'DOWN', Ref, _, _, normal} -> ok end
+                      end,
+                      ok = ?T:write(Tx, <<"c">>, <<"y">>)
+                  end, [{read_locks, guard_only} | ?FAST]),
+            ?assertEqual(2, erase(attempts)),
+            ?assertError({badarg, {read_locks, nope}},
+                         ?T:transaction(H, fun(_) -> ok end, [{read_locks, nope}]))
+        after
+            bitcask:close(H)
+        end
+    end).
+
+wait_no_locks(0) -> ok;
+wait_no_locks(N) ->
+    case maps:get(locks, ?L:status()) of
+        0 -> ok;
+        _ -> timer:sleep(5), wait_no_locks(N - 1)
+    end.

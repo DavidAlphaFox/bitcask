@@ -11,15 +11,34 @@ Bitcask 是一个日志结构（log-structured）的哈希表键值存储引擎�
 主要特性：BM25 全文检索、向量近似最近邻搜索（三引擎可选：`hnsw` 内存图 /
 `ivfrq` 磁盘档 / `diskann` 实验性）、RRF 混合检索（融合文本与向量两路排序信号）。
 
-实现为单一 C++23 NIF（`cpp/`）+ 薄 Erlang 门面（`src/bitcask.erl`），所有操作经由
-`bitcask_cpp_nifs` → `priv/bitcask_cpp.so`。
+实现为单一 C++23 NIF（`apps/bitcask/cpp/`）+ 薄 Erlang 门面（`apps/bitcask/src/bitcask.erl`），所有操作经由
+`bitcask_cpp_nifs` → `apps/bitcask/priv/bitcask_cpp.so`。
+
+## 目录结构与作为依赖使用
+
+仓库是 rebar3 的 umbrella 项目：
+
+| 目录 | 内容 |
+|---|---|
+| `apps/bitcask/` | 核心：Erlang 门面（`src/`、`include/`、`test/`）、C++23 NIF（`cpp/`、`CMakeLists.txt`、`cmake/`）、子模块（`third_party/libbitcask`、`third_party/llama.cpp`）、`priv/`、`scripts/`、`examples/` |
+| `apps/bitcask_cypher/` | 图查询语言（openCypher），只依赖核心的公开接口（见其 `README.md`） |
+| `doc/`、`README*`、`CHANGELOG*`、`TASK.md`、`ROADMAP*` | 项目文档 |
+
+在别的 rebar3 项目里依赖核心（rebar3 3.14 起支持 `git_subdir`）：
+
+```erlang
+{deps, [{bitcask, {git_subdir, "https://github.com/DavidAlphaFox/bitcask.git", {tag, "<版本>"}, "apps/bitcask"}}]}.
+```
+
+rebar3 会克隆整个仓库并在 `apps/bitcask` 里跑构建 hooks（初始化子模块、CMake 编 NIF，构建目录在你的项目的
+`_build/cmake`）。拆分之前的版本（≤ 13.1.0）仍按 `{git, Url, {tag, …}}` 依赖。
 
 ## 构建
 
 ### rebar3（Erlang + C++ NIF）
 
 ```sh
-rebar3 compile        # 编译 priv/bitcask_cpp.so
+rebar3 compile        # 编译 apps/bitcask/priv/bitcask_cpp.so
 rebar3 eunit          # Erlang/NIF 测试 (eunit)
 rebar3 do xref, dialyzer
 ```
@@ -32,7 +51,7 @@ rebar3 do xref, dialyzer
 可选的本地嵌入后端（llama.cpp），**默认不构建**：
 
 ```sh
-BITCASK_WITH_LLAMA=1 rebar3 compile   # 额外产出 priv/bitcask_llama.so 与一组 vendored ggml/llama 库
+BITCASK_WITH_LLAMA=1 rebar3 compile   # 额外产出 apps/bitcask/priv/bitcask_llama.so 与一组 vendored ggml/llama 库
 ```
 
 关掉时构建产物与这个后端存在之前一字不差：不拉子模块、不加 CMake 开关、不多
@@ -41,7 +60,7 @@ BITCASK_WITH_LLAMA=1 rebar3 compile   # 额外产出 priv/bitcask_llama.so 与�
 ### CMake（C++ 测试 + 基准）
 
 ```sh
-cmake -S . -B _build/cmake -DBUILD_TESTING=ON
+cmake -S apps/bitcask -B _build/cmake -DBUILD_TESTING=ON
 cmake --build _build/cmake -j
 ctest --test-dir _build/cmake --output-on-failure   # 400+ GoogleTests
 ```
@@ -49,16 +68,16 @@ ctest --test-dir _build/cmake --output-on-failure   # 400+ GoogleTests
 Sanitizer（一次只能开一种——ASan 和 TSan 互斥）：
 
 ```sh
-cmake -S . -B _build/asan -DCMAKE_BUILD_TYPE=Debug \
+cmake -S apps/bitcask -B _build/asan -DCMAKE_BUILD_TYPE=Debug \
     -DBITCASK_SANITIZE=address,undefined -DBUILD_TESTING=ON
-cmake -S . -B _build/tsan -DCMAKE_BUILD_TYPE=Debug \
+cmake -S apps/bitcask -B _build/tsan -DCMAKE_BUILD_TYPE=Debug \
     -DBITCASK_SANITIZE=thread -DBUILD_TESTING=ON
 ```
 
 基准（仅 Release）：
 
 ```sh
-cmake -S . -B _build/bench -DCMAKE_BUILD_TYPE=Release \
+cmake -S apps/bitcask -B _build/bench -DCMAKE_BUILD_TYPE=Release \
     -DBITCASK_BUILD_BENCHMARKS=ON -DBUILD_TESTING=OFF
 cmake --build _build/bench -j
 _build/bench/cpp/bench/bitcask_bench
@@ -280,7 +299,7 @@ ok
 
 > **本地嵌入（可选，默认不构建）**：`{custom, bitcask_embedder_llama}` 在 BEAM
 > 进程内用 llama.cpp 直接算 embedding，不经 HTTP 端点。`BITCASK_WITH_LLAMA=1
-> rebar3 compile` 打开；产物是独立的第二个 NIF（`priv/bitcask_llama.so` + 一组
+> rebar3 compile` 打开；产物是独立的第二个 NIF（`apps/bitcask/priv/bitcask_llama.so` + 一组
 > vendored ggml/llama 共享库），核心 `bitcask_cpp.so` 不受影响。
 > ⚠️ 这是**另开一档**不是替换 HTTP 端点：CPU 上跑得动的是 0.6B/1024 维这一类，
 > 换档 = 落库维度变了 = 全量重建索引；而且 ggml 的 `abort()` 会带走整个 node。
@@ -296,8 +315,8 @@ ok
 > 旧描述：默认 `AUTO`——构建机上有 CUDA Toolkit 就编进去
 > （`BITCASK_LLAMA_CUDA=AUTO|ON|OFF`）。发布构建请用 `ON`，AUTO 在缺 toolkit 的
 > 机器上会**悄悄**产出纯 CPU 包。CUDA 运行时（cudart/cublas/cublasLt）默认随包
-> 平铺进 `priv/`——体积不是约束，换掉的是"目标机缺 libcublas → ggml 静默跳过
-> → 降级纯 CPU"这一整类故障。先跑 `scripts/detect-llama-backends.sh` 探测环境
+> 平铺进 `apps/bitcask/priv/`——体积不是约束，换掉的是"目标机缺 libcublas → ggml 静默跳过
+> → 降级纯 CPU"这一整类故障。先跑 `apps/bitcask/scripts/detect-llama-backends.sh` 探测环境
 > 并核对运行时真正枚举到了什么（`--build` 问 SDK、`--runtime` 问显卡，两段可以
 > 在不同机器上跑）。构建期事实烧在 .so 里，运行期用 `bitcask_llama_nifs:gpu_status()`
 > 把两者对到一起——只看运行期的话，"0 个 GPU"分不清是包里没编 CUDA（要重新构建）
@@ -322,7 +341,7 @@ ok
 | `range/2,3`, `range_fold/5` | 有序范围查询 `[Lo, Hi)`，代价 **O(range)**；per-key 弱一致（非快照）；`{prefetch, N}` 可批量并发取值 |
 | `put_batch_atomic/2,3`, `txn_commit/2,3` | 跨崩溃原子批 / 多键事务；`Ops :: [{put,K,V} \| {remove,K}]`，可带前置条件 `{put,K,V,Cond}` / `{remove,K,Cond}` / `{check,K,Cond}`（`Cond :: absent \| {ord,N}`，不成立 → `{error,{conflict,I}}`）；`/3` 的 `[return_ords]` 带回各 op 的 LSN；⚠️ 首次调用把目录 meta 懒升级为 v6 |
 | `get_with_ord/2` | 读值并带回 key 当前 LSN（`{ok, V, Ord}`），给前置条件 `{ord, Ord}` 用 |
-| `bitcask_txn:transaction/2,3`, `read/2,3`, `read_guarded/3`, `write/3`, `delete/2`, `abort/1` | **隔离事务**：2PL 点锁 + 死锁检测 + 重跑；`{atomic,R} \| {aborted,Why}`；选项 `retries`/`timeout`/`lock_wait_timeout`/`sync`/`index_fun`；`read/3` 的 `write` 模式给读-改-写用；`read_guarded/3` 把读到的版本带进提交条件（与直通写混用不丢更新） |
+| `bitcask_txn:transaction/2,3`, `read/2,3`, `read_guarded/3`, `write/3`, `delete/2`, `abort/1` | **隔离事务**：2PL 点锁 + 死锁检测 + 重跑；`{atomic,R} \| {aborted,Why}`；选项 `retries`/`timeout`/`lock_wait_timeout`/`sync`/`index_fun`/`read_locks`；`read/3` 的 `write` 模式给读-改-写用；`read_guarded/3` 把读到的版本带进提交条件（与直通写混用不丢更新） |
 | `bitcask:put_docs/2` | **批量写文档**：`[{Key, Doc}]`，需要嵌入的文本**一次** `embed_batch` 完成；嵌入失败不写任何一条，某条 put 失败返回 `{error, {Key, Reason}}`（非原子） |
 | `bitcask_txn:idem_lookup/2`, `idem_purge/2,3` | **幂等键**（`transaction/3` 选项 `{idem_key, K}`，`{idem_result, false}` 不存结果）：同键至多提交一次，重来返回首次结果；`idem_lookup` 不上锁自查，`idem_purge(H, MaxAgeSec [, [{chunk, N}]])` 流式按块清理旧标记 |
 | `bitcask_txn:lock_key/3` | **点锁**：只拿锁不读写（同 `mnesia:lock`），给锁下直接操作引擎的调用方 |
@@ -335,6 +354,7 @@ ok
 | `search_near/3,4,5`, `search_fuzzy/3,4,5`, `search_wildcard/2,3,4` | 近邻 / 模糊（编辑距离）/ 通配符搜索；末参为 meta filter |
 | `search_vector/2,3,4,5`, `search_hybrid/2,3,4,5` | 向量近邻（HNSW / IVF-RaBitQ / DiskANN 三引擎，`open` 时 `{vector_engine, ...}` 选定）/ RRF 混合检索（BM25 + 向量）；查询传 `{text,_}`（vector）或 `auto`（hybrid）自动 embed；`/5` 末参为 meta filter |
 | `bitcask_query:q/2` | 结构化查询 DSL：key（eq/prefix/range）+ 全文（match/phrase/fields/near/fuzzy/wildcard）+ meta `where` 组合，规划器选一个索引驱动；见 `doc/api-zh.md` |
+| `bitcask_cypher:q/2,3,4` | 图查询语言（openCypher）：已拆为同一仓库里的独立应用 `apps/bitcask_cypher/`（只依赖本库公开接口），见其 `README.md` |
 | `embed/2` | 用句柄 embedder 把文本编码成向量（`{ok, Vec}`/`{error, no_embedder}`） |
 | `is_empty_estimate/1`, `is_frozen/1`, `close_write_file/1` | 工具函数 |
 
@@ -354,13 +374,15 @@ ok
 | `doc/vector-db-design-zh.md` | 向量库设计方案（V1–V6 蓝图） |
 | `doc/vector-search-extension-zh.md` | 向量搜索扩展：HNSW + RRF 混合检索 |
 | `doc/graph-adjacency-pack-design-zh.md` / `-en.md` | **图层 v2**：一个顶点两个 KV（邻接表打包 + hub 分块）+ 按 LSN 的条件写；盘上契约、写路径、迁移、基准 |
+| `apps/bitcask_cypher/doc/cypher-zh.md` / `cypher-en.md` | **图查询语言使用说明**（独立应用 `bitcask_cypher`；设计见同目录 `cypher-query-design-zh.md`） |
+| `apps/bitcask_cypher/doc/cypher-syntax-zh.md` / `cypher-syntax-en.md` | **图查询语法参考**：openCypher 2024.3 的子句、模式（含量化路径、路径搜索前缀）、表达式、函数，以及 bitcask 特有的语法（`@@`、`<=>`、检索函数、`text` / `embedding`、用户过程） |
 | `doc/graph-layer-design-zh.md` / `-en.md` | **图处理层设计 v1**（KV per-key；盘上布局已被 v2 取代，遍历 / OLAP 物化 / etype 注册仍有效） |
 | `doc/txn-layer-design-zh.md` | **事务协调层设计**（原子批之上的 2PL + 死锁检测 + 重跑；§11 实现对账、§12 前缀锁、§13 锁管理器分片） |
 | `doc/hnsw-design-zh.md` | HNSW 向量索引设计（并发/持久化/RRF/实施表） |
 | `doc/keydir-sharding-design-zh.md` | KeyDir 分片并发 + 屏障 v2 写者闸门 |
 | `doc/unified-architecture-plan-zh.md` | 统一架构计划（已实施） |
 | `doc/libcask-extraction-zh.md` | **libcask 独立库拆分可行性评估**（2.2.0 规划） |
-| `ROADMAP.md` / `ROADMAP_EN.md` | **路线图**：12.1.0 / 12.0.3 / 12.0.2 / 12.0.1 / 12.0.0 / 11.0.0 / 10.0.0 / 9.0.0 / 8.0.0 / 7.0.3 / 7.0.2 / 7.0.1 / 7.0.0 / 6.9.1 / 6.9.0 / 6.8.1 / 6.8.0 / 6.7.3 / 6.7.2 / 6.7.1 / 6.7.0 / 6.6.0 / 6.5.1 / 6.5.0 / 6.4.0 / 6.3.2 / 6.3.1 / 6.2.2 / 6.2.1 / 6.1.0 / 6.0.0 / 5.1.0 / 5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 落地 + 2.1.1 已落地（P5–P15）+ 2.2.0 规划（libcask 独立 / V7+ 向量优化）（中/英） |
+| `ROADMAP.md` / `ROADMAP_EN.md` | **路线图**：13.1.0 / 12.1.0 / 12.0.3 / 12.0.2 / 12.0.1 / 12.0.0 / 11.0.0 / 10.0.0 / 9.0.0 / 8.0.0 / 7.0.3 / 7.0.2 / 7.0.1 / 7.0.0 / 6.9.1 / 6.9.0 / 6.8.1 / 6.8.0 / 6.7.3 / 6.7.2 / 6.7.1 / 6.7.0 / 6.6.0 / 6.5.1 / 6.5.0 / 6.4.0 / 6.3.2 / 6.3.1 / 6.2.2 / 6.2.1 / 6.1.0 / 6.0.0 / 5.1.0 / 5.0.0 / 4.0.0 / 3.1.0 / 3.0.0 落地 + 2.1.1 已落地（P5–P15）+ 2.2.0 规划（libcask 独立 / V7+ 向量优化）（中/英） |
 | `TASK.md` | 详细任务拆分与历史 |
 
 ## 项目状态
@@ -377,9 +399,10 @@ ok
 - **并发加固**（2026-06 审计）— 索引读路径与异步索引 worker 并发安全：`meta_blob`/搜索缓存锁内拷贝不逃逸、倒排索引快照安全遍历、跨线程标量原子化、IndexPool 消费者异常兜底；详见 [`doc/concurrency-zh.md` §6](doc/concurrency-zh.md)
 - **3.0.0**（2026-06-25）— 升级 libbitcask v3.0.0（ABI 破坏，`SOVERSION` 1→3）：同义词词典改为 open-time 不可变选项 `{synonym_file, Path}`（移除运行期 `set_synonym_map/2`）；随库引入 `Cask` handle 多线程安全、`parallel_scan` 全表并行扫描、异步索引 MapReduce 流水线、批量检索
 - **3.1.0**（2026-07-01）— 升级 libbitcask v3.1.0（ABI 不破坏）：`{max_read_handles, unlimited}` / `{auto_compact_dead_ratio, R}` 选项、错误原子 `closed`；随库引入 read 句柄默认上限（按 `RLIMIT_NOFILE` 自动推导）、`bitcask.meta` v3 加 CRC32、field.schema FSCH v1 头 + CRC
-- **4.0.0**（2026-07-13）— 升级 libbitcask v4.0.0（ABI 破坏，`SOVERSION` 3→4，源码级兼容）：`{vector_engine, hnsw|ivfrq|diskann}` 向量双引擎 + 调优选项、`{auto_checkpoint_min_docs, N}` 崩溃恢复重放有界；随库引入 IVF-RaBitQ-lite 引擎、DiskANN 引擎（实验性）、AVX2 int8 内核、HNSW `.qc8` mmap 化；`examples/` Wikipedia 检索库示例
+- **4.0.0**（2026-07-13）— 升级 libbitcask v4.0.0（ABI 破坏，`SOVERSION` 3→4，源码级兼容）：`{vector_engine, hnsw|ivfrq|diskann}` 向量双引擎 + 调优选项、`{auto_checkpoint_min_docs, N}` 崩溃恢复重放有界；随库引入 IVF-RaBitQ-lite 引擎、DiskANN 引擎（实验性）、AVX2 int8 内核、HNSW `.qc8` mmap 化；`apps/bitcask/examples/` Wikipedia 检索库示例
 - **4.1.0**（2026-07-15）— 升级 libbitcask v4.1.0（ABI 不破坏，`SOVERSION` 保持 4，盘上格式不变）：对 Erlang 调用方**无 API 变更**，重编即得；随库引入 Phase 5/6 深度审计成果——修复 `close/1` 拆卸路径的进程级永久挂死（`IndexPool` 计数泄漏 + `unregister_lib` 无界 `flush`）、hnsw 三处原子写 rename 前补 `fdatasync`（此前崩溃即半截文件）、`RowChunks`/`MmapSegment` 资源泄漏；`file_util` 归并使 fsync 纪律 4 套收敛为 1 套
-- **12.1.0**（2026-11-23，当前版本）— 升级 libbitcask 12.0.3 → **12.1.0**（MINOR；既有 C API / ABI / 盘上格式不变，`SOVERSION` 保持 12）。新增 `bitcask:vector_rank/3,4`：在给定的一组 key 里按向量相似度精确排序（不经向量索引）。上游修复：数据文件中间的损坏不再让打开库时把文件截断（坏区跳过，只有崩溃写者的活跃文件才截断）；带 filter 的 `search_vector` 在 HNSW 图不超过 2^20 个节点时回满；行落盘之后的点读提速。⚠️ 正常关闭过的库，文件尾部的残缺不再被截掉；过滤全拒 / 极严的向量查询多一遍对全部节点的过滤求值
+- **13.1.0**（2026-11-23，当前版本）— 新增图查询语言 `bitcask_cypher`（openCypher 子集：MATCH / WHERE / WITH / UNWIND / RETURN、CREATE / SET / REMOVE / DELETE，一条语句一个事务，变长与最短路，全文 `@@` 与向量 `<=>`；见 `doc/cypher-zh.md`）与图的统一数据模型（`graphdb:create_vertex/2,3`、标签与标签索引、API 与 Cypher 同一个 id 空间）。升级 libbitcask 12.1.0 → **13.1.0**（跨 12.2.0 / 13.0.0；13.0.0 破坏 C++ ABI，本库从源码编、无影响；C API 与盘上格式不变）：修复原子批删除后重开丢数据 / 打不开（图层删边删顶点、Cypher `DELETE` 都会撞上）；memdelta 落段挪到后台线程（单条写最大延迟 153 ms → 约 1.5 ms）；全表扫描与 range 提速（每行约 950 → 250～440 ns、重开后 range 约 600～830 → 270～410 ns）。⚠️ `range` / `range_fold` 变成快照语义（迭代期间的写不可见）；重开后高亮更常走冷路径（`cold => load` 照常出片段）
+- **12.1.0**（2026-11-23）— 升级 libbitcask 12.0.3 → **12.1.0**（MINOR；既有 C API / ABI / 盘上格式不变，`SOVERSION` 保持 12）。新增 `bitcask:vector_rank/3,4`：在给定的一组 key 里按向量相似度精确排序（不经向量索引）。上游修复：数据文件中间的损坏不再让打开库时把文件截断（坏区跳过，只有崩溃写者的活跃文件才截断）；带 filter 的 `search_vector` 在 HNSW 图不超过 2^20 个节点时回满；行落盘之后的点读提速。⚠️ 正常关闭过的库，文件尾部的残缺不再被截掉；过滤全拒 / 极严的向量查询多一遍对全部节点的过滤求值
 - **12.0.3**（2026-11-23）— 升级 libbitcask 12.0.2 → **12.0.3**（PATCH；C API / ABI / 盘上格式不变，`SOVERSION` 保持 12）。上游 S65 点读命中提速（内存点查索引换平表、活跃文件的命中读走只读映射，仅 Linux / FreeBSD）：经 NIF 命中一次 1.3～2.0 µs → 0.26～0.73 µs。本版同时并入图层读写路径与 NIF 调度的内部优化（一遍解码的邻接读、hub 块目录二分、单条增删直接改二进制、小原子批不转 dirty 调度器）：`out_edges` 约 4 → 2 µs，单条 `put_edge` 约 17 → 8 µs，20 万度 hub 上 `put_edge` 255 → 20 µs；API 与盘上格式不变。⚠️ 活跃文件被点读过的页计入 RSS，映射读遇到 I/O 错误是 SIGBUS（同已封口文件）
 - **12.0.2**（2026-11-23）— 升级 libbitcask 12.0.1 → **12.0.2**（PATCH；C API / ABI / 盘上格式不变，`SOVERSION` 保持 12）。上游 S64：每次写之后的第一次 `range` / 迭代不再整份重排未落盘的行（40 万未落盘行时扫 1 行 80 ms → 13 µs）。本版同时修正图层 hub 路径：`del_vertex` 删 hub 由 O(度数²) 降到线性（20 万邻居 450 s → 2.1 s），分块顶点的邻接读改按块目录点读（`limit` 只读用到的块），`put_edges` 排序键加上 dst（hub 装载 15.3 s → 3.5 s）；API 与盘上格式不变
 - **12.0.1**（2026-11-20）— 升级 libbitcask 12.0.0 → **12.0.1**（PATCH；C API / ABI / 盘上格式不变，`SOVERSION` 保持 12）。上游 S63 修复原子批对并发读者不是整批可见的问题：graph 写会话此前可能基于「新头 + 旧块」覆盖别人刚写的块，缺块自愈也可能把刚建好的块写空；现引擎整批先裁决、再在一个索引临界区发布，读者要么看到整批、要么一行都看不到。本版同时把 graph 写会话条件扩展到整个读集（头、读过的块、读过没改的顶点），并让 `out_edges` / `in_edges` 的 `#{consistent => true}` 用只含 `check` 的原子批在读集版本校验后返回。
@@ -403,13 +426,13 @@ ok
 - **6.5.1**（2026-09-21）— **事务协调层落地**：`bitcask_txn`（原子批之上的隔离性：悲观 2PL 点锁 + wait-for 图死锁检测 + 自动重跑，写进 pdict 缓冲、提交为一条 `txn_commit` 批；`{retries,N}`/`{timeout,Ms}`/`index_fun`）；**前缀锁** `lock_prefix/3` + `prefix_range/2,3`（事务内范围扫描无幻读）；**锁管理器分片**（`txn_locker_shards` 默认 8，前缀锁每分片各拿一份，跨分片死锁检测不漏报，locker 微基准 26k 平线 → P=16 50k+）；**受害者 = 环上最年轻**（年龄跨重跑不变，长事务不被短事务反复打断）。`graphdb` 事务式 API（`transaction` + `put_edge_txn`/`del_edge_txn`/`del_vertex_txn`/`out_edges_txn`/`degree_txn` …）：边五键 + 计数器锁下同批提交，并发加边计数精确。引擎零改动、零新依赖、无 ABI / 盘上格式变更；设计 `doc/txn-layer-design-zh.md`；`rebar3 eunit` 235/235
 - **6.5.0**（2026-09-18）— **图处理层落地**：`graphdb`（KV per-key：k=顶点、边为定宽大端 key 经原子批双向双写、邻接走 OKI 前缀 range、BFS/k-hop/双向最短路、deg/et 索引、`neighbors_where` 过滤遍历）+ `graphdb_analytics`（内存 CSR 物化 + PageRank/连通分量/SSSP）；设计文档 `doc/graph-layer-design-zh.md`。随库升级 libbitcask 6.3.2 → **6.5.0**：OKI memdelta 排序视图缓存拔掉「装载后 range 静默变慢 4200×」悬崖（图基准实测一跳 110ms → 0.078ms），`status()` 新增 `oki_delta_rows`/`oki_delta_bytes`；embedder 池派发测试采样合一消假红。C API 纯加法、SOVERSION 6 不变、无盘上格式变更
 - **6.4.0**（2026-09-08）— 本地嵌入后端两个产品决定：**`slots => K` 并发槽位**（新配置：K 个同配置 worker = K 路真正并发的 forward，配置原样透传、proxy least-queue 透明分摊，起不满就死，与 `instances` 互斥）与**设备选择只认独立 GPU**（随 llama.cpp b10859 的 IGPU 类型：核显不参与 GPU 加速，没有独显直接走 CPU——刻意取舍：嵌入负载小、iGPU 驱动与显存共享策略参差）。`backend_info`/`gpu_status` 设备表 `type` 扩为 `cpu/gpu/igpu/accel/meta` 五档。复用既有池机制，核心 KV/检索零变化，无 ABI / 盘上格式变更
-- **6.3.2**（2026-09-08）— 升级 llama.cpp `b10257` → **`b10859`**（本地嵌入后端，opt-in；**不涉及 libbitcask**，核心 `bitcask_cpp.so` 零变化）：NIF 源码零改动，CPU 与 Vulkan 两档构建全路径复核通过——14 个 CPU 变体、`libggml-vulkan.so` 正常落 `priv/`、`build_info` / `gpu_status` 的构建期/运行期诊断三态（vulkan on/off、gpu_count、cpu_only_build）如实。⚠️ 上游沿用「只认 Discrete/Integrated GPU」的 Vulkan 设备过滤：llvmpipe 等 CPU 软件渲染设备默认跳过（`GGML_VK_VISIBLE_DEVICES` 可强制纳入，诊断用）。⚠️ 从旧 pin 原地升级会留下 `libggml-*.so.0.18.0` 残骸（无害，`rebar3 clean` 清除）
+- **6.3.2**（2026-09-08）— 升级 llama.cpp `b10257` → **`b10859`**（本地嵌入后端，opt-in；**不涉及 libbitcask**，核心 `bitcask_cpp.so` 零变化）：NIF 源码零改动，CPU 与 Vulkan 两档构建全路径复核通过——14 个 CPU 变体、`libggml-vulkan.so` 正常落 `apps/bitcask/priv/`、`build_info` / `gpu_status` 的构建期/运行期诊断三态（vulkan on/off、gpu_count、cpu_only_build）如实。⚠️ 上游沿用「只认 Discrete/Integrated GPU」的 Vulkan 设备过滤：llvmpipe 等 CPU 软件渲染设备默认跳过（`GGML_VK_VISIBLE_DEVICES` 可强制纳入，诊断用）。⚠️ 从旧 pin 原地升级会留下 `libggml-*.so.0.18.0` 残骸（无害，`rebar3 clean` 清除）
 - **6.3.1**（2026-09-08）— 升级 libbitcask 6.2.2 → **6.3.1**（跨上游 6.3.0 + 6.3.1 两版；既有 C API 与 C++ 公开头签名/枚举/结构体布局零改动，新增皆为 additive，`SOVERSION` 保持 6，盘上格式不动、无迁移）：对 Erlang 调用方**无 API 变更**，NIF 代码一行没改，重编即得。⚠️ **新增构建依赖 ICU**（≥ 60）：文本底座从 utf8proc 迁到 ICU（NFKC_Casefold / 字符属性 / GB18030 等编码转换），默认走系统 `libicu-dev`，vendored `third_party/icu`（380 MB，`update = none` 被有意跳过）为回落；CI apt 列表已随动。⚠️ 索引可复现性：分词 = NFKC_Casefold 表 = ICU 版本，系统 ICU 漂移时新旧文档可能切成不同 term（召回悄悄变少、无显式症状），`bitcask.meta` 现记录建索引时的 ICU/Unicode 主版本并在重开不一致时告警（只告警不拒开）；要钉死版本用 `-DBITCASK_ICU_PROVIDER=vendored`。随库带入 S39 C API 增量（多字段文档 `bitcask_put_doc_ex`、meta 编解码、search 分页 `*_ex`、`bitcask_search_text_highlight`），Erlang 门面暂未开到
 - **6.2.2**（2026-09-01）— 升级 libbitcask 6.2.1 → **6.2.2**（PATCH，纯可移植性；C API 与 C++ 公开头的签名/枚举/结构体布局零改动，`SOVERSION` 保持 6，盘上格式不动、无迁移）：对 Erlang 调用方**无 API 变更**，本仓库 Erlang / NIF 代码一行没改，重编即得。上游把库编译到 **libc++**（FreeBSD 15 / macOS 的默认标准库）上——四处 `std::atomic<std::shared_ptr<T>>` 改走新的 `AtomicSharedPtr<T>` shim（libstdc++ 上就是 `std::atomic` 的别名，**本仓库逐字零变化**；libc++ 缺 P0718R2 偏特化，落到互斥量兜底）、`hnsw` 的 `atomic_ref` 去 const、bundled oneTBB 头改标 SYSTEM。随库带入一条**真 UB 修复**：`IndexPool` 超时用例里的 use-after-scope，Linux 上一直静默通过（libstdc++ 放过「解锁未持有的 mutex」），libc++ 必炸
 - **6.2.1**（2026-08-14）— 升级 libbitcask 6.1.0 → **6.2.1**（跨上游 6.2.0 + 6.2.1 两版；C API 与 C++ 公开头零改动，`SOVERSION` 保持 6，盘上格式不动、无迁移）：对 Erlang 调用方**无 API 变更**，重编即得。随库带入上游 Windows 移植（MSVC 原生 x64）与 I/O 稳健性收口——**撕裂尾部覆盖**（写入偏移锚定到最后一个完整 record，崩溃/掉电后尾部半条 record 不再当有效数据）、裸 POSIX 调用收进 `bitcask::io` seam、SIMD 改运行期 CPU 探测（换机器不再 SIGILL）。构建侧：上游路径改用 `PROJECT_SOURCE_DIR` 后，本仓库那段 `third_party/*` 符号链接 workaround 已删除。⚠️ 唯一对外可见的行为变化是 `bitcask.write.lock` 多了第二行（进程实例令牌，POSIX 恒为 `0`），两个解析器都只看首行、新旧双向兼容
 - **6.1.0**（2026-08-06）— 升级 libbitcask 6.0.0 → **6.1.0**（MINOR，纯增量：新枚举值追加在尾部，ABI 未破坏，`SOVERSION` 保持 6，无盘上格式变更、无迁移）：`range` 的「索引不可用」按成因拆成两个错误码——`{error, no_index}`（本句柄本就不建索引：只读/`merge_only` 打开无 OKI 的目录，读写重开即建）与新增的 `{error, index_rebuild_failed}`（可写 open 试建而败，IO/环境问题）。⚠️ 后者意味着**数据在、只有索引不在**，值得告警而不是当成空库
 - **6.0.0**（2026-08-06）— 升级 libbitcask v5.0.0 → **6.0.0**（跨上游 5.1.0 + 6.0.0 两版；ABI 破坏，`SOVERSION` 5→6，本仓库源码级依赖重编即可）：新开三块 API——`range/2,3` + `range_fold/5` 有序范围查询（O(range)，上游实测 15×）、`put_batch_atomic/2` 跨崩溃原子批、`txn_commit/2,3` 多键事务；新增 `{keydir_cache_entries, N}` 选项（keydir 磁盘驻留 Level B，上游 1 亿 key 实测常驻 -90%）；`open/2` 的错误现在带 detail（`{error, {io_error \| invalid_option, Msg}}`）。⚠️ **存量目录必须先离线迁移**：上游 5.1.0 的 hint ord flag-day 使 `bitcask.meta` v4 → v5，5.x 写出的目录被干净拒开，用 `bitcask_migrate hintord <src> <dst>` 非破坏性迁移（data 字节零改动）
-- **5.1.0**（2026-08-06）— 本地嵌入后端（llama.cpp / ggml，**默认不构建**）+ 独立 embedder 进程。**不涉及 libbitcask 升级**，无 ABI / 盘上格式变更，关掉时产物与 5.0.0 一字不差：独立第二 NIF `priv/bitcask_llama.so`（`BITCASK_WITH_LLAMA=1` 打开），`bitcask_embedder_server` 让多个 cask 共用一份权重且生命周期跟着进程走，CUDA 支持（`BITCASK_LLAMA_CUDA=AUTO|ON|OFF`）+ 构建期/运行期分离诊断（`build_info/0` / `backend_info/0` / `gpu_status/0`）+ 探测脚本 `scripts/detect-llama-backends.sh`；⚠️ `bitcask:open/2` 不再吞掉 `application:start` 失败（返回 `{error, {bitcask_app_start_failed, _}}`，有意的行为变更）
+- **5.1.0**（2026-08-06）— 本地嵌入后端（llama.cpp / ggml，**默认不构建**）+ 独立 embedder 进程。**不涉及 libbitcask 升级**，无 ABI / 盘上格式变更，关掉时产物与 5.0.0 一字不差：独立第二 NIF `apps/bitcask/priv/bitcask_llama.so`（`BITCASK_WITH_LLAMA=1` 打开），`bitcask_embedder_server` 让多个 cask 共用一份权重且生命周期跟着进程走，CUDA 支持（`BITCASK_LLAMA_CUDA=AUTO|ON|OFF`）+ 构建期/运行期分离诊断（`build_info/0` / `backend_info/0` / `gpu_status/0`）+ 探测脚本 `apps/bitcask/scripts/detect-llama-backends.sh`；⚠️ `bitcask:open/2` 不再吞掉 `application:start` 失败（返回 `{error, {bitcask_app_start_failed, _}}`，有意的行为变更）
 - **5.0.0**（2026-07-17）— 升级 libbitcask v5.0.0（64 位时间戳 flag-day，ABI + **盘上格式**双破坏，`SOVERSION` 4→5）：`tstamp`/`expiry_at` 全链路 u32→u64（Y2038 前瞻），修复极大 `expiry_secs` 下 u32 求和回绕致全库误判过期；对 Erlang 调用方**无 API 变更**（`tstamp` 本就是任意精度整数）；`bitcask.meta` v4 门禁干净拒开旧 u32 纪元库，存量库用上游 `bitcask_migrate tstamp64` 非破坏性离线迁移，无须重灌
 
 ## 许可证
