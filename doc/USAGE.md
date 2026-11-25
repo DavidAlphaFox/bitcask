@@ -1,4 +1,7 @@
-# bitcask 使用指南
+# 实用方法与运维指南
+
+本文件是常用操作的示例集；函数签名、完整选项和错误语义见
+[`api-zh.md`](api-zh.md)。能力边界见 [`capabilities-zh.md`](capabilities-zh.md)。
 
 本指南涵盖 C++23 NIF（`cask_cpp`）——唯一可用的模式。
 所有操作通过 `bitcask_cpp_nifs` → `apps/bitcask/priv/bitcask_cpp.so` 进行。
@@ -281,6 +284,58 @@ not_found
 >
 > ⚠️ 批里任何一条形态不认（标签错、元数错、非 binary、改进列表）一律
 > `badarg`——**绝不静默丢弃**，悄悄少一条会让「原子」失去意义。
+
+## 隔离事务与幂等键
+
+需要读-改-写或避免并发交错时，用 `bitcask_txn`。事务函数可能被自动重跑，
+所以必须无副作用：
+
+```erlang
+Move = fun(Tx) ->
+    {ok, A} = bitcask_txn:read(Tx, <<"a">>, write),
+    {ok, B} = bitcask_txn:read(Tx, <<"b">>, write),
+    Moved = binary_to_integer(A) - 30,
+    ok = bitcask_txn:write(Tx, <<"a">>, integer_to_binary(Moved)),
+    ok = bitcask_txn:write(Tx, <<"b">>,
+                           integer_to_binary(binary_to_integer(B) + 30)),
+    Moved
+end,
+{atomic, Moved} = bitcask_txn:transaction(R, Move),
+```
+
+显式中止不写数据；锁与死锁状态可以用 `bitcask_txn_locker:status/0` 观察：
+
+```erlang
+{aborted, insufficient} =
+    bitcask_txn:transaction(R, fun(Tx) ->
+        {ok, A} = bitcask_txn:read(Tx, <<"a">>),
+        case binary_to_integer(A) < 1000 of
+            true  -> bitcask_txn:abort(insufficient);
+            false -> ok
+        end
+    end).
+```
+
+提交途中进程被 kill 时，幂等键保证同一个业务操作重试不会执行两次：
+
+```erlang
+Pay = fun(Tx) ->
+    {ok, A} = bitcask_txn:read(Tx, <<"a">>, write),
+    Paid = binary_to_integer(A) - 30,
+    ok = bitcask_txn:write(Tx, <<"a">>, integer_to_binary(Paid)),
+    {paid, Paid}
+end,
+{atomic, {paid, 70}} =
+    bitcask_txn:transaction(R, Pay, [{idem_key, <<"order-42">>}]),
+{atomic, {paid, 70}} =
+    bitcask_txn:transaction(R, Pay, [{idem_key, <<"order-42">>}]),
+{ok, {paid, 70}} = bitcask_txn:idem_lookup(R, <<"order-42">>).
+```
+
+幂等标记不会自动过期；定期用 `bitcask_txn:idem_purge/2,3` 清理旧标记。直接
+`bitcask:put/get` 会绕过事务锁；与事务读写同一批 key 时改用
+`bitcask_txn:read_guarded/3`。设计细节见
+[`txn-layer-design-zh.md`](txn-layer-design-zh.md)。
 
 ## 崩溃恢复
 
