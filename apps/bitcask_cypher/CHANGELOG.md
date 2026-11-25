@@ -4,6 +4,11 @@ English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。格式大致遵循 [Keep
 
 Cypher 查询层原在 bitcask 主应用里（13.1.0 起），现拆为独立应用 `bitcask_cypher`；拆分前的条目照录如下。
 
+## [13.2.0] — 2026-11-25
+
+本应用没有变化，版本号跟随 `bitcask` 13.2.0（核心图层新增图布局 2；新布局 2 的库由旧版本打开会报 `{error, {graph_layout, 2}}`）。
+明细见根目录 `CHANGELOG.md`。
+
 ## [13.1.2] — 2026-11-25
 
 本应用没有变化，版本号跟随 `bitcask` 13.1.2（libbitcask 升到 13.1.2，库源码与 13.1.1 相同）。明细见根目录 `CHANGELOG.md`。

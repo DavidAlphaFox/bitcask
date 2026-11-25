@@ -3,6 +3,29 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [13.2.0] — 2026-11-25
+
+### Added
+
+- **图层布局 2**（TASK G17，设计稿 `doc/graph-layout-2-zh.md`）：每组边是 KV 上的一棵 B+ 树——块按条数切（缺省 512 条，另有 64 KiB 字节安全上限、
+  每组块数安全阀 65536），块数超过 16 时块目录从头里搬到新的 `d` 家族（目录节点最多 256 项），头里只记块数与层数。加一条边只重写一个块和很小的头，
+  写入量不再随度数涨：30 万入度的大号每条边写入 22 KiB → 4.1 KiB、300 万 56 KiB → 4.3 KiB，加边约快一倍；点查多读一两个目录节点（30 万入度
+  3.6 → 4.6 µs），前 N 条与度数更快。新库缺省布局 2。
+- `graphdb:open/2` 新选项：`adj_layout`（1 | 2）、`adj_chunk_entries`、`adj_chunk_count_max`、`adj_dir_inline_max`、`adj_dir_node_max`；
+  `graph_config/1` 的结果多 `layout` 键（布局 2 另有上述参数）。
+- `graphdb:upgrade_layout/2`：布局 1 的库单向升级到布局 2，只改写 `g`，数据被写到时再逐组转换；读不依赖转完。
+- `graphdb:check_invariants/1` 核对目录树（缺失 / 畸形 / 层号 / 首项 / 顺序 / 块数）并报 `d` 家族里走不到的节点。
+
+### Changed
+
+- ⚠️ **新建的图库是布局 2**（`g` 版本 2）：之前的版本打不开（`{error, {graph_layout, 2}}`）。要让旧程序也能打开，建库时给 `{adj_layout, 1}`。
+  已有的布局 1 库照旧按布局 1 读写，不自动升级。
+- `adj_chunk_max` 在布局 2 里是单块的字节安全上限（缺省 65536）；布局 1 的含义与缺省（4096）不变。
+
+### Fixed
+
+- `graphdb:open/2` 的图参数不合法时在打开库之前就报 `{badarg, _}`；原先在 `bitcask:open` 之后才报，句柄没关、目录锁不释放。
+
 ## [13.1.2] — 2026-11-25
 
 升级 libbitcask **13.1.1 → 13.1.2**（上游 PATCH：S79）。submodule 从 `8511c09` 切到 `90fdc5f`（tag `13.1.2`）。上游库源码与

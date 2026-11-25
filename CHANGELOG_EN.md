@@ -3,6 +3,35 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [13.2.0] — 2026-11-25
+
+### Added
+
+- **Graph layout 2** (TASK G17, design `doc/graph-layout-2-en.md`): each edge group is a B+ tree over the KV store — chunks are capped by entry
+  count (default 512, with a 64 KiB byte safety cap and a per-group chunk-count safety valve of 65536), and once a group has more than 16 chunks
+  the chunk directory moves out of the head into a new `d` family (at most 256 entries per directory node); the head only records the chunk
+  count and the tree height. Adding an edge rewrites one chunk and a small head, so write volume no longer grows with degree: 22 KiB → 4.1 KiB
+  per edge for an account with 300k followers, 56 KiB → 4.3 KiB at 3M, and adding an edge is about twice as fast; lookups read one or two extra
+  directory nodes (3.6 → 4.6 µs at 300k), first-N reads and degree are faster. New stores default to layout 2.
+- New `graphdb:open/2` options: `adj_layout` (1 | 2), `adj_chunk_entries`, `adj_chunk_count_max`, `adj_dir_inline_max`, `adj_dir_node_max`;
+  `graph_config/1` gains a `layout` key (plus the parameters above for layout 2).
+- `graphdb:upgrade_layout/2`: one-way upgrade of a layout 1 store to layout 2 — only `g` is rewritten, groups are converted when next written;
+  reads never depend on the conversion being complete.
+- `graphdb:check_invariants/1` checks directory trees (missing / malformed / level / first entry / order / chunk count) and reports unreachable
+  nodes in family `d`.
+
+### Changed
+
+- ⚠️ **New graph stores use layout 2** (`g` version 2): earlier releases cannot open them (`{error, {graph_layout, 2}}`). Pass `{adj_layout, 1}`
+  at creation if older programs must open the store. Existing layout 1 stores keep being read and written as layout 1; nothing is upgraded
+  automatically.
+- In layout 2 `adj_chunk_max` is a per-chunk byte safety cap (default 65536); its meaning and default (4096) in layout 1 are unchanged.
+
+### Fixed
+
+- `graphdb:open/2` now raises `{badarg, _}` for invalid graph options before opening the store; previously it raised after `bitcask:open`,
+  leaking the handle and its directory lock.
+
 ## [13.1.2] — 2026-11-25
 
 Upgrades libbitcask **13.1.1 → 13.1.2** (an upstream PATCH: S79). The submodule moves from `8511c09` to `90fdc5f` (tag `13.1.2`).

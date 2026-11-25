@@ -1,9 +1,23 @@
 %% =========================================================================
-%% graphdb_adj — 当前图层布局（第 1 版）的邻接表：盘上编解码 + 读原语 + 写会话
+%% graphdb_adj — 图层的邻接表：盘上编解码 + 读原语 + 写会话
 %%
 %% 设计文档：doc/graph-adjacency-pack-design-zh.md（§4 盘上契约、§5 条件写、
-%% §6 写路径）。graphdb 是门面（API / 重试 / 遍历 / 事务包装），本模块是它
-%% 唯一碰 `a` / `p` 家族字节的地方；graphdb_analytics 复用这里的编解码。
+%% §6 写路径）；布局 2（块目录外置成 KV 上的 B+ 树、块按条数切）见
+%% doc/graph-layout-2-zh.md。graphdb 是门面（API / 重试 / 遍历 / 事务包装），本模块是它
+%% 唯一碰 `a` / `d` / `p` 家族字节的地方；graphdb_analytics 复用这里的编解码。
+%%
+%% ---- 布局 2（`g` 版本 2，新库缺省）相对布局 1 的差别 ----
+%%   * 块按条数切：一块最多 chunk_entries 条（缺省 512），另有字节安全上限 chunk_max
+%%     （缺省 64 KiB）；不再「超大组放宽到 组字节 / 1024」。安全阀 chunk_count_max：组大到
+%%     「块数上限 × 0.7 × 每块条数」以上时每块条数随组放大。
+%%   * 块数超过 dir_inline_max（缺省 16）时块目录外置成 `d` 家族的一棵 B+ 树：
+%%       <1,"_g:"> d <vid:64> <dir:8> <etype:32> <level:8> <o:64> <r:64>   目录节点（35 B）
+%%       DirNode = <<1:8, Level:8, Count:16, <<O:64, R:64>> × Count>>      子节点下界，升序；
+%%                 首项 = 节点自己的下界；第 1 层的子节点是块；Count ≤ dir_node_max
+%%     组在头里只记 <<NChunks:32, Levels:8>>（GFlags bit3 = 目录外置）；根 = (Levels, (0,0))。
+%%     块数降到 dir_inline_max / 2 以下转回内联目录。
+%%   * 库的 `g` 是版本 1 就照布局 1 的规则写（旧程序仍能打开）；graphdb:upgrade_layout/2
+%%     单向改成版本 2，数据碰到再转。
 %%
 %% ---- Key 家族 ----
 %%   <1,"_g:"> a <vid:64>                                  邻接表头（13 B）
@@ -23,7 +37,8 @@
 %%           Body（内联）= Entry × Count
 %%           Body（分块）= <<NChunks:32, <<O:64, R:64>> × NChunks>>（各块下界）
 %%   Chunk = <<1:8, GFlags:8, Count:32, Entry × Count>>
-%%   GFlags: bit0 has_rank、bit1 has_props、bit2 chunked
+%%           Body（分块、目录外置，布局 2）= <<NChunks:32, Levels:8>>
+%%   GFlags: bit0 has_rank、bit1 has_props、bit2 chunked、bit3 目录外置（布局 2）
 %%   Entry = <<O:64>> [<<R:64>>]（has_rank） [<<PLen:16, Props/bytes>>]（has_props）
 %%           PLen = 16#FFFF：属性在 p 家族。条目按 (O, R) 升序。
 %%   入边条目恒无属性（属性只在出边一侧存一份）。
@@ -40,7 +55,10 @@
 %%      即使有人绕过图层协议直写块，读-改-写也不会静默覆盖。一致性读同理：读集
 %%      在写锁下用只含 check 的批校验（graphdb consistent_read）。上游反馈
 %%      libbitcask feedbacks/2026-11-20-atomic-batch-no-read-isolation.md。
-%%   3. Count = 实际条目数；块目录 = 实际存在的块 key。
+%%   3. Count = 实际条目数；块目录 = 实际存在的块 key（目录外置时 = 自根枚举出的第 1 层
+%%      子节点下界集合；`d vid dir etype` 下没有走不到的节点）。
+%%      写会话读目录树时读不到某个节点（读头之后有人改过这个顶点）⇒ 会话标过期，提交按
+%%      冲突重来，不在过期的树上继续写。
 %%
 %% ---- IO 抽象 ----
 %%   Io :: {direct, Handle}          直通：读带 LSN，提交走带条件的原子批
@@ -51,24 +69,28 @@
 -module(graphdb_adj).
 
 -export([prefix/0, range/1, head_key/1, chunk_key/4, group_prefix/3, pkey/4, gkey/0,
-         parse_chunk_key/1,
+         parse_chunk_key/1, dir_node_key/5, parse_dir_node_key/1,
          encode_head/1, decode_head/1, encode_chunk/1, decode_chunk/1, decode_chunk/2,
-         default_cfg/0, encode_cfg/1, decode_cfg/1,
+         encode_node/2, decode_node/1,
+         default_cfg/0, layout1_cfg/0, layout2/1, encode_cfg/1, decode_cfg/1,
          %% 读原语
          entries/5, entries_guarded/5, edge_maps/6, neighbor_ids/4, lookup/6, counts/2,
          %% 写会话
          new_session/2, put_edge/6, del_edge/5, all_entries/2, first_entries/3,
          commit/1, commit/2,
          %% 分析 / 校验用的纯函数
-         build_vertex/3, groups_info/1, out_ids/2, out_entries/2, out_entries/3, chunk_ids/1]).
+         build_vertex/3, groups_info/1, out_ids/2, out_entries/2, out_entries/3, chunk_ids/1,
+         xdir_check/3]).
 
 -define(VER, 1).
 -define(F_RANK,    1).
 -define(F_PROPS,   2).
 -define(F_CHUNKED, 4).
+-define(F_XDIR,    8).
 -define(PEXT, 16#FFFF).
 -define(LB0, {0, 0}).
 -define(LAYOUT_VER, 1).
+-define(LAYOUT2_VER, 2).
 -define(PREFIX, <<16#01, "_g:">>).
 -define(B_OPS_MAX, 16).
 -define(ENC_FAST_MIN, 32).               % 条目数达到它才走一遍式编码（小表逐条拼更快）
@@ -81,7 +103,9 @@
               %% 分块组：块目录保持盘上的二进制（各块下界 <<O:64, R:64>> 依次排列）——
               %% hub 的目录上千项，解成列表再线性找块曾是 hub 点操作的大头；现在在
               %% 二进制上二分，写回时目录没变就原样复用。
-              body     :: {entries, elist()} | {chunks, binary()}}).
+              %% 目录外置的组（布局 2）：{xdir, 块数, 层数}，目录在 `d` 家族。
+              body     :: {entries, elist()} | {chunks, binary()}
+                        | {xdir, pos_integer(), pos_integer()}}).
 
 -record(vs, {vid      :: non_neg_integer(),
              hcond    :: absent | {ord, non_neg_integer()} | txn,
@@ -95,6 +119,13 @@
              rconds = #{} :: #{binary() => absent | {ord, non_neg_integer()}},
                                                        %% 直通读过的块 → 读到时的版本（提交条件）
              extra  = [] :: [term()],                  %% p 家族 op（逆序）
+             %% 目录树（布局 2）：节点 key → 下界表（二进制 <<O:64, R:64>> × n）
+             nodes  = #{} :: #{binary() => binary()},
+             ndirty = #{} :: #{binary() => true},      %% 要写的目录节点
+             ndels  = #{} :: #{binary() => true},      %% 要删的目录节点
+             ondisk = #{} :: #{binary() => true},      %% 读到时盘上就有的块 / 节点（外置目录
+                                                       %% 的块不在 orig 里，删时靠它判断）
+             stale  = false :: boolean(),              %% 读树时遇到缺失的节点 ⇒ 提交按冲突重来
              touched = false :: boolean(),
              henc :: undefined | binary()}).           %% finalize 算好的头编码（emit 复用）
 
@@ -146,18 +177,50 @@ parse_chunk_key(<< _P:4/binary, "a", Vid:64/big, Dir:8, Etype:32/big,
 parse_chunk_key(_) ->
     skip.
 
+%% 目录节点（布局 2）：层 Level（≥ 1）上下界为 {O, R} 的节点。
+dir_node_key(Vid, Dir, Etype, Level, {O, R}) ->
+    << ?PREFIX/binary, "d", Vid:64/big, Dir:8, Etype:32/big, Level:8,
+       O:64/big, R:64/big >>.
+
+parse_dir_node_key(<< _P:4/binary, "d", Vid:64/big, Dir:8, Etype:32/big, Level:8,
+                      O:64/big, R:64/big >> = K)
+  when binary_part(K, 0, 4) =:= ?PREFIX, Dir =< 1, Level >= 1 ->
+    {ok, Vid, Dir, Etype, Level, {O, R}};
+parse_dir_node_key(_) ->
+    skip.
+
 %% =========================================================================
 %% 图参数（记在 `g` 键）
 %% =========================================================================
 
+%% 新库缺省 = 布局 2：头超 4 KiB 分块；块按条数切（512 条）、另有 64 KiB 字节安全上限；
+%% 每组块数安全阀 65536（0 = 不限）；块超过 16 个时块目录外置，节点最多 256 项。
 default_cfg() ->
-    #{inline_max => 4096, chunk_max => 4096, props_max => 128}.
+    #{layout => 2, inline_max => 4096, chunk_max => 65536, props_max => 128,
+      chunk_entries => 512, chunk_count_max => 65536, dir_inline_max => 16, dir_node_max => 256}.
 
+%% 布局 1 的缺省（块目录总在头里、单块 ≤ 4 KiB、超大组放宽到 组字节 / 1024）。
+layout1_cfg() ->
+    #{layout => 1, inline_max => 4096, chunk_max => 4096, props_max => 128}.
+
+layout2(#{layout := 2}) -> true;
+layout2(_)              -> false.
+
+encode_cfg(#{layout := 2, inline_max := I, chunk_max := C, props_max := P,
+             chunk_entries := CE, chunk_count_max := CC, dir_inline_max := DI,
+             dir_node_max := DN}) ->
+    <<?LAYOUT2_VER:8, I:32/big, C:32/big, P:16/big, CE:32/big, CC:32/big,
+      DI:16/big, DN:16/big>>;
 encode_cfg(#{inline_max := I, chunk_max := C, props_max := P}) ->
     <<?LAYOUT_VER:8, I:32/big, C:32/big, P:16/big>>.
 
 decode_cfg(<<?LAYOUT_VER:8, I:32/big, C:32/big, P:16/big>>) ->
-    {ok, #{inline_max => I, chunk_max => C, props_max => P}};
+    {ok, #{layout => 1, inline_max => I, chunk_max => C, props_max => P}};
+decode_cfg(<<?LAYOUT2_VER:8, I:32/big, C:32/big, P:16/big, CE:32/big, CC:32/big,
+             DI:16/big, DN:16/big>>) ->
+    {ok, #{layout => 2, inline_max => I, chunk_max => C, props_max => P,
+           chunk_entries => CE, chunk_count_max => CC, dir_inline_max => DI,
+           dir_node_max => DN}};
 decode_cfg(<<Ver:8, _/binary>>) ->
     {error, {graph_layout, Ver}};
 decode_cfg(_) ->
@@ -248,7 +311,10 @@ enc_group(#grp{dir = D, etype = T, count = C, body = {entries, Es}}) ->
     [<<D:8, F:8, T:32/big, C:64/big>> | Data];
 enc_group(#grp{dir = D, etype = T, count = C, flags = F0, body = {chunks, Dir}}) ->
     F = (F0 band (?F_RANK bor ?F_PROPS)) bor ?F_CHUNKED,
-    [<<D:8, F:8, T:32/big, C:64/big, (byte_size(Dir) div 16):32/big>>, Dir].
+    [<<D:8, F:8, T:32/big, C:64/big, (byte_size(Dir) div 16):32/big>>, Dir];
+enc_group(#grp{dir = D, etype = T, count = C, flags = F0, body = {xdir, N, Lv}}) ->
+    F = (F0 band (?F_RANK bor ?F_PROPS)) bor ?F_CHUNKED bor ?F_XDIR,
+    [<<D:8, F:8, T:32/big, C:64/big, N:32/big, Lv:8>>].
 
 decode_head(<<?VER:8, N:16/big, Rest/binary>>) ->
     dec_groups(N, Rest, undefined, []);
@@ -261,7 +327,19 @@ dec_groups(0, _Trailing, _Prev, _Acc) ->
     error;
 dec_groups(N, <<D:8, F:8, T:32/big, C:64/big, Rest/binary>>, Prev, Acc)
   when D =< 1, C > 0, (Prev =:= undefined orelse {D, T} > Prev) ->
-    case F band ?F_CHUNKED of
+    case F band (?F_CHUNKED bor ?F_XDIR) of
+        ?F_XDIR ->
+            error;                                   %% 目录外置必须同时是分块组
+        X when X =:= ?F_CHUNKED bor ?F_XDIR ->
+            case Rest of
+                <<NC:32/big, Lv:8, Rest2/binary>> when NC > 0, Lv > 0 ->
+                    dec_groups(N - 1, Rest2, {D, T},
+                               [#grp{dir = D, etype = T, count = C,
+                                     flags = F band (?F_RANK bor ?F_PROPS),
+                                     body = {xdir, NC, Lv}} | Acc]);
+                _ ->
+                    error
+            end;
         0 ->
             case dec_entries_s(Rest, C, F) of
                 {ok, Es, Rest2} ->
@@ -345,6 +423,33 @@ decode_chunk(<<?VER:8, F:8, C:32/big, Rest/binary>>, Limit) when is_integer(Limi
     dec_entries_lim(Rest, C, F, Limit);
 decode_chunk(_, _) ->
     error.
+
+%% 目录节点（布局 2）：下界表保持二进制（<<O:64, R:64>> × n），点查在字节上二分，
+%% 要改时直接拼接——同块目录。
+encode_node(Level, Lbs) when is_binary(Lbs) ->
+    <<?VER:8, Level:8, (byte_size(Lbs) div 16):16/big, Lbs/binary>>.
+
+%% {ok, Level, LbsBin} | error：长度不符、Count = 0、Level = 0、下界不严格升序都算畸形。
+decode_node(<<?VER:8, Level:8, N:16/big, Lbs/binary>>)
+  when N > 0, Level > 0, byte_size(Lbs) =:= N * 16 ->
+    case lbs_ascending(Lbs) of
+        true  -> {ok, Level, Lbs};
+        false -> error
+    end;
+decode_node(_) ->
+    error.
+
+%% 下界严格升序：一遍走完二进制（匹配上下文复用，不切子二进制）。
+lbs_ascending(<<O:64/big, R:64/big, Rest/binary>>) -> lbs_asc(Rest, O, R);
+lbs_ascending(<<>>)                               -> true.
+
+lbs_asc(<<O:64/big, R:64/big, Rest/binary>>, PO, PR)
+  when O > PO; O =:= PO, R > PR ->
+    lbs_asc(Rest, O, R);
+lbs_asc(<<>>, _PO, _PR) ->
+    true;
+lbs_asc(_, _PO, _PR) ->
+    false.
 
 %% =========================================================================
 %% IO
@@ -472,8 +577,12 @@ rg_groups(Io, Vid, [{_D, T, F, C, {inline, Body}} | Sel], Limit, Mode, Guard, Ac
         error ->
             {error, {bad_adj, Vid}}
     end;
-rg_groups(Io, Vid, [{D, T, F, _C, {chunks, Dir}} | Sel], Limit, Mode, Guard, Acc, Checks) ->
-    case rg_chunks(Io, Vid, D, T, Dir, Limit, Mode, Guard, [], 0, Checks) of
+rg_groups(Io, Vid, [{D, T, F, _C, Body} | Sel], Limit, Mode, Guard, Acc, Checks) ->
+    Res = case Body of
+              {chunks, Dir}  -> rg_chunks(Io, Vid, D, T, Dir, Limit, Mode, Guard, [], 0, Checks);
+              {xdir, _N, Lv} -> rg_xdir(Io, Vid, D, T, Lv, ?LB0, Limit, Mode, Guard, [], 0, Checks)
+          end,
+    case Res of
         {ok, Parts, N, Checks2} ->
             %% 分块的带 rank 组取 id：同一对端的多条 rank 可能跨块相邻，整组拼好再去一遍。
             Acc2 = case Mode =:= ids andalso F band ?F_RANK =/= 0 of
@@ -522,6 +631,62 @@ rg_chunks(Io, Vid, D, T, <<O:64/big, R:64/big, Dir/binary>>, Limit, Mode, Guard,
             E
     end.
 
+%% 目录外置的组（布局 2）：自根深度优先，第 1 层节点的下界表交给 rg_chunks 逐块点读；
+%% Limit（整组的上限）到了就停——只取开头几条时只走最左一路。读不到的节点按空处理
+%% （弱一致读，同缺块）；Guard 时它与读过的节点都记进 Checks。
+rg_xdir(Io, Vid, D, T, Level, Lb, Limit, Mode, Guard, Acc, N, Checks) ->
+    case dec_limit(Limit, N) of
+        0 ->
+            {ok, Acc, N, Checks};
+        Rem ->
+            Key = dir_node_key(Vid, D, T, Level, Lb),
+            case read_node(Io, Key, Level) of
+                {ok, Lbs, Cond} when Level =:= 1 ->
+                    rg_chunks(Io, Vid, D, T, Lbs, Rem, Mode, Guard, Acc, N,
+                              [{check, Key, Cond} || Guard] ++ Checks);
+                {ok, Lbs, Cond} ->
+                    rg_xdir_children(Io, Vid, D, T, Level - 1, Lbs, Limit, Mode, Guard, Acc, N,
+                                     [{check, Key, Cond} || Guard] ++ Checks);
+                {absent, Cond} ->
+                    {ok, Acc, N, [{check, Key, Cond} || Guard] ++ Checks};
+                {error, _} = E ->
+                    E
+            end
+    end.
+
+rg_xdir_children(_Io, _Vid, _D, _T, _Level, <<>>, _Limit, _Mode, _Guard, Acc, N, Checks) ->
+    {ok, Acc, N, Checks};
+rg_xdir_children(Io, Vid, D, T, Level, <<O:64/big, R:64/big, More/binary>>, Limit, Mode, Guard,
+                 Acc, N, Checks) ->
+    case rg_xdir(Io, Vid, D, T, Level, {O, R}, Limit, Mode, Guard, Acc, N, Checks) of
+        {ok, Acc2, N2, Checks2} ->
+            rg_xdir_children(Io, Vid, D, T, Level, More, Limit, Mode, Guard, Acc2, N2, Checks2);
+        {error, _} = E ->
+            E
+    end.
+
+%% 读一个目录节点：{ok, LbsBin, Cond} | {absent, Cond} | {error, _}；层号与 key 不符、
+%% 解不开 ⇒ {error, {bad_adj_dir, Key}}。
+read_node(Io, Key, Level) ->
+    case io_head(Io, Key) of
+        {ok, Bin, Cond} ->
+            case decode_node(Bin) of
+                {ok, Level, Lbs} -> {ok, Lbs, Cond};
+                _                -> {error, {bad_adj_dir, Key}}
+            end;
+        Other ->
+            Other
+    end.
+
+%% 目录外置的组里 (O, R) 所在块的下界（逐层点读）：{ok, Lb} | absent | {error, _}。
+xlocate(Io, Vid, D, T, Level, Lb, Key) ->
+    case read_node(Io, dir_node_key(Vid, D, T, Level, Lb), Level) of
+        {ok, Lbs, _} when Level =:= 1 -> {ok, locate_lb(Lbs, Key)};
+        {ok, Lbs, _}                  -> xlocate(Io, Vid, D, T, Level - 1, locate_lb(Lbs, Key), Key);
+        {absent, _}                   -> absent;
+        {error, _} = E                -> E
+    end.
+
 %% 头二进制 → 选中的组 [{Dir, Etype, Flags, Count, {inline, Body} | {chunks, DirBin}}]
 %% （头里的顺序 = (Dir, Etype) 升序）。没选中的组只算字节数跳过；结构校验与
 %% decode_head/1 同口径（版本、组序、Dir、Count、长度、块 0 下界、无尾随字节）。
@@ -538,7 +703,21 @@ sel_groups(N, <<D:8, F:8, T:32/big, C:64/big, Rest/binary>>, Prev, DirSel, Etype
   when D =< 1, C > 0, (Prev =:= undefined orelse {D, T} > Prev) ->
     Want = (DirSel =:= both orelse D =:= DirSel)
         andalso (Etype =:= undefined orelse T =:= Etype),
-    case F band ?F_CHUNKED of
+    case F band (?F_CHUNKED bor ?F_XDIR) of
+        ?F_XDIR ->
+            error;
+        X when X =:= ?F_CHUNKED bor ?F_XDIR ->
+            case Rest of
+                <<NC:32/big, Lv:8, Rest2/binary>> when NC > 0, Lv > 0 ->
+                    Acc2 = case Want of
+                               true  -> [{D, T, F band (?F_RANK bor ?F_PROPS), C,
+                                          {xdir, NC, Lv}} | Acc];
+                               false -> Acc
+                           end,
+                    sel_groups(N - 1, Rest2, {D, T}, DirSel, Etype, Acc2);
+                _ ->
+                    error
+            end;
         0 ->
             case split_body(Rest, C, F) of
                 {ok, Body, Rest2} ->
@@ -673,18 +852,27 @@ lookup(Io, Vid, Dir, Etype, Other, Rank) ->
                         Res   -> Res
                     end;
                 {ok, [{_, _, _F, _C, {chunks, DirBin}}]} ->
-                    Key = chunk_key(Vid, Dir, Etype, locate_lb(DirBin, {Other, Rank})),
-                    case io_head(Io, Key) of
-                        {ok, <<?VER:8, CF:8, CC:32/big, Body/binary>>, _} ->
-                            case find_in_body(CF, CC, Body, Other, Rank) of
-                                error -> {error, {bad_adj_chunk, Key}};
-                                Res   -> Res
-                            end;
-                        {ok, _, _}     -> {error, {bad_adj_chunk, Key}};
-                        {absent, _}    -> not_found;
+                    lookup_chunk(Io, chunk_key(Vid, Dir, Etype, locate_lb(DirBin, {Other, Rank})),
+                                 Other, Rank);
+                {ok, [{_, _, _F, _C, {xdir, _N, Lv}}]} ->
+                    case xlocate(Io, Vid, Dir, Etype, Lv, ?LB0, {Other, Rank}) of
+                        {ok, Lb}       -> lookup_chunk(Io, chunk_key(Vid, Dir, Etype, Lb), Other, Rank);
+                        absent         -> not_found;          %% 弱一致：读头之后树被改过
                         {error, _} = E -> E
                     end
             end
+    end.
+
+lookup_chunk(Io, Key, Other, Rank) ->
+    case io_head(Io, Key) of
+        {ok, <<?VER:8, CF:8, CC:32/big, Body/binary>>, _} ->
+            case find_in_body(CF, CC, Body, Other, Rank) of
+                error -> {error, {bad_adj_chunk, Key}};
+                Res   -> Res
+            end;
+        {ok, _, _}     -> {error, {bad_adj_chunk, Key}};
+        {absent, _}    -> not_found;
+        {error, _} = E -> E
     end.
 
 %% {ok, Props} | not_found | error
@@ -761,6 +949,40 @@ chunk_keys_of(Vid, Gs) ->
 %% 块目录：二进制 ⟷ 下界列表（只在目录要变 / 要整组遍历时才展开）。
 dir_lbs(Dir) -> [{O, R} || <<O:64/big, R:64/big>> <= Dir].
 lbs_dir(Lbs) -> << <<O:64/big, R:64/big>> || {O, R} <- Lbs >>.
+
+%% ---- 二进制下界表上的增删改（目录节点用）----
+
+%% 按序插入（已在就不动）。
+lb_insert(Bin, {O, R}) ->
+    case b_find(Bin, 16, O, R) of
+        {found, _}    -> Bin;
+        {absent, Pos} ->
+            <<A:(Pos * 16)/binary, B/binary>> = Bin,
+            <<A/binary, O:64/big, R:64/big, B/binary>>
+    end.
+
+lb_delete(Bin, {O, R}) ->
+    case b_find(Bin, 16, O, R) of
+        {found, Pos} ->
+            <<A:(Pos * 16)/binary, _:16/binary, B/binary>> = Bin,
+            <<A/binary, B/binary>>;
+        {absent, _} ->
+            Bin
+    end.
+
+%% 子项改名：Old → New（New 落在 Old 与后一项之间，序不变）。
+lb_replace(Bin, {O, R}, {NO, NR}) ->
+    case b_find(Bin, 16, O, R) of
+        {found, Pos} ->
+            <<A:(Pos * 16)/binary, _:16/binary, B/binary>> = Bin,
+            <<A/binary, NO:64/big, NR:64/big, B/binary>>;
+        {absent, _} ->
+            Bin
+    end.
+
+lb_first(<<O:64/big, R:64/big, _/binary>>) -> {O, R}.
+
+lb_count(Bin) -> byte_size(Bin) div 16.
 
 find_group([#grp{dir = D, etype = T} = G | _], D, T) -> {ok, G};
 find_group([_ | Gs], D, T) -> find_group(Gs, D, T);
@@ -919,7 +1141,9 @@ get_chunk(Io, #vs{chunks = Cs} = Vs, Key) ->
             case io_head(Io, Key) of
                 {ok, Bin, Cond} ->
                     case decode_chunk_s(Bin) of
-                        {ok, Es} -> {ok, Es, rcond(Vs#vs{chunks = Cs#{Key => Es}}, Key, Cond)};
+                        {ok, Es} -> {ok, Es, rcond(Vs#vs{chunks = Cs#{Key => Es},
+                                                         ondisk = (Vs#vs.ondisk)#{Key => true}},
+                                                   Key, Cond)};
                         error    -> {error, {bad_adj_chunk, Key}}
                     end;
                 {absent, Cond} ->
@@ -940,6 +1164,161 @@ set_chunk(#vs{chunks = Cs, dirty = Dy, dels = Ds} = Vs, Key, Es) ->
 del_chunk(#vs{chunks = Cs, dirty = Dy, dels = Ds} = Vs, Key) ->
     Vs#vs{chunks = maps:remove(Key, Cs), dirty = maps:remove(Key, Dy), dels = Ds#{Key => true}}.
 
+%% ---- 目录树（布局 2）：会话内 ----
+%% 节点按 key 缓存在 #vs.nodes（key → 下界表二进制）；改过的进 ndirty、要删的进 ndels、
+%% 读到时盘上有的进 ondisk。直通模式读到的版本进 rconds（与块同一张表，提交时作条件）。
+
+%% {ok, LbsBin, Vs'} | {error, _}。读不到 ⇒ 标 stale，按只有 (0,0) 一项继续算（结果不会提交）。
+get_node(Io, #vs{nodes = Ns} = Vs, Key, Level) ->
+    case maps:find(Key, Ns) of
+        {ok, Lbs} -> {ok, Lbs, Vs};
+        error ->
+            case read_node(Io, Key, Level) of
+                {ok, Lbs, Cond} ->
+                    {ok, Lbs, rcond(Vs#vs{nodes = Ns#{Key => Lbs},
+                                          ondisk = (Vs#vs.ondisk)#{Key => true}}, Key, Cond)};
+                {absent, _} ->
+                    {ok, <<0:128>>, Vs#vs{stale = true}};
+                {error, _} = E ->
+                    E
+            end
+    end.
+
+set_node(#vs{nodes = Ns, ndirty = Dy, ndels = Ds} = Vs, Key, Lbs) ->
+    Vs#vs{nodes = Ns#{Key => Lbs}, ndirty = Dy#{Key => true}, ndels = maps:remove(Key, Ds)}.
+
+del_node(#vs{nodes = Ns, ndirty = Dy, ndels = Ds} = Vs, Key) ->
+    Vs#vs{nodes = maps:remove(Key, Ns), ndirty = maps:remove(Key, Dy), ndels = Ds#{Key => true}}.
+
+%% 沿树走到 Key 所在的块：{ok, Path, 块下界, Vs'} | {error, _}。
+%% Path = [{Level, 节点下界}]，自第 1 层往上到根（逆序，便于自底向上改）。
+xwalk(Io, Vs, Vid, D, T, Levels, Key) ->
+    xwalk(Io, Vs, Vid, D, T, Levels, ?LB0, Key, []).
+
+xwalk(Io, Vs, Vid, D, T, Level, Nlb, Key, Path) ->
+    case get_node(Io, Vs, dir_node_key(Vid, D, T, Level, Nlb), Level) of
+        {error, _} = E -> E;
+        {ok, Lbs, Vs1} ->
+            C = locate_lb(Lbs, Key),
+            Path1 = [{Level, Nlb} | Path],
+            case Level of
+                1 -> {ok, Path1, C, Vs1};
+                _ -> xwalk(Io, Vs1, Vid, D, T, Level - 1, C, Key, Path1)
+            end
+    end.
+
+%% 整棵树：{ok, 全部块下界（二进制，有序）, 全部节点 key, Vs'} | {error, _}。
+xall(Io, Vs, Vid, D, T, Levels) ->
+    xall(Io, Vs, Vid, D, T, Levels, <<0:128>>, []).
+
+xall(Io, Vs0, Vid, D, T, Level, Nlbs, Keys0) ->
+    Res = lists:foldl(
+            fun(_, {error, _} = E) -> E;
+               (Nlb, {ok, Acc, Keys, Vs}) ->
+                    K = dir_node_key(Vid, D, T, Level, Nlb),
+                    case get_node(Io, Vs, K, Level) of
+                        {ok, Lbs, Vs1} -> {ok, [Lbs | Acc], [K | Keys], Vs1};
+                        {error, _} = E -> E
+                    end
+            end, {ok, [], Keys0, Vs0}, dir_lbs(Nlbs)),
+    case Res of
+        {error, _} = E -> E;
+        {ok, Parts, Keys, Vs} ->
+            Children = iolist_to_binary(lists:reverse(Parts)),
+            case Level of
+                1 -> {ok, Children, Keys, Vs};
+                _ -> xall(Io, Vs, Vid, D, T, Level - 1, Children, Keys)
+            end
+    end.
+
+%% 第 1 层节点（Path 的头）换成 Lbs1，自底向上处理溢出：超过 dir_node_max 对半分裂、
+%% 右半的下界登记进上一层；根分裂 ⇒ 新根在上一层（下界 (0,0)），层数加一。→ {Levels', Vs'}
+xput_path(Vs, Vid, D, T, Levels, [{Level, Nlb} | Up], Lbs, #{dir_node_max := Max} = Cfg) ->
+    K = dir_node_key(Vid, D, T, Level, Nlb),
+    case lb_count(Lbs) =< Max of
+        true ->
+            {Levels, set_node(Vs, K, Lbs)};
+        false ->
+            Half = (lb_count(Lbs) + 1) div 2,
+            <<Left:(Half * 16)/binary, Right/binary>> = Lbs,
+            Rlb = lb_first(Right),
+            Vs1 = set_node(set_node(Vs, K, Left), dir_node_key(Vid, D, T, Level, Rlb), Right),
+            case Up of
+                [] ->
+                    {Levels + 1, set_node(Vs1, dir_node_key(Vid, D, T, Level + 1, ?LB0),
+                                          <<0:128, (element(1, Rlb)):64/big,
+                                            (element(2, Rlb)):64/big>>)};
+                [{PLevel, PNlb} | _] ->
+                    PLbs = maps:get(dir_node_key(Vid, D, T, PLevel, PNlb), Vs1#vs.nodes),
+                    xput_path(Vs1, Vid, D, T, Levels, Up, lb_insert(PLbs, Rlb), Cfg)
+            end
+    end.
+
+%% 全部块下界（二进制）→ 新建一棵树（节点装满到 dir_node_max）→ {Levels, Vs'}。
+xbuild(Vs, Vid, D, T, Lbs, #{dir_node_max := Max}) ->
+    xbuild(Vs, Vid, D, T, 1, Lbs, Max).
+
+xbuild(Vs0, Vid, D, T, Level, Lbs, Max) ->
+    Parts = lb_parts(Lbs, Max * 16, []),
+    Vs = lists:foldl(fun(P, V) -> set_node(V, dir_node_key(Vid, D, T, Level, lb_first(P)), P) end,
+                     Vs0, Parts),
+    case Parts of
+        [_] -> {Level, Vs};
+        _   -> xbuild(Vs, Vid, D, T, Level + 1,
+                      << <<(element(1, lb_first(P))):64/big, (element(2, lb_first(P))):64/big>>
+                         || P <- Parts >>, Max)
+    end.
+
+lb_parts(Bin, Sz, Acc) when byte_size(Bin) =< Sz -> lists:reverse([Bin | Acc]);
+lb_parts(Bin, Sz, Acc) ->
+    <<P:Sz/binary, Rest/binary>> = Bin,
+    lb_parts(Rest, Sz, [P | Acc]).
+
+%% 从 Path 的头那个节点里摘掉子项 X：
+%%   摘空 ⇒ 删这个节点、再从上一层摘掉它（最左一路的下界是 (0,0)，块 0 从不删，摘不到根）；
+%%   X 是首项 ⇒ 节点改名为新的首项（上一层跟着改，必要时继续往上）；否则就地改。
+xremove(Vs, Vid, D, T, [{Level, Nlb} | Up], X) ->
+    K = dir_node_key(Vid, D, T, Level, Nlb),
+    Lbs = lb_delete(maps:get(K, Vs#vs.nodes), X),
+    if
+        Lbs =:= <<>>, Up =/= [] ->
+            xremove(del_node(Vs, K), Vid, D, T, Up, Nlb);
+        Lbs =:= <<>> ->
+            set_node(Vs, K, Lbs);                     %% 不该发生（块 0 恒在）：留给不变式校验报
+        X =:= Nlb ->
+            New = lb_first(Lbs),
+            Vs1 = set_node(del_node(Vs, K), dir_node_key(Vid, D, T, Level, New), Lbs),
+            xrelabel(Vs1, Vid, D, T, Up, Nlb, New);
+        true ->
+            set_node(Vs, K, Lbs)
+    end.
+
+%% Path 的头那个节点里的子项 Old 改名为 New；Old 恰好是这个节点自己的下界 ⇒ 节点也改名，
+%% 继续往上。根的下界恒为 (0,0)，不会被改名。
+xrelabel(Vs, _Vid, _D, _T, [], _Old, _New) ->
+    Vs;
+xrelabel(Vs, Vid, D, T, [{Level, Nlb} | Up], Old, New) ->
+    K = dir_node_key(Vid, D, T, Level, Nlb),
+    Lbs = lb_replace(maps:get(K, Vs#vs.nodes), Old, New),
+    case Nlb =:= Old of
+        true  -> xrelabel(set_node(del_node(Vs, K), dir_node_key(Vid, D, T, Level, New), Lbs),
+                          Vid, D, T, Up, Old, New);
+        false -> set_node(Vs, K, Lbs)
+    end.
+
+%% 分块组里 (O, R) 所在块的下界：{ok, Lb, Vs'} | {error, _}。
+leaf_lb(_Io, Vs, _Vid, _D, _T, {chunks, Dirb}, Key) ->
+    {ok, locate_lb(Dirb, Key), Vs};
+leaf_lb(Io, Vs, Vid, D, T, {xdir, _N, Lv}, Key) ->
+    case xwalk(Io, Vs, Vid, D, T, Lv, Key) of
+        {ok, _Path, Lb, Vs1} -> {ok, Lb, Vs1};
+        {error, _} = E       -> E
+    end.
+
+%% 分块组的全部块下界（二进制）：{ok, Lbs, NodeKeys, Vs'} | {error, _}。
+group_lbs(_Io, Vs, _Vid, _D, _T, {chunks, Dirb}) -> {ok, Dirb, [], Vs};
+group_lbs(Io, Vs, Vid, D, T, {xdir, _N, Lv})     -> xall(Io, Vs, Vid, D, T, Lv).
+
 %% upsert：{ok, Old | none | same, Vs'} | {error, _}。
 %% same = 条目原样已在（同样的内联属性）：不改、不标脏（外置属性恒重写）。
 put_entry(Io, #vs{vid = Vid, groups = Gs} = Vs, Dir, T, O, R, P) ->
@@ -956,10 +1335,9 @@ put_entry(Io, #vs{vid = Vid, groups = Gs} = Vs, Dir, T, O, R, P) ->
                     G2 = G#grp{count = C + new(Old), body = {entries, Es2}},
                     {ok, Old, touch(Vs#vs{groups = store_group(Gs, G2)})}
             end;
-        {ok, #grp{count = C, flags = F, body = {chunks, Dirb}} = G} ->
-            Key = chunk_key(Vid, Dir, T, locate_lb(Dirb, {O, R})),
-            case get_chunk(Io, Vs, Key) of
-                {ok, Es, Vs1} ->
+        {ok, #grp{count = C, flags = F, body = Body} = G} ->
+            case leaf_chunk(Io, Vs, Vid, Dir, T, Body, {O, R}) of
+                {ok, Key, Es, Vs1} ->
                     case ent_put(Es, E) of
                         {P, _} when P =/= ext ->
                             {ok, same, Vs1};
@@ -975,6 +1353,19 @@ put_entry(Io, #vs{vid = Vid, groups = Gs} = Vs, Dir, T, O, R, P) ->
 
 new(none) -> 1;
 new(_)    -> 0.
+
+%% 分块组里 Key 所在的块：{ok, 块 key, 条目, Vs'} | {error, _}。
+leaf_chunk(Io, Vs, Vid, Dir, T, Body, Key) ->
+    case leaf_lb(Io, Vs, Vid, Dir, T, Body, Key) of
+        {ok, Lb, Vs1} ->
+            CK = chunk_key(Vid, Dir, T, Lb),
+            case get_chunk(Io, Vs1, CK) of
+                {ok, Es, Vs2}  -> {ok, CK, Es, Vs2};
+                {error, _} = E -> E
+            end;
+        {error, _} = E ->
+            E
+    end.
 
 %% {ok, Old | none, Vs'} | {error, _}；条目不存在时 Vs 不标脏。
 del_entry(Io, #vs{vid = Vid, groups = Gs} = Vs, Dir, T, O, R) ->
@@ -992,10 +1383,9 @@ del_entry(Io, #vs{vid = Vid, groups = Gs} = Vs, Dir, T, O, R) ->
                             {ok, Old, touch(Vs#vs{groups = store_group(Gs, G2)})}
                     end
             end;
-        {ok, #grp{count = C, body = {chunks, Dirb}} = G} ->
-            Key = chunk_key(Vid, Dir, T, locate_lb(Dirb, {O, R})),
-            case get_chunk(Io, Vs, Key) of
-                {ok, Es, Vs1} ->
+        {ok, #grp{count = C, body = Body} = G} ->
+            case leaf_chunk(Io, Vs, Vid, Dir, T, Body, {O, R}) of
+                {ok, Key, Es, Vs1} ->
                     case ent_del(Es, O, R) of
                         {none, _} -> {ok, none, Vs1};
                         {Old, Es2} ->
@@ -1025,11 +1415,16 @@ vs_first_groups(Io, Vs, Vid, [#grp{dir = D, etype = T, body = {entries, Es0}} | 
     Es = e_list(Es0),
     vs_first_groups(Io, Vs, Vid, Gs, Max, seen_others(Es, Vid, Seen),
                     [[{D, T, O, R, P} || {O, R, P} <- Es] | Acc]);
-vs_first_groups(Io, Vs, Vid, [#grp{dir = D, etype = T, body = {chunks, Dirb}} | Gs], Max, Seen, Acc) ->
-    case vs_first_chunks(Io, Vs, Vid, D, T, Dirb, Max, Seen, Acc) of
-        {more, Vs1, Seen1, Acc1} -> vs_first_groups(Io, Vs1, Vid, Gs, Max, Seen1, Acc1);
-        {stop, Vs1, Acc1}        -> {ok, lists:append(lists:reverse(Acc1)), false, Vs1};
-        {error, _} = E           -> E
+vs_first_groups(Io, Vs0, Vid, [#grp{dir = D, etype = T, body = Body} | Gs], Max, Seen, Acc) ->
+    %% 目录外置的组先把整棵树读进会话（节点数是块数的 1/256 量级），再逐块走
+    case group_lbs(Io, Vs0, Vid, D, T, Body) of
+        {error, _} = E -> E;
+        {ok, Dirb, _NKeys, Vs} ->
+            case vs_first_chunks(Io, Vs, Vid, D, T, Dirb, Max, Seen, Acc) of
+                {more, Vs1, Seen1, Acc1} -> vs_first_groups(Io, Vs1, Vid, Gs, Max, Seen1, Acc1);
+                {stop, Vs1, Acc1}        -> {ok, lists:append(lists:reverse(Acc1)), false, Vs1};
+                {error, _} = E           -> E
+            end
     end.
 
 vs_first_chunks(_Io, Vs, _Vid, _D, _T, <<>>, _Max, Seen, Acc) ->
@@ -1095,59 +1490,83 @@ finalize_1(Io, #vs{touched = false} = Vs, Cfg) ->
     case maps:size(Vs#vs.dirty) =/= 0 orelse maps:size(Vs#vs.dels) =/= 0 of
         false -> {ok, [], Vs};
         true  ->
-            case normalize_chunked(Vs, Cfg) of
-                #vs{dirty = Dy} = Vs1 when map_size(Dy) =:= 0, map_size(Vs1#vs.dels) =:= 0 ->
+            case normalize_chunked(Io, Vs, Cfg) of
+                {error, _} = E ->
+                    E;
+                {ok, #vs{dirty = Dy} = Vs1} when map_size(Dy) =:= 0, map_size(Vs1#vs.dels) =:= 0 ->
                     {ok, [], Vs1};
-                Vs1 ->
-                    Vs2 = Vs1#vs{touched = true},
-                    case unchunk_small(Io, Vs2, Cfg) of
-                        {error, _} = E -> E;
-                        {ok, Vs3} ->
-                            Vs4 = chunk_oversized(Vs3, Cfg),
-                            {ok, emit_ops(Vs4), Vs4}
-                    end
+                {ok, Vs1} ->
+                    finalize_2(Io, Vs1#vs{touched = true}, Cfg)
             end
     end;
 finalize_1(_Io, #vs{vid = Vid, groups = Gs}, _Cfg) when length(Gs) > 16#FFFF ->
     {error, {too_many_groups, Vid}};
 finalize_1(Io, Vs0, Cfg) ->
-    Vs1 = normalize_chunked(Vs0, Cfg),
+    case normalize_chunked(Io, Vs0, Cfg) of
+        {error, _} = E -> E;
+        {ok, Vs1}      -> finalize_2(Io, Vs1, Cfg)
+    end.
+
+%% 内联组 ⟷ 分块组、内联目录 ⟷ 外置目录的转换，然后生成 op。
+%% chunk_oversized 之后再 xrebalance 一次：新分块的组可能一上来就超过 dir_inline_max 块。
+finalize_2(Io, Vs1, Cfg) ->
     case unchunk_small(Io, Vs1, Cfg) of
         {error, _} = E -> E;
         {ok, Vs2} ->
-            Vs3 = chunk_oversized(Vs2, Cfg),
-            {ok, emit_ops(Vs3), Vs3}
+            case xrebalance(Io, Vs2, Cfg) of
+                {error, _} = E -> E;
+                {ok, Vs3} ->
+                    case xrebalance(Io, chunk_oversized(Vs3, Cfg), Cfg) of
+                        {error, _} = E -> E;
+                        {ok, Vs4}      -> {ok, emit_ops(Vs4), Vs4}
+                    end
+            end
     end.
 
-%% 分块组：脏块过大 → 分裂；空块（非块 0）→ 删；组空 → 删组与全部块。
-normalize_chunked(#vs{groups = Gs} = Vs0, Cfg) ->
-    lists:foldl(fun(#grp{body = {chunks, _}} = G, Vs) -> normalize_group(G, Vs, Cfg);
-                   (_, Vs) -> Vs
-                end, Vs0, Gs).
+%% 分块组：脏块过大 → 分裂；空块（非块 0）→ 删；组空 → 删组与全部块（与目录节点）。
+%% {ok, Vs'} | {error, _}
+normalize_chunked(Io, #vs{groups = Gs} = Vs0, Cfg) ->
+    lists:foldl(fun(_, {error, _} = E) -> E;
+                   (#grp{body = {entries, _}}, Acc) -> Acc;
+                   (G, {ok, Vs}) -> normalize_group(Io, G, Vs, Cfg)
+                end, {ok, Vs0}, Gs).
 
-normalize_group(#grp{dir = D, etype = T, count = 0, body = {chunks, Dirb}}, #vs{vid = Vid} = Vs, _Cfg) ->
+normalize_group(_Io, #grp{dir = D, etype = T, count = 0, body = {chunks, Dirb}},
+                #vs{vid = Vid} = Vs, _Cfg) ->
     Vs1 = lists:foldl(fun(Lb, A) -> del_chunk(A, chunk_key(Vid, D, T, Lb)) end, Vs, dir_lbs(Dirb)),
-    Vs1#vs{groups = drop_group(Vs1#vs.groups, D, T)};
-normalize_group(#grp{dir = D, etype = T, count = C, body = {chunks, Dirb}} = G,
+    {ok, Vs1#vs{groups = drop_group(Vs1#vs.groups, D, T)}};
+normalize_group(Io, #grp{dir = D, etype = T, count = 0, body = {xdir, _, Lv}},
+                #vs{vid = Vid} = Vs, _Cfg) ->
+    %% 整组删空：删全部块与全部目录节点。块按「目录 = 实际块」视为盘上已有。
+    case xall(Io, Vs, Vid, D, T, Lv) of
+        {error, _} = E -> E;
+        {ok, Lbs, NKeys, Vs1} ->
+            Vs2 = lists:foldl(fun(Lb, A) ->
+                                      K = chunk_key(Vid, D, T, Lb),
+                                      del_chunk(A#vs{ondisk = (A#vs.ondisk)#{K => true}}, K)
+                              end, Vs1, dir_lbs(Lbs)),
+            Vs3 = lists:foldl(fun(K, A) -> del_node(A, K) end, Vs2, NKeys),
+            {ok, Vs3#vs{groups = drop_group(Vs3#vs.groups, D, T)}}
+    end;
+normalize_group(Io, #grp{dir = D, etype = T, count = C, body = Body} = G,
                 #vs{vid = Vid} = Vs0, Cfg) ->
     %% 只看本组里改过的块（从 dirty 表反查），不遍历整个块目录；目录只在有块被删 /
-    %% 分裂时才展开重建——hub 上绝大多数写只改一两个块的内容，目录原样复用。
+    %% 分裂时才改——hub 上绝大多数写只改一两个块的内容，目录原样复用。
     Mine = lists:sort([Lb || K <- maps:keys(Vs0#vs.dirty),
                              {ok, V, D2, T2, Lb} <- [parse_chunk_key(K)],
                              V =:= Vid, D2 =:= D, T2 =:= T]),
-    Max = eff_chunk_max(C, Cfg),
-    {Changes, Vs2} =
+    {Removed, Added, Vs2} =
         lists:foldl(
-          fun(Lb, {Ch, Vs}) ->
+          fun(Lb, {Rm, Ad, Vs}) ->
                   Key = chunk_key(Vid, D, T, Lb),
                   Es = maps:get(Key, Vs#vs.chunks),
                   case e_empty(Es) andalso Lb =/= ?LB0 of
                       true ->
-                          {[{Lb, remove} | Ch], del_chunk(Vs, Key)};
+                          {[Lb | Rm], Ad, del_chunk(Vs, Key)};
                       false ->
-                          case split_balanced(Es, Max) of
+                          case split_chunk(Es, C, Cfg) of
                               [_] ->
-                                  {Ch, Vs};
+                                  {Rm, Ad, Vs};
                               [First | More] ->
                                   VsA = set_chunk(Vs, Key, First),
                                   {NewLbsR, VsB} =
@@ -1157,27 +1576,148 @@ normalize_group(#grp{dir = D, etype = T, count = C, body = {chunks, Dirb}} = G,
                                                 {[NLb | L],
                                                  set_chunk(VV, chunk_key(Vid, D, T, NLb), Piece)}
                                         end, {[], VsA}, More),
-                                  {[{Lb, {add, lists:reverse(NewLbsR)}} | Ch], VsB}
+                                  {Rm, [{Lb, lists:reverse(NewLbsR)} | Ad], VsB}
                           end
                   end
-          end, {[], Vs0}, Mine),
-    case Changes of
-        [] ->
-            Vs2;
-        _ ->
-            M = maps:from_list(Changes),
-            Lbs2 = lists:append([case maps:find(Lb, M) of
-                                     error            -> [Lb];
-                                     {ok, remove}     -> [];
-                                     {ok, {add, New}} -> [Lb | New]
+          end, {[], [], Vs0}, Mine),
+    case {Removed, Added, Body} of
+        {[], [], _} ->
+            {ok, Vs2};
+        {_, _, {chunks, Dirb}} ->
+            RmSet = maps:from_list([{Lb, true} || Lb <- Removed]),
+            AdMap = maps:from_list(Added),
+            Lbs2 = lists:append([case maps:is_key(Lb, RmSet) of
+                                     true  -> [];
+                                     false -> [Lb | maps:get(Lb, AdMap, [])]
                                  end || Lb <- dir_lbs(Dirb)]),
             G2 = G#grp{body = {chunks, lbs_dir(Lbs2)}},
-            Vs2#vs{groups = store_group(Vs2#vs.groups, G2)}
+            {ok, Vs2#vs{groups = store_group(Vs2#vs.groups, G2)}};
+        {_, _, {xdir, N, Lv}} ->
+            New = lists:sort(lists:append([L || {_, L} <- Added])),
+            case xdir_apply(Io, Vs2, Vid, D, T, Lv, lists:sort(Removed), New, Cfg) of
+                {error, _} = E -> E;
+                {ok, Lv2, Vs3} ->
+                    N2 = N + length(New) - length(Removed),
+                    G2 = G#grp{body = {xdir, N2, Lv2}},
+                    {ok, Vs3#vs{groups = store_group(Vs3#vs.groups, G2)}}
+            end
     end.
 
-%% 单块值上限：超大组放宽到 组字节 / 1024，让块目录保持在约 1024 项内（§4.3）。
+%% 外置目录上摘掉删掉的块、登记新块，最后根只剩一个子节点就降层：{ok, Levels', Vs'} | {error, _}。
+xdir_apply(Io, Vs0, Vid, D, T, Lv0, Removed, New, Cfg) ->
+    R1 = lists:foldl(
+           fun(_, {error, _} = E) -> E;
+              (Lb, {ok, Lv, Vs}) ->
+                   case xwalk(Io, Vs, Vid, D, T, Lv, Lb) of
+                       {ok, Path, _, Vs1} -> {ok, Lv, xremove(Vs1, Vid, D, T, Path, Lb)};
+                       {error, _} = E     -> E
+                   end
+           end, {ok, Lv0, Vs0}, Removed),
+    R2 = lists:foldl(
+           fun(_, {error, _} = E) -> E;
+              (Lb, {ok, Lv, Vs}) ->
+                   case xwalk(Io, Vs, Vid, D, T, Lv, Lb) of
+                       {ok, [{L1, N1} | _] = Path, _, Vs1} ->
+                           Lbs1 = maps:get(dir_node_key(Vid, D, T, L1, N1), Vs1#vs.nodes),
+                           {Lv2, Vs2} = xput_path(Vs1, Vid, D, T, Lv, Path, lb_insert(Lbs1, Lb), Cfg),
+                           {ok, Lv2, Vs2};
+                       {error, _} = E ->
+                           E
+                   end
+           end, R1, New),
+    case R2 of
+        {error, _} = E -> E;
+        {ok, Lv, Vs}   -> xshrink(Io, Vs, Vid, D, T, Lv)
+    end.
+
+xshrink(Io, Vs, Vid, D, T, Lv) when Lv > 1 ->
+    RK = dir_node_key(Vid, D, T, Lv, ?LB0),
+    case get_node(Io, Vs, RK, Lv) of
+        {error, _} = E -> E;
+        {ok, Lbs, Vs1} ->
+            case lb_count(Lbs) of
+                1 -> xshrink(Io, del_node(Vs1, RK), Vid, D, T, Lv - 1);
+                _ -> {ok, Lv, Vs1}
+            end
+    end;
+xshrink(_Io, Vs, _Vid, _D, _T, Lv) ->
+    {ok, Lv, Vs}.
+
+%% 布局 2：内联目录的块数超过 dir_inline_max ⇒ 外置成树；外置目录的块数降到
+%% dir_inline_max / 2 以下 ⇒ 转回内联（滞回）。{ok, Vs'} | {error, _}
+xrebalance(Io, #vs{groups = Gs} = Vs0, #{layout := 2, dir_inline_max := DI} = Cfg) ->
+    lists:foldl(
+      fun(_, {error, _} = E) -> E;
+         (#grp{dir = D, etype = T, body = {chunks, Dirb}} = G, {ok, #vs{vid = Vid} = Vs})
+           when byte_size(Dirb) > DI * 16 ->
+              {Lv, Vs1} = xbuild(Vs, Vid, D, T, Dirb, Cfg),
+              G2 = G#grp{body = {xdir, lb_count(Dirb), Lv}},
+              {ok, Vs1#vs{groups = store_group(Vs1#vs.groups, G2), henc = undefined}};
+         (#grp{dir = D, etype = T, body = {xdir, N, Lv}} = G, {ok, #vs{vid = Vid} = Vs})
+           when N < DI div 2 ->
+              case xall(Io, Vs, Vid, D, T, Lv) of
+                  {error, _} = E -> E;
+                  {ok, Lbs, NKeys, Vs1} ->
+                      Vs2 = lists:foldl(fun(K, A) -> del_node(A, K) end, Vs1, NKeys),
+                      G2 = G#grp{body = {chunks, Lbs}},
+                      {ok, Vs2#vs{groups = store_group(Vs2#vs.groups, G2), henc = undefined}}
+              end;
+         (_, Acc) ->
+              Acc
+      end, {ok, Vs0}, Gs);
+xrebalance(_Io, Vs, _Cfg) ->
+    {ok, Vs}.
+
+%% 单块值上限（布局 1）：超大组放宽到 组字节 / 1024，让块目录保持在约 1024 项内（§4.3）。
 eff_chunk_max(Count, #{chunk_max := CM}) ->
     max(CM, (Count * 8) div 1024).
+
+%% 布局 2 每块条数的有效上限：chunk_entries；组大到「块数安全阀 × 七成满」以上时随组放大
+%% （安全阀 0 = 不限）。
+eff_entries(Count, #{chunk_entries := E, chunk_count_max := M}) when M > 0 ->
+    max(E, ceil_div(Count * 10, M * 7));
+eff_entries(_Count, #{chunk_entries := E}) ->
+    E.
+
+ceil_div(A, B) -> (A + B - 1) div B.
+
+%% 已有块超限就切：布局 1 按字节（超大组放宽）；布局 2 条数 / 字节两个上限取先到的，
+%% 切成约等大的 k 片。没超 ⇒ [Es]（原样，二进制表不展开）。
+split_chunk(Es, Count, #{layout := 2, chunk_max := B} = Cfg) ->
+    E = eff_entries(Count, Cfg),
+    N = e_count(Es),
+    Size = 6 + e_bytes(Es),
+    case N =< E andalso Size =< B of
+        true  -> [Es];
+        false ->
+            K = lists:max([2, ceil_div(N, E), ceil_div(Size, B)]),
+            split_by(e_list(Es), ceil_div(N, K), B)
+    end;
+split_chunk(Es, Count, Cfg) ->
+    split_balanced(Es, eff_chunk_max(Count, Cfg)).
+
+%% 内联组转分块时的切片：布局 1 按字节装满；布局 2 按条数 / 字节装满。
+split_initial(Es, Count, #{layout := 2, chunk_max := B} = Cfg) ->
+    split_by(Es, eff_entries(Count, Cfg), B);
+split_initial(Es, Count, Cfg) ->
+    split_entries(Es, eff_chunk_max(Count, Cfg)).
+
+e_count({b, W, Bin, _}) -> byte_size(Bin) div W;
+e_count(Es)             -> length(e_list(Es)).
+
+%% 按条数与字节贪心切片（块头 6 B）：加上下一条会超过 MaxE 条或 MaxB 字节就切；每片至少一条。
+split_by(Es, MaxE, MaxB) ->
+    F = flags_of(Es),
+    split_by(Es, F, MaxE, MaxB, 6, 0, [], []).
+
+split_by([], _F, _ME, _MB, _Sz, _N, Cur, Acc) ->
+    lists:reverse([lists:reverse(Cur) | Acc]);
+split_by([E | Es], F, ME, MB, Sz, N, Cur, Acc) ->
+    ESz = entry_size(E, F),
+    case Cur =/= [] andalso (N >= ME orelse Sz + ESz > MB) of
+        true  -> split_by(Es, F, ME, MB, 6 + ESz, 1, [E], [lists:reverse(Cur) | Acc]);
+        false -> split_by(Es, F, ME, MB, Sz + ESz, N + 1, [E | Cur], Acc)
+    end.
 
 %% 已有块超限：切成 n = max(2, ⌈字节/Max⌉) 片、每片约等大（对半分裂的推广）。
 %% 只超一点点时就是对半分，随机插入下两半各有余量，不会下一条又分裂。
@@ -1209,29 +1749,34 @@ unchunk_small(Io, #vs{groups = Gs} = Vs0, #{inline_max := IM}) ->
     Thresh = IM div 4,
     lists:foldl(
       fun(_G, {error, _} = E) -> E;
-         (#grp{dir = D, etype = T, count = C, flags = F, body = {chunks, Dirb}} = G, {ok, Vs}) ->
+         (#grp{body = {entries, _}}, Acc) -> Acc;
+         (#grp{dir = D, etype = T, count = C, flags = F, body = Body} = G, {ok, Vs}) ->
               MinW = 8 + case F band ?F_RANK of 0 -> 0; _ -> 8 end
                        + case F band ?F_PROPS of 0 -> 0; _ -> 2 end,
               case C * MinW < Thresh of
                   false -> {ok, Vs};
-                  true ->
-                      case load_group_chunks(Io, Vs, Vs#vs.vid, D, T, Dirb) of
-                          {error, _} = E -> E;
-                          {ok, Es, Vs1} ->
-                              case body_size(Es) < Thresh of
-                                  false -> {ok, Vs1};
-                                  true ->
-                                      Vs2 = lists:foldl(
-                                              fun(Lb, A) ->
-                                                      del_chunk(A, chunk_key(Vs1#vs.vid, D, T, Lb))
-                                              end, Vs1, dir_lbs(Dirb)),
-                                      G2 = G#grp{flags = 0, body = {entries, Es}},
-                                      {ok, Vs2#vs{groups = store_group(Vs2#vs.groups, G2)}}
-                              end
-                      end
-              end;
-         (_, Acc) -> Acc
+                  true  -> unchunk_group(Io, Vs, G, D, T, Body, Thresh)
+              end
       end, {ok, Vs0}, Gs).
+
+unchunk_group(Io, #vs{vid = Vid} = Vs0, G, D, T, Body, Thresh) ->
+    case group_lbs(Io, Vs0, Vid, D, T, Body) of
+        {error, _} = E -> E;
+        {ok, Lbs, NKeys, Vs} ->
+            case load_group_chunks(Io, Vs, Vid, D, T, Lbs) of
+                {error, _} = E -> E;
+                {ok, Es, Vs1} ->
+                    case body_size(Es) < Thresh of
+                        false -> {ok, Vs1};
+                        true ->
+                            Vs2 = lists:foldl(fun(Lb, A) -> del_chunk(A, chunk_key(Vid, D, T, Lb)) end,
+                                              Vs1, dir_lbs(Lbs)),
+                            Vs3 = lists:foldl(fun(K, A) -> del_node(A, K) end, Vs2, NKeys),
+                            G2 = G#grp{flags = 0, body = {entries, Es}},
+                            {ok, Vs3#vs{groups = store_group(Vs3#vs.groups, G2), henc = undefined}}
+                    end
+            end
+    end.
 
 %% 头超过 inline_max → 把最大的内联组转为分块，直到放得下或没有可转的组
 %% （只转体积 > inline_max / 4 的组，与 unchunk_small 的门槛构成滞回）。
@@ -1253,7 +1798,7 @@ chunk_oversized(#vs{groups = Gs} = Vs, #{inline_max := IM} = Cfg) ->
     end.
 
 chunkify(#vs{vid = Vid} = Vs0, #grp{dir = D, etype = T, count = C, body = {entries, Es}} = G, Cfg) ->
-    [First | More] = split_entries(Es, eff_chunk_max(C, Cfg)),
+    [First | More] = split_initial(Es, C, Cfg),
     Vs1 = set_chunk(Vs0, chunk_key(Vid, D, T, ?LB0), First),
     {Lbs, Vs2} = lists:foldl(fun([{O, R, _} | _] = Piece, {L, V}) ->
                                      {[{O, R} | L], set_chunk(V, chunk_key(Vid, D, T, {O, R}), Piece)}
@@ -1261,9 +1806,10 @@ chunkify(#vs{vid = Vid} = Vs0, #grp{dir = D, etype = T, count = C, body = {entri
     G2 = G#grp{flags = flags_of(Es), body = {chunks, lbs_dir([?LB0 | lists:reverse(Lbs)])}},
     Vs2#vs{groups = store_group(Vs2#vs.groups, G2)}.
 
-%% 头 op（带条件）+ 块删除 + 块写入 + p 家族 op。
+%% 头 op（带条件）+ 块删除 + 块写入 + 目录节点删除 / 写入 + p 家族 op。
 emit_ops(#vs{vid = Vid, hcond = Cond, existed = Existed, groups = Gs, henc = HEnc,
-             chunks = Cs, dirty = Dy, dels = Ds, orig = Orig, extra = Extra, rconds = RC}) ->
+             chunks = Cs, dirty = Dy, dels = Ds, orig = Orig, extra = Extra, rconds = RC,
+             nodes = Ns, ndirty = NDy, ndels = NDs, ondisk = OD}) ->
     HK = head_key(Vid),
     HeadOps = case Gs of
                   [] when Existed -> [cond_op({remove, HK}, Cond)];
@@ -1274,30 +1820,38 @@ emit_ops(#vs{vid = Vid, hcond = Cond, existed = Existed, groups = Gs, henc = HEn
     %% 本次会话里新建又删掉的块从没落过盘，不发删除（否则白写一条墓碑）。
     %% 读过的块带读到时的版本作条件；读过没改的块发 check（读集校验，见不变式 2）。
     %% 盘上已有的块集合只在真有块要删时才算：hub 的头有上千个块，每次读头都建这张
-    %% 表曾占 degree / edge / put_edge 约 3/4 的 CPU。
+    %% 表曾占 degree / edge / put_edge 约 3/4 的 CPU。外置目录的块不在 orig 的头里，
+    %% 靠 ondisk（读到过 / 整组拆除时按不变式记下）判断。
     Dels = case map_size(Ds) of
                0 -> [];
                _ ->
                    OnDisk = chunk_keys_of(Vid, Orig),
                    [chunk_op({remove, K}, RC) || K <- lists:sort(maps:keys(Ds)),
-                                                 maps:is_key(K, OnDisk)]
+                                                 maps:is_key(K, OnDisk) orelse maps:is_key(K, OD)]
            end,
     Puts = [chunk_op({put, K, encode_chunk(maps:get(K, Cs))}, RC)
             || K <- lists:sort(maps:keys(Dy))],
-    HeadOps ++ Dels ++ Puts ++ read_checks(RC, Dy, Ds) ++ lists:reverse(Extra).
+    NDels = [chunk_op({remove, K}, RC) || K <- lists:sort(maps:keys(NDs)), maps:is_key(K, OD)],
+    NPuts = [chunk_op({put, K, encode_node(node_level(K), maps:get(K, Ns))}, RC)
+             || K <- lists:sort(maps:keys(NDy))],
+    HeadOps ++ Dels ++ Puts ++ NDels ++ NPuts
+        ++ read_checks(RC, [Dy, Ds, NDy, NDs]) ++ lists:reverse(Extra).
+
+node_level(K) -> {ok, _, _, _, Lv, _} = parse_dir_node_key(K), Lv.
 
 chunk_op({put, K, _} = Op, RC) ->
     case maps:find(K, RC) of {ok, C} -> cond_op(Op, C); error -> Op end;
 chunk_op({remove, K} = Op, RC) ->
     case maps:find(K, RC) of {ok, C} -> cond_op(Op, C); error -> Op end.
 
-read_checks(RC, Dy, Ds) ->
+%% 读过、没改的块 / 目录节点：发 check。
+read_checks(RC, Written) ->
     [{check, K, C} || {K, C} <- lists:sort(maps:to_list(RC)),
-                      not maps:is_key(K, Dy), not maps:is_key(K, Ds)].
+                      not lists:any(fun(M) -> maps:is_key(K, M) end, Written)].
 
-%% 会话读过但不改的顶点：头 + 读过的块都发 check（它们参与了这次的决定）。
-guard_ops(#vs{vid = Vid, hcond = HC, rconds = RC, dirty = Dy, dels = Ds}) ->
-    [{check, head_key(Vid), HC} || HC =/= txn] ++ read_checks(RC, Dy, Ds).
+%% 会话读过但不改的顶点：头 + 读过的块 / 节点都发 check（它们参与了这次的决定）。
+guard_ops(#vs{vid = Vid, hcond = HC, rconds = RC, dirty = Dy, dels = Ds, ndirty = NDy, ndels = NDs}) ->
+    [{check, head_key(Vid), HC} || HC =/= txn] ++ read_checks(RC, [Dy, Ds, NDy, NDs]).
 
 cond_op(Op, txn) -> Op;
 cond_op({put, K, V}, Cond) -> {put, K, V, Cond};
@@ -1402,7 +1956,18 @@ first_entries(S0, Vid, MaxOthers) ->
 %% 也可以带额外 op（如 del_vertex 的顶点键删除）：commit/2。
 commit(S) -> commit(S, []).
 
-commit(#sess{io = Io, cfg = Cfg, vs = M}, ExtraOps) ->
+commit(#sess{io = Io, vs = M} = S, ExtraOps) ->
+    case lists:any(fun(#vs{stale = St}) -> St end, maps:values(M)) of
+        true  -> stale_conflict(Io);
+        false -> commit_1(S, ExtraOps)
+    end.
+
+%% 读目录树时遇到缺失的节点：读头之后有人改过这个顶点，这次算出来的东西不能用。
+%% 直通 ⇒ conflict（调用方重来）；事务 ⇒ 走 bitcask_txn 的重启路径（同版本守卫失败）。
+stale_conflict({direct, _}) -> conflict;
+stale_conflict({txn, _, _}) -> throw({bitcask_txn_restart, {conflict, stale_adj_dir}}).
+
+commit_1(#sess{io = Io, cfg = Cfg, vs = M}, ExtraOps) ->
     Res = lists:foldl(fun(_V, {error, _} = E) -> E;
                          ({_Vid, Vs}, {ok, Acc, Guards}) ->
                               case finalize(Io, Vs, Cfg) of
@@ -1439,7 +2004,8 @@ build_vertex(Vid, {Out, In}, #{props_max := PM} = Cfg) ->
     InEs = [{1, T, {S, R, <<>>}} || {T, S, R} <- In],
     Gs = to_groups(OutEs ++ InEs),
     Vs0 = #vs{vid = Vid, hcond = absent, groups = Gs, touched = true},
-    Vs = chunk_oversized(Vs0, Cfg),
+    %% 新顶点只会「内联目录 → 外置」，不读盘（Io 用不到）
+    {ok, Vs} = xrebalance(none, chunk_oversized(Vs0, Cfg), Cfg),
     Ops = case Gs of [] -> []; _ -> emit_ops(Vs) end,
     NChunks = map_size(Vs#vs.dirty),
     {[strip_cond(Op) || Op <- Ops] ++ PutsP, NChunks}.
@@ -1485,7 +2051,7 @@ inline_out_lim([{_D, _T, F, C, {inline, Body}} | Sel], Limit, Acc) ->
         {ok, L} -> inline_out_lim(Sel, Limit - length(L), [L | Acc]);
         error   -> error
     end;
-inline_out_lim([{_D, _T, _F, _C, {chunks, _}} | Sel], Limit, Acc) ->
+inline_out_lim([{_D, _T, _F, _C, _Chunked} | Sel], Limit, Acc) ->
     inline_out_lim(Sel, Limit, Acc).
 
 %% 条目区（Count 条）的前 min(Count, Limit) 条，raw 形态 {O, R, P}。
@@ -1520,18 +2086,60 @@ inline_out_1([{_D, T, F, C, {inline, Body}} | Sel], Mode, Acc) ->
         {ok, L} -> inline_out_1(Sel, Mode, [L | Acc]);
         error   -> error
     end;
-inline_out_1([{_D, _T, _F, _C, {chunks, _}} | Sel], Mode, Acc) ->
+inline_out_1([{_D, _T, _F, _C, _Chunked} | Sel], Mode, Acc) ->
     inline_out_1(Sel, Mode, Acc).
 
 chunk_ids(<<?VER:8, F:8, C:32/big, Body/binary>>) -> dec_body(ids, 0, F, C, Body);
 chunk_ids(_)                                      -> error.
 
-%% 头 binary → [{Dir, Etype, Count, {entries, [Entry]} | {chunks, [Lb]}}]
+%% 全库校验用：核对一棵目录树。Nodes = 扫 `d` 家族得到的
+%% #{{Vid, Dir, Etype, Level, Lb} => {ok, Level, LbsBin} | error}。
+%% → {全部块下界（列表，按树序）, 用到的节点 key 列表, Problems}：节点在、解得开、层号对、
+%% 首项 = 节点下界、块下界整体严格升序、第 1 层项数之和 = 头里记的块数 N。
+xdir_check(Nodes, {Vid, D, T}, {N, Lv}) ->
+    {Lbs, Used, Bad} = xdir_check_level(Nodes, Vid, D, T, Lv, [?LB0], [], []),
+    Order = case lbs_ascending(lbs_dir(Lbs)) of
+                true  -> [];
+                false -> [{dir_order, Vid, D, T}]
+            end,
+    Cnt = case length(Lbs) =:= N of
+              true  -> [];
+              false -> [{dir_chunk_count, Vid, D, T, N, length(Lbs)}]
+          end,
+    {Lbs, Used, Bad ++ Order ++ Cnt}.
+
+xdir_check_level(Nodes, Vid, D, T, Level, Nlbs, Used0, Bad0) ->
+    {ChildrenR, Used, Bad} =
+        lists:foldl(
+          fun(Nlb, {Acc, U, B}) ->
+                  K = {Vid, D, T, Level, Nlb},
+                  case maps:find(K, Nodes) of
+                      error ->
+                          {Acc, U, [{missing_dir_node, K} | B]};
+                      {ok, error} ->
+                          {Acc, [K | U], [{bad_dir_node, K} | B]};
+                      {ok, {ok, L, Bin}} ->
+                          Cl = dir_lbs(Bin),
+                          B2 = if L =/= Level -> [{dir_node_level, K, L} | B];
+                                  hd(Cl) =/= Nlb -> [{dir_node_bound, K} | B];
+                                  true -> B
+                               end,
+                          {lists:reverse(Cl, Acc), [K | U], B2}
+                  end
+          end, {[], Used0, Bad0}, Nlbs),
+    Children = lists:reverse(ChildrenR),
+    case Level of
+        1 -> {Children, Used, Bad};
+        _ -> xdir_check_level(Nodes, Vid, D, T, Level - 1, Children, Used, Bad)
+    end.
+
+%% 头 binary → [{Dir, Etype, Count, {entries, [Entry]} | {chunks, [Lb]} | {xdir, N, Levels}}]
 groups_info(Bin) ->
     case decode_head(Bin) of
         {ok, Gs} ->
             {ok, [{D, T, C, case B of
                                 {chunks, Dir} -> {chunks, dir_lbs(Dir)};
+                                {xdir, N, Lv} -> {xdir, N, Lv};
                                 {entries, Es} -> {entries, e_list(Es)}
                             end} || #grp{dir = D, etype = T, count = C, body = B} <- Gs]};
         error ->

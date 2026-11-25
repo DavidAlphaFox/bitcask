@@ -68,18 +68,22 @@
 %%   * 多跳遍历跨跳弱一致，与 v1 相同。
 %%
 %% === 布局版本 ===
-%%   open 时：有新 `g` 且版本 1 → 用它记下的参数；没有新 `g` 但有旧无前缀 `g` →
+%%   open 时：有新 `g`（版本 1 或 2）→ 用它记下的参数；没有新 `g` 但有旧无前缀 `g` →
 %%   {error, graph_layout_unprefixed_v2}；有 v1 的 `e` 家族 →
 %%   {error, graph_layout_v1}（不提供自动迁移）；都没有
-%%   且可写 → 写新 `g`。分块参数只在建库时生效（之后以 `g` 为准）：
+%%   且可写 → 写新 `g`（缺省布局 2）。分块参数只在建库时生效（之后以 `g` 为准）：
+%%     {adj_layout, 1 | 2}    布局（默认 2；1 = 块目录总在头里，旧程序也能开）
 %%     {adj_inline_max, N}    头超过 N 字节就把最大的组分块（默认 4096）
-%%     {adj_chunk_max, N}     单块上限（默认 4096）
+%%     {adj_chunk_max, N}     单块字节上限（布局 1 默认 4096；布局 2 是安全上限，默认 65536）
 %%     {props_inline_max, N}  边属性超过 N 字节落 p 家族（默认 128）
+%%   布局 2 另有 adj_chunk_entries（每块条数，默认 512）、adj_chunk_count_max（每组块数
+%%   安全阀，默认 65536，0 = 不限）、adj_dir_inline_max（默认 16）、adj_dir_node_max（默认 256）。
+%%   布局 1 的库用 upgrade_layout/2 单向升级到布局 2（只改 `g`，数据碰到再转）。
 %% =========================================================================
 -module(graphdb).
 
 -export([create_index/3, drop_index/3, indexes/1]).
--export([open/1, open/2, close/1, graph_config/1,
+-export([open/1, open/2, close/1, graph_config/1, upgrade_layout/2,
 
          nkey/1, akey/1, pkey/4, succ/1,
 
@@ -149,6 +153,7 @@ open(Dir) -> open(Dir, []).
 
 open(Dir, Opts) when is_list(Opts) ->
     {GOpts, BOpts} = lists:partition(fun is_graph_opt/1, Opts),
+    _ = cfg_from_opts(GOpts),                 %% 参数不对先报 badarg，别等打开库之后（句柄会泄漏）
     case bitcask:open(Dir, BOpts) of
         {error, _} = E -> E;
         H ->
@@ -161,7 +166,8 @@ open(Dir, Opts) when is_list(Opts) ->
 close(Handle) ->
     bitcask:close(Handle).
 
-%% 本句柄生效的图参数（#{inline_max, chunk_max, props_max}）。
+%% 本句柄生效的图参数：#{layout => 1 | 2, inline_max, chunk_max, props_max}，布局 2 另有
+%% chunk_entries / chunk_count_max / dir_inline_max / dir_node_max（见 open/2 的选项）。
 graph_config(Handle) -> cfg(Handle).
 
 %% 属性索引（二期）：按 (标签, 属性) 声明。声明后立刻从现有数据建好，之后所有改顶点的写入同批
@@ -184,8 +190,45 @@ drop_index(Handle, Label, Prop) when is_binary(Label), is_binary(Prop) ->
 -spec indexes(handle()) -> {ok, [{binary(), binary(), building | ready}]} | {error, term()}.
 indexes(Handle) -> graphdb_model:list_indexes(Handle).
 
-is_graph_opt({K, _}) -> lists:member(K, [adj_inline_max, adj_chunk_max, props_inline_max]);
+-define(GRAPH_OPTS, [adj_layout, adj_inline_max, adj_chunk_max, props_inline_max,
+                     adj_chunk_entries, adj_chunk_count_max, adj_dir_inline_max, adj_dir_node_max]).
+
+is_graph_opt({K, _}) -> lists:member(K, ?GRAPH_OPTS);
 is_graph_opt(_)      -> false.
+
+%% 布局 1 的库升级到布局 2：只改写 `g`（带版本条件），数据不整库重写——之后被写到的组
+%% 按布局 2 的规则逐个转换（块目录超过 dir_inline_max 外置、超限的块按条数切）；读不依赖
+%% 已经转完。Opts 是布局 2 那几个图参数（同 open/2：adj_chunk_entries、adj_chunk_max、
+%% adj_chunk_count_max、adj_dir_inline_max、adj_dir_node_max；不给 ⇒ 缺省）；inline_max /
+%% props_max 沿用库里的。单向：升级后旧版本的程序拒开（布局版本不认得）。
+%% 已是布局 2 ⇒ 不写、回现有参数。{ok, Cfg} | {error, _}
+-spec upgrade_layout(handle(), [{atom(), term()}]) -> {ok, map()} | {error, term()}.
+upgrade_layout(Handle, Opts) when is_list(Opts) ->
+    case bitcask:get_with_ord(Handle, graphdb_adj:gkey()) of
+        {ok, V, Ord} ->
+            case graphdb_adj:decode_cfg(vbin(V)) of
+                {ok, #{layout := 2} = Cur} ->
+                    {ok, Cur};
+                {ok, #{inline_max := I, props_max := P}} ->
+                    Cfg = cfg_from_opts([{adj_inline_max, I}, {props_inline_max, P}]
+                                        ++ [O || {K, _} = O <- Opts, K =/= adj_layout,
+                                                 lists:member(K, ?GRAPH_OPTS)]
+                                        ++ [{adj_layout, 2}]),
+                    case bitcask:put_batch_atomic(Handle, [{put, graphdb_adj:gkey(),
+                                                            graphdb_adj:encode_cfg(Cfg),
+                                                            {ord, Ord}}]) of
+                        ok                     -> {ok, Cfg};
+                        {error, {conflict, _}} -> upgrade_layout(Handle, Opts);
+                        Other                  -> normalize_error(Other)
+                    end;
+                {error, _} = E ->
+                    E
+            end;
+        not_found ->
+            {ok, cfg(Handle)};
+        Other ->
+            normalize_error(Other)
+    end.
 
 init_layout(H, GOpts, RW) ->
     case bitcask:get(H, graphdb_adj:gkey()) of
@@ -216,18 +259,34 @@ init_layout(H, GOpts, RW) ->
             normalize_error(Other)
     end.
 
+%% 图参数：adj_layout（2 缺省；1 = 块目录总在头里的旧布局）、adj_inline_max、adj_chunk_max
+%% （布局 1：单块字节上限，缺省 4096；布局 2：单块字节安全上限，缺省 65536）、props_inline_max；
+%% 布局 2 另有 adj_chunk_entries（每块最多多少条，缺省 512）、adj_chunk_count_max（每组块数
+%% 安全阀，缺省 65536，0 = 不限）、adj_dir_inline_max（块数超过它目录外置，缺省 16）、
+%% adj_dir_node_max（目录节点最多多少项，缺省 256）。
 cfg_from_opts(GOpts) ->
-    D = graphdb_adj:default_cfg(),
-    I = proplists:get_value(adj_inline_max, GOpts, maps:get(inline_max, D)),
-    C = proplists:get_value(adj_chunk_max, GOpts, maps:get(chunk_max, D)),
-    P = proplists:get_value(props_inline_max, GOpts, maps:get(props_max, D)),
-    true = (is_integer(I) andalso I >= 64 andalso I < 1 bsl 32)
-        orelse erlang:error({badarg, {adj_inline_max, I}}),
-    true = (is_integer(C) andalso C >= 64 andalso C < 1 bsl 32)
-        orelse erlang:error({badarg, {adj_chunk_max, C}}),
-    true = (is_integer(P) andalso P >= 0 andalso P < 16#FFFF)
-        orelse erlang:error({badarg, {props_inline_max, P}}),
-    #{inline_max => I, chunk_max => C, props_max => P}.
+    Layout = proplists:get_value(adj_layout, GOpts, 2),
+    D = case Layout of
+            1 -> graphdb_adj:layout1_cfg();
+            2 -> graphdb_adj:default_cfg();
+            _ -> erlang:error({badarg, {adj_layout, Layout}})
+        end,
+    Spec = [{inline_max, adj_inline_max, 64, 1 bsl 32 - 1},
+            {chunk_max, adj_chunk_max, 64, 1 bsl 32 - 1},
+            {props_max, props_inline_max, 0, 16#FFFE}]
+        ++ case Layout of
+               2 -> [{chunk_entries, adj_chunk_entries, 2, 1 bsl 32 - 1},
+                     {chunk_count_max, adj_chunk_count_max, 0, 1 bsl 32 - 1},
+                     {dir_inline_max, adj_dir_inline_max, 2, 16#FFFF},
+                     {dir_node_max, adj_dir_node_max, 4, 16#FFFF}];
+               1 -> []
+           end,
+    lists:foldl(fun({K, Opt, Lo, Hi}, Acc) ->
+                        V = proplists:get_value(Opt, GOpts, maps:get(K, D)),
+                        true = (is_integer(V) andalso V >= Lo andalso V =< Hi)
+                            orelse erlang:error({badarg, {Opt, V}}),
+                        Acc#{K => V}
+                end, #{layout => Layout}, Spec).
 
 %% 图参数随用随读 `g` 键（每次写会话一次点查，不进任何进程外缓存——句柄不论经
 %% graphdb:close 还是 bitcask:close 关掉都不留残留）。没有 `g`（只读打开的空目录、
@@ -1086,8 +1145,10 @@ neighbors_where(Handle, Vid, Dir, Pred) when is_function(Pred, 2) ->
     end.
 
 %% =========================================================================
-%% 全图不变式校验（§4.5）：扫 `a` / `p` 家族，检查
+%% 全图不变式校验（§4.5）：扫 `a` / `p` / `d` 家族，检查
 %%   * 头 / 块可解码；块目录与实际块 key 一致；块内条目落在自己的下界区间；
+%%   * 目录外置的组（布局 2）：目录树的节点都在、层号与首项对、块下界严格升序、
+%%     块数与头里记的一致；`d` 家族没有走不到的节点；
 %%   * 每组 Count = 实际条目数；
 %%   * 对称：出边集合 = 入边集合；
 %%   * 外置属性：标 ext 的出边 ⟺ 有 p 键；
@@ -1116,17 +1177,31 @@ check_invariants(Handle) ->
                     [{S, T, D, R} | Acc];
                (_, _, _, _, Acc) -> Acc
             end,
+    %% 目录节点（布局 2）：{Vid, Dir, Etype, Level, Lb} => {ok, Level, LbsBin} | error
+    DScan = fun(K, V, _T, _O, {Ns, Bad}) ->
+                    case graphdb_adj:parse_dir_node_key(K) of
+                        {ok, Vid, D, T, Lv, Lb} ->
+                            {Ns#{{Vid, D, T, Lv, Lb} => graphdb_adj:decode_node(vbin(V))}, Bad};
+                        skip ->
+                            {Ns, [{bad_dir_key, K} | Bad]}
+                    end
+            end,
     case {bitcask:range_fold(Handle, graphdb_adj:range(<<"a">>), [],
                              Scan, {#{}, #{}, []}),
           bitcask:range_fold(Handle, graphdb_adj:range(<<"p">>), [],
-                             PScan, [])} of
-        {{error, _} = E, _} -> E;
-        {_, {error, _} = E} -> E;
-        {{Heads, Chunks, Bad0}, PKeys} ->
+                             PScan, []),
+          bitcask:range_fold(Handle, graphdb_adj:range(<<"d">>), [],
+                             DScan, {#{}, []})} of
+        {{error, _} = E, _, _} -> E;
+        {_, {error, _} = E, _} -> E;
+        {_, _, {error, _} = E} -> E;
+        {{Heads, Chunks, Bad00}, PKeys, {Nodes, DBad}} ->
+            Bad0 = DBad ++ Bad00,
             {Out, In, Bad1, Used} =
-                maps:fold(fun(Vid, Gs, Acc) -> check_vertex(Vid, Gs, Chunks, Acc) end,
+                maps:fold(fun(Vid, Gs, Acc) -> check_vertex(Vid, Gs, Chunks, Nodes, Acc) end,
                           {[], [], Bad0, #{}}, Heads),
-            Orphans = [{orphan_chunk, K} || K <- maps:keys(Chunks), not maps:is_key(K, Used)],
+            Orphans = [{orphan_chunk, K} || K <- maps:keys(Chunks), not maps:is_key(K, Used)]
+                ++ [{orphan_dir_node, K} || K <- maps:keys(Nodes), not maps:is_key(K, Used)],
             OutSet = lists:sort([{S, T, D, R} || {S, T, D, R, _} <- Out]),
             InSet = lists:sort(In),
             Sym = case OutSet =:= InSet of
@@ -1187,13 +1262,18 @@ model_problems(Handle, Heads) ->
             Labels ++ Ctr
     end.
 
-check_vertex(Vid, Gs, Chunks, Acc0) ->
+check_vertex(Vid, Gs, Chunks, Nodes, Acc0) ->
     lists:foldl(
       fun({D, T, C, Body}, {Out, In, Bad, Used}) ->
               {Es, Bad2, Used2} =
                   case Body of
                       {entries, L} -> {L, Bad, Used};
-                      {chunks, Lbs} -> chunk_entries(Vid, D, T, Lbs, Chunks, Bad, Used)
+                      {chunks, Lbs} -> chunk_entries(Vid, D, T, Lbs, Chunks, Bad, Used);
+                      {xdir, N, Lv} ->
+                          %% 目录外置：自根走一遍树（第 4、5 条不变式），再按块核对
+                          {Lbs, UsedN, DProbs} = graphdb_adj:xdir_check(Nodes, {Vid, D, T}, {N, Lv}),
+                          UsedX = lists:foldl(fun(K, U) -> U#{K => true} end, Used, UsedN),
+                          chunk_entries(Vid, D, T, Lbs, Chunks, DProbs ++ Bad, UsedX)
                   end,
               Bad3 = case length(Es) =:= C of
                          true  -> Bad2;

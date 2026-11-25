@@ -6,6 +6,14 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 13.2.0 shipped
+
+### Graph layout 2: externalized B+ tree directories ✅
+
+Each edge group becomes a B+ tree over the KV store: chunks are capped by entry count and a large group's chunk directory moves to family
+`d`, so write volume no longer grows with degree. New stores default to layout 2 (`g` version 2), which older releases cannot open; layout 1
+stores keep working and can be upgraded one way. Details in TASK.md G17.
+
 ## 13.1.2 shipped
 
 ### libbitcask upgrade 13.1.1 → 13.1.2 ✅

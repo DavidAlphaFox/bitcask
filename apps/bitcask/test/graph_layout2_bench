@@ -1,0 +1,86 @@
+#!/usr/bin/env escript
+
+%% graph_layout2_bench — 布局 1 / 布局 2（doc/graph-layout-2-zh.md）的真实实现对比。
+%%
+%% 用法（仓库根目录，先 rebar3 compile）：
+%%   escript apps/bitcask/test/graph_layout2_bench [入度 ...]
+%% 缺省入度：3000 30000 300000。
+%%
+%% 每个入度、每种布局：新库里先用 put_edges 批量建好一个大号（偶数 src 2,4,…,2N → hub），
+%% 再逐条加 2000 条入边（随机奇数 src，均匀落在已有条目之间），记：
+%%   每条边写入 B   逐条加边期间 *.data 增长的字节 / 条数（含起点一端）
+%%   加边 µs        put_edge 平均
+%%   点查 µs        hub 入边组里随机一条（graphdb_adj:lookup）
+%%   前 100 µs      in_edges limit 100
+%%   入度 µs        in_degree
+%%   全读 ms        in_edges 全部
+%%   形状           块数 / 目录层数
+%% 库目录建在 /tmp/kgl2b<数字>，跑完删掉。参数取各布局缺省（布局 1：块 4 KiB、超大组放宽；
+%% 布局 2：块 512 条、块数 > 16 目录外置）。
+
+-mode(compile).
+
+-define(HUB, 1 bsl 40).
+-define(SINGLE, 2000).
+
+main(Args) ->
+    Degs = case [list_to_integer(A) || A <- Args] of
+               [] -> [3000, 30000, 300000];
+               L  -> L
+           end,
+    code:add_pathsz(filelib:wildcard("_build/default/lib/*/ebin")),
+    {ok, _} = application:ensure_all_started(bitcask),
+    io:format("~ts~n", [<<"入度 | 布局 | 每条边写入 B | 加边 µs | 点查 µs | 前100 µs | 入度 µs | 全读 ms | 形状"/utf8>>]),
+    [run(N, L) || N <- Degs, L <- [1, 2]],
+    ok.
+
+run(N, Layout) ->
+    rand:seed(exsss, {N, Layout, 7}),
+    Dir = "/tmp/kgl2b" ++ integer_to_list(erlang:unique_integer([positive])),
+    try
+        R = graphdb:open(Dir, [read_write, {adj_layout, Layout}]),
+        prebuild(R, N),
+        B0 = data_bytes(Dir),
+        Srcs = [2 * rand:uniform(N) - 1 || _ <- lists:seq(1, ?SINGLE)],
+        {TPut, _} = timer:tc(fun() -> [ok = graphdb:put_edge(R, S, 1, ?HUB) || S <- Srcs] end),
+        B1 = data_bytes(Dir),
+        Distinct = length(lists:usort(Srcs)),
+        Probe = [2 * rand:uniform(N) || _ <- lists:seq(1, 2000)],
+        TLook = avg_us(fun() -> [{ok, _} = graphdb_adj:lookup({direct, R}, ?HUB, 1, 1, X, 0)
+                                 || X <- Probe] end, length(Probe)),
+        TFirst = avg_us(fun() -> [{ok, _} = graphdb:in_edges(R, ?HUB, #{limit => 100})
+                                  || _ <- lists:seq(1, 200)] end, 200),
+        TDeg = avg_us(fun() -> [{ok, _} = graphdb:in_degree(R, ?HUB) || _ <- lists:seq(1, 2000)] end, 2000),
+        {TFull, {ok, All}} = timer:tc(fun() -> graphdb:in_edges(R, ?HUB) end),
+        true = (N + Distinct =:= length(All)),
+        io:format("~p | ~ts ~p | ~.1f | ~.1f | ~.2f | ~.1f | ~.2f | ~.1f | ~ts~n",
+                  [N, <<"布局"/utf8>>, Layout, (B1 - B0) / ?SINGLE, TPut / ?SINGLE, TLook, TFirst, TDeg,
+                   TFull / 1000, shape(R)]),
+        graphdb:close(R)
+    after
+        _ = file:del_dir_r(Dir)
+    end.
+
+%% 偶数 src 2,4,…,2N；每 5 万条一次 put_edges（一个原子批，大号的头一批只写一次）。
+prebuild(R, N) ->
+    lists:foreach(fun(Lo) ->
+                          Hi = min(N, Lo + 49999),
+                          ok = graphdb:put_edges(R, [{2 * I, 1, ?HUB} || I <- lists:seq(Lo, Hi)],
+                                                 #{batch_vids => 65536})
+                  end, lists:seq(1, N, 50000)).
+
+shape(R) ->
+    {ok, V} = bitcask:get(R, graphdb:akey(?HUB)),
+    {ok, Gs} = graphdb_adj:groups_info(V),
+    case [B || {1, 1, _, B} <- Gs] of
+        [{chunks, Lbs}]   -> io_lib:format("~p ~ts", [length(Lbs), <<"块"/utf8>>]);
+        [{xdir, NC, Lv}]  -> io_lib:format("~p ~ts ~p ~ts", [NC, <<"块，目录"/utf8>>, Lv, <<"层"/utf8>>]);
+        [{entries, _}]    -> <<"内联"/utf8>>
+    end.
+
+avg_us(F, K) ->
+    {T, _} = timer:tc(F),
+    T / K.
+
+data_bytes(Dir) ->
+    lists:sum([filelib:file_size(F) || F <- filelib:wildcard(filename:join(Dir, "*.data"))]).

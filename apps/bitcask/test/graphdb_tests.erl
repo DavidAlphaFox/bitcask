@@ -810,19 +810,32 @@ put_del_edges_batch_test_() ->
      end}}.
 
 layout_and_config_test_() ->
-    {"建库写 g（布局 1 + 参数）；重开以 g 为准；旧图库拒开",
+    {"建库写 g（缺省布局 2 + 参数；指定布局 1）；重开以 g 为准；旧图库拒开",
      fun() ->
         with_dir(fun(D) ->
             R = graphdb:open(D, [read_write, {adj_inline_max, 512}]),
-            ?assertEqual(#{inline_max => 512, chunk_max => 4096, props_max => 128},
+            ?assertEqual(#{layout => 2, inline_max => 512, chunk_max => 65536, props_max => 128,
+                           chunk_entries => 512, chunk_count_max => 65536,
+                           dir_inline_max => 16, dir_node_max => 256},
                          graphdb:graph_config(R)),
-            {ok, <<1, _/binary>>} = bitcask:get(R, <<?GP/binary, "g">>),
+            {ok, <<2, _:22/binary>>} = bitcask:get(R, <<?GP/binary, "g">>),
             ok = graphdb:close(R),
             R2 = graphdb:open(D, [read_write, {adj_inline_max, 9999}]),
             ?assertEqual(512, maps:get(inline_max, graphdb:graph_config(R2))),
             ok = graphdb:close(R2),
             ?assertError({badarg, {adj_chunk_max, 1}},
-                         graphdb:open(D ++ "_x", [read_write, {adj_chunk_max, 1}]))
+                         graphdb:open(D ++ "_x", [read_write, {adj_chunk_max, 1}])),
+            ?assertError({badarg, {adj_layout, 3}},
+                         graphdb:open(D ++ "_x", [read_write, {adj_layout, 3}])),
+            ?assertError({badarg, {adj_dir_node_max, 2}},
+                         graphdb:open(D ++ "_x", [read_write, {adj_dir_node_max, 2}]))
+        end),
+        with_dir(fun(D) ->
+            R = graphdb:open(D, [read_write, {adj_layout, 1}, {adj_inline_max, 512}]),
+            ?assertEqual(#{layout => 1, inline_max => 512, chunk_max => 4096, props_max => 128},
+                         graphdb:graph_config(R)),
+            {ok, <<1, _:10/binary>>} = bitcask:get(R, <<?GP/binary, "g">>),
+            ok = graphdb:close(R)
         end),
         with_dir(fun(D) ->
             B = bitcask:open(D, [read_write]),
@@ -1061,11 +1074,12 @@ del_vertex_hub_reads_only_needed_chunks_test_() ->
      end}}.
 
 chunked_read_by_directory_test_() ->
-    {"分块组的直通读按块目录点读：limit 只读用到的块、不开 range；全量 / etype / 事务读结果"
-     "不变；目录里有、盘上没有的块按空处理；degree 只读头",
+    {"分块组的直通读按块目录点读（布局 1：目录在头里）：limit 只读用到的块、不开 range；全量 / "
+     "etype / 事务读结果不变；目录里有、盘上没有的块按空处理；degree 只读头",
      {timeout, 60, fun() ->
         with_dir(fun(D) ->
-            R = graphdb:open(D, [read_write, {adj_inline_max, 256}, {adj_chunk_max, 256}]),
+            R = graphdb:open(D, [read_write, {adj_layout, 1}, {adj_inline_max, 256},
+                                 {adj_chunk_max, 256}]),
             Dsts = lists:seq(1001, 3000),
             ok = graphdb:put_edges(R, [{1, 7, Y} || Y <- Dsts]),
             ok = graphdb:put_edges(R, [{1, 8, Y} || Y <- lists:seq(5001, 5010)]),

@@ -133,6 +133,10 @@ Entry = <<Other:64>>                                  %% simple graph, no props:
 
 ### 4.3 Chunking (hubs)
 
+> Layout 2 (`g` version 2, the default for new stores, TASK G17): chunks are capped by entry count (default 512) and the chunk
+> directory moves out into a B+ tree in family `d` once a group has more than 16 chunks; huge groups no longer get larger chunks. This
+> section describes layout 1; see [graph-layout-2-en.md](graph-layout-2-en.md) for the differences.
+
 Parameters (open-time, recorded in `g`):
 
 - `adj_inline_max`, default 4096 B: when the head value exceeds it, the largest inline

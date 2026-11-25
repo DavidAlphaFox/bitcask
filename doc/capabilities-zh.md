@@ -15,7 +15,7 @@ English API: [`api-en.md`](api-en.md)。完整函数签名与参数见
 | 向量检索 | 近似最近邻、meta filter、精确重排 | 索引模式 + embedder 或 `{vector_dim, N}` | 引擎与度量建库固定；磁盘档要求 cosine / dot |
 | 混合检索 | BM25 与向量 RRF 融合 | 索引 + 向量路径 | 文本与向量两路都可用时效果最好；单路可退化 |
 | Embedder | OpenAI 兼容 HTTP、可插拔 behaviour、本地 llama.cpp | `{embedder, _}` 或独立进程 | 本地后端默认不构建；换模型 / 维度需重建索引 |
-| 图层 | 顶点、标签、边、度数、邻接读写、事务式边写 | `graphdb:open/2` | 图布局 v2；旧布局 fail-loud 拒开 |
+| 图层 | 顶点、标签、边、度数、邻接读写、事务式边写 | `graphdb:open/2` | 新库缺省布局 2：大组的块目录外置成 B+ 树（见 graph-layout-2-zh.md）；旧版本打不开布局 2，需旧程序兼容时建库传 `{adj_layout, 1}` |
 | Cypher | openCypher 子集、参数、预编译、explain、游标 | `bitcask_cypher:q/2,3,4` | 写语句一个事务；向量 / 全文需相应模式 |
 | 运维 | merge、needs_merge、status、过期、崩溃锁回收 | open 选项或显式 API | 活跃写入文件会被 merge 跳过 |
 

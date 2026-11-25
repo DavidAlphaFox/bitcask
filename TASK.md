@@ -693,6 +693,26 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## G17 — 图层布局 2：块目录外置成 KV 上的 B+ 树（13.2.0）
+
+> 来源：keelson 一侧的布局 2（keelson `designs/graph-layout-2.md`、D-51）在本库同步实现。设计稿 [`doc/graph-layout-2-zh.md`](doc/graph-layout-2-zh.md)（英文版
+> `graph-layout-2-en.md`）。盘上**值**与 keelson 逐字节相同；键仍是本库的二进制编码（与 keelson 的十六进制文本不同，统一与否待定）。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **G17-1** | 盘上格式：`d` 家族目录节点 `<1,"_g:"> d vid dir etype level o r`（35 B）与值 `<<1, Level, Count:16, (O, R) × Count>>`；头的组标志 bit3 = 目录外置，组体 `<<NChunks:32, Levels:8>>`；`g` 版本 2（23 B，多 chunk_entries / chunk_count_max / dir_inline_max / dir_node_max）。`graphdb_adj`：`dir_node_key/5`、`parse_dir_node_key/1`、`encode_node/2`、`decode_node/1`（校验长度、层号、下界严格升序）、`layout1_cfg/0`、`layout2/1`；`default_cfg/0` 改为布局 2。 | ✅ |
+| **G17-2** | 写会话：节点按 key 缓存（`nodes` / `ndirty` / `ndels` / `ondisk`），直通读到的版本进读集；`xwalk` / `xall` / `xput_path`（溢出向上分裂、根分裂长一层）/ `xbuild` / `xremove`（摘空删节点、摘首项给节点改名）/ `xrelabel` / `xshrink`（根只剩一个子节点降一层）；块按条数切（`split_chunk` / `split_initial` / 安全阀 `eff_entries`），布局 1 的库照旧按字节；`xrebalance`（> dir_inline_max 外置、< 一半转回内联）；整组删空连节点一起删；读树遇到缺失节点 ⇒ 会话 `stale`，直通提交回 `conflict`、事务走 `bitcask_txn` 重启。 | ✅ |
+| **G17-3** | 读路径：`rg_xdir`（自根深度优先、limit 到了就停、Guard 时节点进读集）、`lookup` 逐层定位、`sel_groups` / `groups_info` / `out_ids` / `out_entries` 认外置组。 | ✅ |
+| **G17-4** | 门面：`graphdb:open/2` 新选项 `adj_layout`、`adj_chunk_entries`、`adj_chunk_count_max`、`adj_dir_inline_max`、`adj_dir_node_max`（参数不合法在打开库之前报 badarg——原先在 open 之后报、句柄泄漏）；`graphdb:upgrade_layout/2`（布局 1 → 2，只改 `g`，带版本条件，数据碰到再转）；`check_invariants/1` 扫 `d` 家族核对每棵树、报孤儿节点。 | ✅ |
+| **G17-5** | 测试：新增 `graphdb_layout2_tests`（11 个：编解码、新库是布局 2、小参数逼出 ≥ 3 层的树随机加删与模型对照、5 个种子随机交替、rank + 外置属性、安全阀、缺省按 512 条切、布局 1 照旧 + 升级、过期目录当冲突、事务、8 进程并发写 hub、校验发现孤儿 / 缺失节点）；`graphdb_tests` 两处改为布局 2 的预期 / 钉在布局 1（`chunked_read_by_directory_test_` 测的是头里目录的点读次数）。 | ✅ |
+| **G17-6** | 基准 `apps/bitcask/test/graph_layout2_bench`（入度 3 千～300 万，批量建好后逐条加 2000 条）：每条边写入 30 万入度 22089 → 4214 B、300 万 56837 → 4432 B；加边约快一倍；点查 3 万 1.8 → 3.9 µs、30 万 3.6 → 4.6 µs、300 万 7.0 → 5.2 µs；前 100 条、入度更快；全读 300 万条慢 18%。节点读校验从逐项切子二进制改成一遍匹配（点查 11.9 → 4.6 µs）。数字见设计稿 §7。 | ✅ |
+| **G17-7** | 验证：两个应用一起 eunit 658/658，TCK 3880/3880，`rebar3 as prod compile`、xref、dialyzer 干净。 | ✅ |
+| **G17-8** | 发版记录：`vsn` 13.1.2 → **13.2.0**（`bitcask` 与 `bitcask_cypher` 同版；libbitcask 与 KV 盘上格式不变，只演进图层的邻接布局）；CHANGELOG（中英）、Cypher CHANGELOG（中英）、ROADMAP（中英）。 | ✅ |
+
+没做（设计稿 §8）：键编码与 keelson 统一；半空块 / 稀疏节点合并；组提交写入器；`put_edges` 的 `batch_vids` 缺省值。
+
+---
+
 ## M28 — libbitcask 升级 12.1.0 → 13.1.0（13.1.0）
 
 > submodule `1caee1a` → `02aa247`（tag `v13.1.0`，跨上游 12.2.0 / 13.0.0 / 13.1.0：S69～S76）。上游 13.0.0 破坏 C++ ABI（`SOVERSION` 13），
