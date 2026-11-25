@@ -6,6 +6,13 @@ Legend: ✅ committed (will do) · ⚠️ candidate (gated by measurement).
 
 ---
 
+## 13.1.2 shipped
+
+### libbitcask upgrade 13.1.1 → 13.1.2 ✅
+
+libbitcask moves to the upstream PATCH `13.1.2` (`90fdc5f`): only upstream's own records and tests changed; library source, C API,
+C++ ABI (`SOVERSION` 13) and on-disk format are unchanged. Details in TASK.md M30.
+
 ## 13.1.1 shipped
 
 ### git_subdir downstream build fix + libbitcask upgrade 13.1.0 → 13.1.1 ✅

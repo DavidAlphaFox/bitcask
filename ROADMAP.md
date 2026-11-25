@@ -6,6 +6,13 @@ English: [`ROADMAP_EN.md`](ROADMAP_EN.md)。详细子任务拆分与历史见 [`
 
 ---
 
+## 13.1.2 落地
+
+### libbitcask 升级 13.1.1 → 13.1.2 ✅
+
+libbitcask 升到上游 PATCH `13.1.2`（`90fdc5f`）：只动上游自己的记录与测试，库源码、C API、C++ ABI（`SOVERSION` 13）与盘上格式不变。
+明细见 TASK.md M30。
+
 ## 13.1.1 落地
 
 ### 修复 git_subdir 下游构建 + libbitcask 升级 13.1.0 → 13.1.1 ✅

@@ -3,6 +3,17 @@
 English version: [`CHANGELOG_EN.md`](CHANGELOG_EN.md)。
 格式大致遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [13.1.2] — 2026-11-25
+
+升级 libbitcask **13.1.1 → 13.1.2**（上游 PATCH：S79）。submodule 从 `8511c09` 切到 `90fdc5f`（tag `13.1.2`）。上游库源码与
+13.1.1 逐字节相同（`src` / `include` / `c_api` / `tools` / `cmake` 无差异，`CMakeLists.txt` 只改了版本号），C API、C++ ABI
+（`SOVERSION` 13）、盘上格式与本库既有 API 均不变，NIF 不用改，重编即得。
+
+### Changed
+
+- libbitcask 13.1.2 只动了上游自己的记录与测试，对本库都不可见：风险报告与遗留表按代码对账（`O_CLOEXEC` 早已修、多项冗余已归并）；
+  上游测试跑完不再在系统临时目录留文件。本库构建时不编上游测试（`BUILD_TESTING=OFF`），不受影响。
+
 ## [13.1.1] — 2026-11-24
 
 升级 libbitcask **13.1.0 → 13.1.1**（上游 PATCH：S77、S78）。submodule 从 `02aa247` 切到 `8511c09`（tag `v13.1.1`）。上游库源码与

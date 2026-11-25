@@ -3,6 +3,19 @@
 中文版见 [`CHANGELOG.md`](CHANGELOG.md)。
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [13.1.2] — 2026-11-25
+
+Upgrades libbitcask **13.1.1 → 13.1.2** (an upstream PATCH: S79). The submodule moves from `8511c09` to `90fdc5f` (tag `13.1.2`).
+Upstream library source is byte-for-byte identical to 13.1.1 (no diff under `src` / `include` / `c_api` / `tools` / `cmake`; `CMakeLists.txt`
+only bumps the version); the C API, C++ ABI (`SOVERSION` 13), on-disk format and this library's existing API are unchanged, the NIFs need
+no change — just rebuild.
+
+### Changed
+
+- libbitcask 13.1.2 only touches upstream's own records and tests, none of it visible here: the risk report and the leftovers table are
+  reconciled with the code (`O_CLOEXEC` was fixed long ago, several redundancies are merged); upstream tests no longer leave files in the
+  system temp directory. This library builds libbitcask without its tests (`BUILD_TESTING=OFF`), so nothing changes for it.
+
 ## [13.1.1] — 2026-11-24
 
 Upgrades libbitcask **13.1.0 → 13.1.1** (an upstream PATCH: S77, S78). The submodule moves from `02aa247` to `8511c09` (tag `v13.1.1`).

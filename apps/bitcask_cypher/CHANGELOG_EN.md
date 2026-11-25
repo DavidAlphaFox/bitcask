@@ -5,6 +5,11 @@
 The Cypher query layer used to live in the main bitcask application (since 13.1.0); it is now a separate application,
 `bitcask_cypher`. Entries from before the split are kept below.
 
+## [13.1.2] — 2026-11-25
+
+No changes to this application; the version follows `bitcask` 13.1.2 (libbitcask upgraded to 13.1.2, library source identical to
+13.1.1). See the root `CHANGELOG_EN.md` for details.
+
 ## [13.1.1] — 2026-11-24
 
 No changes to this application; the version follows `bitcask` 13.1.1 (libbitcask upgraded to 13.1.1, library source identical to

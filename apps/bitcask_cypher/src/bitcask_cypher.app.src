@@ -1,7 +1,7 @@
 {application, bitcask_cypher,
  [
   {description, "Cypher (openCypher) query layer over the bitcask graph API"},
-  {vsn, "13.1.1"},
+  {vsn, "13.1.2"},
   {modules, []},
   {registered, [bitcask_cypher_sup]},
   {applications, [kernel, stdlib, bitcask]},

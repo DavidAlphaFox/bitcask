@@ -719,6 +719,20 @@ submodule 升至 v3.0.0（三套版本号统一，`SOVERSION` 1 → 3）；本�
 
 ---
 
+## M30 — 发 13.1.2：libbitcask 升级 13.1.1 → 13.1.2（13.1.2）
+
+> submodule `8511c09` → `90fdc5f`（tag `13.1.2`，上游 S79）。上游库源码与 13.1.1 逐字节相同（`CMakeLists.txt` 只改版本号），
+> C API、C++ ABI（`SOVERSION` 13）与盘上格式不变；NIF 不用改。
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| **M30-1** | submodule checkout `90fdc5f`（`13.1.2`）；`apps/bitcask/CMakeLists.txt` 子模块注释同步。上游嵌套子模块无变化。 | ✅ |
+| **M30-2** | 上游这版动了什么（对本库都不可见）：S79 风险报告 / 遗留表按代码对账；上游测试跑完不留临时文件（`scratch_dir()` 等）。 | ✅ |
+| **M30-3** | 验证：`rebar3 compile`、eunit 628/628、xref、dialyzer 干净。CMake 重新生成了上游 `bitcask_version.h`（13.1.2），但它只被上游 C API 源文件包含、不在 `bitcask_cpp` 目标里，其余源码与 13.1.1 相同，故 `priv/bitcask_cpp.so` 不重链（预期行为）。上游 `check` 本库不跑（`BUILD_TESTING=OFF`）。 | ✅ |
+| **M30-4** | 发版记录：`vsn` 13.1.1 → **13.1.2**（`bitcask` 与 `bitcask_cypher` 同版）；CHANGELOG（中英）、README（中英）、ROADMAP（中英）。 | ✅ |
+
+---
+
 ## M29 — 发 13.1.1：修 git_subdir 下游构建 + libbitcask 升级 13.1.0 → 13.1.1（13.1.1）
 
 > submodule `02aa247` → `8511c09`（tag `v13.1.1`，上游 S77 + S78）。上游库源码与 13.1.0 逐字节相同，C API、C++ ABI
